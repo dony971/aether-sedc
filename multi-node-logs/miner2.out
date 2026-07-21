@@ -1,0 +1,88 @@
+[2m2026-07-21T04:33:51.706854Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🚀 Aether Node v1.0.0 - The Satoshi Protocol
+[2m2026-07-21T04:33:51.707698Z[0m [32m INFO[0m [2maether[0m[2m:[0m ========================================
+[2m2026-07-21T04:33:51.708105Z[0m [32m INFO[0m [2maether[0m[2m:[0m Node Type: miner
+[2m2026-07-21T04:33:51.708429Z[0m [32m INFO[0m [2maether[0m[2m:[0m Data Directory: "data-miner-2"
+[2m2026-07-21T04:33:51.708759Z[0m [32m INFO[0m [2maether[0m[2m:[0m P2P Port: 25567
+[2m2026-07-21T04:33:51.710296Z[0m [32m INFO[0m [2maether[0m[2m:[0m RPC Port: 9935
+[2m2026-07-21T04:33:51.710661Z[0m [32m INFO[0m [2maether[0m[2m:[0m Bootnodes: [127.0.0.1:25565]
+[2m2026-07-21T04:33:51.714357Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🗄️  Initializing Sled database at "data-miner-2\\sled_db"
+[2m2026-07-21T04:33:51.774628Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🔄 Migration from JSON to Sled needed
+[2m2026-07-21T04:33:51.776373Z[0m [32m INFO[0m [2maether_unified::storage[0m[2m:[0m 🔄 Starting migration from JSON to Sled...
+[2m2026-07-21T04:33:51.777582Z[0m [32m INFO[0m [2maether_unified::storage[0m[2m:[0m ✅ Migration from JSON to Sled completed successfully
+[2m2026-07-21T04:33:51.783513Z[0m [32m INFO[0m [2maether_unified::ledger[0m[2m:[0m ✓ Ledger loaded from Sled: 0 accounts, 0 nonces, total supply: 0
+[2m2026-07-21T04:33:51.783904Z[0m [32m INFO[0m [2maether_unified::genesis[0m[2m:[0m 🔍 GenesisConfig: Adding address 3d17ace653283dbd9aeba6e0d4684795a800e9da952cb682bb67cd970cbe1b3e with balance 100000000000 (raw)
+[2m2026-07-21T04:33:51.784260Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🔍 Genesis check: 3d17ace653283dbd9aeba6e0d4684795a800e9da952cb682bb67cd970cbe1b3e -> current balance: 0
+[2m2026-07-21T04:33:51.784546Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🔍 Genesis config balance for 3d17ace653283dbd9aeba6e0d4684795a800e9da952cb682bb67cd970cbe1b3e: 100000000000 (raw)
+[2m2026-07-21T04:33:51.786413Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🌱 Genesis balance set for 3d17ace653283dbd9aeba6e0d4684795a800e9da952cb682bb67cd970cbe1b3e: 10 AETH
+[2m2026-07-21T04:33:51.786714Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🌱 Genesis initialized: 1 addresses with message: 23/Apr/2026 - Aether: Trust is computed, not granted. Le Monde 21/04/2026: L'Aether naît du chaos numérique.
+[2m2026-07-21T04:33:51.787534Z[0m [32m INFO[0m [2maether[0m[2m:[0m 💾 Genesis balances saved to Sled
+[2m2026-07-21T04:33:51.787982Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🌱 No existing DAG state found, initializing genesis...
+[2m2026-07-21T04:33:51.788347Z[0m [32m INFO[0m [2maether_unified::genesis[0m[2m:[0m 🔍 GenesisConfig: Adding address 3d17ace653283dbd9aeba6e0d4684795a800e9da952cb682bb67cd970cbe1b3e with balance 100000000000 (raw)
+[2m2026-07-21T04:33:51.788803Z[0m [32m INFO[0m [2maether_unified::parent_selection[0m[2m:[0m ✅ Transaction 0e32f4afc8be0cc787e32fc947ffbd505c4ab389c9538ece92212567f820a5bd added to DAG (validated). Tips count: 1
+[2m2026-07-21T04:33:51.789222Z[0m [32m INFO[0m [2maether[0m[2m:[0m 💾 DAG loaded from JSON
+[2m2026-07-21T04:33:51.789540Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🔄 Rebuilding tips...
+[2m2026-07-21T04:33:51.789852Z[0m [32m INFO[0m [2maether_unified::parent_selection[0m[2m:[0m Rebuilt tips: 1 tips from 1 transactions
+[2m2026-07-21T04:33:51.791424Z[0m [32m INFO[0m [2maether[0m[2m:[0m   TIP COUNT: 1
+[2m2026-07-21T04:33:51.791747Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✅ Tips rebuilt
+[2m2026-07-21T04:33:51.793367Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⚙️  Initializing Micro-PoW...
+[2m2026-07-21T04:33:51.793692Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✓ Micro-PoW initialized
+[2m2026-07-21T04:33:51.793985Z[0m [32m INFO[0m [2maether[0m[2m:[0m   Initial Difficulty: 100
+[2m2026-07-21T04:33:51.794283Z[0m [32m INFO[0m [2maether[0m[2m:[0m   Target TPS: 100000
+[2m2026-07-21T04:33:51.794570Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✓ Mempool initialized
+[2m2026-07-21T04:33:51.797285Z[0m [32m INFO[0m [2maether[0m[2m:[0m 📡 Creating P2P channel...
+[2m2026-07-21T04:33:51.797670Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✓ P2P channel created
+[2m2026-07-21T04:33:51.797994Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🌐 Initializing P2P network...
+[2m2026-07-21T04:33:51.798313Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✅ P2P network initialized
+[2m2026-07-21T04:33:51.798590Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🔄 Spawning P2P Network task...
+[2m2026-07-21T04:33:51.798917Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🔄 Spawning P2P transaction receiver...
+[2m2026-07-21T04:33:51.798960Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✅ P2P Network task spawned
+[2m2026-07-21T04:33:51.799268Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✓ P2P Network initialized
+[2m2026-07-21T04:33:51.799315Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✅ P2P transaction receiver task spawned
+[2m2026-07-21T04:33:51.799556Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m Starting P2P network on 0.0.0.0:25567
+[2m2026-07-21T04:33:51.799821Z[0m [32m INFO[0m [2maether[0m[2m:[0m   Listening on port 25567
+[2m2026-07-21T04:33:51.800680Z[0m [32m INFO[0m [2maether[0m[2m:[0m 📡 About to start RPC server...
+[2m2026-07-21T04:33:51.801071Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🔄 Spawning RPC Server task...
+[2m2026-07-21T04:33:51.801452Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✓ RPC Server initialized
+[2m2026-07-21T04:33:51.801479Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✅ RPC Server task spawned
+[2m2026-07-21T04:33:51.801783Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✅ Aether Node Ready
+[2m2026-07-21T04:33:51.802815Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🚀 Starting RPC server on http://0.0.0.0:9935
+[2m2026-07-21T04:33:51.802916Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m Tentative de connexion au bootnode: 127.0.0.1:25565
+[2m2026-07-21T04:33:51.803163Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Starting Mining Mode...
+[2m2026-07-21T04:33:51.803512Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📊 Mempool: max_size=1000, available_permits=10
+[2m2026-07-21T04:33:51.804367Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m Connected to peer: 127.0.0.1:25565
+[2m2026-07-21T04:33:51.805940Z[0m [32m INFO[0m [2maether[0m[2m:[0m   Node will actively mine transactions to secure the DAG
+[2m2026-07-21T04:33:51.806648Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m ✅ RPC + Explorer server listening on http://0.0.0.0:9935
+[2m2026-07-21T04:33:51.806976Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🔄 Spawning Mining task...
+[2m2026-07-21T04:33:51.807174Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m [Sync] Sending GetInventory with 1 tips to 127.0.0.1:25565
+[2m2026-07-21T04:33:51.809773Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✓ Mining task initialized
+[2m2026-07-21T04:33:51.809804Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✅ Mining task spawned
+[2m2026-07-21T04:33:51.810421Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m [Sync] GetInventory from 127.0.0.1:25565: we need 1 tips, peer might need 1 tips
+[2m2026-07-21T04:33:51.810458Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✅ Node running. Press Ctrl+C to stop.
+[2m2026-07-21T04:33:51.811398Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m [Sync] Sending 1 transactions to 127.0.0.1:25565
+[2m2026-07-21T04:33:51.812159Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - Sender: 0000000000000000000000000000000000000000000000000000000000000000
+[2m2026-07-21T04:33:51.812499Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - Receiver: e6e05920156d3184ace93cc8fcc34c6be69c55e903b34b2b614452a9a1a8a398
+[2m2026-07-21T04:33:51.812789Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - Amount: 0
+[2m2026-07-21T04:33:51.813111Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - Fee: 0
+[2m2026-07-21T04:33:51.816548Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - Parents: [0000000000000000000000000000000000000000000000000000000000000000, 0000000000000000000000000000000000000000000000000000000000000000]
+[2m2026-07-21T04:33:51.816914Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - PoW Nonce: 0
+[2m2026-07-21T04:33:51.817249Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - Account Nonce: 0
+[2m2026-07-21T04:33:51.817638Z[0m [32m INFO[0m [2maether_unified::transaction_processor[0m[2m:[0m 🔍 Processing transaction: 603839000baec78854f41d9023b0096197bae0d955475bf9e5b551aa40d719ec
+[2m2026-07-21T04:33:51.818028Z[0m [31mERROR[0m [2maether_unified::rpc[0m[2m:[0m ❌ Transaction processing failed: Validation failed: Invalid PoW: transaction must meet difficulty 16
+[2m2026-07-21T04:33:51.818459Z[0m [33m WARN[0m [2maether[0m[2m:[0m ❌ P2P transaction rejected: Validation failed: Invalid PoW: transaction must meet difficulty 16
+[2m2026-07-21T04:33:51.872328Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m [Sync] Downloaded 1 missing transactions from 127.0.0.1:25565
+[2m2026-07-21T04:33:51.872896Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m [Sync] Sending 1 transactions to 127.0.0.1:25565
+[2m2026-07-21T04:33:56.945769Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:34:01.818328Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:34:02.079571Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:34:07.215054Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:34:11.843520Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:34:12.348554Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:34:17.483236Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:34:21.860087Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:34:22.616505Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:34:27.751306Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:34:31.880057Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:34:32.885096Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:34:38.019784Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:34:41.897880Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:34:43.151578Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC

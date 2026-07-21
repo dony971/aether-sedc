@@ -1,0 +1,59 @@
+services:
+  bootnode:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aether-bootnode
+    hostname: bootnode
+    command: >
+      --node-type miner
+      --data-dir /data
+      --p2p-port 25565
+      --rpc-port 9933
+    ports:
+      - "25565:25565"
+      - "9933:9933"
+    volumes:
+      - bootnode-data:/data
+    environment:
+      - RUST_LOG=info
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -X POST http://localhost:9933 -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"method\":\"aether_getDagStats\",\"params\":[],\"id\":1}' > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - aether-net
+
+  miner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles:
+      - multi
+    command: >
+      --node-type miner
+      --data-dir /data
+      --p2p-port 25565
+      --rpc-port 9933
+      --bootnodes bootnode:25565
+    ports:
+      - "9934-9945:9933"
+    volumes:
+      - miner-data:/data
+    environment:
+      - RUST_LOG=info
+    depends_on:
+      bootnode:
+        condition: service_healthy
+    networks:
+      - aether-net
+
+volumes:
+  bootnode-data:
+  miner-data:
+
+networks:
+  aether-net:
+    driver: bridge

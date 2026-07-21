@@ -1,0 +1,192 @@
+[2m2026-07-21T04:34:55.055934Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🚀 Aether Node v1.0.0 - The Satoshi Protocol
+[2m2026-07-21T04:34:55.056695Z[0m [32m INFO[0m [2maether[0m[2m:[0m ========================================
+[2m2026-07-21T04:34:55.056936Z[0m [32m INFO[0m [2maether[0m[2m:[0m Node Type: miner
+[2m2026-07-21T04:34:55.057169Z[0m [32m INFO[0m [2maether[0m[2m:[0m Data Directory: "data-bootnode"
+[2m2026-07-21T04:34:55.057440Z[0m [32m INFO[0m [2maether[0m[2m:[0m P2P Port: 25565
+[2m2026-07-21T04:34:55.057674Z[0m [32m INFO[0m [2maether[0m[2m:[0m RPC Port: 9933
+[2m2026-07-21T04:34:55.057917Z[0m [32m INFO[0m [2maether[0m[2m:[0m Bootnodes: []
+[2m2026-07-21T04:34:55.058434Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🗄️  Initializing Sled database at "data-bootnode\\sled_db"
+[2m2026-07-21T04:34:55.129228Z[0m [32m INFO[0m [2maether_unified::ledger[0m[2m:[0m ✓ Ledger loaded from Sled: 1 accounts, 0 nonces, total supply: 100000000000
+[2m2026-07-21T04:34:55.129617Z[0m [32m INFO[0m [2maether_unified::genesis[0m[2m:[0m 🔍 GenesisConfig: Adding address 3d17ace653283dbd9aeba6e0d4684795a800e9da952cb682bb67cd970cbe1b3e with balance 100000000000 (raw)
+[2m2026-07-21T04:34:55.129911Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🔍 Genesis check: 3d17ace653283dbd9aeba6e0d4684795a800e9da952cb682bb67cd970cbe1b3e -> current balance: 100000000000
+[2m2026-07-21T04:34:55.130968Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🔍 Genesis config balance for 3d17ace653283dbd9aeba6e0d4684795a800e9da952cb682bb67cd970cbe1b3e: 100000000000 (raw)
+[2m2026-07-21T04:34:55.131217Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✅ Genesis balances already initialized
+[2m2026-07-21T04:34:55.131851Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🌱 No existing DAG state found, initializing genesis...
+[2m2026-07-21T04:34:55.132108Z[0m [32m INFO[0m [2maether_unified::genesis[0m[2m:[0m 🔍 GenesisConfig: Adding address 3d17ace653283dbd9aeba6e0d4684795a800e9da952cb682bb67cd970cbe1b3e with balance 100000000000 (raw)
+[2m2026-07-21T04:34:55.132571Z[0m [32m INFO[0m [2maether_unified::parent_selection[0m[2m:[0m ✅ Transaction 0d5877eb70eb4bbb6eff2b7a809136a5fa4a51393696f116f4b454757663daae added to DAG (validated). Tips count: 1
+[2m2026-07-21T04:34:55.133008Z[0m [32m INFO[0m [2maether[0m[2m:[0m 💾 DAG loaded from JSON
+[2m2026-07-21T04:34:55.133253Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🔄 Rebuilding tips...
+[2m2026-07-21T04:34:55.133515Z[0m [32m INFO[0m [2maether_unified::parent_selection[0m[2m:[0m Rebuilt tips: 1 tips from 1 transactions
+[2m2026-07-21T04:34:55.133744Z[0m [32m INFO[0m [2maether[0m[2m:[0m   TIP COUNT: 1
+[2m2026-07-21T04:34:55.133972Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✅ Tips rebuilt
+[2m2026-07-21T04:34:55.134214Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⚙️  Initializing Micro-PoW...
+[2m2026-07-21T04:34:55.134459Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✓ Micro-PoW initialized
+[2m2026-07-21T04:34:55.134690Z[0m [32m INFO[0m [2maether[0m[2m:[0m   Initial Difficulty: 100
+[2m2026-07-21T04:34:55.134935Z[0m [32m INFO[0m [2maether[0m[2m:[0m   Target TPS: 100000
+[2m2026-07-21T04:34:55.135190Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✓ Mempool initialized
+[2m2026-07-21T04:34:55.135446Z[0m [32m INFO[0m [2maether[0m[2m:[0m 📡 Creating P2P channel...
+[2m2026-07-21T04:34:55.135681Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✓ P2P channel created
+[2m2026-07-21T04:34:55.135945Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🌐 Initializing P2P network...
+[2m2026-07-21T04:34:55.136184Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✅ P2P network initialized
+[2m2026-07-21T04:34:55.136422Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🔄 Spawning P2P Network task...
+[2m2026-07-21T04:34:55.136679Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🔄 Spawning P2P transaction receiver...
+[2m2026-07-21T04:34:55.136728Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✅ P2P Network task spawned
+[2m2026-07-21T04:34:55.136961Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✓ P2P Network initialized
+[2m2026-07-21T04:34:55.137030Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✅ P2P transaction receiver task spawned
+[2m2026-07-21T04:34:55.137183Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m Starting P2P network on 0.0.0.0:25565
+[2m2026-07-21T04:34:55.137554Z[0m [32m INFO[0m [2maether[0m[2m:[0m   Listening on port 25565
+[2m2026-07-21T04:34:55.138268Z[0m [32m INFO[0m [2maether[0m[2m:[0m 📡 About to start RPC server...
+[2m2026-07-21T04:34:55.138510Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🔄 Spawning RPC Server task...
+[2m2026-07-21T04:34:55.138779Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✓ RPC Server initialized
+[2m2026-07-21T04:34:55.138822Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✅ RPC Server task spawned
+[2m2026-07-21T04:34:55.139016Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✅ Aether Node Ready
+[2m2026-07-21T04:34:55.139272Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🚀 Starting RPC server on http://0.0.0.0:9933
+[2m2026-07-21T04:34:55.139483Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Starting Mining Mode...
+[2m2026-07-21T04:34:55.139701Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📊 Mempool: max_size=1000, available_permits=10
+[2m2026-07-21T04:34:55.139931Z[0m [32m INFO[0m [2maether[0m[2m:[0m   Node will actively mine transactions to secure the DAG
+[2m2026-07-21T04:34:55.140381Z[0m [32m INFO[0m [2maether[0m[2m:[0m 🔄 Spawning Mining task...
+[2m2026-07-21T04:34:55.140620Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✓ Mining task initialized
+[2m2026-07-21T04:34:55.140675Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✅ Mining task spawned
+[2m2026-07-21T04:34:55.140812Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m ✅ RPC + Explorer server listening on http://0.0.0.0:9933
+[2m2026-07-21T04:34:55.140852Z[0m [32m INFO[0m [2maether[0m[2m:[0m ✅ Node running. Press Ctrl+C to stop.
+[2m2026-07-21T04:35:00.265868Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:35:05.157969Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:35:05.401293Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:35:10.533511Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:35:15.174393Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:35:15.671015Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:35:20.804198Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:35:25.196223Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:35:25.938244Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:35:31.075335Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:35:35.217134Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:35:36.206282Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:35:41.337671Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:35:45.233228Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:35:46.458287Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:35:51.588948Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:35:55.251655Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:35:56.723189Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:36:01.853691Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:36:05.266408Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:36:07.003130Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:36:12.122361Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:36:15.285119Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:36:17.255709Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:36:22.389209Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:36:25.304129Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:36:27.522542Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:36:32.654956Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:36:35.350154Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:36:37.789288Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:36:42.936825Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:36:45.408268Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:36:48.072111Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:36:53.221627Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:36:55.436523Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:36:58.356174Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:37:03.490044Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:37:05.455616Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:37:08.624805Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:37:13.757495Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:37:15.473365Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:37:18.890587Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:37:24.008848Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:37:25.491640Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:37:29.141404Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:37:34.276660Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:37:35.511706Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:37:39.411565Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:37:44.547148Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:37:45.530426Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:37:49.680910Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:37:54.818005Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:37:55.554078Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:37:59.952466Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:38:05.084297Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:38:05.571545Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:38:10.219983Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:38:15.353969Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:38:15.591723Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:38:20.487190Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:38:25.611595Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:38:25.612581Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:38:30.739790Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:38:35.631750Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:38:35.874389Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:38:41.007643Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:38:45.650192Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:38:46.142437Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:38:51.274929Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:38:55.665705Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:38:56.408265Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:39:01.540708Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:39:05.684902Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:39:06.676501Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:39:11.809611Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:39:15.704653Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:39:16.943152Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:39:22.076864Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:39:25.453603Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m New peer connected: 127.0.0.1:56275
+[2m2026-07-21T04:39:25.454543Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m [Sync] Sending GetInventory with 1 tips to 127.0.0.1:56275
+[2m2026-07-21T04:39:25.455442Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m [Sync] GetInventory from 127.0.0.1:56275: we need 1 tips, peer might need 1 tips
+[2m2026-07-21T04:39:25.455776Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m [Sync] Sending 1 transactions to 127.0.0.1:56275
+[2m2026-07-21T04:39:25.456776Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - Sender: 0000000000000000000000000000000000000000000000000000000000000000
+[2m2026-07-21T04:39:25.457081Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - Receiver: e6e05920156d3184ace93cc8fcc34c6be69c55e903b34b2b614452a9a1a8a398
+[2m2026-07-21T04:39:25.457330Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - Amount: 0
+[2m2026-07-21T04:39:25.457654Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - Fee: 0
+[2m2026-07-21T04:39:25.457924Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - Parents: [0000000000000000000000000000000000000000000000000000000000000000, 0000000000000000000000000000000000000000000000000000000000000000]
+[2m2026-07-21T04:39:25.458195Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - PoW Nonce: 0
+[2m2026-07-21T04:39:25.458472Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - Account Nonce: 0
+[2m2026-07-21T04:39:25.458738Z[0m [32m INFO[0m [2maether_unified::transaction_processor[0m[2m:[0m 🔍 Processing transaction: 084fa37fc1b04663ae374b04a8d8287fa9aeaa575ba8d0d8de5e2932584bec4a
+[2m2026-07-21T04:39:25.459037Z[0m [31mERROR[0m [2maether_unified::rpc[0m[2m:[0m ❌ Transaction processing failed: Validation failed: Invalid PoW: transaction must meet difficulty 16
+[2m2026-07-21T04:39:25.459287Z[0m [33m WARN[0m [2maether[0m[2m:[0m ❌ P2P transaction rejected: Validation failed: Invalid PoW: transaction must meet difficulty 16
+[2m2026-07-21T04:39:25.516347Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m [Sync] Downloaded 1 missing transactions from 127.0.0.1:56275
+[2m2026-07-21T04:39:25.517122Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m [Sync] Sending 1 transactions to 127.0.0.1:56275
+[2m2026-07-21T04:39:25.724620Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:39:27.211042Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:39:32.345652Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:39:35.743839Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:39:37.480104Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:39:42.614756Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:39:45.763459Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:39:46.018797Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m New peer connected: 127.0.0.1:65421
+[2m2026-07-21T04:39:46.019336Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m [Sync] Sending GetInventory with 1 tips to 127.0.0.1:65421
+[2m2026-07-21T04:39:46.019826Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m [Sync] GetInventory from 127.0.0.1:65421: we need 1 tips, peer might need 1 tips
+[2m2026-07-21T04:39:46.020132Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m [Sync] Sending 1 transactions to 127.0.0.1:65421
+[2m2026-07-21T04:39:46.021112Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - Sender: 0000000000000000000000000000000000000000000000000000000000000000
+[2m2026-07-21T04:39:46.021390Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - Receiver: e6e05920156d3184ace93cc8fcc34c6be69c55e903b34b2b614452a9a1a8a398
+[2m2026-07-21T04:39:46.021625Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - Amount: 0
+[2m2026-07-21T04:39:46.021927Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - Fee: 0
+[2m2026-07-21T04:39:46.022192Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - Parents: [0000000000000000000000000000000000000000000000000000000000000000, 0000000000000000000000000000000000000000000000000000000000000000]
+[2m2026-07-21T04:39:46.022482Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - PoW Nonce: 0
+[2m2026-07-21T04:39:46.022707Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 🔍 Processing transaction [P2P] - Account Nonce: 0
+[2m2026-07-21T04:39:46.023041Z[0m [32m INFO[0m [2maether_unified::transaction_processor[0m[2m:[0m 🔍 Processing transaction: bfb4bb0020fe456d6839c450b1ab8c4cae0d45bf33c7e86894c12e5a48a37cdf
+[2m2026-07-21T04:39:46.023405Z[0m [31mERROR[0m [2maether_unified::rpc[0m[2m:[0m ❌ Transaction processing failed: Validation failed: Invalid PoW: transaction must meet difficulty 16
+[2m2026-07-21T04:39:46.023669Z[0m [33m WARN[0m [2maether[0m[2m:[0m ❌ P2P transaction rejected: Validation failed: Invalid PoW: transaction must meet difficulty 16
+[2m2026-07-21T04:39:46.083116Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m [Sync] Downloaded 1 missing transactions from 127.0.0.1:65421
+[2m2026-07-21T04:39:46.083663Z[0m [32m INFO[0m [2maether_unified::p2p[0m[2m:[0m [Sync] Sending 1 transactions to 127.0.0.1:65421
+[2m2026-07-21T04:39:47.748579Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:39:52.882441Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:39:55.785163Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:39:58.018694Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:40:03.156297Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:40:05.801848Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:40:08.286920Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:40:13.419543Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:40:15.821728Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:40:18.554081Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:40:23.689879Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:40:25.843848Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:40:28.821069Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:40:33.954765Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:40:35.858164Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:40:39.090471Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:40:44.224893Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:40:45.880810Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:40:49.359781Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:40:54.493691Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:40:55.898444Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk
+[2m2026-07-21T04:40:59.625358Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:41:04.759056Z[0m [32m INFO[0m [2maether[0m[2m:[0m ⛏️  Mining Active | Mempool: 0 tx | DAG: 1 tx | TPS: 0.00 | Connected to RPC
+[2m2026-07-21T04:41:05.916321Z[0m [32m INFO[0m [2maether_unified::rpc[0m[2m:[0m 📦 Loaded 0 orphans from disk

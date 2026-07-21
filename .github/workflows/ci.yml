@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy (lib)
+        run: cargo clippy --lib -- -D warnings
+
+      - name: Build (lib)
+        run: cargo build --lib --verbose
+
+      - name: Build (binary, skip gui)
+        run: cargo build --bin aether --verbose
+
+      - name: Run tests
+        run: cargo test --lib --verbose
+
+  integration:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: build-and-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --bin aether --verbose
+
+      - name: Start bootnode
+        run: |
+          mkdir -p multi-node-logs
+          ./target/debug/aether --node-type miner --data-dir data-bootnode --p2p-port 25565 --rpc-port 9933 &
+          BOOT_PID=$!
+          echo "Bootnode PID: $BOOT_PID"
+
+          # Wait for RPC
+          for i in $(seq 1 30); do
+            if curl -s -X POST http://127.0.0.1:9933 -H "Content-Type: application/json" \
+              -d '{"jsonrpc":"2.0","method":"aether_getDagStats","params":[],"id":1}' 2>/dev/null | grep -q "result"; then
+              echo "Bootnode ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Start miner1
+          ./target/debug/aether --node-type miner --data-dir data-miner-1 --p2p-port 25566 --rpc-port 9934 --bootnodes 127.0.0.1:25565 &
+          M1_PID=$!
+          echo "Miner1 PID: $M1_PID"
+
+          # Start miner2
+          ./target/debug/aether --node-type miner --data-dir data-miner-2 --p2p-port 25567 --rpc-port 9935 --bootnodes 127.0.0.1:25565 &
+          M2_PID=$!
+          echo "Miner2 PID: $M2_PID"
+
+          sleep 15
+
+          # Check peer counts
+          echo "=== Checking peer counts ==="
+          for port in 9933 9934 9935; do
+            PEERS=$(curl -s -X POST http://127.0.0.1:$port -H "Content-Type: application/json" \
+              -d '{"jsonrpc":"2.0","method":"aether_getDagStats","params":[],"id":1}' | \
+              python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('peer_count',0))" 2>/dev/null || echo "0")
+            echo "Port $port -> $PEERS peers"
+            if [ "$PEERS" -lt 1 ]; then
+              echo "FAIL: Port $port has $PEERS peers"
+              kill $BOOT_PID $M1_PID $M2_PID 2>/dev/null
+              exit 1
+            fi
+          done
+
+          # Faucet on miner1
+          echo "=== Faucet transaction ==="
+          curl -s -X POST http://127.0.0.1:9934 -H "Content-Type: application/json" \
+            -d '{"jsonrpc":"2.0","method":"aether_faucet","params":["127.0.0.1:9934"],"id":1}' > /dev/null
+
+          sleep 10
+
+          # Check propagation
+          echo "=== Checking propagation ==="
+          for port in 9933 9935; do
+            TX_COUNT=$(curl -s -X POST http://127.0.0.1:$port -H "Content-Type: application/json" \
+              -d '{"jsonrpc":"2.0","method":"aether_getDagStats","params":[],"id":1}' | \
+              python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('transaction_count',0))" 2>/dev/null || echo "0")
+            echo "Port $port -> $TX_COUNT transactions"
+            if [ "$TX_COUNT" -lt 1 ]; then
+              echo "FAIL: Transaction not propagated to port $port"
+              kill $BOOT_PID $M1_PID $M2_PID 2>/dev/null
+              exit 1
+            fi
+          done
+
+          echo "=== All integration tests passed ==="
+          kill $BOOT_PID $M1_PID $M2_PID 2>/dev/null

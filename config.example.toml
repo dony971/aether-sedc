@@ -1,0 +1,16 @@
+# Aether Node Configuration
+
+node_type = "miner"
+data_dir = "./data"
+p2p_port = 25565
+rpc_port = 9933
+reset = false
+
+# Bootnode addresses (IP:PORT or domain:PORT)
+bootnodes = ["192.168.1.100:25565", "node1.aether.network:25565"]
+
+# DNS seed domains for peer discovery
+dns_seeds = ["seed1.aether.network", "seed2.aether.network"]
+
+# Miner address (hex, required for mining rewards)
+# miner_address = "abcd1234..."

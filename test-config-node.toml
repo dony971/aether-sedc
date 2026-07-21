@@ -1,0 +1,7 @@
+node_type = "miner"
+data_dir = "./data-test-node"
+p2p_port = 25568
+rpc_port = 9936
+reset = true
+bootnodes = ["127.0.0.1:25565"]
+dns_seeds = []
