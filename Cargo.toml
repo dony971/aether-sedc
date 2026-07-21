@@ -41,7 +41,7 @@ bip39 = "2.0"
 bs58 = "0.5"
 aes-gcm = "0.9"
 chacha20poly1305 = { version = "0.9", features = ["alloc"] }
-pbkdf2 = "0.12"
+pbkdf2 = "0.13"
 
 # CLI
 clap = { version = "4.4", features = ["derive"] }
