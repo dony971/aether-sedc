@@ -28,6 +28,7 @@ pub mod validation;
 pub mod transaction_processor;
 pub mod reputation;
 pub mod config;
+pub mod node;
 
 #[cfg(test)]
 mod tests;

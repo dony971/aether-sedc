@@ -22,7 +22,10 @@ impl Default for NodeConfig {
             p2p_port: 25565,
             rpc_port: 9933,
             bootnodes: Vec::new(),
-            dns_seeds: Vec::new(),
+            dns_seeds: vec![
+                "seed.aether.network".into(),
+                "seed1.aether.network".into(),
+            ],
             miner_address: None,
             reset: false,
         }
