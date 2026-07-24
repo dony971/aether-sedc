@@ -8,10 +8,6 @@ description = "AETHER SEDC - Self-Evolving DAG Consensus - Unified Implementatio
 
 [[bin]]
 name = "aether"
-path = "src/main.rs"
-
-[[bin]]
-name = "aether-gui"
 path = "src/gui.rs"
 
 [workspace]
