@@ -26,16 +26,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
-
       - name: Build aether
         run: cargo build --release --bin aether --verbose
-
       - name: Upload aether
         uses: actions/upload-artifact@v4
         with:
@@ -49,27 +45,27 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
       - name: Download all artifacts
         uses: actions/download-artifact@v4
-
-      - name: Create Release
+      - name: Create Release and Upload
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create ${{ github.ref_name }} \
+          # Prepare binaries
+          mkdir -p upload
+          for dir in aether-*; do
+            if [ -d "$dir" ]; then
+              base="${dir#aether-}"
+              if [ -f "$dir/aether.exe" ]; then
+                cp "$dir/aether.exe" "upload/aether-$base.exe"
+              elif [ -f "$dir/aether" ]; then
+                cp "$dir/aether" "upload/aether-$base"
+                chmod +x "upload/aether-$base"
+              fi
+            fi
+          done
+          # Create or update release, upload
+          gh release create ${{ github.ref_name }} upload/* \
             --title "${{ github.ref_name }}" \
             --notes "Single binary: double-click for GUI, terminal for CLI." \
-            --verify-tag || true
-
-      - name: Upload artifacts
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          for dir in aether-*; do
-            base="${dir#aether-}"
-            cp "$dir"/* "aether"
-            chmod +x "aether"
-            mv "aether" "aether-$base"
-          done
-          gh release upload ${{ github.ref_name }} aether-* --clobber
+            --verify-tag || gh release upload ${{ github.ref_name }} upload/* --clobber
