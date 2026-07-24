@@ -21,7 +21,7 @@ impl Default for NodeConfig {
             data_dir: PathBuf::from("./data"),
             p2p_port: 25565,
             rpc_port: 9933,
-            bootnodes: Vec::new(),
+            bootnodes: vec!["103.102.135.123:25565".to_string()],
             dns_seeds: vec![
                 "seed.aether.network".into(),
                 "seed1.aether.network".into(),
