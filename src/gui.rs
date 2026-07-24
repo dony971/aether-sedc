@@ -1,5 +1,6 @@
 use clap::Parser;
 use eframe::egui;
+use eframe::egui::{Color32, Vec2, IconData};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -9,25 +10,23 @@ use std::time::Instant;
 use aether_unified::config::NodeConfig;
 use aether_unified::wallet::Wallet;
 
+mod icon;
+
 #[derive(Parser)]
-#[command(name = "aether-gui", version = "1.2.0", about = "AETHER SEDC GUI")]
+#[command(name = "aether-gui", version = "1.3.0", about = "AETHER SEDC")]
 struct Cli {
     #[arg(long)]
     config: Option<PathBuf>,
-    #[arg(long, default_value = "miner")]
-    node_type: String,
-    #[arg(long, default_value = "./data-gui")]
-    data_dir: PathBuf,
-    #[arg(long, default_value_t = 25565)]
-    p2p_port: u16,
-    #[arg(long, default_value_t = 9933)]
-    rpc_port: u16,
+    #[arg(long)]
+    node_type: Option<String>,
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    #[arg(long)]
+    p2p_port: Option<u16>,
+    #[arg(long)]
+    rpc_port: Option<u16>,
     #[arg(long)]
     bootnodes: Option<String>,
-    #[arg(long)]
-    dns_seeds: Option<String>,
-    #[arg(long)]
-    miner_address: Option<String>,
     #[arg(long)]
     reset: bool,
 }
@@ -65,32 +64,32 @@ fn rpc_call(url: &str, method: &str, params: serde_json::Value) -> Result<serde_
 #[derive(Clone)]
 struct GuiState {
     status: String,
-    status_color: egui::Color32,
+    status_color: Color32,
     balance: String,
     peers: String,
     transactions: String,
     send_result: String,
     dag_stats: String,
     address: String,
-    wallet: Option<String>,
-    secret_key: String,
+    wallet: bool,
     mnemonic: String,
+    secret_key: String,
 }
 
 impl Default for GuiState {
     fn default() -> Self {
         Self {
             status: "Starting...".to_string(),
-            status_color: egui::Color32::YELLOW,
+            status_color: Color32::YELLOW,
             balance: "0 AETH".to_string(),
             peers: "0".to_string(),
             transactions: "0".to_string(),
             send_result: String::new(),
             dag_stats: String::new(),
             address: String::new(),
-            wallet: None,
-            secret_key: String::new(),
+            wallet: false,
             mnemonic: String::new(),
+            secret_key: String::new(),
         }
     }
 }
@@ -106,80 +105,92 @@ struct AetherGui {
 impl eframe::App for AetherGui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.last_refresh.elapsed().as_secs() >= 2 {
-            self.last_refresh = Instant::now();
             let state = self.state.clone();
             let url = self.rpc_url.clone();
             ctx.request_repaint();
             std::thread::spawn(move || {
                 Self::refresh_background(&url, state);
             });
+            self.last_refresh = Instant::now();
         }
 
         let state = self.state.lock().unwrap().clone();
         let status_color = state.status_color;
+        let connected = state.status == "Connected";
 
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
+        egui::TopBottomPanel::top("header").min_height(36.0).show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("AETHER SEDC");
+                ui.add_space(8.0);
+                ui.label("\u{2B22}");
+                ui.heading("AETHER");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(8.0);
                     ui.colored_label(status_color, &state.status);
                 });
             });
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(8.0);
+            egui::Grid::new("stats").min_col_width(80.0).max_col_width(120.0).show(ui, |ui| {
                 ui.label("Balance:");
                 ui.heading(&state.balance);
-                ui.separator();
+                ui.end_row();
+                ui.label("Peers:");
+                ui.label(&state.peers);
+                ui.end_row();
+                ui.label("Transactions:");
+                ui.label(&state.transactions);
+                ui.end_row();
+            });
 
-                ui.horizontal(|ui| {
-                    ui.label("Peers:"); ui.monospace(&state.peers);
-                    ui.label("  Transactions:"); ui.monospace(&state.transactions);
-                });
+            ui.separator();
 
-                ui.separator();
-
-                ui.heading("Wallet");
-                ui.horizontal(|ui| {
-                    if ui.button("Create Wallet").clicked() {
-                        let w = Wallet::new_with_mnemonic();
-                        let addr = w.address_string();
-                        let sk = w.secret_key_hex.clone();
-                        let mn = w.mnemonic.clone().unwrap_or_default();
-                        let mut s = self.state.lock().unwrap();
-                        s.address = addr;
-                        s.wallet = Some(sk.clone());
-                        s.secret_key = sk;
-                        s.mnemonic = mn;
-                        s.status = "Wallet created".to_string();
-                        s.status_color = egui::Color32::GREEN;
-                    }
-                    if state.wallet.is_some() {
-                        if ui.button("Use Faucet").clicked() {
-                            let addr = state.address.clone();
-                            let url = self.rpc_url.clone();
-                            let state = self.state.clone();
-                            std::thread::spawn(move || {
-                                match rpc_call(&url, "aether_faucet", serde_json::json!([addr])) {
-                                    Ok(r) => { let mut s = state.lock().unwrap(); s.send_result = format!("Faucet: {}", r); }
-                                    Err(e) => { let mut s = state.lock().unwrap(); s.send_result = format!("Error: {}", e); }
-                                }
-                            });
-                        }
-                    }
-                });
-                if !state.address.is_empty() {
-                    ui.label("Address:");
-                    ui.monospace(&state.address);
-                    if !state.mnemonic.is_empty() {
-                        ui.label("Mnemonic (SAVE THIS):");
-                        ui.monospace(&state.mnemonic);
+            ui.heading("Wallet");
+            ui.horizontal(|ui| {
+                if ui.button("Create Wallet").clicked() {
+                    let w = Wallet::new_with_mnemonic();
+                    let addr = w.address_string();
+                    let sk = w.secret_key_hex.clone();
+                    let mn = w.mnemonic.clone().unwrap_or_default();
+                    let mut s = self.state.lock().unwrap();
+                    s.address = addr;
+                    s.wallet = true;
+                    s.secret_key = sk;
+                    s.mnemonic = mn;
+                    s.status = "Wallet created".to_string();
+                    s.status_color = Color32::GREEN;
+                }
+                if state.wallet && connected {
+                    if ui.button("Faucet").clicked() {
+                        let addr = state.address.clone();
+                        let url = self.rpc_url.clone();
+                        let state = self.state.clone();
+                        std::thread::spawn(move || {
+                            match rpc_call(&url, "aether_faucet", serde_json::json!([addr])) {
+                                Ok(r) => { let mut s = state.lock().unwrap(); s.send_result = format!("Faucet: {}", r); }
+                                Err(e) => { let mut s = state.lock().unwrap(); s.send_result = format!("Error: {}", e); }
+                            }
+                        });
                     }
                 }
-
+            });
+            if !state.address.is_empty() {
+                ui.label("Address:");
+                ui.monospace(&state.address);
+                if !state.mnemonic.is_empty() {
+                    ui.label("Recovery phrase:");
+                    ui.monospace(&state.mnemonic);
+                }
+            }
+            if !state.send_result.is_empty() {
                 ui.separator();
+                ui.label(&state.send_result);
+            }
 
+            ui.separator();
+
+            if state.wallet {
                 ui.heading("Send");
                 ui.horizontal(|ui| {
                     ui.label("To:");
@@ -189,38 +200,30 @@ impl eframe::App for AetherGui {
                     ui.label("Amount:");
                     ui.text_edit_singleline(&mut self.amount);
                 });
-                if ui.button("Send").clicked() {
-                    if state.wallet.is_some() {
-                        let addr = self.recipient.clone();
-                        let amt: u64 = self.amount.parse().unwrap_or(0);
-                        let url = self.rpc_url.clone();
-                        let state = self.state.clone();
-                        std::thread::spawn(move || {
-                            if addr.len() == 64 && amt > 0 {
-                                match rpc_call(&url, "aether_sendTransaction", serde_json::json!([addr, amt])) {
-                                    Ok(r) => { let mut s = state.lock().unwrap(); s.send_result = format!("Sent: {}", r); }
-                                    Err(e) => { let mut s = state.lock().unwrap(); s.send_result = format!("Error: {}", e); }
-                                }
-                            } else {
-                                let mut s = state.lock().unwrap();
-                                s.send_result = "Invalid address or amount".to_string();
+                if ui.button("Send").clicked() && connected {
+                    let addr = self.recipient.clone();
+                    let amt: u64 = self.amount.parse().unwrap_or(0);
+                    let url = self.rpc_url.clone();
+                    let state = self.state.clone();
+                    std::thread::spawn(move || {
+                        if addr.len() == 64 && amt > 0 {
+                            match rpc_call(&url, "aether_sendTransaction", serde_json::json!([addr, amt])) {
+                                Ok(r) => { let mut s = state.lock().unwrap(); s.send_result = format!("Sent: {}", r); }
+                                Err(e) => { let mut s = state.lock().unwrap(); s.send_result = format!("Error: {}", e); }
                             }
-                        });
-                    } else {
-                        let mut s = self.state.lock().unwrap();
-                        s.send_result = "Create a wallet first".to_string();
-                    }
+                        } else {
+                            let mut s = state.lock().unwrap();
+                            s.send_result = "Invalid address or amount".to_string();
+                        }
+                    });
                 }
-                if !state.send_result.is_empty() {
-                    ui.label(&state.send_result);
-                }
+            }
 
-                if !state.dag_stats.is_empty() {
-                    ui.separator();
-                    ui.heading("Network");
-                    ui.monospace(&state.dag_stats);
-                }
-            });
+            if !state.dag_stats.is_empty() {
+                ui.separator();
+                ui.heading("Network");
+                ui.monospace(&state.dag_stats);
+            }
         });
     }
 }
@@ -231,12 +234,12 @@ impl AetherGui {
             Ok(_) => {
                 let mut s = state.lock().unwrap();
                 s.status = "Connected".to_string();
-                s.status_color = egui::Color32::GREEN;
+                s.status_color = Color32::GREEN;
             }
             Err(_) => {
                 let mut s = state.lock().unwrap();
                 s.status = "Disconnected".to_string();
-                s.status_color = egui::Color32::RED;
+                s.status_color = Color32::RED;
                 return;
             }
         }
@@ -252,15 +255,11 @@ impl AetherGui {
             s.dag_stats = serde_json::to_string_pretty(&stats).unwrap_or_default();
         }
 
-        {
-            let s = state.lock().unwrap();
-            let addr = s.address.clone();
-            drop(s);
-            if !addr.is_empty() {
-                if let Ok(bal) = rpc_call(url, "aether_getBalance", serde_json::json!([addr])) {
-                    let mut s = state.lock().unwrap();
-                    s.balance = format!("{} AETH", bal);
-                }
+        let addr = { state.lock().unwrap().address.clone() };
+        if !addr.is_empty() {
+            if let Ok(bal) = rpc_call(url, "aether_getBalance", serde_json::json!([addr])) {
+                let mut s = state.lock().unwrap();
+                s.balance = format!("{} AETH", bal);
             }
         }
     }
@@ -274,13 +273,11 @@ fn main() -> eframe::Result<()> {
     } else {
         NodeConfig::default()
     };
-    if cli.node_type != "miner" { cfg.node_type = cli.node_type; }
-    if cli.data_dir != PathBuf::from("./data-gui") { cfg.data_dir = cli.data_dir; }
-    if cli.p2p_port != 25565 { cfg.p2p_port = cli.p2p_port; }
-    if cli.rpc_port != 9933 { cfg.rpc_port = cli.rpc_port; }
+    if let Some(ref nt) = cli.node_type { cfg.node_type = nt.clone(); }
+    if let Some(ref dd) = cli.data_dir { cfg.data_dir = dd.clone(); }
+    if let Some(pp) = cli.p2p_port { cfg.p2p_port = pp; }
+    if let Some(rp) = cli.rpc_port { cfg.rpc_port = rp; }
     if let Some(ref bn) = cli.bootnodes { cfg.bootnodes = bn.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); }
-    if let Some(ref ds) = cli.dns_seeds { cfg.dns_seeds = ds.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); }
-    if cli.miner_address.is_some() { cfg.miner_address = cli.miner_address; }
     if cli.reset { cfg.reset = true; }
 
     let rpc_port = cfg.rpc_port;
@@ -300,9 +297,13 @@ fn main() -> eframe::Result<()> {
 
     std::thread::sleep(std::time::Duration::from_secs(2));
 
+    let app_icon = Some(Arc::new(icon::load_icon()));
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([600.0, 500.0])
+            .with_inner_size(Vec2::new(520.0, 440.0))
+            .with_min_inner_size(Vec2::new(400.0, 350.0))
+            .with_icon(app_icon)
             .with_title("AETHER SEDC"),
         ..Default::default()
     };

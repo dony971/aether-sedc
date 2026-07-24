@@ -1,6 +1,34 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub fn default_data_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            let mut path = PathBuf::from(appdata);
+            path.push("Aether");
+            return path;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            let mut path = PathBuf::from(home);
+            path.push("Library/Application Support/Aether");
+            return path;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            let mut path = PathBuf::from(home);
+            path.push(".aether");
+            return path;
+        }
+    }
+    PathBuf::from("./data")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NodeConfig {
@@ -18,7 +46,7 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             node_type: "miner".into(),
-            data_dir: PathBuf::from("./data"),
+            data_dir: default_data_dir(),
             p2p_port: 25565,
             rpc_port: 9933,
             bootnodes: vec!["103.102.135.123:25565".to_string()],

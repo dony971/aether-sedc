@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 /// AETHER SEDC — Self-Evolving DAG Consensus Node
 #[derive(Parser)]
-#[command(name = "aether", version = "1.2.0", about = "AETHER SEDC Blockchain Node")]
+#[command(name = "aether", version = "1.3.0", about = "AETHER SEDC")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
