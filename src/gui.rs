@@ -319,13 +319,11 @@ fn main() -> eframe::Result<()> {
 
     std::thread::sleep(std::time::Duration::from_secs(2));
 
-    let app_icon = Some(Arc::new(load_icon()));
-
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(Vec2::new(520.0, 440.0))
             .with_min_inner_size(Vec2::new(400.0, 350.0))
-            .with_icon(app_icon)
+            .with_icon(Arc::new(load_icon()))
             .with_title("AETHER SEDC"),
         ..Default::default()
     };
