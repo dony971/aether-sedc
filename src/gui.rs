@@ -10,7 +10,7 @@ use aether_unified::config::NodeConfig;
 use aether_unified::wallet::Wallet;
 
 #[derive(Parser)]
-#[command(name = "aether-gui", version = "1.1.0", about = "AETHER SEDC GUI")]
+#[command(name = "aether-gui", version = "1.2.0", about = "AETHER SEDC GUI")]
 struct Cli {
     #[arg(long)]
     config: Option<PathBuf>,
