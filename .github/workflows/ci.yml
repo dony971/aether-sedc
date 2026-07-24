@@ -64,7 +64,7 @@ jobs:
       - name: Start bootnode
         run: |
           mkdir -p multi-node-logs
-          ./target/debug/aether --node-type miner --data-dir data-bootnode --p2p-port 25565 --rpc-port 9933 &
+          ./target/debug/aether --daemon --data-dir data-bootnode --p2p-port 25565 --rpc-port 9933 &
           BOOT_PID=$!
           echo "Bootnode PID: $BOOT_PID"
 
@@ -79,12 +79,12 @@ jobs:
           done
 
           # Start miner1
-          ./target/debug/aether --node-type miner --data-dir data-miner-1 --p2p-port 25566 --rpc-port 9934 --bootnodes 127.0.0.1:25565 &
+          ./target/debug/aether --daemon --data-dir data-miner-1 --p2p-port 25566 --rpc-port 9934 --bootnodes 127.0.0.1:25565 &
           M1_PID=$!
           echo "Miner1 PID: $M1_PID"
 
           # Start miner2
-          ./target/debug/aether --node-type miner --data-dir data-miner-2 --p2p-port 25567 --rpc-port 9935 --bootnodes 127.0.0.1:25565 &
+          ./target/debug/aether --daemon --data-dir data-miner-2 --p2p-port 25567 --rpc-port 9935 --bootnodes 127.0.0.1:25565 &
           M2_PID=$!
           echo "Miner2 PID: $M2_PID"
 
