@@ -60,7 +60,7 @@ tower-http = { version = "0.5", features = ["fs", "cors"] }
 colored = "2.1"
 
 # GUI
-eframe = "0.27"
+eframe = "0.35"
 egui = "0.27"
 
 [dev-dependencies]
