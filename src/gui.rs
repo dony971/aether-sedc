@@ -46,6 +46,12 @@ enum Commands {
     Keygen {
         #[arg(default_value = "wallet.json")]
         path: String,
+        /// Import wallet from private key hex string
+        #[arg(long)]
+        import: Option<String>,
+        /// Import wallet from file containing private key hex
+        #[arg(long)]
+        import_file: Option<String>,
     },
     Wallet {
         #[command(subcommand)]
@@ -395,8 +401,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse_from(std::env::args_os());
 
     match &cli.command {
-        Some(Commands::Keygen { path }) => {
-            let wallet = Wallet::new();
+        Some(Commands::Keygen { path, import, import_file }) => {
+            let wallet: Wallet = if let Some(sk) = import {
+                Wallet::from_secret_key(sk)?
+            } else if let Some(file_path) = import_file {
+                let content = tokio::fs::read_to_string(file_path).await?;
+                let sk = content.trim();
+                Wallet::from_secret_key(sk)?
+            } else {
+                Wallet::new()
+            };
             wallet.to_file(path, None).await?;
             println!("Wallet saved to {}", path);
             println!("Address: {}", hex::encode(wallet.address()));

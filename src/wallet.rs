@@ -137,6 +137,23 @@ impl Wallet {
         }
     }
 
+    /// Restore wallet from a secret key hex string
+    pub fn from_secret_key(secret_key_hex: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let secret_bytes = hex::decode(secret_key_hex)?;
+        if secret_bytes.len() != 32 {
+            return Err("Invalid secret key length (expected 64 hex chars)".into());
+        }
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(&secret_bytes);
+        let signing_key = SigningKey::from_bytes(&key_bytes);
+        let verifying_key = signing_key.verifying_key();
+        Ok(Wallet {
+            public_key_hex: hex::encode(verifying_key.to_bytes()),
+            secret_key_hex: hex::encode(signing_key.to_bytes()),
+            mnemonic: None,
+        })
+    }
+
     /// Restore wallet from BIP39 mnemonic
     pub fn from_mnemonic(mnemonic_phrase: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let mnemonic = Mnemonic::parse_in(Language::English, mnemonic_phrase)?;
