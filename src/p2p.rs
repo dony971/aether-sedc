@@ -197,7 +197,7 @@ impl P2PNetwork {
 
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
 
                 let peer_count = {
                     let peers_read = peers.read().await;
@@ -306,7 +306,7 @@ impl P2PNetwork {
 
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(600)).await; // Every 10 minutes
+                tokio::time::sleep(Duration::from_secs(120)).await; // Every 2 minutes
                 for seed in &dns_seeds {
                     match tokio::net::lookup_host(format!("{}:{}", seed, default_port)).await {
                         Ok(addrs) => {
@@ -336,7 +336,7 @@ impl P2PNetwork {
 
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(120)).await; // Every 2 minutes
+                tokio::time::sleep(Duration::from_secs(15)).await; // Every 15 seconds for fast peer discovery
                 let peer_list: Vec<SocketAddr> = {
                     let known = known_peers.read().await;
                     known.iter().copied().collect()
