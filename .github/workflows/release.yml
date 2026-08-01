@@ -33,7 +33,7 @@ jobs:
       - name: Build aether
         run: cargo build --release --bin aether --verbose
       - name: Upload aether
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: target/release/aether${{ matrix.ext }}
