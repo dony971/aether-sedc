@@ -924,8 +924,11 @@ impl AetherRpcImpl {
             drop(dag);
             
             // Persist orphan to disk (survives restart)
-            if let Ok(storage) = crate::storage::Storage::open(self.ledger_path.parent().unwrap_or(std::path::Path::new("data"))) {
-                if let Err(e) = storage.put_orphan(tx.id, &tx) {
+            // 🔧 FIX: use the main storage (data_dir/sled_db), NOT a new sled at
+            // ledger_path.parent() which silently opened a different database at
+            // the data-dir root, leaving orphans invisible to the node's DAG.
+            if let Ok(storage_guard) = self.storage.try_read() {
+                if let Err(e) = storage_guard.put_orphan(tx.id, &tx) {
                     tracing::error!("❌ Failed to persist orphan to storage: {}", e);
                 }
             }
@@ -1006,8 +1009,11 @@ impl AetherRpcImpl {
         let mut orphans_to_process = Vec::new();
         
         // Load orphans from disk on startup
-        if let Ok(storage) = crate::storage::Storage::open(self.ledger_path.parent().unwrap_or(std::path::Path::new("data"))) {
-            if let Ok(disk_orphans) = storage.get_all_orphans() {
+        // 🔧 FIX: use the main storage (data_dir/sled_db), NOT a new sled at
+        // ledger_path.parent() which silently opened a different database at
+        // the data-dir root.
+        if let Ok(storage_guard) = self.storage.try_read() {
+            if let Ok(disk_orphans) = storage_guard.get_all_orphans() {
                 tracing::info!("📦 Loaded {} orphans from disk", disk_orphans.len());
                 for orphan in disk_orphans {
                     let mut orphans = self.orphans.write().await;
@@ -1045,8 +1051,8 @@ impl AetherRpcImpl {
                     orphans.remove(&tx_id);
                     
                     // Also remove from disk
-                    if let Ok(storage) = crate::storage::Storage::open(self.ledger_path.parent().unwrap_or(std::path::Path::new("data"))) {
-                        let _ = storage.remove_orphan(tx_id);
+                    if let Ok(storage_guard) = self.storage.try_read() {
+                        let _ = storage_guard.remove_orphan(tx_id);
                     }
                 }
                 Err(e) => {
@@ -1062,8 +1068,8 @@ impl AetherRpcImpl {
                         orphans.remove(&tx_id);
                         
                         // Also remove from disk
-                        if let Ok(storage) = crate::storage::Storage::open(self.ledger_path.parent().unwrap_or(std::path::Path::new("data"))) {
-                            let _ = storage.remove_orphan(tx_id);
+                        if let Ok(storage_guard) = self.storage.try_read() {
+                            let _ = storage_guard.remove_orphan(tx_id);
                         }
                     } else {
                         // Temporary error (mempool full, lock error, etc.) - keep in queue

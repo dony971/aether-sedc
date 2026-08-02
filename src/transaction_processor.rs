@@ -232,6 +232,19 @@ impl TransactionProcessor {
             return Err(ProcessingError::PersistenceError(format!("Save failed: {}", e)));
         }
 
+        // STEP 9b: PERSIST TRANSACTION TO SLED (DAG survives restarts)
+        // 🔧 FIX: The DAG is in-memory only; without this, a hard kill loses the DAG
+        // while the ledger (balances+nonces) survives -> node restarts with an
+        // advanced ledger and an empty DAG, silently rejecting all network txs.
+        if let Some(storage) = ledger.storage() {
+            let storage_read = storage.read().await;
+            if let Err(e) = storage_read.put_transaction(&tx) {
+                tracing::error!("❌ Failed to persist transaction to Sled: {}", e);
+            } else {
+                storage_read.flush().ok();
+            }
+        }
+
         tracing::info!("✅ Transaction processed successfully: {}", hex::encode(tx.id));
         Ok(())
     }

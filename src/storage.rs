@@ -364,16 +364,14 @@ impl Storage {
     }
 
     /// Migrate from JSON storage to Sled
-    pub fn migrate_from_json<P: AsRef<Path>>(&self, json_path: P) -> Result<(), StorageError> {
+    pub async fn migrate_from_json<P: AsRef<Path>>(&self, json_path: P) -> Result<(), StorageError> {
         tracing::info!("🔄 Starting migration from JSON to Sled...");
 
         // Load JSON DAG
         let dag_path = json_path.as_ref().join("dag.json");
         if dag_path.exists() {
-            use crate::json_storage::{DagStore, load_dag_from_json};
-            let store: DagStore = tokio::runtime::Runtime::new()
-                .map_err(|e| StorageError::DatabaseError(format!("Failed to create runtime: {}", e)))?
-                .block_on(load_dag_from_json(&dag_path))?;
+            use crate::json_storage::DagStore;
+            let store: DagStore = crate::json_storage::load_dag_from_json(&dag_path).await?;
 
             tracing::info!("  Migrating {} transactions from JSON...", store.transactions.len());
 

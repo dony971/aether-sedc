@@ -3,6 +3,7 @@
 //! Manages the ledger state (account balances) with persistence to Sled DB.
 
 use crate::consensus::{ConsensusState, BlockId};
+use crate::genesis::FAUCET_ADDRESS;
 use crate::storage::Storage;
 use crate::transaction::Address;
 use serde::{Deserialize, Serialize};
@@ -301,8 +302,18 @@ impl Ledger {
 
     /// Validate account nonce (strict: must be exactly last_nonce + 1)
     /// Does NOT update the nonce - call commit_nonce() after successful transaction
+    /// Faucet exception: the faucet key is deterministic and shared across all nodes,
+    /// so each node has its own view of the faucet nonce. Strict +1 validation would
+    /// reject valid faucet transactions from nodes with divergent state. For the faucet
+    /// account, accept any strictly increasing nonce instead.
     pub fn validate_account_nonce(&self, address: &Address, account_nonce: u64) -> Result<(), String> {
         let last_nonce = self.get_nonce(address);
+        if hex::encode(address) == FAUCET_ADDRESS {
+            if account_nonce <= last_nonce {
+                return Err(format!("Invalid account_nonce: {} <= {} (faucet nonce must strictly increase)", account_nonce, last_nonce));
+            }
+            return Ok(());
+        }
         if account_nonce != last_nonce + 1 {
             return Err(format!("Invalid account_nonce: {} != {} + 1 (expected last_nonce + 1)", account_nonce, last_nonce));
         }
@@ -315,11 +326,21 @@ impl Ledger {
     }
 
     /// Validate and commit nonce atomically (INTERNAL USE ONLY)
-    /// 🔒 ZERO TRUST: This method is private. Use TransactionProcessor for all nonce operations.
+    /// ZERO TRUST: This method is private. Use TransactionProcessor for all nonce operations.
     /// Economic policy: prevents race conditions between validation and commit
     /// Returns error if nonce is invalid, commits if valid
+    /// Faucet exception: shared deterministic faucet key across nodes, so each node
+    /// has its own view of the nonce. Accept any strictly increasing nonce (see
+    /// validate_account_nonce for details), anti-replay is still enforced.
     pub(crate) fn validate_and_commit_nonce_internal(&mut self, address: &Address, account_nonce: u64) -> Result<(), String> {
         let last_nonce = self.get_nonce(address);
+        if hex::encode(address) == FAUCET_ADDRESS {
+            if account_nonce <= last_nonce {
+                return Err(format!("Invalid account_nonce: {} <= {} (faucet nonce must strictly increase)", account_nonce, last_nonce));
+            }
+            self.set_nonce(address, account_nonce);
+            return Ok(());
+        }
         if account_nonce != last_nonce + 1 {
             return Err(format!("Invalid account_nonce: {} != {} + 1 (expected last_nonce + 1)", account_nonce, last_nonce));
         }

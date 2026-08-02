@@ -597,9 +597,16 @@ impl P2PNetwork {
                                 info!("Received transaction from {}: {}", addr, hex::encode(tx.id));
                                 let _ = tx_channel.send(tx);
 
-                                // Note: Full validation (PoW, signature, balance, nonce, etc.) 
-                                // is now done in main.rs via process_transaction() to ensure
-                                // consistency with RPC path
+                                // Forward transaction to all other connected peers (relay)
+                                let relay_msg = P2PMessage::Transaction(tx_bytes.clone());
+                                if let Ok(relay_bytes) = bincode::serialize(&relay_msg) {
+                                    let peers_guard = peers.read().await;
+                                    for (peer_addr, sender) in peers_guard.iter() {
+                                        if *peer_addr != addr {
+                                            let _ = sender.send(relay_bytes.clone());
+                                        }
+                                    }
+                                }
                             } else {
                                 warn!("Failed to deserialize transaction from {}", addr);
                             }

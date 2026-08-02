@@ -2,7 +2,7 @@ use crate::{
     config::NodeConfig,
     consensus::VQVConsensus,
     genesis::{initialize_genesis, GenesisConfig, GENESIS_MESSAGE},
-    json_storage::{ensure_data_dir, load_dag_from_json},
+    json_storage::{ensure_data_dir, load_dag_from_json, save_dag_to_json},
     ledger::Ledger,
     parent_selection::DAG,
     p2p::{P2PConfig, P2PNetwork},
@@ -124,6 +124,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             let mut storage_write = storage.write().await;
             storage_write
                 .migrate_from_json(&data_dir)
+                .await
                 .map_err(|e| format!("Failed to migrate from JSON: {}", e))?;
         }
     }
@@ -163,18 +164,40 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
 
     let (save_tx, mut save_rx) = mpsc::channel::<SyncEvent>(100);
 
-    let (dag, consensus, balances, orphans, missing_parent_hashes) =
-        if dag_store_path.exists() {
-            tracing::info!("📂 Loading DAG state from JSON...");
+    let (dag, consensus, balances, orphans, missing_parent_hashes) = {
+        let genesis_config = GenesisConfig::default();
+        let (mut dag, consensus, balances, mut orphans_rebuilt, mut missing_parent_hashes) =
+            initialize_genesis(genesis_config);
+
+        // 🔧 FIX (unified): Sled is the single source of truth for the DAG.
+        // Every accepted transaction is persisted to Sled (STEP 9b), so on
+        // restart we rebuild the DAG from Sled transactions + orphans.
+        // dag.json is only a legacy fallback when Sled has no transactions
+        // (pre-fix data, first migration). Loading from dag.json alone used
+        // to silently drop transactions (non-topological order, no
+        // rebuild_tips, and it ignored Sled entirely) -> wallet showed fewer
+        // transactions than the network after a hard kill.
+        let mut all_txs: Vec<Transaction> = Vec::new();
+        {
+            let storage_read = storage.read().await;
+            if let Ok(persisted_txs) = storage_read.get_all_transactions() {
+                all_txs.extend(persisted_txs);
+            }
+            if let Ok(persisted_orphans) = storage_read.get_all_orphans() {
+                for orphan in persisted_orphans {
+                    if !all_txs.iter().any(|tx| tx.id == orphan.id) {
+                        all_txs.push(orphan);
+                    }
+                }
+            }
+        }
+
+        // Legacy fallback: if Sled is empty but dag.json exists (data written
+        // by an old build without Sled persistence), load from dag.json.
+        if all_txs.is_empty() && dag_store_path.exists() {
+            tracing::info!("📂 Sled empty, loading DAG state from JSON (legacy)...");
             let store = load_dag_from_json(&dag_store_path).await?;
-            tracing::info!("  Loaded {} transactions from storage", store.transactions.len());
-            tracing::info!("  Loaded {} child relationships from storage", store.children.len());
-
-            let mut dag = DAG::new();
-            let mut consensus = VQVConsensus::new(100, 0.7, 5, 50);
-            let mut orphans: HashMap<[u8; 32], Transaction> = HashMap::new();
-
-            let mut skipped_count = 0;
+            tracing::info!("  Loaded {} transactions from dag.json", store.transactions.len());
             for stored_tx in store.transactions {
                 let signature = if let Some(sig) = stored_tx.signature {
                     hex::decode(&sig).unwrap_or_else(|_| {
@@ -234,42 +257,13 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                     && receiver_bytes.iter().all(|&b| b == 0)
                 {
                     tracing::warn!("Skipping transaction with all-zero critical fields");
-                    skipped_count += 1;
-                    continue;
-                }
-
-                let parent0_missing =
-                    parent0 != [0u8; 32] && !dag.transactions().contains_key(&parent0);
-                let parent1_missing =
-                    parent1 != [0u8; 32] && !dag.transactions().contains_key(&parent1);
-
-                if parent0_missing || parent1_missing {
-                    tracing::warn!(
-                        "⚠️ Orphan transaction detected: missing parent(s) - tx_id: {}, parent0: {}, parent1: {}",
-                        hex::encode(&parent0_bytes[..8]),
-                        if parent0_missing { "MISSING" } else { "OK" },
-                        if parent1_missing { "MISSING" } else { "OK" }
-                    );
-                    let orphan_tx = Transaction::new(
-                        [parent0, parent1],
-                        sender,
-                        receiver,
-                        stored_tx.amount,
-                        stored_tx.fee,
-                        stored_tx.timestamp,
-                        stored_tx.nonce,
-                        stored_tx.account_nonce,
-                        signature,
-                        public_key,
-                    );
-                    orphans.insert(orphan_tx.id, orphan_tx);
                     continue;
                 }
 
                 let tx = Transaction::new(
                     [parent0, parent1],
-                    sender_bytes.try_into().unwrap_or_else(|_| [0u8; 32]),
-                    receiver_bytes.try_into().unwrap_or_else(|_| [0u8; 32]),
+                    sender,
+                    receiver,
                     stored_tx.amount,
                     stored_tx.fee,
                     stored_tx.timestamp,
@@ -278,79 +272,86 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                     signature,
                     public_key,
                 );
-                if let Err(e) = dag.add_transaction_validated(tx.clone()) {
-                    tracing::warn!("⚠️ Failed to load transaction from storage: {}", e);
-                    continue;
+                if !all_txs.iter().any(|existing| existing.id == tx.id) {
+                    all_txs.push(tx);
                 }
             }
+        }
 
-            let mut missing_parent_hashes: Vec<Vec<u8>> = Vec::new();
-            if skipped_count > 0 {
-                tracing::warn!("⚠️ Skipped {} invalid transactions during DAG loading", skipped_count);
-            }
-            if !orphans.is_empty() {
-                tracing::warn!("⚠️ {} orphan transactions detected - requesting missing parents via P2P", orphans.len());
-                for (_tx_id, orphan) in &orphans {
-                    for parent in orphan.parents.iter() {
-                        if *parent != [0u8; 32] && !dag.transactions().contains_key(parent) {
-                            missing_parent_hashes.push(parent.to_vec());
-                            tracing::info!("📡 Orphan Solver - Requesting missing parent: {}", hex::encode(parent));
+        if !all_txs.is_empty() {
+            tracing::info!(
+                "📂 Rebuilding DAG from {} persisted transactions + orphans (Sled/JSON)",
+                all_txs.len()
+            );
+            // Topological insert: repeatedly add transactions whose parents
+            // are already in the DAG (Sled iteration order is random).
+            // The ledger (balances+nonces) is already persisted and must NOT
+            // be re-validated here (nonce replay would reject valid txs).
+            let mut remaining: Vec<Transaction> = all_txs;
+            let mut progress = true;
+            while progress && !remaining.is_empty() {
+                progress = false;
+                let mut still_pending = Vec::new();
+                for tx in remaining {
+                    let parent0_ok = tx.parents[0] == [0u8; 32]
+                        || dag.transactions().contains_key(&tx.parents[0]);
+                    let parent1_ok = tx.parents[1] == [0u8; 32]
+                        || dag.transactions().contains_key(&tx.parents[1]);
+                    if !(parent0_ok && parent1_ok) {
+                        still_pending.push(tx);
+                        continue;
+                    }
+                    match dag.add_transaction_validated(tx) {
+                        Ok(_) => {
+                            progress = true;
+                        }
+                        Err(e) => {
+                            tracing::warn!("⚠️ Failed to rebuild transaction: {}", e);
+                            progress = true;
                         }
                     }
                 }
+                remaining = still_pending;
             }
+            for tx in remaining {
+                tracing::warn!(
+                    "⚠️ Orphan transaction detected during rebuild: tx_id: {}",
+                    hex::encode(&tx.id[..8])
+                );
+                orphans_rebuilt.insert(tx.id, tx);
+            }
+            dag.rebuild_tips();
+            tracing::info!(
+                "  DAG rebuilt: {} transactions, {} tips",
+                dag.transaction_count(),
+                dag.tip_count()
+            );
+        }
 
-            for stored_child in store.children {
-                let parent_bytes = hex::decode(&stored_child.parent).unwrap_or_else(|_| vec![0u8; 32]);
-                let child_bytes = hex::decode(&stored_child.child).unwrap_or_else(|_| vec![0u8; 32]);
-                let parent: [u8; 32] = parent_bytes.try_into().unwrap_or_else(|_| [0u8; 32]);
-                let child: [u8; 32] = child_bytes.try_into().unwrap_or_else(|_| [0u8; 32]);
+        for (addr_hex, balance) in &balances {
+            let addr_bytes = hex::decode(addr_hex)?;
+            let address: Address = addr_bytes.as_slice().try_into()
+                .map_err(|e| format!("Invalid address length: {}", e))?;
+            ledger.set_balance(&address, *balance);
+        }
+        ledger.save().await?;
 
-                if let Some(children_vec) = dag.children_mut().get_mut(&parent) {
-                    let mut temp_vec: Vec<[u8; 32]> = children_vec.clone();
-                    temp_vec.push(child);
-                    dag.children_mut().insert(parent, temp_vec);
-                } else {
-                    dag.children_mut().insert(parent, vec![child]);
+        for (_tx_id, orphan) in &orphans_rebuilt {
+            for parent in orphan.parents.iter() {
+                if *parent != [0u8; 32] && !dag.transactions().contains_key(parent) {
+                    missing_parent_hashes.push(parent.to_vec());
                 }
             }
+        }
 
-            tracing::info!("  DAG reconstruction complete");
-            tracing::info!("  Ledger (balances+nonces) loaded from Sled as source of truth");
-
-            let ledger_balances = ledger.get_all_balances();
-            tracing::info!("  Ledger has {} accounts with balances", ledger_balances.len());
-            tracing::info!("  Ledger has {} accounts with nonces", ledger.nonces.len());
-
-            (
-                dag,
-                consensus,
-                ledger.balances.clone(),
-                orphans,
-                missing_parent_hashes,
-            )
-        } else {
-            tracing::info!("🌱 No existing DAG state found, initializing genesis...");
-            let genesis_config = GenesisConfig::default();
-            let (dag, consensus, balances, orphans, missing_parent_hashes) =
-                initialize_genesis(genesis_config);
-
-            for (addr_hex, balance) in &balances {
-                let addr_bytes = hex::decode(addr_hex)?;
-                let address: Address = addr_bytes.as_slice().try_into()
-                    .map_err(|e| format!("Invalid address length: {}", e))?;
-                ledger.set_balance(&address, *balance);
-            }
-            ledger.save().await?;
-
-            (
-                dag,
-                consensus,
-                ledger.balances.clone(),
-                orphans,
-                missing_parent_hashes,
-            )
-        };
+        (
+            dag,
+            consensus,
+            ledger.balances.clone(),
+            orphans_rebuilt,
+            missing_parent_hashes,
+        )
+    };
 
     let orphans: Arc<RwLock<HashMap<[u8; 32], Transaction>>> =
         Arc::new(RwLock::new(orphans));
@@ -466,7 +467,20 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
 
     let _p2p_dag = dag.clone();
     let _p2p_dag_store_path = dag_store_path.clone();
-    let save_dag = Arc::new(move || {});
+    let save_dag = {
+        let dag_save = dag.clone();
+        let dag_store_path_save = dag_store_path.clone();
+        Arc::new(move || {
+            let dag_inner = dag_save.clone();
+            let path_inner = dag_store_path_save.clone();
+            tokio::spawn(async move {
+                let dag_lock = dag_inner.read().await;
+                if let Err(e) = save_dag_to_json(&dag_lock, &path_inner).await {
+                    tracing::warn!("⚠️ Failed to save DAG: {}", e);
+                }
+            });
+        })
+    };
 
     let process_orphans_dag = dag.clone();
     let process_orphans_ledger = ledger.clone();
@@ -622,10 +636,22 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     let save_tx_periodic = save_tx.clone();
     let mining_enabled_periodic = mining_enabled.clone();
     let miner_addr_periodic = miner_address.clone();
+    let dag_save_periodic = dag.clone();
+    let dag_store_path_save_periodic = dag_store_path.clone();
 
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+            // 🔧 FIX: Persist the DAG periodically so a hard kill cannot leave
+            // the node with an advanced ledger but an empty DAG.
+            {
+                let dag_lock = dag_save_periodic.read().await;
+                if let Err(e) = save_dag_to_json(&dag_lock, &dag_store_path_save_periodic).await {
+                    tracing::warn!("⚠️ Periodic DAG save failed: {}", e);
+                }
+                drop(dag_lock);
+            }
 
             let rpc_impl = AetherRpcImpl::new(
                 consensus_periodic.clone(),
