@@ -15,7 +15,7 @@ use aether_unified::transaction::Transaction;
 use aether_unified::json_storage::save_dag_to_json;
 
 #[derive(Parser)]
-#[command(name = "aether", version = "1.1.0", about = "AETHER SEDC")]
+#[command(name = "aether", version = "1.1.1", about = "AETHER SEDC")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
