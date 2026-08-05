@@ -241,19 +241,19 @@ impl P2PNetwork {
         let p2p_network = self.clone();
 
         tokio::spawn(async move {
-            for bootnode in bootnodes {
-                let bootnode_addr = bootnode;
-                let mut retry_count = 0;
-
-                loop {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-
+            let mut retry_counts: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
+            loop {
+                for bootnode in &bootnodes {
+                    let bootnode_addr = bootnode.clone();
                     let connected = {
                         let current_peers = peers.read().await;
                         current_peers.contains_key(&bootnode_addr)
                     };
 
                     if !connected {
+                        let retry_count =
+                            *retry_counts.entry(bootnode_addr.to_string()).or_insert(0);
                         let delay = std::cmp::min(2u64.pow(retry_count), 60); // Max 60 seconds
                         info!(
                             "Bootnode {} disconnected, reconnecting in {}s (attempt {})",
@@ -263,12 +263,16 @@ impl P2PNetwork {
                         );
                         tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
 
-                        p2p_network.connect_to_peer(bootnode_addr).await;
-                        retry_count = std::cmp::min(retry_count + 1, 6); // Cap at 6 (max delay 64s)
+                        p2p_network.connect_to_peer(bootnode_addr.clone()).await;
+                        retry_counts.insert(
+                            bootnode_addr.to_string(),
+                            std::cmp::min(retry_count + 1, 6), // Cap at 6 (max delay 64s)
+                        );
                     } else {
-                        retry_count = 0; // Reset retry count if connected
+                        retry_counts.insert(bootnode_addr.to_string(), 0); // Reset retry count if connected
                     }
                 }
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
         });
     }
