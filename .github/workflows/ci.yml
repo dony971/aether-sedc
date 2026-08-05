@@ -117,6 +117,17 @@ jobs:
             echo "Port $port -> $PEERS peers"
             if [ "$PEERS" -lt 1 ]; then
               echo "FAIL: Port $port has $PEERS peers"
+              echo "=== DIAG: processes ==="
+              ps aux | grep aether | grep -v grep || true
+              echo "=== DIAG: listening ports ==="
+              ss -tlnp 2>/dev/null | grep -E "25565|25566|25567|9933|9934|9935" || true
+              echo "=== DIAG: miner RPC reachability ==="
+              for port in 9933 9934 9935; do
+                curl -s -m 2 -X POST http://127.0.0.1:$port -H "Content-Type: application/json" \
+                  -d '{"jsonrpc":"2.0","method":"aether_getDagStats","params":[],"id":1}' || echo "port $port unreachable"
+              done
+              echo "=== DIAG: node logs ==="
+              find . -name "*.log" -newer Cargo.toml 2>/dev/null | head -20
               kill $BOOT_PID $M1_PID $M2_PID 2>/dev/null
               exit 1
             fi
