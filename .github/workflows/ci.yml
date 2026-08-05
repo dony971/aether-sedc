@@ -96,7 +96,7 @@ jobs:
             for port in 9933 9934 9935; do
               PEERS=$(curl -s -X POST http://127.0.0.1:$port -H "Content-Type: application/json" \
                 -d '{"jsonrpc":"2.0","method":"aether_getDagStats","params":[],"id":1}' | \
-                python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('peer_count',0))" 2>/dev/null || echo "0")
+                python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('connected_peers',0))" 2>/dev/null || echo "0")
               if [ "$PEERS" -lt 1 ]; then
                 ALL_PEERED=0
               fi
@@ -113,7 +113,7 @@ jobs:
           for port in 9933 9934 9935; do
             PEERS=$(curl -s -X POST http://127.0.0.1:$port -H "Content-Type: application/json" \
               -d '{"jsonrpc":"2.0","method":"aether_getDagStats","params":[],"id":1}' | \
-              python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('peer_count',0))" 2>/dev/null || echo "0")
+              python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('connected_peers',0))" 2>/dev/null || echo "0")
             echo "Port $port -> $PEERS peers"
             if [ "$PEERS" -lt 1 ]; then
               echo "FAIL: Port $port has $PEERS peers"
