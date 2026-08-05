@@ -88,7 +88,25 @@ jobs:
           M2_PID=$!
           echo "Miner2 PID: $M2_PID"
 
-          sleep 15
+          # Wait for peer connections (up to 90s on slow runners)
+          echo "=== Waiting for peer connections ==="
+          ALL_PEERED=0
+          for i in $(seq 1 90); do
+            ALL_PEERED=1
+            for port in 9933 9934 9935; do
+              PEERS=$(curl -s -X POST http://127.0.0.1:$port -H "Content-Type: application/json" \
+                -d '{"jsonrpc":"2.0","method":"aether_getDagStats","params":[],"id":1}' | \
+                python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('peer_count',0))" 2>/dev/null || echo "0")
+              if [ "$PEERS" -lt 1 ]; then
+                ALL_PEERED=0
+              fi
+            done
+            if [ "$ALL_PEERED" -eq 1 ]; then
+              echo "All nodes peered after ${i}s"
+              break
+            fi
+            sleep 1
+          done
 
           # Check peer counts
           echo "=== Checking peer counts ==="
@@ -109,7 +127,18 @@ jobs:
           curl -s -X POST http://127.0.0.1:9934 -H "Content-Type: application/json" \
             -d '{"jsonrpc":"2.0","method":"aether_faucet","params":["0000000000000000000000000000000000000000000000000000000000000001"],"id":1}' > /dev/null
 
-          sleep 10
+          # Wait for transaction propagation (up to 90s)
+          echo "=== Waiting for transaction propagation ==="
+          for i in $(seq 1 90); do
+            TX_COUNT=$(curl -s -X POST http://127.0.0.1:9935 -H "Content-Type: application/json" \
+              -d '{"jsonrpc":"2.0","method":"aether_getDagStats","params":[],"id":1}' | \
+              python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('total_transactions',0))" 2>/dev/null || echo "0")
+            if [ "$TX_COUNT" -ge 1 ]; then
+              echo "Transaction propagated to miner2 after ${i}s"
+              break
+            fi
+            sleep 1
+          done
 
           # Check propagation
           echo "=== Checking propagation ==="
