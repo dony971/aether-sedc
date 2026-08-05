@@ -6,8 +6,8 @@
 //!
 //! Economic policy: validation BEFORE any state modification, atomic rollback on failure.
 
-use crate::parent_selection::DAG;
 use crate::ledger::Ledger;
+use crate::parent_selection::DAG;
 use crate::transaction::Transaction;
 use crate::transaction::TransactionId;
 
@@ -23,7 +23,10 @@ pub enum ValidationError {
     /// Duplicate transaction already exists
     DuplicateTransaction { tx_id: TransactionId },
     /// Parent transaction missing
-    MissingParent { parent_index: usize, parent_id: TransactionId },
+    MissingParent {
+        parent_index: usize,
+        parent_id: TransactionId,
+    },
     /// Double spend detected (parents already used)
     DoubleSpend,
     /// Sender conflict (multiple pending transactions)
@@ -42,7 +45,11 @@ impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ValidationError::InvalidPoW { difficulty } => {
-                write!(f, "Invalid PoW: transaction must meet difficulty {}", difficulty)
+                write!(
+                    f,
+                    "Invalid PoW: transaction must meet difficulty {}",
+                    difficulty
+                )
             }
             ValidationError::InvalidSignature => {
                 write!(f, "Invalid signature")
@@ -51,22 +58,44 @@ impl std::fmt::Display for ValidationError {
                 write!(f, "Sender address does not match public key")
             }
             ValidationError::DuplicateTransaction { tx_id } => {
-                write!(f, "Duplicate transaction: {} already exists", hex::encode(tx_id))
+                write!(
+                    f,
+                    "Duplicate transaction: {} already exists",
+                    hex::encode(tx_id)
+                )
             }
-            ValidationError::MissingParent { parent_index, parent_id } => {
-                write!(f, "Parent {} missing: {}", parent_index, hex::encode(parent_id))
+            ValidationError::MissingParent {
+                parent_index,
+                parent_id,
+            } => {
+                write!(
+                    f,
+                    "Parent {} missing: {}",
+                    parent_index,
+                    hex::encode(parent_id)
+                )
             }
             ValidationError::DoubleSpend => {
                 write!(f, "Double spend detected: parents already used")
             }
             ValidationError::SenderConflict => {
-                write!(f, "Sender conflict: only one pending transaction per sender allowed")
+                write!(
+                    f,
+                    "Sender conflict: only one pending transaction per sender allowed"
+                )
             }
-            ValidationError::InsufficientBalance { required, available } => {
+            ValidationError::InsufficientBalance {
+                required,
+                available,
+            } => {
                 write!(f, "Insufficient balance: {} < {}", available, required)
             }
             ValidationError::InvalidNonce { expected, provided } => {
-                write!(f, "Invalid nonce: expected {}, provided {}", expected, provided)
+                write!(
+                    f,
+                    "Invalid nonce: expected {}, provided {}",
+                    expected, provided
+                )
             }
             ValidationError::InsufficientFee { required, provided } => {
                 write!(f, "Insufficient fee: {} < minimum {}", provided, required)
@@ -108,7 +137,9 @@ impl TransactionValidator {
     pub(crate) fn validate_pure(&self, tx: &Transaction) -> Result<(), ValidationError> {
         // Step 1: Verify PoW
         if !tx.verify_pow(self.difficulty) {
-            return Err(ValidationError::InvalidPoW { difficulty: self.difficulty });
+            return Err(ValidationError::InvalidPoW {
+                difficulty: self.difficulty,
+            });
         }
 
         // Step 2: Verify signature
@@ -143,7 +174,10 @@ impl TransactionValidator {
         for (i, parent) in tx.parents.iter().enumerate() {
             let is_genesis = *parent == TransactionId::default();
             if !is_genesis && !dag.transactions().contains_key(parent) {
-                return Err(ValidationError::MissingParent { parent_index: i, parent_id: *parent });
+                return Err(ValidationError::MissingParent {
+                    parent_index: i,
+                    parent_id: *parent,
+                });
             }
         }
 
@@ -164,7 +198,12 @@ impl TransactionValidator {
     /// 🔒 ZERO TRUST: This method is private. Use validate_full() for all validation.
     /// These checks require Ledger access but don't modify state
     /// Economic policy: read-only access to Ledger
-    pub(crate) fn validate_ledger(&self, tx: &Transaction, ledger: &Ledger, min_fee: u64) -> Result<(), ValidationError> {
+    pub(crate) fn validate_ledger(
+        &self,
+        tx: &Transaction,
+        ledger: &Ledger,
+        min_fee: u64,
+    ) -> Result<(), ValidationError> {
         // Check balance
         let sender_balance = ledger.get_balance(&tx.sender);
         let required = match tx.amount.checked_add(tx.fee) {
@@ -173,20 +212,26 @@ impl TransactionValidator {
         };
 
         if sender_balance < required {
-            return Err(ValidationError::InsufficientBalance { required, available: sender_balance });
+            return Err(ValidationError::InsufficientBalance {
+                required,
+                available: sender_balance,
+            });
         }
 
         // Check account nonce
         if let Err(e) = ledger.validate_account_nonce(&tx.sender, tx.account_nonce) {
-            return Err(ValidationError::InvalidNonce { 
+            return Err(ValidationError::InvalidNonce {
                 expected: ledger.get_nonce(&tx.sender) + 1,
-                provided: tx.account_nonce 
+                provided: tx.account_nonce,
             });
         }
 
         // Check minimum fee
         if tx.fee < min_fee {
-            return Err(ValidationError::InsufficientFee { required: min_fee, provided: tx.fee });
+            return Err(ValidationError::InsufficientFee {
+                required: min_fee,
+                provided: tx.fee,
+            });
         }
 
         Ok(())
@@ -217,15 +262,15 @@ impl Default for TransactionValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parent_selection::DAG;
     use crate::ledger::Ledger;
+    use crate::parent_selection::DAG;
     use crate::transaction::Transaction;
     use tempfile::tempdir;
 
     #[test]
     fn test_validate_pure_valid() {
         let validator = TransactionValidator::new();
-        
+
         let tx = Transaction::new(
             [[0u8; 32]; 2],
             [1u8; 32],
@@ -248,7 +293,7 @@ mod tests {
         let validator = TransactionValidator::new();
         let mut dag = DAG::new();
         let ledger = Ledger::new();
-        
+
         let tx = Transaction::new(
             [[0u8; 32]; 2],
             [1u8; 32],
@@ -263,7 +308,8 @@ mod tests {
         );
 
         // Add transaction to DAG (using validated method)
-        dag.add_transaction_validated(tx.clone()).expect("Failed to add transaction to DAG");
+        dag.add_transaction_validated(tx.clone())
+            .expect("Failed to add transaction to DAG");
 
         // This should fail due to overflow
         let result = validator.validate_pure(&tx);
@@ -315,14 +361,17 @@ mod tests {
             vec![2u8; 64],
         );
 
-        assert!(matches!(validator.validate_dag(&tx, &dag), Err(ValidationError::MissingParent { .. })));
+        assert!(matches!(
+            validator.validate_dag(&tx, &dag),
+            Err(ValidationError::MissingParent { .. })
+        ));
     }
 
     #[test]
     fn test_validate_dag_duplicate() {
         let validator = TransactionValidator::new();
         let mut dag = DAG::new();
-        
+
         let tx = Transaction::new(
             [[0u8; 32]; 2],
             [1u8; 32],
@@ -337,7 +386,8 @@ mod tests {
         );
 
         // Add transaction to DAG (using validated method)
-        dag.add_transaction_validated(tx.clone()).expect("Failed to add transaction to DAG");
+        dag.add_transaction_validated(tx.clone())
+            .expect("Failed to add transaction to DAG");
 
         // Validation should fail (duplicate)
         let result = validator.validate_dag(&tx, &dag);
@@ -349,7 +399,7 @@ mod tests {
         let validator = TransactionValidator::new();
         let _dag = DAG::new();
         let ledger = Ledger::new();
-        
+
         let tx = Transaction::new(
             [[0u8; 32]; 2],
             [1u8; 32],
@@ -374,10 +424,10 @@ mod tests {
         let _dag = DAG::new();
         let mut ledger = Ledger::new();
         let addr = [1u8; 32];
-        
+
         // Set nonce to 5
         ledger.commit_nonce(&addr, 5);
-        
+
         let tx = Transaction::new(
             [[0u8; 32]; 2],
             addr,
@@ -402,10 +452,10 @@ mod tests {
         let _dag = DAG::new();
         let mut ledger = Ledger::new();
         let addr = [1u8; 32];
-        
+
         ledger.set_balance(&addr, 1000);
         ledger.commit_nonce(&addr, 0);
-        
+
         let tx = Transaction::new(
             [[0u8; 32]; 2],
             addr,

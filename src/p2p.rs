@@ -5,6 +5,10 @@
 //! Supports DNS-based peer discovery and peer exchange (PEX).
 
 use crate::transaction::Transaction;
+use chacha20poly1305::aead::{Aead, NewAead};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use rand::rngs::OsRng;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -12,12 +16,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{info, warn, error, debug};
-use sha2::{Sha256, Digest};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use chacha20poly1305::aead::{Aead, NewAead};
+use tracing::{debug, error, info, warn};
 use x25519_dalek::{EphemeralSecret, PublicKey};
-use rand::rngs::OsRng;
 
 /// P2P handshake magic bytes ("AETH")
 const HANDSHAKE_MAGIC: [u8; 4] = [0x41, 0x45, 0x54, 0x48];
@@ -38,7 +38,9 @@ impl Default for P2PConfig {
         Self {
             listen_addr: "0.0.0.0:30333".parse().unwrap_or_else(|_| {
                 tracing::warn!("Failed to parse default P2P address, using fallback");
-                "127.0.0.1:30333".parse().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
+                "127.0.0.1:30333"
+                    .parse()
+                    .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap())
             }),
             bootnodes: Vec::new(),
             dns_seeds: Vec::new(),
@@ -82,7 +84,7 @@ struct SeenTxEntry {
 /// Transaction source for better deduplication logic
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TxSource {
-    Local,  // Transaction created locally via RPC
+    Local,   // Transaction created locally via RPC
     Network, // Transaction received from P2P network
 }
 
@@ -160,7 +162,22 @@ impl P2PNetwork {
             }
         });
         tokio::spawn(async move {
-            Self::accept_loop(listener, peers, local_addr, known_peers, tx_channel, get_dag_hashes, get_transaction_by_hash, get_balance, save_dag, process_orphans, get_tips, seen_transactions, peer_discovery_tx).await;
+            Self::accept_loop(
+                listener,
+                peers,
+                local_addr,
+                known_peers,
+                tx_channel,
+                get_dag_hashes,
+                get_transaction_by_hash,
+                get_balance,
+                save_dag,
+                process_orphans,
+                get_tips,
+                seen_transactions,
+                peer_discovery_tx,
+            )
+            .await;
         });
 
         // Connect to bootnodes
@@ -238,7 +255,12 @@ impl P2PNetwork {
 
                     if !connected {
                         let delay = std::cmp::min(2u64.pow(retry_count), 60); // Max 60 seconds
-                        info!("Bootnode {} disconnected, reconnecting in {}s (attempt {})", bootnode_addr, delay, retry_count + 1);
+                        info!(
+                            "Bootnode {} disconnected, reconnecting in {}s (attempt {})",
+                            bootnode_addr,
+                            delay,
+                            retry_count + 1
+                        );
                         tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
 
                         p2p_network.connect_to_peer(bootnode_addr).await;
@@ -260,10 +282,17 @@ impl P2PNetwork {
                 let now = Instant::now();
                 let mut seen = seen_transactions.write().await;
                 let before = seen.len();
-                seen.retain(|_, entry| now.duration_since(entry.timestamp) < Duration::from_secs(3600));
+                seen.retain(|_, entry| {
+                    now.duration_since(entry.timestamp) < Duration::from_secs(3600)
+                });
                 let after = seen.len();
                 if before != after {
-                    debug!("Cache cleanup: removed {} entries ({} -> {})", before - after, before, after);
+                    debug!(
+                        "Cache cleanup: removed {} entries ({} -> {})",
+                        before - after,
+                        before,
+                        after
+                    );
                 }
             }
         });
@@ -398,7 +427,25 @@ impl P2PNetwork {
                     let peer_discovery_tx = peer_discovery_tx.clone();
                     let known_peers = known_peers.clone();
                     tokio::spawn(async move {
-                        Self::handle_peer(socket, addr, peers_clone, local_addr, known_peers, tx_channel, get_dag_hashes, get_transaction_by_hash, get_balance, save_dag, process_orphans, get_tips, seen_transactions, msg_sender, msg_receiver, peer_discovery_tx).await;
+                        Self::handle_peer(
+                            socket,
+                            addr,
+                            peers_clone,
+                            local_addr,
+                            known_peers,
+                            tx_channel,
+                            get_dag_hashes,
+                            get_transaction_by_hash,
+                            get_balance,
+                            save_dag,
+                            process_orphans,
+                            get_tips,
+                            seen_transactions,
+                            msg_sender,
+                            msg_receiver,
+                            peer_discovery_tx,
+                        )
+                        .await;
                     });
                 }
                 Err(e) => {
@@ -495,15 +542,26 @@ impl P2PNetwork {
                     let key = Key::from_slice(key_enc.as_ref());
                     ChaCha20Poly1305::new(key)
                 };
-                let nonce_val = send_counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let nonce_val =
+                    send_counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let nonce_bytes = Self::build_nonce(nonce_val);
                 let nonce = Nonce::from_slice(&nonce_bytes);
                 match cipher.encrypt(nonce, msg.as_ref()) {
                     Ok(ciphertext) => {
                         let total_len = 12 + ciphertext.len();
-                        if writer.write_all(&(total_len as u32).to_be_bytes()).await.is_err() { break; }
-                        if writer.write_all(nonce).await.is_err() { break; }
-                        if writer.write_all(&ciphertext).await.is_err() { break; }
+                        if writer
+                            .write_all(&(total_len as u32).to_be_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if writer.write_all(nonce).await.is_err() {
+                            break;
+                        }
+                        if writer.write_all(&ciphertext).await.is_err() {
+                            break;
+                        }
                     }
                     Err(e) => {
                         warn!("Encryption failed for {}: {:?}", addr, e);
@@ -518,7 +576,11 @@ impl P2PNetwork {
         if let Ok(getinv_msg) = bincode::serialize(&P2PMessage::GetInventory {
             tips: our_tips.clone(),
         }) {
-            info!("[Sync] Sending GetInventory with {} tips to {}", our_tips.len(), addr);
+            info!(
+                "[Sync] Sending GetInventory with {} tips to {}",
+                our_tips.len(),
+                addr
+            );
             let _ = msg_sender.send(getinv_msg);
         }
 
@@ -589,10 +651,13 @@ impl P2PNetwork {
                             // Deserialize transaction
                             if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
                                 // Mark as seen with timestamp and source (Network) before sending to channel
-                                seen_transactions.write().await.insert(tx_bytes.clone(), SeenTxEntry { 
-                                    timestamp: Instant::now(),
-                                    source: TxSource::Network,
-                                });
+                                seen_transactions.write().await.insert(
+                                    tx_bytes.clone(),
+                                    SeenTxEntry {
+                                        timestamp: Instant::now(),
+                                        source: TxSource::Network,
+                                    },
+                                );
 
                                 info!("Received transaction from {}: {}", addr, hex::encode(tx.id));
                                 let _ = tx_channel.send(tx);
@@ -622,8 +687,14 @@ impl P2PNetwork {
 
                             // Request missing transactions via GetData
                             if !missing_hashes.is_empty() {
-                                info!("Requesting {} missing transactions from {}", missing_hashes.len(), addr);
-                                if let Ok(getdata_msg) = bincode::serialize(&P2PMessage::GetData(missing_hashes)) {
+                                info!(
+                                    "Requesting {} missing transactions from {}",
+                                    missing_hashes.len(),
+                                    addr
+                                );
+                                if let Ok(getdata_msg) =
+                                    bincode::serialize(&P2PMessage::GetData(missing_hashes))
+                                {
                                     let _ = msg_sender.send(getdata_msg);
                                 }
                             }
@@ -633,31 +704,27 @@ impl P2PNetwork {
                             let our_hashes = get_dag_hashes();
                             let our_tips = get_tips();
                             let _our_hash_set: HashSet<Vec<u8>> = our_hashes.into_iter().collect();
-                            
+
                             // Find transactions we have that peer doesn't have (compare tips)
                             let peer_tips_set: HashSet<Vec<u8>> = peer_tips.into_iter().collect();
                             let our_tips_set: HashSet<Vec<u8>> = our_tips.into_iter().collect();
-                            
+
                             // Transactions we need from peer (tips we don't have)
-                            let missing_for_us: Vec<Vec<u8>> = peer_tips_set
-                                .difference(&our_tips_set)
-                                .cloned()
-                                .collect();
-                            
+                            let missing_for_us: Vec<Vec<u8>> =
+                                peer_tips_set.difference(&our_tips_set).cloned().collect();
+
                             // Transactions peer might need from us (tips we have that they don't)
-                            let missing_for_peer: Vec<Vec<u8>> = our_tips_set
-                                .difference(&peer_tips_set)
-                                .cloned()
-                                .collect();
-                            
+                            let missing_for_peer: Vec<Vec<u8>> =
+                                our_tips_set.difference(&peer_tips_set).cloned().collect();
+
                             info!("[Sync] GetInventory from {}: we need {} tips, peer might need {} tips", 
                                 addr, missing_for_us.len(), missing_for_peer.len());
-                            
+
                             // Send our tips that peer doesn't have (with pagination)
                             if !missing_for_peer.is_empty() {
                                 const PAGE_SIZE: usize = 100;
                                 let mut tx_bytes_list = Vec::new();
-                                
+
                                 for hash in missing_for_peer.iter().take(PAGE_SIZE) {
                                     if let Some(tx) = get_transaction_by_hash(hash) {
                                         if let Ok(bytes) = bincode::serialize(&tx) {
@@ -665,18 +732,26 @@ impl P2PNetwork {
                                         }
                                     }
                                 }
-                                
+
                                 if !tx_bytes_list.is_empty() {
-                                    info!("[Sync] Sending {} transactions to {}", tx_bytes_list.len(), addr);
-                                    if let Ok(sync_resp_msg) = bincode::serialize(&P2PMessage::SyncResponse(tx_bytes_list)) {
+                                    info!(
+                                        "[Sync] Sending {} transactions to {}",
+                                        tx_bytes_list.len(),
+                                        addr
+                                    );
+                                    if let Ok(sync_resp_msg) =
+                                        bincode::serialize(&P2PMessage::SyncResponse(tx_bytes_list))
+                                    {
                                         let _ = msg_sender.send(sync_resp_msg);
                                     }
                                 }
                             }
-                            
+
                             // Request missing transactions from peer
                             if !missing_for_us.is_empty() {
-                                if let Ok(getdata_msg) = bincode::serialize(&P2PMessage::GetData(missing_for_us)) {
+                                if let Ok(getdata_msg) =
+                                    bincode::serialize(&P2PMessage::GetData(missing_for_us))
+                                {
                                     let _ = msg_sender.send(getdata_msg);
                                 }
                             }
@@ -695,8 +770,14 @@ impl P2PNetwork {
                             }
 
                             if !tx_bytes_list.is_empty() {
-                                info!("[Sync] Sending {} transactions to {}", tx_bytes_list.len(), addr);
-                                if let Ok(sync_resp_msg) = bincode::serialize(&P2PMessage::SyncResponse(tx_bytes_list)) {
+                                info!(
+                                    "[Sync] Sending {} transactions to {}",
+                                    tx_bytes_list.len(),
+                                    addr
+                                );
+                                if let Ok(sync_resp_msg) =
+                                    bincode::serialize(&P2PMessage::SyncResponse(tx_bytes_list))
+                                {
                                     let _ = msg_sender.send(sync_resp_msg);
                                 }
                             }
@@ -704,8 +785,14 @@ impl P2PNetwork {
                         P2PMessage::SyncRequest => {
                             // Respond with full inventory
                             let our_hashes = get_dag_hashes();
-                            info!("[Sync] Sending inventory with {} hashes to {}", our_hashes.len(), addr);
-                            if let Ok(inv_msg) = bincode::serialize(&P2PMessage::Inventory(our_hashes)) {
+                            info!(
+                                "[Sync] Sending inventory with {} hashes to {}",
+                                our_hashes.len(),
+                                addr
+                            );
+                            if let Ok(inv_msg) =
+                                bincode::serialize(&P2PMessage::Inventory(our_hashes))
+                            {
                                 let _ = msg_sender.send(inv_msg);
                             }
                         }
@@ -735,10 +822,13 @@ impl P2PNetwork {
                             // Add to DAG via channel (full validation will be done in main.rs)
                             for tx in transactions {
                                 if let Ok(tx_bytes) = bincode::serialize(&tx) {
-                                    seen_transactions.write().await.insert(tx_bytes, SeenTxEntry { 
-                                        timestamp: Instant::now(),
-                                        source: TxSource::Network,
-                                    });
+                                    seen_transactions.write().await.insert(
+                                        tx_bytes,
+                                        SeenTxEntry {
+                                            timestamp: Instant::now(),
+                                            source: TxSource::Network,
+                                        },
+                                    );
                                 }
                                 let _ = tx_channel.send(tx);
 
@@ -747,7 +837,10 @@ impl P2PNetwork {
                             }
 
                             if downloaded_count > 0 {
-                                info!("[Sync] Downloaded {} missing transactions from {}", downloaded_count, addr);
+                                info!(
+                                    "[Sync] Downloaded {} missing transactions from {}",
+                                    downloaded_count, addr
+                                );
                                 // Note: process_orphans is now handled by the validation logic in main.rs
                             }
                         }
@@ -818,7 +911,25 @@ impl P2PNetwork {
                     })
                 };
                 tokio::spawn(async move {
-                    Self::handle_peer(socket, addr, peers, local_addr, known_peers, tx_channel, get_dag_hashes, get_transaction_by_hash, get_balance, save_dag, process_orphans, get_tips, seen_transactions, msg_sender, msg_receiver, peer_discovery_tx).await;
+                    Self::handle_peer(
+                        socket,
+                        addr,
+                        peers,
+                        local_addr,
+                        known_peers,
+                        tx_channel,
+                        get_dag_hashes,
+                        get_transaction_by_hash,
+                        get_balance,
+                        save_dag,
+                        process_orphans,
+                        get_tips,
+                        seen_transactions,
+                        msg_sender,
+                        msg_receiver,
+                        peer_discovery_tx,
+                    )
+                    .await;
                 });
             }
             Err(e) => {
@@ -838,10 +949,13 @@ impl P2PNetwork {
         };
 
         // Mark as seen with Local source before broadcasting to avoid rebroadcast loops
-        self.seen_transactions.write().await.insert(tx_bytes.clone(), SeenTxEntry {
-            timestamp: Instant::now(),
-            source: TxSource::Local,
-        });
+        self.seen_transactions.write().await.insert(
+            tx_bytes.clone(),
+            SeenTxEntry {
+                timestamp: Instant::now(),
+                source: TxSource::Local,
+            },
+        );
 
         let msg = P2PMessage::Transaction(tx_bytes.clone());
         let msg_bytes = match bincode::serialize(&msg) {
@@ -905,7 +1019,7 @@ mod tests {
         // Test that TxSource enum works correctly
         let local = TxSource::Local;
         let network = TxSource::Network;
-        
+
         assert_eq!(local, TxSource::Local);
         assert_eq!(network, TxSource::Network);
         assert_ne!(local, network);
@@ -915,18 +1029,21 @@ mod tests {
     async fn test_seen_transactions_deduplication() {
         // Test that seen_transactions correctly tracks and deduplicates
         let seen = Arc::new(RwLock::new(HashMap::new()));
-        
+
         let tx_bytes = vec![1u8, 2, 3, 4];
-        
+
         // First insert should succeed
         {
             let mut seen_write = seen.write().await;
-            seen_write.insert(tx_bytes.clone(), SeenTxEntry {
-                timestamp: Instant::now(),
-                source: TxSource::Network,
-            });
+            seen_write.insert(
+                tx_bytes.clone(),
+                SeenTxEntry {
+                    timestamp: Instant::now(),
+                    source: TxSource::Network,
+                },
+            );
         }
-        
+
         // Check that it's present
         {
             let seen_read = seen.read().await;
@@ -934,16 +1051,19 @@ mod tests {
             let entry = seen_read.get(&tx_bytes).unwrap();
             assert_eq!(entry.source, TxSource::Network);
         }
-        
+
         // Second insert should not duplicate (just update)
         {
             let mut seen_write = seen.write().await;
-            seen_write.insert(tx_bytes.clone(), SeenTxEntry {
-                timestamp: Instant::now(),
-                source: TxSource::Local,
-            });
+            seen_write.insert(
+                tx_bytes.clone(),
+                SeenTxEntry {
+                    timestamp: Instant::now(),
+                    source: TxSource::Local,
+                },
+            );
         }
-        
+
         // Should still be only one entry
         {
             let seen_read = seen.read().await;
@@ -958,24 +1078,30 @@ mod tests {
     async fn test_seen_transactions_cleanup() {
         // Test that old entries are evicted
         let seen = Arc::new(RwLock::new(HashMap::new()));
-        
+
         let tx_bytes1 = vec![1u8, 2, 3, 4];
         let tx_bytes2 = vec![5u8, 6, 7, 8];
-        
+
         // Insert one entry with old timestamp (use smaller duration to avoid overflow)
         {
             let mut seen_write = seen.write().await;
             let now = Instant::now();
-            seen_write.insert(tx_bytes1.clone(), SeenTxEntry {
-                timestamp: now.checked_sub(Duration::from_secs(60)).unwrap_or(now),
-                source: TxSource::Network,
-            });
-            seen_write.insert(tx_bytes2.clone(), SeenTxEntry {
-                timestamp: now,
-                source: TxSource::Local,
-            });
+            seen_write.insert(
+                tx_bytes1.clone(),
+                SeenTxEntry {
+                    timestamp: now.checked_sub(Duration::from_secs(60)).unwrap_or(now),
+                    source: TxSource::Network,
+                },
+            );
+            seen_write.insert(
+                tx_bytes2.clone(),
+                SeenTxEntry {
+                    timestamp: now,
+                    source: TxSource::Local,
+                },
+            );
         }
-        
+
         // Simulate cleanup (remove entries older than 30 seconds)
         let now = Instant::now();
         {
@@ -985,7 +1111,7 @@ mod tests {
                     .map_or(false, |d| d < Duration::from_secs(30))
             });
         }
-        
+
         // Old entry should be removed, new entry should remain
         {
             let seen_read = seen.read().await;
@@ -1009,7 +1135,7 @@ mod tests {
             Arc::new(|| {}),
             Arc::new(|| vec![]),
         );
-        
+
         let tx = Transaction::new(
             [[0u8; 32]; 2],
             [1u8; 32],
@@ -1022,12 +1148,12 @@ mod tests {
             vec![0u8; 64],
             vec![0u8; 32],
         );
-        
+
         let tx_bytes = bincode::serialize(&tx).unwrap();
-        
+
         // Broadcast should mark as Local
         p2p.broadcast_transaction(tx.clone()).await;
-        
+
         // Check that it's marked as Local in seen_transactions
         let seen = p2p.seen_transactions.read().await;
         assert!(seen.contains_key(&tx_bytes));
@@ -1035,4 +1161,3 @@ mod tests {
         assert_eq!(entry.source, TxSource::Local);
     }
 }
-

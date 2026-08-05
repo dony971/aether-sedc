@@ -3,37 +3,37 @@
 //! Provides cryptographic key generation, signing, and verification for transactions.
 //! Uses Ed25519 for digital signatures with BIP39 mnemonic support.
 
-use ed25519_dalek::{Signature, Signer, Verifier};
+use crate::transaction::{Address, Transaction};
+use aes_gcm::aead::{Aead, NewAead};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
+use bip39::{Language, Mnemonic};
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{Signature, Signer, Verifier};
+use pbkdf2::pbkdf2_hmac;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use tokio::fs;
+use sha2::{Digest, Sha256};
 use std::path::Path;
-use crate::transaction::{Transaction, Address};
-use bip39::{Mnemonic, Language};
-use aes_gcm::aead::{Aead, NewAead};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
-use pbkdf2::pbkdf2_hmac;
-use sha2::{Sha256, Digest};
+use tokio::fs;
 
 /// Convert public key to human-readable address with checksum
 /// Format: AETH<base58_encoded_public_key><checksum>
 pub fn public_key_to_address(public_key: &[u8]) -> String {
     // Use first 20 bytes of public key for shorter address
     let key_bytes = &public_key[..20.min(public_key.len())];
-    
+
     // Double SHA256 for checksum
     let hash1 = sha2::Sha256::digest(key_bytes);
     let hash2 = sha2::Sha256::digest(&hash1);
     let checksum = &hash2[..4]; // First 4 bytes as checksum
-    
+
     // Combine key + checksum
     let mut combined = Vec::with_capacity(key_bytes.len() + checksum.len());
     combined.extend_from_slice(key_bytes);
     combined.extend_from_slice(checksum);
-    
+
     // Encode to hex and prefix
     format!("AETH{}", hex::encode(combined))
 }
@@ -43,27 +43,27 @@ pub fn verify_address_checksum(address: &str) -> bool {
     if !address.starts_with("AETH") {
         return false;
     }
-    
+
     let hex_part = &address[4..]; // Remove "AETH" prefix
-    
+
     // Decode hex
     let decoded = match hex::decode(hex_part) {
         Ok(bytes) => bytes,
         Err(_) => return false,
     };
-    
+
     if decoded.len() < 24 {
         return false; // 20 bytes key + 4 bytes checksum
     }
-    
+
     let key_bytes = &decoded[..20];
     let checksum = &decoded[20..24];
-    
+
     // Recompute checksum
     let hash1 = sha2::Sha256::digest(key_bytes);
     let hash2 = sha2::Sha256::digest(&hash1);
     let expected_checksum = &hash2[..4];
-    
+
     checksum == expected_checksum
 }
 
@@ -112,24 +112,24 @@ impl Wallet {
         // Generate random entropy
         let mut entropy = [0u8; 16]; // 128 bits for 12 words
         rand::rngs::OsRng.fill_bytes(&mut entropy);
-        
+
         // Generate mnemonic from entropy
         let mnemonic = Mnemonic::from_entropy(&entropy).unwrap_or_else(|_| {
             // Fallback: generate a simple mnemonic if entropy fails
             Mnemonic::from_entropy(&[0u8; 16]).unwrap()
         });
         let mnemonic_phrase = mnemonic.to_string();
-        
+
         // Derive seed from mnemonic using BIP39
         let seed = mnemonic.to_seed("");
-        
+
         // Use first 32 bytes of seed as private key
         let mut secret_key_bytes = [0u8; 32];
         secret_key_bytes.copy_from_slice(&seed[..32]);
-        
+
         let signing_key = SigningKey::from_bytes(&secret_key_bytes);
         let verifying_key = signing_key.verifying_key();
-        
+
         Wallet {
             public_key_hex: hex::encode(verifying_key.to_bytes()),
             secret_key_hex: hex::encode(signing_key.to_bytes()),
@@ -158,13 +158,13 @@ impl Wallet {
     pub fn from_mnemonic(mnemonic_phrase: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let mnemonic = Mnemonic::parse_in(Language::English, mnemonic_phrase)?;
         let seed = mnemonic.to_seed("");
-        
+
         let mut secret_key_bytes = [0u8; 32];
         secret_key_bytes.copy_from_slice(&seed[..32]);
-        
+
         let signing_key = SigningKey::from_bytes(&secret_key_bytes);
         let verifying_key = signing_key.verifying_key();
-        
+
         Ok(Wallet {
             public_key_hex: hex::encode(verifying_key.to_bytes()),
             secret_key_hex: hex::encode(signing_key.to_bytes()),
@@ -177,33 +177,35 @@ impl Wallet {
         // Generate salt
         let mut salt = [0u8; 16];
         OsRng.fill_bytes(&mut salt);
-        
+
         // Derive key from password using PBKDF2
         let mut key_bytes = [0u8; 32];
         let iterations: u32 = 100_000;
         pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, iterations, &mut key_bytes);
-        
+
         // Generate nonce
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
-        
+
         // Encrypt secret key
         let key = Key::from_slice(&key_bytes);
         let cipher = Aes256Gcm::new(key);
         let nonce = Nonce::from_slice(&nonce_bytes);
-        
+
         let secret_bytes = hex::decode(&self.secret_key_hex)?;
-        let encrypted_secret = cipher.encrypt(nonce, secret_bytes.as_ref())
+        let encrypted_secret = cipher
+            .encrypt(nonce, secret_bytes.as_ref())
             .map_err(|e| format!("Encryption failed: {}", e))?;
-        
+
         // Encrypt mnemonic if present
         let encrypted_mnemonic = if let Some(ref mnemonic) = self.mnemonic {
-            cipher.encrypt(nonce, mnemonic.as_bytes())
+            cipher
+                .encrypt(nonce, mnemonic.as_bytes())
                 .map_err(|e| format!("Mnemonic encryption failed: {}", e))?
         } else {
             vec![]
         };
-        
+
         Ok(EncryptedWallet {
             encrypted_secret: hex::encode(encrypted_secret),
             salt: hex::encode(salt),
@@ -214,33 +216,38 @@ impl Wallet {
     }
 
     /// Decrypt wallet with password
-    pub fn decrypt(encrypted: &EncryptedWallet, password: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn decrypt(
+        encrypted: &EncryptedWallet,
+        password: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // Derive key from password
         let salt = hex::decode(&encrypted.salt)?;
         let mut key_bytes = [0u8; 32];
         let iterations: u32 = 100_000;
         pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, iterations, &mut key_bytes);
-        
+
         // Decrypt secret key
         let key = Key::from_slice(&key_bytes);
         let cipher = Aes256Gcm::new(key);
         let nonce_bytes = hex::decode(&encrypted.nonce)?;
         let nonce = Nonce::from_slice(&nonce_bytes);
-        
+
         let encrypted_secret = hex::decode(&encrypted.encrypted_secret)?;
-        let secret_bytes = cipher.decrypt(nonce, encrypted_secret.as_ref())
+        let secret_bytes = cipher
+            .decrypt(nonce, encrypted_secret.as_ref())
             .map_err(|e| format!("Decryption failed: {}", e))?;
-        
+
         // Decrypt mnemonic if present
         let mnemonic = if !encrypted.encrypted_mnemonic.is_empty() {
             let encrypted_mnemonic = hex::decode(&encrypted.encrypted_mnemonic)?;
-            let mnemonic_bytes = cipher.decrypt(nonce, encrypted_mnemonic.as_ref())
+            let mnemonic_bytes = cipher
+                .decrypt(nonce, encrypted_mnemonic.as_ref())
                 .map_err(|e| format!("Mnemonic decryption failed: {}", e))?;
             Some(String::from_utf8(mnemonic_bytes)?)
         } else {
             None
         };
-        
+
         Ok(Wallet {
             public_key_hex: encrypted.public_key_hex.clone(),
             secret_key_hex: hex::encode(secret_bytes),
@@ -249,9 +256,12 @@ impl Wallet {
     }
 
     /// Load wallet from a file (encrypted)
-    pub async fn from_file<P: AsRef<Path>>(path: P, password: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn from_file<P: AsRef<Path>>(
+        path: P,
+        password: Option<&str>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let content = fs::read_to_string(path).await?;
-        
+
         // Try to load as encrypted wallet first
         if let Ok(encrypted) = serde_json::from_str::<EncryptedWallet>(&content) {
             if let Some(pwd) = password {
@@ -260,14 +270,18 @@ impl Wallet {
                 return Err("Password required for encrypted wallet".into());
             }
         }
-        
+
         // Fallback to unencrypted wallet (legacy)
         let wallet: Wallet = serde_json::from_str(&content)?;
         Ok(wallet)
     }
 
     /// Save wallet to a file (encrypted if password provided)
-    pub async fn to_file<P: AsRef<Path>>(&self, path: P, password: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn to_file<P: AsRef<Path>>(
+        &self,
+        path: P,
+        password: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(pwd) = password {
             let encrypted = self.encrypt(pwd)?;
             let content = serde_json::to_string_pretty(&encrypted)?;
@@ -318,7 +332,10 @@ impl Wallet {
     }
 
     /// Sign a transaction hash directly
-    pub fn sign_transaction_hash(&self, tx_hash: &[u8]) -> Result<Signature, Box<dyn std::error::Error>> {
+    pub fn sign_transaction_hash(
+        &self,
+        tx_hash: &[u8],
+    ) -> Result<Signature, Box<dyn std::error::Error>> {
         let secret_key_bytes = self.secret_key_bytes();
         let signing_key = SigningKey::try_from(secret_key_bytes.as_slice())?;
 
@@ -336,13 +353,16 @@ impl Wallet {
     }
 
     /// Sign a transaction
-    pub fn sign_transaction(&self, tx: &Transaction) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub fn sign_transaction(
+        &self,
+        tx: &Transaction,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let secret_key_bytes = self.secret_key_bytes();
         let signing_key = SigningKey::try_from(secret_key_bytes.as_slice())?;
 
         // Sign the transaction signing hash (excludes signature and public_key)
         let tx_hash = tx.compute_signing_hash();
-        
+
         let signature = signing_key.sign(&tx_hash);
         Ok(signature.to_bytes().to_vec())
     }
@@ -398,8 +418,13 @@ mod tests {
         let wallet = Wallet::new();
         let path = "test_wallet.json";
 
-        wallet.to_file(path, None).await.expect("Failed to save wallet");
-        let loaded = Wallet::from_file(path, None).await.expect("Failed to load wallet");
+        wallet
+            .to_file(path, None)
+            .await
+            .expect("Failed to save wallet");
+        let loaded = Wallet::from_file(path, None)
+            .await
+            .expect("Failed to load wallet");
 
         assert_eq!(wallet.public_key_hex, loaded.public_key_hex);
         assert_eq!(wallet.secret_key_hex, loaded.secret_key_hex);
@@ -442,7 +467,7 @@ mod tests {
             10,
             1234567890,
             0,
-            1, // account_nonce
+            1,              // account_nonce
             vec![99u8; 64], // Invalid signature
             wallet.public_key_bytes(),
         );
@@ -456,10 +481,15 @@ mod tests {
         let path = "test_wallet_persistence.json";
 
         // Save wallet
-        wallet.to_file(path, None).await.expect("Failed to save wallet");
+        wallet
+            .to_file(path, None)
+            .await
+            .expect("Failed to save wallet");
 
         // Load wallet
-        let loaded_wallet = Wallet::from_file(path, None).await.expect("Failed to load wallet");
+        let loaded_wallet = Wallet::from_file(path, None)
+            .await
+            .expect("Failed to load wallet");
 
         // Create test transaction
         let tx = Transaction::new(
@@ -476,7 +506,9 @@ mod tests {
         );
 
         // Sign with loaded wallet
-        let signature = loaded_wallet.sign_transaction(&tx).expect("Failed to sign transaction");
+        let signature = loaded_wallet
+            .sign_transaction(&tx)
+            .expect("Failed to sign transaction");
         let mut signed_tx = tx.clone();
         signed_tx.signature = signature;
 
@@ -494,10 +526,15 @@ mod tests {
         let path = "test_wallet_loop.json";
 
         // Save wallet
-        wallet.to_file(path, None).await.expect("Failed to save wallet");
+        wallet
+            .to_file(path, None)
+            .await
+            .expect("Failed to save wallet");
 
         // Load wallet
-        let loaded_wallet = Wallet::from_file(path, None).await.expect("Failed to load wallet");
+        let loaded_wallet = Wallet::from_file(path, None)
+            .await
+            .expect("Failed to load wallet");
 
         // Create test transaction
         let tx = Transaction::new(
@@ -514,7 +551,9 @@ mod tests {
         );
 
         // Sign with loaded wallet
-        let signature = loaded_wallet.sign_transaction(&tx).expect("Failed to sign transaction");
+        let signature = loaded_wallet
+            .sign_transaction(&tx)
+            .expect("Failed to sign transaction");
         let mut signed_tx = tx.clone();
         signed_tx.signature = signature;
 

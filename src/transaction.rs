@@ -3,9 +3,9 @@
 //! Defines the core Transaction structure for the DAG network.
 //! Each transaction references two parent transactions, forming a DAG topology.
 
+use hex;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use hex;
 
 /// Unique identifier for a transaction (256-bit hash)
 pub type TransactionId = [u8; 32];
@@ -88,7 +88,7 @@ impl Transaction {
         tx.id = tx.compute_hash();
         tx
     }
-    
+
     /// Compute the transaction hash using BLAKE3 (includes signature and public_key)
     pub fn compute_hash(&self) -> TransactionId {
         let mut hasher = blake3::Hasher::new();
@@ -108,7 +108,7 @@ impl Transaction {
 
         hasher.finalize().into()
     }
-    
+
     /// Compute the signing hash (excludes signature and public_key)
     /// This is what should be signed, not the full hash
     /// Order: Sender + Receiver + Amount + Account Nonce (for replay protection)
@@ -123,17 +123,17 @@ impl Transaction {
 
         hasher.finalize().into()
     }
-    
+
     /// Verify that the transaction hash is valid
     pub fn verify_hash(&self) -> bool {
         self.compute_hash() == self.id
     }
-    
+
     /// Check if this transaction is a genesis transaction (no parents)
     pub fn is_genesis(&self) -> bool {
         self.parents == [TransactionId::default(); 2]
     }
-    
+
     /// Get the total deduction from sender (amount + fee)
     pub fn total_deduction(&self) -> u64 {
         self.amount.saturating_add(self.fee)
@@ -152,7 +152,8 @@ impl Transaction {
         let difficulty_factor = (difficulty as f64 / 10000.0).min(2.0); // Cap at 2x multiplier
 
         // Calculate final fee
-        let recommended_fee = (base_fee as f64 * (1.0 + load_factor + tps_factor + difficulty_factor)) as u64;
+        let recommended_fee =
+            (base_fee as f64 * (1.0 + load_factor + tps_factor + difficulty_factor)) as u64;
 
         // Ensure minimum fee of 1
         recommended_fee.max(1)
@@ -164,7 +165,11 @@ impl Transaction {
         const MIN_SIZE: usize = 208; // Fixed fields: 5*32 + 6*8 = 160 + 48 = 208 (added account_nonce)
 
         if bytes.len() < MIN_SIZE {
-            return Err(format!("Data too short: minimum {} bytes required, got {}", MIN_SIZE, bytes.len()));
+            return Err(format!(
+                "Data too short: minimum {} bytes required, got {}",
+                MIN_SIZE,
+                bytes.len()
+            ));
         }
 
         let mut cursor = 0;
@@ -179,62 +184,91 @@ impl Transaction {
         };
 
         // Fixed-size fields (208 bytes total)
-        let id: TransactionId = read_slice(cursor, 32, "id")?.try_into()
+        let id: TransactionId = read_slice(cursor, 32, "id")?
+            .try_into()
             .map_err(|_| "Invalid id: cannot convert to [u8; 32]".to_string())?;
         cursor += 32;
 
-        let parent0: TransactionId = read_slice(cursor, 32, "parent0")?.try_into()
+        let parent0: TransactionId = read_slice(cursor, 32, "parent0")?
+            .try_into()
             .map_err(|_| "Invalid parent0: cannot convert to [u8; 32]".to_string())?;
         cursor += 32;
 
-        let parent1: TransactionId = read_slice(cursor, 32, "parent1")?.try_into()
+        let parent1: TransactionId = read_slice(cursor, 32, "parent1")?
+            .try_into()
             .map_err(|_| "Invalid parent1: cannot convert to [u8; 32]".to_string())?;
         cursor += 32;
 
-        let sender: Address = read_slice(cursor, 32, "sender")?.try_into()
+        let sender: Address = read_slice(cursor, 32, "sender")?
+            .try_into()
             .map_err(|_| "Invalid sender: cannot convert to [u8; 32]".to_string())?;
         cursor += 32;
 
-        let receiver: Address = read_slice(cursor, 32, "receiver")?.try_into()
+        let receiver: Address = read_slice(cursor, 32, "receiver")?
+            .try_into()
             .map_err(|_| "Invalid receiver: cannot convert to [u8; 32]".to_string())?;
         cursor += 32;
 
-        let amount = u64::from_le_bytes(read_slice(cursor, 8, "amount")?.try_into()
-            .map_err(|_| "Invalid amount: cannot convert to u64".to_string())?);
+        let amount = u64::from_le_bytes(
+            read_slice(cursor, 8, "amount")?
+                .try_into()
+                .map_err(|_| "Invalid amount: cannot convert to u64".to_string())?,
+        );
         cursor += 8;
 
-        let fee = u64::from_le_bytes(read_slice(cursor, 8, "fee")?.try_into()
-            .map_err(|_| "Invalid fee: cannot convert to u64".to_string())?);
+        let fee = u64::from_le_bytes(
+            read_slice(cursor, 8, "fee")?
+                .try_into()
+                .map_err(|_| "Invalid fee: cannot convert to u64".to_string())?,
+        );
         cursor += 8;
 
-        let timestamp = u64::from_le_bytes(read_slice(cursor, 8, "timestamp")?.try_into()
-            .map_err(|_| "Invalid timestamp: cannot convert to u64".to_string())?);
+        let timestamp = u64::from_le_bytes(
+            read_slice(cursor, 8, "timestamp")?
+                .try_into()
+                .map_err(|_| "Invalid timestamp: cannot convert to u64".to_string())?,
+        );
         cursor += 8;
 
-        let nonce = u64::from_le_bytes(read_slice(cursor, 8, "nonce")?.try_into()
-            .map_err(|_| "Invalid nonce: cannot convert to u64".to_string())?);
+        let nonce = u64::from_le_bytes(
+            read_slice(cursor, 8, "nonce")?
+                .try_into()
+                .map_err(|_| "Invalid nonce: cannot convert to u64".to_string())?,
+        );
         cursor += 8;
 
-        let account_nonce = u64::from_le_bytes(read_slice(cursor, 8, "account_nonce")?.try_into()
-            .map_err(|_| "Invalid account_nonce: cannot convert to u64".to_string())?);
+        let account_nonce = u64::from_le_bytes(
+            read_slice(cursor, 8, "account_nonce")?
+                .try_into()
+                .map_err(|_| "Invalid account_nonce: cannot convert to u64".to_string())?,
+        );
         cursor += 8;
 
-        let weight = f64::from_le_bytes(read_slice(cursor, 8, "weight")?.try_into()
-            .map_err(|_| "Invalid weight: cannot convert to f64".to_string())?);
+        let weight = f64::from_le_bytes(
+            read_slice(cursor, 8, "weight")?
+                .try_into()
+                .map_err(|_| "Invalid weight: cannot convert to f64".to_string())?,
+        );
         cursor += 8;
 
         // Variable-size fields (with length prefix)
         let sig_len_bytes = read_slice(cursor, 8, "signature_length")?;
-        let sig_len = u64::from_le_bytes(sig_len_bytes.try_into()
-            .map_err(|_| "Invalid signature length: cannot convert to u64".to_string())?) as usize;
+        let sig_len = u64::from_le_bytes(
+            sig_len_bytes
+                .try_into()
+                .map_err(|_| "Invalid signature length: cannot convert to u64".to_string())?,
+        ) as usize;
         cursor += 8;
 
         let signature = read_slice(cursor, sig_len, "signature")?.to_vec();
         cursor += sig_len;
 
         let pk_len_bytes = read_slice(cursor, 8, "public_key_length")?;
-        let pk_len = u64::from_le_bytes(pk_len_bytes.try_into()
-            .map_err(|_| "Invalid public key length: cannot convert to u64".to_string())?) as usize;
+        let pk_len = u64::from_le_bytes(
+            pk_len_bytes
+                .try_into()
+                .map_err(|_| "Invalid public key length: cannot convert to u64".to_string())?,
+        ) as usize;
         cursor += 8;
 
         let public_key = read_slice(cursor, pk_len, "public_key")?.to_vec();
@@ -279,19 +313,19 @@ impl Transaction {
     /// For example, difficulty 16 means the hash must start with 16 zero bits (4 hex zeros)
     pub fn verify_pow(&self, difficulty: u8) -> bool {
         let hash = self.calculate_pow_hash(self.nonce);
-        
+
         // Convert difficulty from bits to bytes
         // difficulty 16 = 2 bytes of zeros
         let zero_bytes = (difficulty / 8) as usize;
         let remaining_bits = (difficulty % 8) as u8;
-        
+
         // Check that the first zero_bytes are all zeros
         for i in 0..zero_bytes {
             if hash[i] != 0 {
                 return false;
             }
         }
-        
+
         // Check remaining bits in the next byte
         if remaining_bits > 0 && zero_bytes < hash.len() {
             let mask = 0xFF << (8 - remaining_bits);
@@ -299,7 +333,7 @@ impl Transaction {
                 return false;
             }
         }
-        
+
         true
     }
 
@@ -307,16 +341,16 @@ impl Transaction {
     /// Returns the nonce that satisfies the PoW requirement
     pub fn mine_nonce(&self, difficulty: u8) -> u64 {
         let mut nonce: u64 = 0;
-        
+
         loop {
             let hash = self.calculate_pow_hash(nonce);
-            
+
             // Check if hash meets difficulty
             let zero_bytes = (difficulty / 8) as usize;
             let remaining_bits = (difficulty % 8) as u8;
-            
+
             let mut valid = true;
-            
+
             // Check that the first zero_bytes are all zeros
             for i in 0..zero_bytes {
                 if hash[i] != 0 {
@@ -324,7 +358,7 @@ impl Transaction {
                     break;
                 }
             }
-            
+
             // Check remaining bits in the next byte
             if valid && remaining_bits > 0 && zero_bytes < hash.len() {
                 let mask = 0xFF << (8 - remaining_bits);
@@ -332,11 +366,11 @@ impl Transaction {
                     valid = false;
                 }
             }
-            
+
             if valid {
                 return nonce;
             }
-            
+
             nonce += 1;
         }
     }
@@ -355,7 +389,7 @@ impl Transaction {
         if self.public_key.len() < 32 {
             return false;
         }
-        
+
         let derived_address: [u8; 32] = self.public_key[..32].try_into().unwrap_or([0u8; 32]);
         self.sender == derived_address
     }
@@ -367,19 +401,19 @@ impl Transaction {
 pub struct AdaptiveDifficulty {
     /// Current difficulty in bits
     current_difficulty: u8,
-    
+
     /// Minimum difficulty
     min_difficulty: u8,
-    
+
     /// Maximum difficulty
     max_difficulty: u8,
-    
+
     /// Transaction timestamps for rate calculation
     tx_timestamps: Vec<u64>,
-    
+
     /// Window size in milliseconds for rate calculation
     window_ms: u64,
-    
+
     /// Target transactions per window
     target_tps: u64,
 }
@@ -396,7 +430,7 @@ impl AdaptiveDifficulty {
             target_tps,
         }
     }
-    
+
     /// Create with default parameters
     pub fn default() -> Self {
         Self {
@@ -408,19 +442,19 @@ impl AdaptiveDifficulty {
             target_tps: 10,    // Target 10 TPS
         }
     }
-    
+
     /// Record a transaction timestamp and adjust difficulty if needed
     pub fn record_transaction(&mut self, timestamp: u64) -> u8 {
         // Add timestamp
         self.tx_timestamps.push(timestamp);
-        
+
         // Remove old timestamps outside window
         let cutoff = timestamp.saturating_sub(self.window_ms);
         self.tx_timestamps.retain(|&ts| ts >= cutoff);
-        
+
         // Calculate current TPS
         let tps = self.tx_timestamps.len() as u64;
-        
+
         // Adjust difficulty based on TPS
         if tps > self.target_tps * 2 {
             // Too many transactions, increase difficulty
@@ -429,15 +463,15 @@ impl AdaptiveDifficulty {
             // Too few transactions, decrease difficulty
             self.current_difficulty = (self.current_difficulty - 1).max(self.min_difficulty);
         }
-        
+
         self.current_difficulty
     }
-    
+
     /// Get the current difficulty
     pub fn current_difficulty(&self) -> u8 {
         self.current_difficulty
     }
-    
+
     /// Get the current TPS
     pub fn current_tps(&self) -> u64 {
         self.tx_timestamps.len() as u64
@@ -466,26 +500,15 @@ mod tests {
 
     #[test]
     fn test_transaction_creation() {
-        let parents = [
-            [1u8; 32],
-            [2u8; 32],
-        ];
+        let parents = [[1u8; 32], [2u8; 32]];
         let sender = [3u8; 32];
         let receiver = [4u8; 32];
         let signature = vec![5u8; 64];
         let public_key = vec![6u8; 32];
 
         let tx = Transaction::new(
-            parents,
-            sender,
-            receiver,
-            1000,
-            10,
-            1234567890,
-            0,
-            1, // account_nonce
-            public_key,
-            signature,
+            parents, sender, receiver, 1000, 10, 1234567890, 0, 1, // account_nonce
+            public_key, signature,
         );
 
         assert!(tx.verify_hash());
@@ -515,10 +538,7 @@ mod tests {
 
     #[test]
     fn test_non_genesis_transaction() {
-        let parents = [
-            [1u8; 32],
-            [2u8; 32],
-        ];
+        let parents = [[1u8; 32], [2u8; 32]];
         let tx = Transaction::new(
             parents,
             [3u8; 32],
@@ -561,8 +581,21 @@ mod tests {
         let signature = vec![4u8; 64];
         let public_key = vec![5u8; 32];
 
-        let tx1 = Transaction::new(parents, sender, receiver, 100, 10, 1234567890, 0, 1, signature.clone(), public_key.clone());
-        let tx2 = Transaction::new(parents, sender, receiver, 100, 10, 1234567890, 0, 1, signature, public_key);
+        let tx1 = Transaction::new(
+            parents,
+            sender,
+            receiver,
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            signature.clone(),
+            public_key.clone(),
+        );
+        let tx2 = Transaction::new(
+            parents, sender, receiver, 100, 10, 1234567890, 0, 1, signature, public_key,
+        );
 
         assert_eq!(tx1.id, tx2.id);
     }
@@ -575,8 +608,21 @@ mod tests {
         let signature = vec![4u8; 64];
         let public_key = vec![5u8; 32];
 
-        let tx1 = Transaction::new(parents, sender, receiver, 100, 10, 1234567890, 0, 1, public_key.clone(), signature.clone());
-        let tx2 = Transaction::new(parents, sender, receiver, 100, 10, 1234567890, 1, 2, public_key, signature);
+        let tx1 = Transaction::new(
+            parents,
+            sender,
+            receiver,
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            public_key.clone(),
+            signature.clone(),
+        );
+        let tx2 = Transaction::new(
+            parents, sender, receiver, 100, 10, 1234567890, 1, 2, public_key, signature,
+        );
 
         assert_ne!(tx1.id, tx2.id);
     }
@@ -585,8 +631,10 @@ mod tests {
     fn test_sender_public_key_match_valid() {
         // Valid case: sender matches public_key (first 32 bytes)
         let public_key = vec![1u8; 64];
-        let sender: [u8; 32] = public_key[..32].try_into().expect("Failed to convert public key to sender");
-        
+        let sender: [u8; 32] = public_key[..32]
+            .try_into()
+            .expect("Failed to convert public key to sender");
+
         let tx = Transaction::new(
             [[0u8; 32]; 2],
             sender,
@@ -599,7 +647,7 @@ mod tests {
             vec![0u8; 64],
             public_key,
         );
-        
+
         assert!(tx.verify_sender_matches_public_key());
     }
 
@@ -608,7 +656,7 @@ mod tests {
         // Invalid case: sender does NOT match public_key
         let public_key = vec![1u8; 64];
         let sender = [99u8; 32]; // Different from public_key[..32]
-        
+
         let tx = Transaction::new(
             [[0u8; 32]; 2],
             sender,
@@ -621,7 +669,7 @@ mod tests {
             vec![0u8; 64],
             public_key,
         );
-        
+
         assert!(!tx.verify_sender_matches_public_key());
     }
 
@@ -640,7 +688,7 @@ mod tests {
             vec![0u8; 16],
             vec![0u8; 64],
         );
-        
+
         assert!(!tx.verify_sender_matches_public_key());
     }
 
@@ -649,20 +697,20 @@ mod tests {
         // Simulate identity spoofing attack
         let victim_address = [1u8; 32];
         let attacker_public_key = vec![2u8; 64];
-        
+
         let malicious_tx = Transaction::new(
             [[0u8; 32]; 2],
-            victim_address,       // Claiming to be victim
+            victim_address, // Claiming to be victim
             [3u8; 32],
-            1000000,              // Large amount
+            1000000, // Large amount
             10,
             1234567890,
             0,
-            1, // account_nonce
-            attacker_public_key,  // But using attacker's public_key
+            1,                   // account_nonce
+            attacker_public_key, // But using attacker's public_key
             vec![0u8; 64],
         );
-        
+
         // V1 fix should block this
         assert!(!malicious_tx.verify_sender_matches_public_key());
     }
@@ -685,10 +733,10 @@ mod tests {
 
         let hash1 = tx.compute_signing_hash();
         let hash2 = tx.compute_signing_hash();
-        
+
         // Should be deterministic
         assert_eq!(hash1, hash2);
-        
+
         // Should be exactly 32 bytes (BLAKE3 output)
         assert_eq!(hash1.len(), 32);
     }

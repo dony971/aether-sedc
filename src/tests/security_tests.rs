@@ -9,17 +9,17 @@
 //! - MAX_SUPPLY enforcement (monetary policy)
 //! - Consensus state as single source of truth
 
-use crate::transaction::Transaction;
-use crate::parent_selection::DAG;
-use crate::ledger::{Ledger, MAX_SUPPLY, calculate_reward};
 use crate::consensus::ConsensusState;
-use crate::validation::TransactionValidator;
-use crate::transaction_processor::TransactionProcessor;
+use crate::ledger::{calculate_reward, Ledger, MAX_SUPPLY};
+use crate::parent_selection::DAG;
 use crate::rpc::Mempool;
 use crate::storage::Storage;
+use crate::transaction::Transaction;
+use crate::transaction_processor::TransactionProcessor;
+use crate::validation::TransactionValidator;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tempfile::tempdir;
+use tokio::sync::RwLock;
 
 #[cfg(test)]
 mod replay_attack_tests {
@@ -220,13 +220,17 @@ mod fork_safety_tests {
 
         // Apply reward
         let reward = calculate_reward(block_height);
-        ledger.apply_block_reward(&validator, block_id, block_height, &consensus).unwrap();
+        ledger
+            .apply_block_reward(&validator, block_id, block_height, &consensus)
+            .unwrap();
 
         let balance_after_reward = ledger.get_balance(&validator);
         assert!(balance_after_reward > 1000);
 
         // Rollback reward
-        ledger.rollback_block_reward(&validator, block_id, reward).unwrap();
+        ledger
+            .rollback_block_reward(&validator, block_id, reward)
+            .unwrap();
         consensus.rollback_block_reward(&block_id);
 
         let balance_after_rollback = ledger.get_balance(&validator);
@@ -291,16 +295,9 @@ mod atomic_execution_tests {
             vec![1u8; 64],
         );
 
-        let result = processor.process(
-            tx,
-            &dag,
-            &ledger,
-            &mempool,
-            10,
-            None,
-            &mut consensus,
-            None,
-        ).await;
+        let result = processor
+            .process(tx, &dag, &ledger, &mempool, 10, None, &mut consensus, None)
+            .await;
 
         assert!(result.is_err());
 
@@ -340,16 +337,9 @@ mod atomic_execution_tests {
             vec![1u8; 64],
         );
 
-        let _ = processor.process(
-            tx,
-            &dag,
-            &ledger,
-            &mempool,
-            10,
-            None,
-            &mut consensus,
-            None,
-        ).await;
+        let _ = processor
+            .process(tx, &dag, &ledger, &mempool, 10, None, &mut consensus, None)
+            .await;
 
         // Verify nonce was not committed
         let nonce_after = ledger.read().await.get_nonce(&sender);
@@ -511,7 +501,7 @@ mod monetary_policy_tests {
             let block_id = [height as u8; 32];
             consensus.current_height = height + 100;
             consensus.validate_and_mark_block_reward(block_id).unwrap();
-            
+
             let result = ledger.apply_block_reward(&validator, block_id, height, &consensus);
             if result.is_ok() {
                 assert!(ledger.total_supply <= MAX_SUPPLY);

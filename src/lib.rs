@@ -10,45 +10,55 @@
 //! - Persistent orphan recovery
 //! - Fork-safe reward distribution
 
-pub mod transaction;
-pub mod parent_selection;
-pub mod pow;
+pub mod config;
 pub mod consensus;
 pub mod economics;
-pub mod security_audit;
-pub mod rpc;
 pub mod explorer_api;
-pub mod p2p;
-pub mod wallet;
-pub mod storage;
-pub mod json_storage;
 pub mod genesis;
+pub mod json_storage;
 pub mod ledger;
-pub mod validation;
-pub mod transaction_processor;
-pub mod reputation;
-pub mod config;
 pub mod node;
+pub mod p2p;
+pub mod parent_selection;
+pub mod pow;
+pub mod reputation;
+pub mod rpc;
+pub mod security_audit;
+pub mod storage;
+pub mod transaction;
+pub mod transaction_processor;
+pub mod validation;
+pub mod wallet;
 
 #[cfg(test)]
 mod tests;
 
-pub use transaction::{Transaction, TransactionId, Address};
-pub use parent_selection::{ParentSelectionAlgorithm, TipSet, DAG};
-pub use pow::{MicroPoW, DifficultyAdjuster};
-pub use consensus::{VQVConsensus, Validator, Vote, ConsensusError, ConsensusState};
-pub use economics::{EmissionCurve, RewardCalculator, TokenBalance, EconomicsError, HARD_CAP, TokenAmount};
-pub use security_audit::{SecurityAuditor, SecurityAudit, DoubleSpendAttempt, ParasiteChain, ValidatorSlash, SlashReason};
-pub use rpc::{AetherRpcImpl, RpcError, start_rpc_server, BalanceResponse, TransactionResponse, DagStatsResponse, Mempool, DagGraphResponse, DagNode as RpcDagNode, DagEdge as RpcDagEdge, TipsResponse, MiningStatusResponse};
-pub use explorer_api::{ExplorerApi, DagGraph, DagNode, DagEdge};
-pub use p2p::{P2PConfig, P2PNetwork, P2PMessage};
-pub use wallet::Wallet;
-pub use storage::{Storage, StorageError, BatchOperation, TreeName};
-pub use genesis::{GenesisConfig, GenesisBlock, GENESIS_MESSAGE, GENESIS_HASH, initialize_genesis, genesis_hash};
+pub use consensus::{ConsensusError, ConsensusState, VQVConsensus, Validator, Vote};
+pub use economics::{
+    EconomicsError, EmissionCurve, RewardCalculator, TokenAmount, TokenBalance, HARD_CAP,
+};
+pub use explorer_api::{DagEdge, DagGraph, DagNode, ExplorerApi};
+pub use genesis::{
+    genesis_hash, initialize_genesis, GenesisBlock, GenesisConfig, GENESIS_HASH, GENESIS_MESSAGE,
+};
 pub use ledger::Ledger;
+pub use p2p::{P2PConfig, P2PMessage, P2PNetwork};
+pub use parent_selection::{ParentSelectionAlgorithm, TipSet, DAG};
+pub use pow::{DifficultyAdjuster, MicroPoW};
+pub use reputation::{Reputation, ReputationConfig, ReputationStore};
+pub use rpc::{
+    start_rpc_server, AetherRpcImpl, BalanceResponse, DagEdge as RpcDagEdge, DagGraphResponse,
+    DagNode as RpcDagNode, DagStatsResponse, Mempool, MiningStatusResponse, RpcError, TipsResponse,
+    TransactionResponse,
+};
+pub use security_audit::{
+    DoubleSpendAttempt, ParasiteChain, SecurityAudit, SecurityAuditor, SlashReason, ValidatorSlash,
+};
+pub use storage::{BatchOperation, Storage, StorageError, TreeName};
+pub use transaction::{Address, Transaction, TransactionId};
+pub use transaction_processor::{ProcessingError, TransactionProcessor};
 pub use validation::{TransactionValidator, ValidationError};
-pub use transaction_processor::{TransactionProcessor, ProcessingError};
-pub use reputation::{Reputation, ReputationStore, ReputationConfig};
+pub use wallet::Wallet;
 
 /// Events for the save worker MPSC channel
 #[derive(Debug, Clone)]

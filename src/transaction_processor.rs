@@ -16,12 +16,12 @@
 //!
 //! Economic policy: validation → lock → snapshot → mutation → commit → persistence
 
-use crate::transaction::Transaction;
-use crate::parent_selection::DAG;
+use crate::consensus::{BlockId, ConsensusState};
 use crate::ledger::Ledger;
-use crate::consensus::{ConsensusState, BlockId};
-use crate::validation::{TransactionValidator, ValidationError};
+use crate::parent_selection::DAG;
 use crate::rpc::Mempool;
+use crate::transaction::Transaction;
+use crate::validation::{TransactionValidator, ValidationError};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -123,7 +123,8 @@ impl TransactionProcessor {
         // STEP 1: FULL VALIDATION (no state access, no locks)
         let dag_read = dag.read().await;
         let ledger_read = ledger.read().await;
-        self.validator.validate_full(&tx, &*dag_read, &*ledger_read, min_fee)?;
+        self.validator
+            .validate_full(&tx, &*dag_read, &*ledger_read, min_fee)?;
         drop(dag_read);
         drop(ledger_read);
 
@@ -158,7 +159,10 @@ impl TransactionProcessor {
             drop(ledger);
             drop(dag);
             drop(mempool);
-            return Err(ProcessingError::LedgerError(format!("Transfer failed: {}", e)));
+            return Err(ProcessingError::LedgerError(format!(
+                "Transfer failed: {}",
+                e
+            )));
         }
 
         // STEP 5: COMMIT NONCE ATOMICALLY
@@ -168,7 +172,10 @@ impl TransactionProcessor {
             drop(ledger);
             drop(dag);
             drop(mempool);
-            return Err(ProcessingError::LedgerError(format!("Nonce commit failed: {}", e)));
+            return Err(ProcessingError::LedgerError(format!(
+                "Nonce commit failed: {}",
+                e
+            )));
         }
 
         // STEP 6: ADD TO DAG (VALIDATED) - THIS IS THE CONSENSUS CONFIRMATION EVENT
@@ -193,17 +200,27 @@ impl TransactionProcessor {
         if let Some(validator_addr) = miner_address {
             // For now, use transaction ID as block ID (in production, this should be the actual block ID)
             let actual_block_id = block_id.unwrap_or(tx.id);
-            
+
             // Increment height once per transaction for consensus tracking
             consensus_state.increment_height();
             let block_height = consensus_state.get_height();
-            
-            if let Err(e) = ledger.apply_block_reward(validator_addr, actual_block_id, block_height, consensus_state) {
+
+            if let Err(e) = ledger.apply_block_reward(
+                validator_addr,
+                actual_block_id,
+                block_height,
+                consensus_state,
+            ) {
                 tracing::error!("❌ Block reward failed (after DAG confirmation): {}", e);
                 // DAG was already added, but reward failed - this is a critical error
                 // In production, we might need to rollback DAG or handle this specially
-                tracing::error!("❌ CRITICAL: DAG confirmed but reward failed - economic inconsistency");
-                return Err(ProcessingError::LedgerError(format!("Block reward failed after DAG confirmation: {}", e)));
+                tracing::error!(
+                    "❌ CRITICAL: DAG confirmed but reward failed - economic inconsistency"
+                );
+                return Err(ProcessingError::LedgerError(format!(
+                    "Block reward failed after DAG confirmation: {}",
+                    e
+                )));
             }
             tracing::info!("💰 Block reward applied AFTER DAG confirmation (block_id: {}, height: {}, finalized: yes)", 
                 hex::encode(actual_block_id), block_height);
@@ -220,7 +237,10 @@ impl TransactionProcessor {
                 drop(ledger);
                 drop(dag);
                 drop(mempool);
-                return Err(ProcessingError::MempoolError(format!("Mempool add failed: {}", e)));
+                return Err(ProcessingError::MempoolError(format!(
+                    "Mempool add failed: {}",
+                    e
+                )));
             }
         }
 
@@ -229,7 +249,10 @@ impl TransactionProcessor {
             tracing::error!("❌ Persistence failed: {}", e);
             // State is already modified but not persisted
             // In production, this should trigger a recovery mechanism
-            return Err(ProcessingError::PersistenceError(format!("Save failed: {}", e)));
+            return Err(ProcessingError::PersistenceError(format!(
+                "Save failed: {}",
+                e
+            )));
         }
 
         // STEP 9b: PERSIST TRANSACTION TO SLED (DAG survives restarts)
@@ -245,7 +268,10 @@ impl TransactionProcessor {
             }
         }
 
-        tracing::info!("✅ Transaction processed successfully: {}", hex::encode(tx.id));
+        tracing::info!(
+            "✅ Transaction processed successfully: {}",
+            hex::encode(tx.id)
+        );
         Ok(())
     }
 }
@@ -288,7 +314,18 @@ mod tests {
         // This should fail signature verification (invalid signature)
         let mut consensus_state = ConsensusState::new();
         let block_id = Some([0u8; 32]);
-        let result = processor.process(tx, &dag, &ledger, &mempool, 10, None, &mut consensus_state, block_id).await;
+        let result = processor
+            .process(
+                tx,
+                &dag,
+                &ledger,
+                &mempool,
+                10,
+                None,
+                &mut consensus_state,
+                block_id,
+            )
+            .await;
         assert!(result.is_err());
         // The error should be validation failed (insufficient balance or signature)
         // We just check that it failed, not the specific error type
@@ -320,7 +357,18 @@ mod tests {
 
         let mut consensus_state = ConsensusState::new();
         let block_id = Some([0u8; 32]);
-        let result = processor.process(tx, &dag, &ledger, &mempool, 10, None, &mut consensus_state, block_id).await;
+        let result = processor
+            .process(
+                tx,
+                &dag,
+                &ledger,
+                &mempool,
+                10,
+                None,
+                &mut consensus_state,
+                block_id,
+            )
+            .await;
         assert!(result.is_err());
         // The error should be validation failed (insufficient balance or signature)
         // We just check that it failed, not the specific error type

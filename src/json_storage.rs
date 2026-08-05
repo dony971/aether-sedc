@@ -3,11 +3,11 @@
 //! Simple JSON-based persistence for DAG state on Windows.
 //! Alternative to RocksDB for Windows compatibility.
 
-use crate::transaction::Transaction;
 use crate::parent_selection::DAG;
+use crate::transaction::Transaction;
 use serde::{Deserialize, Serialize};
-use tokio::fs;
 use std::path::PathBuf;
+use tokio::fs;
 
 /// JSON-serializable DAG state
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,10 +44,7 @@ impl From<&Transaction> for StoredTransaction {
     fn from(tx: &Transaction) -> Self {
         StoredTransaction {
             id: hex::encode(tx.id),
-            parents: [
-                hex::encode(tx.parents[0]),
-                hex::encode(tx.parents[1]),
-            ],
+            parents: [hex::encode(tx.parents[0]), hex::encode(tx.parents[1])],
             sender: hex::encode(tx.sender),
             receiver: hex::encode(tx.receiver),
             amount: tx.amount,
@@ -64,12 +61,14 @@ impl From<&Transaction> for StoredTransaction {
 
 /// Save DAG state to JSON file atomically
 pub async fn save_dag_to_json(dag: &DAG, path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let transactions: Vec<StoredTransaction> = dag.transactions()
+    let transactions: Vec<StoredTransaction> = dag
+        .transactions()
         .values()
         .map(StoredTransaction::from)
         .collect();
 
-    let children: Vec<StoredChild> = dag.children()
+    let children: Vec<StoredChild> = dag
+        .children()
         .iter()
         .flat_map(|(parent, children)| {
             children.iter().map(move |child| StoredChild {

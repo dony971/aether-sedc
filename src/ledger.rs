@@ -2,7 +2,7 @@
 //!
 //! Manages the ledger state (account balances) with persistence to Sled DB.
 
-use crate::consensus::{ConsensusState, BlockId};
+use crate::consensus::{BlockId, ConsensusState};
 use crate::genesis::FAUCET_ADDRESS;
 use crate::storage::Storage;
 use crate::transaction::Address;
@@ -47,29 +47,29 @@ const INITIAL_BLOCK_REWARD: u64 = 100_000_000_000;
 const HALVING_INTERVAL: u64 = 210_000;
 
 /// Calculate block reward based on block height (halving schedule)
-/// 
+///
 /// # Economic Policy
 /// - Initial reward: 10 AETH
 /// - Halving every 210,000 blocks
 /// - Minimum reward: 1 unit (1e-10 AETH)
 /// - Total supply capped at 21,000,000 AETH
-/// 
+///
 /// # Arguments
 /// * `block_height` - Current block height
-/// 
+///
 /// # Returns
 /// Block reward in AETH units (10 decimals)
 pub fn calculate_reward(block_height: u64) -> u64 {
     let halvings = block_height / HALVING_INTERVAL;
-    
+
     // Cap at 63 halvings (u64::MAX would overflow)
     if halvings >= 63 {
         return 0;
     }
-    
+
     // Calculate reward with right shift (divide by 2^halvings)
     let reward = INITIAL_BLOCK_REWARD >> halvings;
-    
+
     // Minimum reward is 1 unit (1 satoshi)
     reward.max(1)
 }
@@ -88,7 +88,10 @@ impl Ledger {
     }
 
     /// Create a new ledger with Sled storage
-    pub async fn new_with_storage<P: AsRef<Path>>(storage: Arc<RwLock<Storage>>, path: P) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new_with_storage<P: AsRef<Path>>(
+        storage: Arc<RwLock<Storage>>,
+        path: P,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let storage_read = storage.read().await;
         let mut ledger = Ledger {
             balances: HashMap::new(),
@@ -122,18 +125,26 @@ impl Ledger {
 
         // Calculate total_supply from all balances (excluding burn address)
         // This is the economic invariant: total_supply <= MAX_SUPPLY
-        ledger.total_supply = ledger.balances.iter()
+        ledger.total_supply = ledger
+            .balances
+            .iter()
             .filter(|(addr, _)| **addr != burn_hex)
             .map(|(_, balance)| *balance)
             .sum();
 
-        tracing::info!("✓ Ledger loaded from Sled: {} accounts, {} nonces, total supply: {}", 
-            ledger.balances.len(), ledger.nonces.len(), ledger.total_supply);
+        tracing::info!(
+            "✓ Ledger loaded from Sled: {} accounts, {} nonces, total supply: {}",
+            ledger.balances.len(),
+            ledger.nonces.len(),
+            ledger.total_supply
+        );
         Ok(ledger)
     }
 
     /// Load ledger from file, or create new if file doesn't exist
-    pub async fn load_or_create<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn load_or_create<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         if path.as_ref().exists() {
             let content = tokio::fs::read_to_string(&path).await?;
             let ledger: Ledger = serde_json::from_str(&content)?;
@@ -152,14 +163,18 @@ impl Ledger {
             // Save balances
             for (addr_hex, balance) in &self.balances {
                 let addr_bytes = hex::decode(addr_hex)?;
-                let address: Address = addr_bytes.as_slice().try_into()
+                let address: Address = addr_bytes
+                    .as_slice()
+                    .try_into()
                     .map_err(|e| format!("Invalid address length: {}", e))?;
                 storage_read.put_balance(address, *balance)?;
             }
             // Save nonces for replay protection
             for (addr_hex, nonce) in &self.nonces {
                 let addr_bytes = hex::decode(addr_hex)?;
-                let address: Address = addr_bytes.as_slice().try_into()
+                let address: Address = addr_bytes
+                    .as_slice()
+                    .try_into()
                     .map_err(|e| format!("Invalid address length: {}", e))?;
                 storage_read.put_nonce(address, *nonce)?;
             }
@@ -170,7 +185,10 @@ impl Ledger {
     }
 
     /// Save ledger to file using atomic write (write to tmp then rename)
-    pub async fn save_to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn save_to_file<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let content = serde_json::to_string_pretty(self)?;
         let path_ref = path.as_ref();
 
@@ -226,7 +244,8 @@ impl Ledger {
     pub fn add_balance(&mut self, address: &Address, amount: u64) -> Result<(), String> {
         let addr_hex = hex::encode(address);
         let current = *self.balances.get(&addr_hex).unwrap_or(&0);
-        let new_balance = current.checked_add(amount)
+        let new_balance = current
+            .checked_add(amount)
             .ok_or_else(|| format!("Balance overflow: {} + {}", current, amount))?;
         self.balances.insert(addr_hex, new_balance);
         Ok(())
@@ -247,44 +266,60 @@ impl Ledger {
     /// 🔒 ZERO TRUST: This method is private. Use TransactionProcessor for all transfers.
     /// Atomic: either all changes apply or none apply
     /// Economic policy: fees are burned (sent to FEE_BURN_ADDRESS), not given to miners
-    pub(crate) fn transfer_internal(&mut self, from: &Address, to: &Address, amount: u64, fee: u64) -> Result<(), String> {
+    pub(crate) fn transfer_internal(
+        &mut self,
+        from: &Address,
+        to: &Address,
+        amount: u64,
+        fee: u64,
+    ) -> Result<(), String> {
         let from_hex = hex::encode(from);
         let to_hex = hex::encode(to);
         let burn_hex = hex::encode(FEE_BURN_ADDRESS);
-        
+
         // Phase 1: Check all preconditions first (no mutations yet)
         let from_balance = *self.balances.get(&from_hex).unwrap_or(&0);
         let to_balance = *self.balances.get(&to_hex).unwrap_or(&0);
         let burn_balance = *self.balances.get(&burn_hex).unwrap_or(&0);
-        
+
         // Check sender has enough for amount + fee
-        let total_deduction = amount.checked_add(fee)
+        let total_deduction = amount
+            .checked_add(fee)
             .ok_or_else(|| format!("Overflow: amount + fee = {} + {}", amount, fee))?;
         if from_balance < total_deduction {
-            return Err(format!("Insufficient balance: {} < {} (amount: {}, fee: {})", from_balance, total_deduction, amount, fee));
+            return Err(format!(
+                "Insufficient balance: {} < {} (amount: {}, fee: {})",
+                from_balance, total_deduction, amount, fee
+            ));
         }
-        
+
         // Phase 2: Calculate all final values first (no mutations yet)
         let new_from_balance = from_balance - total_deduction;
-        let new_to_balance = to_balance.checked_add(amount)
+        let new_to_balance = to_balance
+            .checked_add(amount)
             .ok_or_else(|| format!("Receiver balance overflow: {} + {}", to_balance, amount))?;
-        
+
         let (new_burn_balance, new_total_fees_burned) = if fee > 0 {
-            let new_burn = burn_balance.checked_add(fee)
+            let new_burn = burn_balance
+                .checked_add(fee)
                 .ok_or_else(|| format!("Burn address overflow: {} + {}", burn_balance, fee))?;
-            let new_total = self.total_fees_burned.checked_add(fee)
-                .ok_or_else(|| format!("Total fees burned overflow: {} + {}", self.total_fees_burned, fee))?;
+            let new_total = self.total_fees_burned.checked_add(fee).ok_or_else(|| {
+                format!(
+                    "Total fees burned overflow: {} + {}",
+                    self.total_fees_burned, fee
+                )
+            })?;
             (new_burn, new_total)
         } else {
             (burn_balance, self.total_fees_burned)
         };
-        
+
         // Phase 3: Apply all mutations atomically (all or nothing)
         self.balances.insert(from_hex, new_from_balance);
         self.balances.insert(to_hex, new_to_balance);
         self.balances.insert(burn_hex, new_burn_balance);
         self.total_fees_burned = new_total_fees_burned;
-        
+
         Ok(())
     }
 
@@ -306,16 +341,26 @@ impl Ledger {
     /// so each node has its own view of the faucet nonce. Strict +1 validation would
     /// reject valid faucet transactions from nodes with divergent state. For the faucet
     /// account, accept any strictly increasing nonce instead.
-    pub fn validate_account_nonce(&self, address: &Address, account_nonce: u64) -> Result<(), String> {
+    pub fn validate_account_nonce(
+        &self,
+        address: &Address,
+        account_nonce: u64,
+    ) -> Result<(), String> {
         let last_nonce = self.get_nonce(address);
         if hex::encode(address) == FAUCET_ADDRESS {
             if account_nonce <= last_nonce {
-                return Err(format!("Invalid account_nonce: {} <= {} (faucet nonce must strictly increase)", account_nonce, last_nonce));
+                return Err(format!(
+                    "Invalid account_nonce: {} <= {} (faucet nonce must strictly increase)",
+                    account_nonce, last_nonce
+                ));
             }
             return Ok(());
         }
         if account_nonce != last_nonce + 1 {
-            return Err(format!("Invalid account_nonce: {} != {} + 1 (expected last_nonce + 1)", account_nonce, last_nonce));
+            return Err(format!(
+                "Invalid account_nonce: {} != {} + 1 (expected last_nonce + 1)",
+                account_nonce, last_nonce
+            ));
         }
         Ok(())
     }
@@ -332,17 +377,27 @@ impl Ledger {
     /// Faucet exception: shared deterministic faucet key across nodes, so each node
     /// has its own view of the nonce. Accept any strictly increasing nonce (see
     /// validate_account_nonce for details), anti-replay is still enforced.
-    pub(crate) fn validate_and_commit_nonce_internal(&mut self, address: &Address, account_nonce: u64) -> Result<(), String> {
+    pub(crate) fn validate_and_commit_nonce_internal(
+        &mut self,
+        address: &Address,
+        account_nonce: u64,
+    ) -> Result<(), String> {
         let last_nonce = self.get_nonce(address);
         if hex::encode(address) == FAUCET_ADDRESS {
             if account_nonce <= last_nonce {
-                return Err(format!("Invalid account_nonce: {} <= {} (faucet nonce must strictly increase)", account_nonce, last_nonce));
+                return Err(format!(
+                    "Invalid account_nonce: {} <= {} (faucet nonce must strictly increase)",
+                    account_nonce, last_nonce
+                ));
             }
             self.set_nonce(address, account_nonce);
             return Ok(());
         }
         if account_nonce != last_nonce + 1 {
-            return Err(format!("Invalid account_nonce: {} != {} + 1 (expected last_nonce + 1)", account_nonce, last_nonce));
+            return Err(format!(
+                "Invalid account_nonce: {} != {} + 1 (expected last_nonce + 1)",
+                account_nonce, last_nonce
+            ));
         }
         self.set_nonce(address, account_nonce);
         Ok(())
@@ -374,110 +429,139 @@ impl Ledger {
     }
 
     /// Apply block reward to validator (ONLY source of new tokens)
-    /// 
+    ///
     /// # CRITICAL: Monetary Policy Enforcement
     /// - This is the ONLY way to create new tokens in the system
     /// - Block ID must come from consensus state (single source of truth)
     /// - Rewards are tracked per BlockId to prevent double-reward attacks (fork-safe)
     /// - Total supply is capped at MAX_SUPPLY (hard economic invariant)
     /// - Reward only given if block is finalized (has enough confirmations)
-    /// 
+    ///
     /// # Arguments
     /// * `validator` - The validator address receiving the block reward
     /// * `block_id` - The block ID being rewarded (fork-safe identifier)
     /// * `block_height` - The block height (for reward calculation)
     /// * `consensus_state` - Consensus state containing finality tracking
-    /// 
+    ///
     /// # Economic Impact
     /// - Creates block reward based on halving schedule from block height
     /// - Total supply increases by reward amount
     /// - Enforces MAX_SUPPLY invariant (hard cap)
     /// - Prevents double-reward attacks via BlockId tracking (fork-safe)
     /// - Only rewards finalized blocks (prevents reorg double-spend)
-    /// 
+    ///
     /// # Errors
     /// - Returns error if reward would exceed MAX_SUPPLY
     /// - Returns error if block already rewarded (double-reward attack prevention)
     /// - Returns error if block not finalized (finality check)
     /// - Returns error if balance addition fails (overflow)
     pub(crate) fn apply_block_reward(
-        &mut self, 
-        validator: &Address, 
+        &mut self,
+        validator: &Address,
         block_id: BlockId,
         block_height: u64,
         consensus_state: &ConsensusState,
     ) -> Result<(), String> {
         // Check if this block already received a reward (prevents double-reward attacks)
         if consensus_state.is_block_rewarded(&block_id) {
-            tracing::error!("❌ SECURITY: Attempt to reward already-rewarded block {}", hex::encode(block_id));
-            return Err(format!("Security violation: block {} already rewarded", hex::encode(block_id)));
+            tracing::error!(
+                "❌ SECURITY: Attempt to reward already-rewarded block {}",
+                hex::encode(block_id)
+            );
+            return Err(format!(
+                "Security violation: block {} already rewarded",
+                hex::encode(block_id)
+            ));
         }
-        
+
         // Check if block is finalized (has enough confirmations)
         if !consensus_state.is_finalized(block_height, consensus_state.get_height()) {
-            let needed = consensus_state.confirmation_threshold - (consensus_state.get_height().saturating_sub(block_height));
-            tracing::error!("❌ FINALITY: Block {} not finalized (needs {} more confirmations)", block_height, needed);
-            return Err(format!("Finality violation: block {} not finalized (needs {} more confirmations)", block_height, needed));
+            let needed = consensus_state.confirmation_threshold
+                - (consensus_state.get_height().saturating_sub(block_height));
+            tracing::error!(
+                "❌ FINALITY: Block {} not finalized (needs {} more confirmations)",
+                block_height,
+                needed
+            );
+            return Err(format!(
+                "Finality violation: block {} not finalized (needs {} more confirmations)",
+                block_height, needed
+            ));
         }
-        
+
         // Calculate reward based on block height (halving schedule)
         let reward = calculate_reward(block_height);
-        
+
         // Check if adding reward would exceed MAX_SUPPLY
-        let new_supply = self.total_supply.checked_add(reward)
+        let new_supply = self
+            .total_supply
+            .checked_add(reward)
             .ok_or_else(|| format!("Total supply overflow: {} + {}", self.total_supply, reward))?;
-        
+
         if new_supply > MAX_SUPPLY {
             tracing::error!("❌ MONETARY POLICY VIOLATION: Reward would exceed MAX_SUPPLY");
             tracing::error!("  Current supply: {}", self.total_supply);
             tracing::error!("  Requested reward: {}", reward);
             tracing::error!("  New supply: {}", new_supply);
             tracing::error!("  MAX_SUPPLY: {}", MAX_SUPPLY);
-            return Err(format!("Monetary policy violation: reward would exceed MAX_SUPPLY ({} > {})", 
-                new_supply, MAX_SUPPLY));
+            return Err(format!(
+                "Monetary policy violation: reward would exceed MAX_SUPPLY ({} > {})",
+                new_supply, MAX_SUPPLY
+            ));
         }
-        
+
         // Log monetary creation for audit trail
         tracing::warn!("🔒 MONETARY CREATION: Applying block reward");
         tracing::warn!("  Block ID: {} (fork-safe)", hex::encode(block_id));
         tracing::warn!("  Block height: {}", block_height);
         tracing::warn!("  Validator: {}", hex::encode(validator));
-        tracing::warn!("  Reward: {} AETH ({} units)", reward / 10_000_000_000, reward);
-        tracing::warn!("  Current supply: {} AETH", self.total_supply / 10_000_000_000);
+        tracing::warn!(
+            "  Reward: {} AETH ({} units)",
+            reward / 10_000_000_000,
+            reward
+        );
+        tracing::warn!(
+            "  Current supply: {} AETH",
+            self.total_supply / 10_000_000_000
+        );
         tracing::warn!("  New supply: {} AETH", new_supply / 10_000_000_000);
         tracing::warn!("  MAX_SUPPLY: {} AETH", MAX_SUPPLY / 10_000_000_000);
         tracing::warn!("  This is the ONLY way to create new tokens in the system");
         tracing::warn!("  Block verified via consensus state (single source of truth)");
         tracing::warn!("  Finality check passed (block is finalized)");
-        
+
         // Add balance with overflow protection
         if let Err(e) = self.add_balance(validator, reward) {
             tracing::error!("❌ Failed to apply block reward: {}", e);
             return Err(format!("Block reward failed: {}", e));
         }
-        
+
         // Update total supply (economic invariant)
         self.total_supply = new_supply;
-        
-        tracing::info!("✅ Block reward applied successfully: {} AETH to {}", 
-            reward / 10_000_000_000, 
-            hex::encode(validator));
-        tracing::info!("✅ Total supply updated: {} AETH / {} AETH ({}%)", 
+
+        tracing::info!(
+            "✅ Block reward applied successfully: {} AETH to {}",
+            reward / 10_000_000_000,
+            hex::encode(validator)
+        );
+        tracing::info!(
+            "✅ Total supply updated: {} AETH / {} AETH ({}%)",
             self.total_supply / 10_000_000_000,
             MAX_SUPPLY / 10_000_000_000,
-            (self.total_supply * 100 / MAX_SUPPLY));
-        
+            (self.total_supply * 100 / MAX_SUPPLY)
+        );
+
         Ok(())
     }
 
     /// Rollback block reward (called on fork/reorg)
     /// This is a critical operation for fork safety - removes reward from ledger
-    /// 
+    ///
     /// # Arguments
     /// * `validator` - The validator address that received the reward
     /// * `block_id` - The block ID to rollback
     /// * `reward_amount` - The amount of reward to rollback
-    /// 
+    ///
     /// # Security
     /// - This should only be called by consensus layer on reorg
     /// - Requires block_id to be removed from rewarded_blocks by consensus state
@@ -492,31 +576,47 @@ impl Ledger {
         tracing::warn!("  Block ID: {}", hex::encode(block_id));
         tracing::warn!("  Validator: {}", hex::encode(validator));
         tracing::warn!("  Reward amount: {} AETH", reward_amount / 10_000_000_000);
-        
+
         // Check if validator has enough balance to rollback
         let current_balance = self.get_balance(validator);
         if current_balance < reward_amount {
             tracing::error!("❌ FORK ROLLBACK FAILED: Validator balance insufficient");
             tracing::error!("  Current balance: {}", current_balance);
             tracing::error!("  Required: {}", reward_amount);
-            return Err(format!("Fork rollback failed: validator balance insufficient ({} < {})", 
-                current_balance, reward_amount));
+            return Err(format!(
+                "Fork rollback failed: validator balance insufficient ({} < {})",
+                current_balance, reward_amount
+            ));
         }
-        
+
         // Subtract reward from validator balance
-        let new_balance = current_balance.checked_sub(reward_amount)
+        let new_balance = current_balance
+            .checked_sub(reward_amount)
             .ok_or_else(|| format!("Balance underflow: {} - {}", current_balance, reward_amount))?;
-        
+
         *self.balances.entry(hex::encode(validator)).or_insert(0) = new_balance;
-        
+
         // Update total supply (economic invariant)
-        self.total_supply = self.total_supply.checked_sub(reward_amount)
-            .ok_or_else(|| format!("Total supply underflow: {} - {}", self.total_supply, reward_amount))?;
-        
+        self.total_supply = self
+            .total_supply
+            .checked_sub(reward_amount)
+            .ok_or_else(|| {
+                format!(
+                    "Total supply underflow: {} - {}",
+                    self.total_supply, reward_amount
+                )
+            })?;
+
         tracing::info!("✅ Block reward rolled back successfully");
-        tracing::info!("  New validator balance: {} AETH", new_balance / 10_000_000_000);
-        tracing::info!("  New total supply: {} AETH", self.total_supply / 10_000_000_000);
-        
+        tracing::info!(
+            "  New validator balance: {} AETH",
+            new_balance / 10_000_000_000
+        );
+        tracing::info!(
+            "  New total supply: {} AETH",
+            self.total_supply / 10_000_000_000
+        );
+
         Ok(())
     }
 }
@@ -524,15 +624,17 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use crate::storage::Storage;
+    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_ledger_with_sled() {
         let dir = tempdir().unwrap();
         let storage = Storage::open(dir.path()).unwrap();
         let storage_arc = Arc::new(RwLock::new(storage));
-        let ledger = Ledger::new_with_storage(storage_arc.clone(), dir.path()).await.unwrap();
+        let ledger = Ledger::new_with_storage(storage_arc.clone(), dir.path())
+            .await
+            .unwrap();
 
         assert!(ledger.balances.is_empty());
     }
@@ -683,8 +785,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = Storage::open(dir.path()).unwrap();
         let storage_arc = Arc::new(RwLock::new(storage));
-        
-        let mut ledger = Ledger::new_with_storage(storage_arc.clone(), dir.path()).await.unwrap();
+
+        let mut ledger = Ledger::new_with_storage(storage_arc.clone(), dir.path())
+            .await
+            .unwrap();
         let addr = [1u8; 32];
 
         // Set nonce
@@ -695,7 +799,9 @@ mod tests {
         ledger.save().await.unwrap();
 
         // Load new ledger from storage
-        let ledger2 = Ledger::new_with_storage(storage_arc.clone(), dir.path()).await.unwrap();
+        let ledger2 = Ledger::new_with_storage(storage_arc.clone(), dir.path())
+            .await
+            .unwrap();
         assert_eq!(ledger2.get_nonce(&addr), 5); // Nonce persisted
     }
 
@@ -744,15 +850,15 @@ mod tests {
     fn test_real_concurrent_nonce_race() {
         use std::sync::Arc;
         use std::thread;
-        
+
         let ledger = Arc::new(std::sync::Mutex::new(Ledger::new()));
         let addr = [1u8; 32];
-        
+
         // Set initial nonce to 0
         ledger.lock().unwrap().commit_nonce(&addr, 0);
-        
+
         let mut handles = vec![];
-        
+
         // Spawn 10 threads trying to commit nonce=1 concurrently
         for _ in 0..10 {
             let ledger_clone = ledger.clone();
@@ -769,14 +875,18 @@ mod tests {
             });
             handles.push(handle);
         }
-        
+
         // Wait for all threads
         let successes: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        
+
         // Only one thread should succeed
         let success_count = successes.iter().filter(|&&s| s).count();
-        assert_eq!(success_count, 1, "Exactly one thread should succeed, but {} succeeded", success_count);
-        
+        assert_eq!(
+            success_count, 1,
+            "Exactly one thread should succeed, but {} succeeded",
+            success_count
+        );
+
         // Final nonce should be 1
         assert_eq!(ledger.lock().unwrap().get_nonce(&addr), 1);
     }
@@ -813,15 +923,15 @@ mod tests {
         // Simulates the pattern used in send_transaction: validate + commit under same lock
         use std::sync::Arc;
         use std::thread;
-        
+
         let ledger = Arc::new(std::sync::Mutex::new(Ledger::new()));
         let addr = [1u8; 32];
-        
+
         // Set initial nonce to 0
         ledger.lock().unwrap().commit_nonce(&addr, 0);
-        
+
         let mut handles = vec![];
-        
+
         // Spawn 10 threads trying to validate + commit nonce=1 concurrently
         // This simulates the pattern in send_transaction where validation and commit
         // happen under the same write lock
@@ -841,14 +951,18 @@ mod tests {
             });
             handles.push(handle);
         }
-        
+
         // Wait for all threads
         let successes: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        
+
         // Only one thread should succeed
         let success_count = successes.iter().filter(|&&s| s).count();
-        assert_eq!(success_count, 1, "Exactly one thread should succeed, but {} succeeded", success_count);
-        
+        assert_eq!(
+            success_count, 1,
+            "Exactly one thread should succeed, but {} succeeded",
+            success_count
+        );
+
         // Final nonce should be 1
         assert_eq!(ledger.lock().unwrap().get_nonce(&addr), 1);
     }
@@ -887,48 +1001,51 @@ mod tests {
         // Test reward calculation with halving schedule
         // Initial reward: 10 AETH (10 * 10^10 units)
         // Halving every 210,000 blocks
-        
+
         // Block 0: 10 AETH
         assert_eq!(calculate_reward(0), 100_000_000_000);
-        
+
         // Block 1: 10 AETH (before first halving)
         assert_eq!(calculate_reward(1), 100_000_000_000);
-        
+
         // Block 209,999: 10 AETH (just before first halving)
         assert_eq!(calculate_reward(209_999), 100_000_000_000);
-        
+
         // Block 210,000: 5 AETH (first halving)
         assert_eq!(calculate_reward(210_000), 50_000_000_000);
-        
+
         // Block 420,000: 2.5 AETH (second halving)
         assert_eq!(calculate_reward(420_000), 25_000_000_000);
-        
+
         // Block 630,000: 1.25 AETH (third halving)
         assert_eq!(calculate_reward(630_000), 12_500_000_000);
-        
+
         // Block 1,000,000: should be halved multiple times
         let reward_1m = calculate_reward(1_000_000);
         assert!(reward_1m > 0);
         assert!(reward_1m < 100_000_000_000);
-        
-        println!("✅ Reward at block 1,000,000: {} AETH", reward_1m / 10_000_000_000);
+
+        println!(
+            "✅ Reward at block 1,000,000: {} AETH",
+            reward_1m / 10_000_000_000
+        );
     }
 
     #[test]
     fn test_calculate_reward_minimum() {
         // Test that reward decreases with halving and eventually reaches 0
         // With initial reward of 100_000_000_000 (10 AETH), after ~37 halvings it reaches 0
-        
+
         // Block at 30th halving interval (reward should still be > 0)
         let block_30_halving = 30 * 210_000;
         let reward_30 = calculate_reward(block_30_halving);
         assert!(reward_30 > 0);
-        
+
         // Block at 37th halving interval (should be 0 or 1 due to right shift)
         let block_37_halving = 37 * 210_000;
         let reward_37 = calculate_reward(block_37_halving);
         assert!(reward_37 <= 1);
-        
+
         // Find the block where reward becomes 0
         let mut zero_block = 0;
         for halving in 38..100 {
@@ -938,16 +1055,19 @@ mod tests {
                 break;
             }
         }
-        
+
         // Verify that reward is 0 at that block and beyond
         assert!(zero_block > 0, "Reward should reach 0 at some block");
         let reward_at_zero = calculate_reward(zero_block);
         assert_eq!(reward_at_zero, 0);
-        
+
         let reward_beyond = calculate_reward(zero_block + 210_000);
         assert_eq!(reward_beyond, 0);
-        
-        println!("✅ Reward halving working correctly, reaches 0 at block {}", zero_block);
+
+        println!(
+            "✅ Reward halving working correctly, reaches 0 at block {}",
+            zero_block
+        );
     }
 
     #[test]
@@ -955,29 +1075,33 @@ mod tests {
         // Test that apply_block_reward correctly tracks total supply
         let mut ledger = Ledger::new();
         let validator = [1u8; 32];
-        
+
         // Initial state: total supply = 0
         assert_eq!(ledger.total_supply, 0);
-        
+
         // Apply block reward at block 0 (10 AETH)
         let mut consensus_state = ConsensusState::new();
         consensus_state.current_height = 6; // Height 6 so block 0 is finalized (6 confirmations)
         let block_id = [0u8; 32];
-        ledger.apply_block_reward(&validator, block_id, 0, &consensus_state).unwrap();
-        
+        ledger
+            .apply_block_reward(&validator, block_id, 0, &consensus_state)
+            .unwrap();
+
         // Total supply should be 10 AETH
         assert_eq!(ledger.total_supply, 100_000_000_000);
         assert_eq!(ledger.get_balance(&validator), 100_000_000_000);
-        
+
         // Apply another block reward at block 1 (10 AETH)
         consensus_state.current_height = 7; // Height 7 so block 1 is finalized
         let block_id_1 = [1u8; 32];
-        ledger.apply_block_reward(&validator, block_id_1, 1, &consensus_state).unwrap();
-        
+        ledger
+            .apply_block_reward(&validator, block_id_1, 1, &consensus_state)
+            .unwrap();
+
         // Total supply should be 20 AETH
         assert_eq!(ledger.total_supply, 200_000_000_000);
         assert_eq!(ledger.get_balance(&validator), 200_000_000_000);
-        
+
         println!("✅ Supply tracking working correctly");
     }
 
@@ -986,25 +1110,25 @@ mod tests {
         // Test that apply_block_reward enforces MAX_SUPPLY
         let mut ledger = Ledger::new();
         let validator = [1u8; 32];
-        
+
         // Set total supply near MAX_SUPPLY
         ledger.total_supply = MAX_SUPPLY - 1;
-        
+
         // Try to apply block reward (should fail due to MAX_SUPPLY)
         let mut consensus_state = ConsensusState::new();
         consensus_state.current_height = 6;
         let block_id = [0u8; 32];
         let result = ledger.apply_block_reward(&validator, block_id, 0, &consensus_state);
-        
+
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("MAX_SUPPLY"));
-        
+
         // Total supply should remain unchanged
         assert_eq!(ledger.total_supply, MAX_SUPPLY - 1);
-        
+
         // Validator should not have received reward
         assert_eq!(ledger.get_balance(&validator), 0);
-        
+
         println!("✅ MAX_SUPPLY enforcement working correctly");
     }
 
@@ -1012,11 +1136,11 @@ mod tests {
     fn test_max_supply_constant() {
         // Test that MAX_SUPPLY is set correctly (21,000,000 AETH)
         assert_eq!(MAX_SUPPLY, 210_000_000_000_000_000);
-        
+
         // Verify it's a reasonable value (21 million like Bitcoin)
         let max_supply_aeth = MAX_SUPPLY / 10_000_000_000;
         assert_eq!(max_supply_aeth, 21_000_000);
-        
+
         println!("✅ MAX_SUPPLY: {} AETH", max_supply_aeth);
     }
 
@@ -1025,24 +1149,28 @@ mod tests {
         // Test the economic invariant: total_supply <= MAX_SUPPLY
         let mut ledger = Ledger::new();
         let validator = [1u8; 32];
-        
+
         // Apply many block rewards (simulating long-term operation)
         for block_height in 0..1000 {
             let mut consensus_state = ConsensusState::new();
             consensus_state.current_height = block_height + 6; // Ensure finality
             let block_id = [block_height as u8; 32];
-            let result = ledger.apply_block_reward(&validator, block_id, block_height, &consensus_state);
+            let result =
+                ledger.apply_block_reward(&validator, block_id, block_height, &consensus_state);
             if result.is_err() {
                 // Should only fail if we hit MAX_SUPPLY (unlikely in 1000 blocks)
                 break;
             }
-            
+
             // Verify invariant: total_supply <= MAX_SUPPLY
-            assert!(ledger.total_supply <= MAX_SUPPLY, 
-                "Monetary policy violation: total_supply {} > MAX_SUPPLY {}", 
-                ledger.total_supply, MAX_SUPPLY);
+            assert!(
+                ledger.total_supply <= MAX_SUPPLY,
+                "Monetary policy violation: total_supply {} > MAX_SUPPLY {}",
+                ledger.total_supply,
+                MAX_SUPPLY
+            );
         }
-        
+
         println!("✅ Monetary policy invariant enforced: total_supply <= MAX_SUPPLY");
     }
 
@@ -1051,20 +1179,22 @@ mod tests {
         // Test that block reward uses consensus state height (single source of truth)
         let mut ledger = Ledger::new();
         let validator = [1u8; 32];
-        
+
         // Create consensus state with height 100
         let mut consensus_state = ConsensusState::new();
         consensus_state.current_height = 106; // Height 106 so block 100 is finalized
-        
+
         let block_id = [100u8; 32];
         // Apply block reward - should use height 100 from consensus state
-        ledger.apply_block_reward(&validator, block_id, 100, &consensus_state).unwrap();
-        
+        ledger
+            .apply_block_reward(&validator, block_id, 100, &consensus_state)
+            .unwrap();
+
         // Reward should be calculated based on height 100 (not 0)
         let expected_reward = calculate_reward(100);
         assert_eq!(ledger.get_balance(&validator), expected_reward);
         assert_eq!(ledger.total_supply, expected_reward);
-        
+
         println!("✅ Consensus height used for reward calculation (no external injection)");
     }
 
@@ -1073,29 +1203,29 @@ mod tests {
         // Test that double-reward attacks are prevented via BlockId tracking (fork-safe)
         let mut ledger = Ledger::new();
         let validator = [1u8; 32];
-        
+
         // Create consensus state with height 50
         let mut consensus_state = ConsensusState::new();
         consensus_state.current_height = 56; // Height 56 so block 50 is finalized
-        
+
         let block_id = [50u8; 32];
-        
+
         // First reward at block_id should succeed
         let result1 = ledger.apply_block_reward(&validator, block_id, 50, &consensus_state);
         assert!(result1.is_ok());
-        
+
         // Mark block as rewarded (simulating consensus layer responsibility)
         consensus_state.mark_block_rewarded(block_id);
-        
+
         // Second reward at same block_id should fail (double-reward attack prevention)
         let result2 = ledger.apply_block_reward(&validator, block_id, 50, &consensus_state);
         assert!(result2.is_err());
         assert!(result2.unwrap_err().contains("already rewarded"));
-        
+
         // Total supply should only have increased once
         let expected_reward = calculate_reward(50);
         assert_eq!(ledger.total_supply, expected_reward);
-        
+
         println!("✅ Double-reward attack prevented via BlockId tracking (fork-safe)");
     }
 
@@ -1104,26 +1234,30 @@ mod tests {
         // Test that rewards are linked to consensus height increments
         let mut ledger = Ledger::new();
         let validator = [1u8; 32];
-        
+
         let mut consensus_state = ConsensusState::new();
-        
+
         // Reward at block 0
         consensus_state.current_height = 6;
         let block_id_0 = [0u8; 32];
-        ledger.apply_block_reward(&validator, block_id_0, 0, &consensus_state).unwrap();
-        
+        ledger
+            .apply_block_reward(&validator, block_id_0, 0, &consensus_state)
+            .unwrap();
+
         // Increment height (simulating consensus confirmation)
         consensus_state.current_height = 7;
-        
+
         // Reward at block 1 should succeed
         let block_id_1 = [1u8; 32];
-        ledger.apply_block_reward(&validator, block_id_1, 1, &consensus_state).unwrap();
-        
+        ledger
+            .apply_block_reward(&validator, block_id_1, 1, &consensus_state)
+            .unwrap();
+
         // Total supply should have 2 rewards
         let reward_0 = calculate_reward(0);
         let reward_1 = calculate_reward(1);
         assert_eq!(ledger.total_supply, reward_0 + reward_1);
-        
+
         println!("✅ Rewards linked to consensus height increments");
     }
 
@@ -1132,20 +1266,20 @@ mod tests {
         // Test that rewards are only given to finalized blocks
         let mut ledger = Ledger::new();
         let validator = [1u8; 32];
-        
+
         let mut consensus_state = ConsensusState::new();
         consensus_state.current_height = 3; // Only 3 confirmations (needs 6)
-        
+
         let block_id = [0u8; 32];
-        
+
         // Reward should fail because block is not finalized
         let result = ledger.apply_block_reward(&validator, block_id, 0, &consensus_state);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not finalized"));
-        
+
         // Total supply should remain 0
         assert_eq!(ledger.total_supply, 0);
-        
+
         println!("✅ Finality check prevents rewards for non-finalized blocks");
     }
 
@@ -1154,25 +1288,27 @@ mod tests {
         // Test that BlockId tracking is fork-safe (different heights, same reward possible)
         let mut ledger = Ledger::new();
         let validator = [1u8; 32];
-        
+
         let mut consensus_state = ConsensusState::new();
-        
+
         // Simulate fork: two different blocks at same height
         consensus_state.current_height = 11; // Height 11 so block 5 is finalized (5 + 6 = 11)
-        
+
         let block_id_a = [1u8; 32]; // Block A at height 5
         let block_id_b = [2u8; 32]; // Block B at height 5 (fork)
-        
+
         // Reward block A at height 5
-        ledger.apply_block_reward(&validator, block_id_a, 5, &consensus_state).unwrap();
+        ledger
+            .apply_block_reward(&validator, block_id_a, 5, &consensus_state)
+            .unwrap();
         consensus_state.mark_block_rewarded(block_id_a);
-        
+
         // Reward block B at same height (different block ID) - should succeed (fork scenario)
         let result = ledger.apply_block_reward(&validator, block_id_b, 5, &consensus_state);
         // This would succeed in a real fork scenario, but we're testing the tracking mechanism
         // In production, consensus would only mark one as rewarded based on which chain wins
         assert!(result.is_ok() || result.unwrap_err().contains("already rewarded"));
-        
+
         println!("✅ BlockId tracking is fork-safe (tracks actual blocks, not heights)");
     }
 
@@ -1181,28 +1317,32 @@ mod tests {
         // Test that rewards can be rolled back on fork/reorg
         let mut ledger = Ledger::new();
         let validator = [1u8; 32];
-        
+
         let mut consensus_state = ConsensusState::new();
         consensus_state.current_height = 11; // Height 11 so block 5 is finalized
-        
+
         let block_id = [1u8; 32];
-        
+
         // Apply reward
-        ledger.apply_block_reward(&validator, block_id, 5, &consensus_state).unwrap();
+        ledger
+            .apply_block_reward(&validator, block_id, 5, &consensus_state)
+            .unwrap();
         let initial_balance = ledger.get_balance(&validator);
         let initial_supply = ledger.total_supply;
-        
+
         assert!(initial_balance > 0);
         assert!(initial_supply > 0);
-        
+
         // Rollback reward (simulating fork)
         let reward_amount = calculate_reward(5);
-        ledger.rollback_block_reward(&validator, block_id, reward_amount).unwrap();
-        
+        ledger
+            .rollback_block_reward(&validator, block_id, reward_amount)
+            .unwrap();
+
         // Balance should be back to 0
         assert_eq!(ledger.get_balance(&validator), 0);
         assert_eq!(ledger.total_supply, 0);
-        
+
         println!("✅ Fork rollback successfully removed reward");
     }
 
@@ -1211,18 +1351,18 @@ mod tests {
         // Test that rollback fails if validator doesn't have enough balance
         let mut ledger = Ledger::new();
         let validator = [1u8; 32];
-        
+
         // Set balance to less than reward amount
         ledger.set_balance(&validator, 50);
-        
+
         let block_id = [1u8; 32];
         let reward_amount = 100;
-        
+
         // Rollback should fail
         let result = ledger.rollback_block_reward(&validator, block_id, reward_amount);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("insufficient"));
-        
+
         println!("✅ Fork rollback prevented when balance insufficient");
     }
 }

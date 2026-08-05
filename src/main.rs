@@ -157,12 +157,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  Path: {}", path.cyan());
                 println!("  Address: {}", wallet.address_string().cyan());
                 println!();
-                println!("{}", "⚠️  IMPORTANT: Write down your mnemonic phrase below.".yellow());
+                println!(
+                    "{}",
+                    "⚠️  IMPORTANT: Write down your mnemonic phrase below.".yellow()
+                );
                 println!("   This is the ONLY way to recover your wallet if you lose the file.");
                 println!();
-                println!("   Mnemonic: {}", wallet.mnemonic.as_deref().unwrap_or("<unavailable>").cyan());
+                println!(
+                    "   Mnemonic: {}",
+                    wallet.mnemonic.as_deref().unwrap_or("<unavailable>").cyan()
+                );
                 println!();
-                println!("{}", "   Store this phrase in a secure location. Never share it with anyone.".yellow());
+                println!(
+                    "{}",
+                    "   Store this phrase in a secure location. Never share it with anyone."
+                        .yellow()
+                );
                 return Ok(());
             }
             WalletAction::Restore { path, mnemonic } => {
@@ -174,18 +184,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
         },
-        Some(Commands::Send { receiver, amount, fee, rpc_url, wallet, password }) => {
+        Some(Commands::Send {
+            receiver,
+            amount,
+            fee,
+            rpc_url,
+            wallet,
+            password,
+        }) => {
             if !std::path::Path::new(&wallet).exists() {
                 eprintln!("{}", "⚠️  Wallet file not found".yellow());
                 eprintln!("  Path: {}", wallet);
                 eprintln!("  Create one with: aether wallet create");
                 std::process::exit(1);
             }
-            send_transaction_client(&wallet, &receiver, *amount, *fee, rpc_url, password.as_deref()).await?;
+            send_transaction_client(
+                &wallet,
+                &receiver,
+                *amount,
+                *fee,
+                rpc_url,
+                password.as_deref(),
+            )
+            .await?;
             return Ok(());
         }
-        Some(Commands::Balance { address_or_wallet, rpc_url, password }) => {
-            let address_hex = if address_or_wallet.ends_with(".json") || std::path::Path::new(&address_or_wallet).exists() {
+        Some(Commands::Balance {
+            address_or_wallet,
+            rpc_url,
+            password,
+        }) => {
+            let address_hex = if address_or_wallet.ends_with(".json")
+                || std::path::Path::new(&address_or_wallet).exists()
+            {
                 let w = Wallet::from_file(address_or_wallet, password.as_deref()).await?;
                 let addr = hex::encode(w.address());
                 println!("📍 Address: {}", addr);
@@ -222,18 +253,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // CLI overrides config file
-    if cli.node_type != "miner" { cfg.node_type = cli.node_type.clone(); }
-    if cli.data_dir != PathBuf::from("./data") { cfg.data_dir = cli.data_dir.clone(); }
-    if cli.p2p_port != 25565 { cfg.p2p_port = cli.p2p_port; }
-    if cli.rpc_port != 9933 { cfg.rpc_port = cli.rpc_port; }
-    if let Some(ref bn) = cli.bootnodes { cfg.bootnodes = bn.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); }
-    if let Some(ref ds) = cli.dns_seeds { cfg.dns_seeds = ds.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); }
-    if cli.miner_address.is_some() { cfg.miner_address = cli.miner_address.clone(); }
-    if cli.reset { cfg.reset = true; }
+    if cli.node_type != "miner" {
+        cfg.node_type = cli.node_type.clone();
+    }
+    if cli.data_dir != PathBuf::from("./data") {
+        cfg.data_dir = cli.data_dir.clone();
+    }
+    if cli.p2p_port != 25565 {
+        cfg.p2p_port = cli.p2p_port;
+    }
+    if cli.rpc_port != 9933 {
+        cfg.rpc_port = cli.rpc_port;
+    }
+    if let Some(ref bn) = cli.bootnodes {
+        cfg.bootnodes = bn
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if let Some(ref ds) = cli.dns_seeds {
+        cfg.dns_seeds = ds
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if cli.miner_address.is_some() {
+        cfg.miner_address = cli.miner_address.clone();
+    }
+    if cli.reset {
+        cfg.reset = true;
+    }
 
     let handles = aether_unified::node::run_node(cfg).await?;
 
-    tokio::signal::ctrl_c().await.map_err(|e| format!("Failed to listen for Ctrl+C: {}", e))?;
+    tokio::signal::ctrl_c()
+        .await
+        .map_err(|e| format!("Failed to listen for Ctrl+C: {}", e))?;
     tracing::info!("🛑 Shutting down gracefully...");
 
     tracing::info!("💾 Saving DAG...");
@@ -263,15 +320,16 @@ async fn send_transaction_client(
     password: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Load wallet (with password if provided)
-    let wallet: aether_unified::wallet::Wallet = match Wallet::from_file(wallet_path, password).await {
-        Ok(w) => w,
-        Err(e) if e.to_string().contains("Password required") => {
-            eprintln!("⚠️  Warning: Wallet is encrypted but no password provided");
-            eprintln!("  Use --password option to unlock the wallet");
-            return Err(e);
-        }
-        Err(e) => return Err(e),
-    };
+    let wallet: aether_unified::wallet::Wallet =
+        match Wallet::from_file(wallet_path, password).await {
+            Ok(w) => w,
+            Err(e) if e.to_string().contains("Password required") => {
+                eprintln!("⚠️  Warning: Wallet is encrypted but no password provided");
+                eprintln!("  Use --password option to unlock the wallet");
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
     let sender_address = wallet.address(); // Already returns first 32 bytes of public_key
 
     // Decode receiver address
@@ -288,25 +346,17 @@ async fn send_transaction_client(
         "id": 1
     });
 
-    let account_nonce = match client
-        .post(rpc_url)
-        .json(&rpc_payload)
-        .send()
-        .await
-    {
-        Ok(response) => {
-            match response.json::<serde_json::Value>().await {
-                Ok(json) => {
-                    json.get("result")
-                        .and_then(|r| r.get("next_nonce"))
-                        .and_then(|n| n.as_u64())
-                        .ok_or_else(|| "Failed to extract next_nonce from RPC response")?
-                }
-                Err(e) => {
-                    return Err(format!("Failed to parse account_nonce response: {}", e).into());
-                }
+    let account_nonce = match client.post(rpc_url).json(&rpc_payload).send().await {
+        Ok(response) => match response.json::<serde_json::Value>().await {
+            Ok(json) => json
+                .get("result")
+                .and_then(|r| r.get("next_nonce"))
+                .and_then(|n| n.as_u64())
+                .ok_or_else(|| "Failed to extract next_nonce from RPC response")?,
+            Err(e) => {
+                return Err(format!("Failed to parse account_nonce response: {}", e).into());
             }
-        }
+        },
         Err(e) => {
             return Err(format!("Failed to fetch account_nonce from RPC: {}", e).into());
         }
@@ -320,12 +370,7 @@ async fn send_transaction_client(
         "id": 2
     });
 
-    let parents = match client
-        .post(rpc_url)
-        .json(&tips_payload)
-        .send()
-        .await
-    {
+    let parents = match client.post(rpc_url).json(&tips_payload).send().await {
         Ok(response) => {
             match response.json::<serde_json::Value>().await {
                 Ok(json) => {
@@ -370,7 +415,7 @@ async fn send_transaction_client(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis() as u64,
-        0, // Initial PoW nonce (will be mined)
+        0,             // Initial PoW nonce (will be mined)
         account_nonce, // Fetched from RPC
         vec![0u8; 64], // Will be signed
         wallet.public_key_bytes(),
@@ -382,12 +427,17 @@ async fn send_transaction_client(
     let start = std::time::Instant::now();
     let nonce = tx.mine_nonce(difficulty);
     let elapsed = start.elapsed();
-    println!("{} Nonce: {} (took {:.2}s)", "✓ Mined".green(), nonce, elapsed.as_secs_f64());
-    
+    println!(
+        "{} Nonce: {} (took {:.2}s)",
+        "✓ Mined".green(),
+        nonce,
+        elapsed.as_secs_f64()
+    );
+
     // Update transaction with mined nonce
     let mut signed_tx = tx.clone();
     signed_tx.nonce = nonce;
-    
+
     // Re-compute hash with mined nonce (this will be the final tx.id)
     signed_tx.id = signed_tx.compute_hash();
 
@@ -406,12 +456,7 @@ async fn send_transaction_client(
     });
 
     // Send to RPC server
-    let response = match client
-        .post(rpc_url)
-        .json(&rpc_payload)
-        .send()
-        .await
-    {
+    let response = match client.post(rpc_url).json(&rpc_payload).send().await {
         Ok(resp) => resp,
         Err(e) => {
             eprintln!("{}", "⚠️  Failed to connect to RPC server".yellow());
@@ -432,7 +477,10 @@ async fn send_transaction_client(
         println!("  Signature: {}", hex::encode(&signature).cyan());
     } else {
         let error_text = response.text().await?;
-        eprintln!("{}", format!("✗ Failed to send transaction: {}", error_text).red());
+        eprintln!(
+            "{}",
+            format!("✗ Failed to send transaction: {}", error_text).red()
+        );
         std::process::exit(1);
     }
 
@@ -440,7 +488,10 @@ async fn send_transaction_client(
 }
 
 /// Balance client for querying balance via RPC
-async fn balance_client(address_hex: &str, rpc_url: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn balance_client(
+    address_hex: &str,
+    rpc_url: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Prepare RPC request
     let client = reqwest::Client::new();
     let rpc_payload = serde_json::json!({
@@ -451,12 +502,7 @@ async fn balance_client(address_hex: &str, rpc_url: &str) -> Result<(), Box<dyn 
     });
 
     // Send to RPC server
-    let response = match client
-        .post(rpc_url)
-        .json(&rpc_payload)
-        .send()
-        .await
-    {
+    let response = match client.post(rpc_url).json(&rpc_payload).send().await {
         Ok(resp) => resp,
         Err(e) => {
             eprintln!("{}", "⚠️  Failed to connect to RPC server".yellow());
@@ -475,14 +521,20 @@ async fn balance_client(address_hex: &str, rpc_url: &str) -> Result<(), Box<dyn 
             let balance = result.get("balance").and_then(|v| v.as_u64()).unwrap_or(0);
             println!("{}", "✓ Balance retrieved".green());
             println!("  Address: {}", address_hex.cyan());
-            println!("  Balance: {} AETH", (balance / 10_000_000_000).to_string().cyan());
+            println!(
+                "  Balance: {} AETH",
+                (balance / 10_000_000_000).to_string().cyan()
+            );
         } else if let Some(error) = response_json.get("error") {
             eprintln!("{}", format!("✗ RPC error: {}", error).red());
             std::process::exit(1);
         }
     } else {
         let error_text = response.text().await?;
-        eprintln!("{}", format!("✗ Failed to get balance: {}", error_text).red());
+        eprintln!(
+            "{}",
+            format!("✗ Failed to get balance: {}", error_text).red()
+        );
         std::process::exit(1);
     }
 

@@ -2,28 +2,27 @@
 //!
 //! Implements JSON-RPC server for external communication using jsonrpsee with Axum integration.
 
-use crate::transaction::{Transaction, TransactionId, Address};
-use crate::parent_selection::DAG;
 use crate::consensus::VQVConsensus;
+use crate::consensus::Validator;
 use crate::genesis::FAUCET_SECRET_KEY;
 use crate::ledger::Ledger;
+use crate::parent_selection::DAG;
+use crate::transaction::{Address, Transaction, TransactionId};
 use crate::transaction_processor::TransactionProcessor;
-use crate::consensus::Validator;
 use crate::SyncEvent;
-use ed25519_dalek::{SigningKey, Signer};
+use axum::{
+    extract::State,
+    response::Html,
+    routing::{get, post},
+    Json, Router,
+};
+use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{RwLock, Semaphore, mpsc};
-use axum::{
-    routing::{get, post},
-    Router,
-    response::Html,
-    extract::State,
-    Json,
-};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 use tower_http::cors::CorsLayer;
 
 /// Token bucket rate limiter (sliding window per key)
@@ -117,23 +116,23 @@ pub enum GlobalStatus {
     /// Transaction unknown to querying node (may exist elsewhere)
     /// Economic impact: unknown - not rejected, just not seen
     Unknown,
-    
+
     /// Transaction pending (in mempool or orphan, not yet in DAG)
     /// Economic impact: not yet accepted, may be resolved
     Pending,
-    
+
     /// Transaction in DAG but insufficient references/weight
     /// Economic impact: visible but not stable, may be reorganized
     Unconfirmed,
-    
+
     /// Transaction in DAG with sufficient references (≥3)
     /// Economic impact: stable, reorganization unlikely but possible
     Confirmed,
-    
+
     /// Transaction economically stable (weight ≥5.0)
     /// Economic impact: reorganization extremely unlikely, practically final
     Stable,
-    
+
     /// Transaction finalized by VQV consensus votes
     /// Economic impact: irreversible, guaranteed by protocol
     Finalized,
@@ -160,11 +159,11 @@ impl GlobalStatusResolver {
     /// Create new resolver with default thresholds
     pub fn new() -> Self {
         Self {
-            quorum_threshold: 0.67, // 2/3 for safety
+            quorum_threshold: 0.67,   // 2/3 for safety
             majority_threshold: 0.50, // 1/2 for liveness
         }
     }
-    
+
     /// Create resolver with custom thresholds
     pub fn with_thresholds(quorum: f64, majority: f64) -> Self {
         Self {
@@ -172,19 +171,19 @@ impl GlobalStatusResolver {
             majority_threshold: majority,
         }
     }
-    
+
     /// Reconcile multiple node statuses into single global status
     /// Economic policy: quorum-based weighted convergence
     pub fn reconcile_quorum(&self, reports: &[NodeStatusReport]) -> GlobalStatus {
         if reports.is_empty() {
             return GlobalStatus::Unknown;
         }
-        
+
         let total_weight: f64 = reports.iter().map(|r| r.weight).sum();
         if total_weight == 0.0 {
             return GlobalStatus::Unknown;
         }
-        
+
         // Calculate weight for each status level (ascending)
         let mut weight_unknown = 0.0;
         let mut weight_pending = 0.0;
@@ -192,9 +191,12 @@ impl GlobalStatusResolver {
         let mut weight_confirmed = 0.0;
         let mut weight_stable = 0.0;
         let mut weight_finalized = 0.0;
-        
+
         for report in reports {
-            let global = GlobalStatusResolver::reconcile_single(report.local_status, report.consensus_status);
+            let global = GlobalStatusResolver::reconcile_single(
+                report.local_status,
+                report.consensus_status,
+            );
             match global {
                 GlobalStatus::Unknown => weight_unknown += report.weight,
                 GlobalStatus::Pending => weight_pending += report.weight,
@@ -204,7 +206,7 @@ impl GlobalStatusResolver {
                 GlobalStatus::Finalized => weight_finalized += report.weight,
             }
         }
-        
+
         // Normalize weights
         let w_unknown = weight_unknown / total_weight;
         let w_pending = weight_pending / total_weight;
@@ -212,7 +214,7 @@ impl GlobalStatusResolver {
         let w_confirmed = weight_confirmed / total_weight;
         let w_stable = weight_stable / total_weight;
         let w_finalized = weight_finalized / total_weight;
-        
+
         // Check for quorum at each level (highest first)
         // Finalized requires explicit VQV votes - not just weight
         if w_finalized >= self.quorum_threshold {
@@ -245,7 +247,7 @@ impl GlobalStatusResolver {
             }
         }
     }
-    
+
     /// Reconcile single node's local and consensus status
     /// Economic policy: conservative convergence for single node
     pub fn reconcile_single(local: LocalStatus, consensus: ConsensusStatus) -> GlobalStatus {
@@ -253,14 +255,12 @@ impl GlobalStatusResolver {
             LocalStatus::Unknown => GlobalStatus::Unknown,
             LocalStatus::Orphan => GlobalStatus::Pending,
             LocalStatus::InMempool => GlobalStatus::Pending,
-            LocalStatus::InLocalDag => {
-                match consensus {
-                    ConsensusStatus::Unconfirmed => GlobalStatus::Unconfirmed,
-                    ConsensusStatus::Confirmed => GlobalStatus::Confirmed,
-                    ConsensusStatus::Stable => GlobalStatus::Stable,
-                    ConsensusStatus::Finalized => GlobalStatus::Finalized,
-                }
-            }
+            LocalStatus::InLocalDag => match consensus {
+                ConsensusStatus::Unconfirmed => GlobalStatus::Unconfirmed,
+                ConsensusStatus::Confirmed => GlobalStatus::Confirmed,
+                ConsensusStatus::Stable => GlobalStatus::Stable,
+                ConsensusStatus::Finalized => GlobalStatus::Finalized,
+            },
         }
     }
 }
@@ -274,15 +274,15 @@ impl Default for GlobalStatusResolver {
 impl GlobalStatus {
     /// Minimum number of references for "confirmed" status
     pub const MIN_CONFIRMATIONS: usize = 3;
-    
+
     /// Minimum cumulative weight for "stable" status
     pub const STABILITY_THRESHOLD: f64 = 5.0;
-    
+
     /// Check if status is considered "final" for practical purposes
     pub fn is_practically_final(&self) -> bool {
         matches!(self, Self::Stable | Self::Finalized)
     }
-    
+
     /// Convert to string for RPC response
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -294,7 +294,7 @@ impl GlobalStatus {
             Self::Finalized => "finalized",
         }
     }
-    
+
     /// Reconcile local and consensus status into global status (single node)
     /// Economic policy: conservative convergence - choose minimum certainty
     /// For multi-node reconciliation, use GlobalStatusResolver::reconcile_quorum
@@ -316,15 +316,15 @@ pub enum LocalStatus {
     /// Transaction unknown to this node (may exist elsewhere)
     /// Economic impact: unknown - not rejected, just not seen
     Unknown,
-    
+
     /// Transaction is waiting for missing parents (orphan)
     /// Economic impact: not yet accepted, may be resolved when parents arrive
     Orphan,
-    
+
     /// Transaction accepted locally (in mempool) but not yet in DAG
     /// Economic impact: ledger committed, but may be reorganized
     InMempool,
-    
+
     /// Transaction is in this node's DAG
     /// Economic impact: visible locally, consensus status separate
     InLocalDag,
@@ -355,17 +355,17 @@ pub enum ConsensusStatus {
     /// Not yet confirmed by network (insufficient references/weight)
     /// Economic impact: may be reorganized
     Unconfirmed,
-    
+
     /// Confirmed by sufficient references
     /// Economic policy: confirmed = at least MIN_CONFIRMATIONS references
     /// Economic impact: stable, reorganization unlikely but possible
     Confirmed,
-    
+
     /// Economically stable (high weight/references)
     /// Economic policy: economically_stable = weight above STABILITY_THRESHOLD
     /// Economic impact: reorganization extremely unlikely, practically final
     Stable,
-    
+
     /// Finalized by consensus mechanism
     /// Economic impact: irreversible, guaranteed by protocol (VQV votes)
     Finalized,
@@ -374,15 +374,15 @@ pub enum ConsensusStatus {
 impl ConsensusStatus {
     /// Minimum number of references for "confirmed" status
     pub const MIN_CONFIRMATIONS: usize = 3;
-    
+
     /// Minimum cumulative weight for "stable" status
     pub const STABILITY_THRESHOLD: f64 = 5.0;
-    
+
     /// Check if status is considered "final" for practical purposes
     pub fn is_practically_final(&self) -> bool {
         matches!(self, Self::Stable | Self::Finalized)
     }
-    
+
     /// Convert to string for RPC response
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -422,10 +422,15 @@ impl TransactionStatus {
             practically_final,
         }
     }
-    
+
     /// Convert to string for RPC response (combined status)
     pub fn as_str(&self) -> String {
-        format!("{}:{}:{}", self.local_status.as_str(), self.consensus_status.as_str(), self.global_status.as_str())
+        format!(
+            "{}:{}:{}",
+            self.local_status.as_str(),
+            self.consensus_status.as_str(),
+            self.global_status.as_str()
+        )
     }
 }
 
@@ -533,17 +538,17 @@ impl Mempool {
             min_fee: 1, // Minimum fee of 1 unit (anti-spam)
         }
     }
-    
+
     /// Set minimum fee
     pub fn set_min_fee(&mut self, min_fee: u64) {
         self.min_fee = min_fee;
     }
-    
+
     /// Get minimum fee
     pub fn min_fee(&self) -> u64 {
         self.min_fee
     }
-    
+
     /// Add transaction to mempool with economic validation
     /// Economic policy: transaction must meet minimum fee requirement
     /// When mempool is full, lower-fee transactions may be evicted to make room for higher-fee ones
@@ -552,14 +557,17 @@ impl Mempool {
     pub async fn add_internal(&mut self, tx: Transaction) -> Result<(), RpcError> {
         // Economic validation: check minimum fee
         if tx.fee < self.min_fee {
-            return Err(RpcError(format!("Insufficient fee: {} < minimum {}", tx.fee, self.min_fee)));
+            return Err(RpcError(format!(
+                "Insufficient fee: {} < minimum {}",
+                tx.fee, self.min_fee
+            )));
         }
-        
+
         // If mempool is full, try to evict lower-fee transactions
         if self.queue.len() >= self.max_size {
             // Check if this transaction has higher fee than the lowest in mempool
             let min_fee_in_pool = self.queue.iter().map(|t| t.fee).min().unwrap_or(0);
-            
+
             if tx.fee > min_fee_in_pool {
                 // Evict the lowest-fee transaction to make room
                 if let Some(pos) = self.queue.iter().position(|t| t.fee == min_fee_in_pool) {
@@ -567,29 +575,31 @@ impl Mempool {
                     tracing::info!("🔄 Evicted low-fee transaction (fee: {}) to make room for higher-fee (fee: {})", min_fee_in_pool, tx.fee);
                 }
             } else {
-                return Err(RpcError("Mempool full (consider higher fee for priority)".to_string()));
+                return Err(RpcError(
+                    "Mempool full (consider higher fee for priority)".to_string(),
+                ));
             }
         }
 
         self.queue.push_back(tx);
         Ok(())
     }
-    
+
     /// Get transaction semaphore for rate limiting
     pub fn semaphore(&self) -> Arc<Semaphore> {
         self.semaphore.clone()
     }
-    
+
     /// Get queue size
     pub fn size(&self) -> usize {
         self.queue.len()
     }
-    
+
     /// Get max size
     pub fn max_size(&self) -> usize {
         self.max_size
     }
-    
+
     /// Pop transaction from mempool (FIFO)
     pub fn pop_front(&mut self) -> Option<Transaction> {
         self.queue.pop_front()
@@ -599,7 +609,7 @@ impl Mempool {
     pub fn remove_transaction(&mut self, tx_id: &TransactionId) {
         self.queue.retain(|tx| &tx.id != tx_id);
     }
-    
+
     /// Get all transaction IDs in mempool (for testing)
     pub fn get_transaction_ids(&self) -> Vec<TransactionId> {
         self.queue.iter().map(|tx| tx.id).collect()
@@ -732,7 +742,10 @@ struct FeeOracle {
 
 impl FeeOracle {
     fn new() -> Self {
-        Self { base_fee: 1, last_adjustment: std::time::Instant::now() }
+        Self {
+            base_fee: 1,
+            last_adjustment: std::time::Instant::now(),
+        }
     }
 
     fn adjust(&mut self, mempool_occupancy: f64) {
@@ -806,24 +819,30 @@ impl AetherRpcImpl {
     }
 
     /// Send a transaction
-    pub async fn send_transaction(&self, params: serde_json::Value) -> Result<TransactionResponse, RpcError> {
+    pub async fn send_transaction(
+        &self,
+        params: serde_json::Value,
+    ) -> Result<TransactionResponse, RpcError> {
         tracing::error!("RAW RPC PARAMS RECEIVED: {:?}", params);
 
         // Parse params manually - expect array with single string
         let tx_data: String = match params {
-            serde_json::Value::Array(arr) if arr.len() == 1 => {
-                match &arr[0] {
-                    serde_json::Value::String(s) => s.clone(),
-                    _ => {
-                        tracing::error!("❌ Expected string in params array, got: {:?}", arr[0]);
-                        return Err(RpcError("Invalid params: expected string in array".to_string()));
-                    }
+            serde_json::Value::Array(arr) if arr.len() == 1 => match &arr[0] {
+                serde_json::Value::String(s) => s.clone(),
+                _ => {
+                    tracing::error!("❌ Expected string in params array, got: {:?}", arr[0]);
+                    return Err(RpcError(
+                        "Invalid params: expected string in array".to_string(),
+                    ));
                 }
-            }
+            },
             serde_json::Value::String(s) => s.clone(),
             _ => {
                 tracing::error!("❌ Expected array or string, got: {:?}", params);
-                return Err(RpcError(format!("Invalid params: expected array with string or string, got {:?}", params)));
+                return Err(RpcError(format!(
+                    "Invalid params: expected array with string or string, got {:?}",
+                    params
+                )));
             }
         };
 
@@ -850,7 +869,10 @@ impl AetherRpcImpl {
         // Step 2: Parsing - Deserialize transaction using bincode (same format as GUI)
         let tx: Transaction = match bincode::deserialize::<Transaction>(&tx_bytes) {
             Ok(transaction) => {
-                tracing::info!("✅ Parsing: Transaction désérialisée pour {}", hex::encode(transaction.sender));
+                tracing::info!(
+                    "✅ Parsing: Transaction désérialisée pour {}",
+                    hex::encode(transaction.sender)
+                );
                 transaction
             }
             Err(e) => {
@@ -876,7 +898,11 @@ impl AetherRpcImpl {
     /// Common transaction validation and processing logic (used by both RPC and P2P)
     /// 🔒 ZERO TRUST: Uses TransactionProcessor as single entry point
     /// Economic policy: validation BEFORE any state modification, atomic rollback on failure
-    pub async fn process_transaction(&self, tx: Transaction, source: &str) -> Result<TransactionResponse, RpcError> {
+    pub async fn process_transaction(
+        &self,
+        tx: Transaction,
+        source: &str,
+    ) -> Result<TransactionResponse, RpcError> {
         // CONSENSUS ACCEPTANCE RULES:
         // - VALID BUT NOT ACCEPTABLE: Transaction passes basic checks (PoW, signature) but has missing parents -> orphaned
         // - DEFINITIVELY INVALID: Invalid PoW, signature, balance, nonce, duplicate, double spend, sender conflict -> rejected
@@ -884,13 +910,38 @@ impl AetherRpcImpl {
         // - ACCEPTED: Passes all validation, committed to ledger and DAG -> pending confirmation
 
         // Validation logs
-        tracing::info!("🔍 Processing transaction [{}] - Sender: {}", source, hex::encode(tx.sender));
-        tracing::info!("🔍 Processing transaction [{}] - Receiver: {}", source, hex::encode(tx.receiver));
-        tracing::info!("🔍 Processing transaction [{}] - Amount: {}", source, tx.amount);
+        tracing::info!(
+            "🔍 Processing transaction [{}] - Sender: {}",
+            source,
+            hex::encode(tx.sender)
+        );
+        tracing::info!(
+            "🔍 Processing transaction [{}] - Receiver: {}",
+            source,
+            hex::encode(tx.receiver)
+        );
+        tracing::info!(
+            "🔍 Processing transaction [{}] - Amount: {}",
+            source,
+            tx.amount
+        );
         tracing::info!("🔍 Processing transaction [{}] - Fee: {}", source, tx.fee);
-        tracing::info!("🔍 Processing transaction [{}] - Parents: [{}, {}]", source, hex::encode(tx.parents[0]), hex::encode(tx.parents[1]));
-        tracing::info!("🔍 Processing transaction [{}] - PoW Nonce: {}", source, tx.nonce);
-        tracing::info!("🔍 Processing transaction [{}] - Account Nonce: {}", source, tx.account_nonce);
+        tracing::info!(
+            "🔍 Processing transaction [{}] - Parents: [{}, {}]",
+            source,
+            hex::encode(tx.parents[0]),
+            hex::encode(tx.parents[1])
+        );
+        tracing::info!(
+            "🔍 Processing transaction [{}] - PoW Nonce: {}",
+            source,
+            tx.nonce
+        );
+        tracing::info!(
+            "🔍 Processing transaction [{}] - Account Nonce: {}",
+            source,
+            tx.account_nonce
+        );
 
         // STEP 1: CHECK FOR MISSING PARENTS (orphan handling - before full validation)
         // This is a special case: valid transactions with missing parents are stored as orphans
@@ -906,14 +957,21 @@ impl AetherRpcImpl {
         for (i, parent) in tx.parents.iter().enumerate() {
             let is_genesis = *parent == [0u8; 32];
             if !is_genesis && !dag.transactions().contains_key(parent) {
-                tracing::warn!("⚠️ Parent {} missing: {} - requesting via P2P", i, hex::encode(parent));
+                tracing::warn!(
+                    "⚠️ Parent {} missing: {} - requesting via P2P",
+                    i,
+                    hex::encode(parent)
+                );
                 missing_parents.push((i, parent.clone()));
 
                 // Request missing parent via P2P
                 let parent_hash = parent.to_vec();
                 let p2p = self.p2p_network.clone();
                 tokio::spawn(async move {
-                    tracing::info!("📡 P2P - Requesting missing parent: {}", hex::encode(&parent_hash));
+                    tracing::info!(
+                        "📡 P2P - Requesting missing parent: {}",
+                        hex::encode(&parent_hash)
+                    );
                     p2p.request_transaction(parent_hash).await;
                 });
             }
@@ -922,7 +980,7 @@ impl AetherRpcImpl {
         // VALID BUT NOT ACCEPTABLE: If parents are missing, store as orphan
         if !missing_parents.is_empty() {
             drop(dag);
-            
+
             // Persist orphan to disk (survives restart)
             // 🔧 FIX: use the main storage (data_dir/sled_db), NOT a new sled at
             // ledger_path.parent() which silently opened a different database at
@@ -932,14 +990,18 @@ impl AetherRpcImpl {
                     tracing::error!("❌ Failed to persist orphan to storage: {}", e);
                 }
             }
-            
+
             // Also keep in memory for fast access
             {
                 let mut orphans = self.orphans.write().await;
                 orphans.insert(tx.id, tx.clone());
-                tracing::info!("📦 Orphan stored: {} (missing {} parent(s)) - persisted to disk", hex::encode(tx.id), missing_parents.len());
+                tracing::info!(
+                    "📦 Orphan stored: {} (missing {} parent(s)) - persisted to disk",
+                    hex::encode(tx.id),
+                    missing_parents.len()
+                );
             }
-            
+
             return Err(RpcError(format!(
                 "Transaction has {} missing parent(s). Stored as orphan and requesting via P2P. Please retry in a few seconds.",
                 missing_parents.len()
@@ -973,16 +1035,19 @@ impl AetherRpcImpl {
         // Use transaction ID as block ID (in production, this should be the actual block ID from consensus)
         let block_id = Some(tx.id);
 
-        match processor.process(
-            tx.clone(),
-            &self.dag,
-            &self.ledger,
-            &self.mempool,
-            min_fee,
-            miner_addr,
-            consensus_state,
-            block_id,
-        ).await {
+        match processor
+            .process(
+                tx.clone(),
+                &self.dag,
+                &self.ledger,
+                &self.mempool,
+                min_fee,
+                miner_addr,
+                consensus_state,
+                block_id,
+            )
+            .await
+        {
             Ok(_) => {
                 tracing::info!("✅ Transaction processed successfully via TransactionProcessor");
                 // 💾 Persist to mempool storage
@@ -994,7 +1059,8 @@ impl AetherRpcImpl {
                 Ok(TransactionResponse {
                     tx_id: tx.id,
                     status: "in_mempool".to_string(),
-                    message: "Transaction accepted locally (in mempool, not yet in DAG)".to_string(),
+                    message: "Transaction accepted locally (in mempool, not yet in DAG)"
+                        .to_string(),
                 })
             }
             Err(e) => {
@@ -1007,7 +1073,7 @@ impl AetherRpcImpl {
     /// Process orphans - retry transactions that were waiting for parents
     pub async fn process_orphans(&self) {
         let mut orphans_to_process = Vec::new();
-        
+
         // Load orphans from disk on startup
         // 🔧 FIX: use the main storage (data_dir/sled_db), NOT a new sled at
         // ledger_path.parent() which silently opened a different database at
@@ -1023,33 +1089,44 @@ impl AetherRpcImpl {
                 }
             }
         }
-        
+
         // Check which orphans can now be processed (parents available)
         {
             let orphans = self.orphans.read().await;
             let dag = self.dag.read().await;
-            
+
             for (tx_id, orphan) in orphans.iter() {
-                let parent0_ok = orphan.parents[0] == [0u8; 32] || dag.transactions().contains_key(&orphan.parents[0]);
-                let parent1_ok = orphan.parents[1] == [0u8; 32] || dag.transactions().contains_key(&orphan.parents[1]);
-                
+                let parent0_ok = orphan.parents[0] == [0u8; 32]
+                    || dag.transactions().contains_key(&orphan.parents[0]);
+                let parent1_ok = orphan.parents[1] == [0u8; 32]
+                    || dag.transactions().contains_key(&orphan.parents[1]);
+
                 if parent0_ok && parent1_ok {
-                    tracing::info!("🔗 Orphan {} resolved - parents now available", hex::encode(&tx_id[..8]));
+                    tracing::info!(
+                        "🔗 Orphan {} resolved - parents now available",
+                        hex::encode(&tx_id[..8])
+                    );
                     orphans_to_process.push((*tx_id, orphan.clone()));
                 }
             }
         }
-        
+
         // Process resolved orphans
         for (tx_id, orphan) in orphans_to_process {
-            tracing::info!("🔄 Re-processing orphan transaction: {}", hex::encode(&tx_id[..8]));
+            tracing::info!(
+                "🔄 Re-processing orphan transaction: {}",
+                hex::encode(&tx_id[..8])
+            );
             match self.process_transaction(orphan, "Orphan").await {
                 Ok(_) => {
-                    tracing::info!("✅ Orphan transaction successfully processed: {}", hex::encode(&tx_id[..8]));
+                    tracing::info!(
+                        "✅ Orphan transaction successfully processed: {}",
+                        hex::encode(&tx_id[..8])
+                    );
                     // Remove from orphans on success
                     let mut orphans = self.orphans.write().await;
                     orphans.remove(&tx_id);
-                    
+
                     // Also remove from disk
                     if let Ok(storage_guard) = self.storage.try_read() {
                         let _ = storage_guard.remove_orphan(tx_id);
@@ -1061,19 +1138,25 @@ impl AetherRpcImpl {
                     let is_permanent = error_msg.contains("Duplicate transaction")
                         || error_msg.contains("Double spend")
                         || error_msg.contains("Sender conflict");
-                    
+
                     if is_permanent {
-                        tracing::warn!("🗑️ Orphan {} permanently invalid, removing from queue", hex::encode(&tx_id[..8]));
+                        tracing::warn!(
+                            "🗑️ Orphan {} permanently invalid, removing from queue",
+                            hex::encode(&tx_id[..8])
+                        );
                         let mut orphans = self.orphans.write().await;
                         orphans.remove(&tx_id);
-                        
+
                         // Also remove from disk
                         if let Ok(storage_guard) = self.storage.try_read() {
                             let _ = storage_guard.remove_orphan(tx_id);
                         }
                     } else {
                         // Temporary error (mempool full, lock error, etc.) - keep in queue
-                        tracing::info!("📦 Orphan {} kept in queue (temporary error)", hex::encode(&tx_id[..8]));
+                        tracing::info!(
+                            "📦 Orphan {} kept in queue (temporary error)",
+                            hex::encode(&tx_id[..8])
+                        );
                     }
                 }
             }
@@ -1111,7 +1194,7 @@ impl AetherRpcImpl {
         // For now, return a placeholder based on base difficulty
         // In production, this would calculate from recent transaction nonces
         let estimated_hashrate = 100 * 1000; // difficulty * 1000
-        
+
         Ok(HashrateResponse {
             hashrate: format!("{} H/s", estimated_hashrate),
             difficulty: 100, // Base difficulty
@@ -1146,20 +1229,22 @@ impl AetherRpcImpl {
                 }
             }
         };
-        
+
         // Step 2: Determine consensus status (global stability)
         // Only meaningful if transaction is in local DAG
         let consensus_status = if local_status == LocalStatus::InLocalDag {
             let dag = self.dag.read().await;
             if let Some(tx) = dag.get_transaction(tx_id) {
-                let reference_count = dag.children().get(&tx_id)
+                let reference_count = dag
+                    .children()
+                    .get(&tx_id)
                     .map(|children| children.len())
                     .unwrap_or(0);
-                
+
                 // Check for finalized status (VQV consensus votes)
                 // For now, we don't have a finalized mechanism, so we skip this
                 // In future, this would check VQV votes or other consensus confirmation
-                
+
                 // Check for stable status (high weight)
                 if tx.weight >= ConsensusStatus::STABILITY_THRESHOLD {
                     ConsensusStatus::Stable
@@ -1176,32 +1261,37 @@ impl AetherRpcImpl {
             // Not in local DAG, so consensus status is unknown/unconfirmed
             ConsensusStatus::Unconfirmed
         };
-        
+
         TransactionStatus::new(local_status, consensus_status)
     }
-    
+
     /// Get transaction status
-    pub async fn get_transaction_status(&self, hash: TransactionId) -> Result<TransactionStatusResponse, RpcError> {
+    pub async fn get_transaction_status(
+        &self,
+        hash: TransactionId,
+    ) -> Result<TransactionStatusResponse, RpcError> {
         let status = self.determine_transaction_status(hash).await;
-        
+
         let dag = self.dag.read().await;
         let (reference_count, weight, timestamp) = match dag.get_transaction(hash) {
             Some(tx) => {
-                let ref_count = dag.children().get(&hash)
+                let ref_count = dag
+                    .children()
+                    .get(&hash)
                     .map(|children| children.len())
                     .unwrap_or(0);
                 (ref_count, tx.weight, Some(tx.timestamp))
-            },
+            }
             None => (0, 0.0, None),
         };
-        
+
         Ok(TransactionStatusResponse {
             tx_id: hash,
             local_status: status.local_status.as_str().to_string(),
             consensus_status: status.consensus_status.as_str().to_string(),
             global_status: status.global_status.as_str().to_string(),
-            confirmed: status.global_status == GlobalStatus::Confirmed 
-                || status.global_status == GlobalStatus::Stable 
+            confirmed: status.global_status == GlobalStatus::Confirmed
+                || status.global_status == GlobalStatus::Stable
                 || status.global_status == GlobalStatus::Finalized,
             practically_final: status.practically_final,
             block_height: Some(0), // DAG doesn't have block heights
@@ -1212,7 +1302,10 @@ impl AetherRpcImpl {
     }
 
     /// Get recent transactions for explorer
-    pub async fn get_recent_transactions(&self, limit: u64) -> Result<RecentTransactionsResponse, RpcError> {
+    pub async fn get_recent_transactions(
+        &self,
+        limit: u64,
+    ) -> Result<RecentTransactionsResponse, RpcError> {
         let dag = self.dag.read().await;
         let transactions: Vec<&Transaction> = dag.transactions().values().collect();
 
@@ -1239,17 +1332,22 @@ impl AetherRpcImpl {
     }
 
     /// Get transaction history for a specific address
-    pub async fn get_transaction_history(&self, address: String) -> Result<TransactionHistoryResponse, RpcError> {
+    pub async fn get_transaction_history(
+        &self,
+        address: String,
+    ) -> Result<TransactionHistoryResponse, RpcError> {
         let dag = self.dag.read().await;
-        
+
         // Decode address from hex
-        let address_bytes = hex::decode(&address)
-            .map_err(|_| RpcError("Invalid address hex".to_string()))?;
-        let address_array: [u8; 32] = address_bytes.try_into()
+        let address_bytes =
+            hex::decode(&address).map_err(|_| RpcError("Invalid address hex".to_string()))?;
+        let address_array: [u8; 32] = address_bytes
+            .try_into()
             .map_err(|_| RpcError("Invalid address length".to_string()))?;
-        
+
         // Filter transactions where address is sender or receiver
-        let transactions: Vec<TransactionHistoryItem> = dag.transactions()
+        let transactions: Vec<TransactionHistoryItem> = dag
+            .transactions()
             .values()
             .filter(|tx| tx.sender == address_array || tx.receiver == address_array)
             .map(|tx| {
@@ -1264,9 +1362,9 @@ impl AetherRpcImpl {
                 }
             })
             .collect();
-        
+
         let total_count = transactions.len();
-        
+
         Ok(TransactionHistoryResponse {
             transactions,
             total_count,
@@ -1274,27 +1372,48 @@ impl AetherRpcImpl {
     }
 
     /// Stake tokens for an address
-    pub async fn stake_tokens(&self, address: &Address, amount: u64) -> Result<StakingResponse, RpcError> {
-        tracing::info!("🔒 Stake request: address={}, amount={}", hex::encode(address), amount);
+    pub async fn stake_tokens(
+        &self,
+        address: &Address,
+        amount: u64,
+    ) -> Result<StakingResponse, RpcError> {
+        tracing::info!(
+            "🔒 Stake request: address={}, amount={}",
+            hex::encode(address),
+            amount
+        );
         let storage = self.storage.read().await;
-        
+
         match storage.stake_tokens(*address, amount) {
             Ok(_) => {
                 let staked_amount = storage.get_staked_amount(*address).unwrap_or(0);
                 let rewards = storage.calculate_staking_reward(*address).unwrap_or(0);
                 // Bridge to VQV consensus — register as validator if min stake met
-                let min_stake = { let c = self.consensus.read().await; c.min_stake() };
-                let max_stake = { let c = self.consensus.read().await; c.max_stake() };
+                let min_stake = {
+                    let c = self.consensus.read().await;
+                    c.min_stake()
+                };
+                let max_stake = {
+                    let c = self.consensus.read().await;
+                    c.max_stake()
+                };
                 if staked_amount >= min_stake && staked_amount <= max_stake {
                     let mut cons = self.consensus.write().await;
                     let validator = Validator::new(*address, staked_amount, address.to_vec());
                     if let Err(e) = cons.register_validator(validator) {
                         tracing::warn!("⚠️ Validator registration skipped: {}", e);
                     } else {
-                        tracing::info!("✅ Address registered as VQV validator: {}", hex::encode(address));
+                        tracing::info!(
+                            "✅ Address registered as VQV validator: {}",
+                            hex::encode(address)
+                        );
                     }
                 }
-                tracing::info!("✅ Stake successful: staked_amount={}, rewards={}", staked_amount, rewards);
+                tracing::info!(
+                    "✅ Stake successful: staked_amount={}, rewards={}",
+                    staked_amount,
+                    rewards
+                );
                 Ok(StakingResponse {
                     address: *address,
                     staked_amount,
@@ -1310,14 +1429,14 @@ impl AetherRpcImpl {
                     rewards_earned: 0,
                     success: false,
                 })
-            },
+            }
         }
     }
 
     /// Unstake tokens for an address
     pub async fn unstake_tokens(&self, address: &Address) -> Result<StakingResponse, RpcError> {
         let storage = self.storage.read().await;
-        
+
         match storage.unstake_tokens(*address) {
             Ok(total_return) => {
                 // Unregister from VQV consensus
@@ -1340,9 +1459,12 @@ impl AetherRpcImpl {
     }
 
     /// Get staking info for an address
-    pub async fn get_staking_info(&self, address: &Address) -> Result<StakingInfoResponse, RpcError> {
+    pub async fn get_staking_info(
+        &self,
+        address: &Address,
+    ) -> Result<StakingInfoResponse, RpcError> {
         let storage = self.storage.read().await;
-        
+
         if storage.has_staked_tokens(*address) {
             let staked_amount = storage.get_staked_amount(*address).unwrap_or(0);
             let rewards = storage.calculate_staking_reward(*address).unwrap_or(0);
@@ -1361,12 +1483,15 @@ impl AetherRpcImpl {
     }
 
     /// Get account nonce for an address
-    pub async fn get_account_nonce(&self, address: &Address) -> Result<AccountNonceResponse, RpcError> {
+    pub async fn get_account_nonce(
+        &self,
+        address: &Address,
+    ) -> Result<AccountNonceResponse, RpcError> {
         let ledger = self.ledger.read().await;
         let current_nonce = ledger.get_nonce(address);
         let next_nonce = current_nonce + 1;
         drop(ledger);
-        
+
         Ok(AccountNonceResponse {
             address: *address,
             current_nonce,
@@ -1416,7 +1541,8 @@ impl AetherRpcImpl {
 
         // Get tips (transactions with no children)
         // Only return transactions that exist in the DAG and have no children
-        let mut tips: Vec<TransactionId> = dag.transactions()
+        let mut tips: Vec<TransactionId> = dag
+            .transactions()
             .values()
             .filter(|tx| !dag.children().contains_key(&tx.id))
             .map(|tx| tx.id)
@@ -1430,12 +1556,13 @@ impl AetherRpcImpl {
 
         let count = tips.len();
 
-        tracing::debug!("get_tips: Returning {} tips out of {} total transactions", count, dag.transaction_count());
-
-        Ok(TipsResponse {
-            tips,
+        tracing::debug!(
+            "get_tips: Returning {} tips out of {} total transactions",
             count,
-        })
+            dag.transaction_count()
+        );
+
+        Ok(TipsResponse { tips, count })
     }
 
     /// Get DAG snapshot for explorer
@@ -1467,13 +1594,14 @@ impl AetherRpcImpl {
         }
 
         // Get last 100 transactions
-        let transactions: Vec<TransactionSnapshot> = dag.transactions()
+        let transactions: Vec<TransactionSnapshot> = dag
+            .transactions()
             .values()
             .take(100)
             .map(|tx| {
                 let cumulative_weight = calculate_cumulative_weight(tx.id, &dag);
                 let signature_valid = crate::wallet::Wallet::verify_transaction(tx);
-                
+
                 TransactionSnapshot {
                     hash: hex::encode(tx.id),
                     parents: tx.parents.iter().map(|p| hex::encode(p)).collect(),
@@ -1505,7 +1633,7 @@ impl AetherRpcImpl {
         let is_mining = *self.mining_enabled.read().await;
         // For now, return a placeholder hashrate
         let hashrate = if is_mining { "1000 H/s" } else { "0 H/s" };
-        
+
         Ok(MiningStatusResponse {
             is_mining,
             hashrate: hashrate.to_string(),
@@ -1534,7 +1662,10 @@ impl AetherRpcImpl {
             if let Some(last) = cooldowns.get(&address) {
                 if last.elapsed() < std::time::Duration::from_secs(60) {
                     let remaining = 60 - last.elapsed().as_secs();
-                    return Err(RpcError(format!("Rate limited. Try again in {}s", remaining)));
+                    return Err(RpcError(format!(
+                        "Rate limited. Try again in {}s",
+                        remaining
+                    )));
                 }
             }
             cooldowns.insert(address, std::time::Instant::now());
@@ -1551,7 +1682,8 @@ impl AetherRpcImpl {
 
         // Get DAG tips for parents
         let dag = self.dag.read().await;
-        let tips: Vec<TransactionId> = dag.transactions()
+        let tips: Vec<TransactionId> = dag
+            .transactions()
             .values()
             .filter(|tx| !dag.children().contains_key(&tx.id))
             .map(|tx| tx.id)
@@ -1574,7 +1706,8 @@ impl AetherRpcImpl {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or(std::time::Duration::from_secs(0))
-            .as_secs() * 1000;
+            .as_secs()
+            * 1000;
 
         // Create transaction with placeholder nonce and signature (to be filled)
         let mut tx = Transaction::new(
@@ -1605,29 +1738,35 @@ impl AetherRpcImpl {
         // Submit via process_transaction (validates, adds to mempool, broadcasts via P2P)
         let _response = self.process_transaction(tx.clone(), "Faucet").await?;
 
-        tracing::info!("💰 Faucet: Sent {} to {} via real DAG tx {}",
-            amount, hex::encode(address), hex::encode(tx.id));
+        tracing::info!(
+            "💰 Faucet: Sent {} to {} via real DAG tx {}",
+            amount,
+            hex::encode(address),
+            hex::encode(tx.id)
+        );
 
         Ok(FaucetResponse {
             success: true,
             amount,
-            message: format!("Successfully sent {} AETH to {} (tx: {})",
+            message: format!(
+                "Successfully sent {} AETH to {} (tx: {})",
                 amount / 10_000_000_000,
                 hex::encode(address),
-                hex::encode(tx.id)),
+                hex::encode(tx.id)
+            ),
         })
     }
 
     /// Create a new account (wallet)
     pub async fn create_account(&self) -> Result<CreateAccountResponse, RpcError> {
         use crate::wallet::Wallet;
-        
+
         let wallet = Wallet::new();
         let address = hex::encode(wallet.address());
         let public_key = hex::encode(wallet.public_key_bytes());
-        
+
         tracing::info!("🔑 New account created: {}", address);
-        
+
         Ok(CreateAccountResponse {
             success: true,
             address,
@@ -1652,16 +1791,35 @@ pub async fn start_rpc_server(
     miner_address: Option<Address>,
     orphans: Arc<RwLock<std::collections::HashMap<[u8; 32], Transaction>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let rpc_impl = Arc::new(AetherRpcImpl::new(consensus, dag, ledger, storage, ledger_path, mempool.clone(), p2p_network, save_tx, mining_enabled, miner_address, orphans));
-    
+    let rpc_impl = Arc::new(AetherRpcImpl::new(
+        consensus,
+        dag,
+        ledger,
+        storage,
+        ledger_path,
+        mempool.clone(),
+        p2p_network,
+        save_tx,
+        mining_enabled,
+        miner_address,
+        orphans,
+    ));
+
     // Log mempool config
     let mempool_config = {
         let mempool_read = mempool.read().await;
-        (mempool_read.max_size(), mempool_read.semaphore().available_permits())
+        (
+            mempool_read.max_size(),
+            mempool_read.semaphore().available_permits(),
+        )
     };
-    
+
     tracing::info!("🚀 Starting RPC server on http://{}", addr);
-    tracing::info!("📊 Mempool: max_size={}, available_permits={}", mempool_config.0, mempool_config.1);
+    tracing::info!(
+        "📊 Mempool: max_size={}, available_permits={}",
+        mempool_config.0,
+        mempool_config.1
+    );
 
     // 1. RPC Route - POST only for JSON-RPC
     let rpc_route = Router::new()
@@ -1688,9 +1846,9 @@ pub async fn start_rpc_server(
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("✅ RPC + Explorer server listening on http://{}", addr);
-    
+
     axum::serve(listener, app).await?;
-    
+
     Ok(())
 }
 
@@ -1699,8 +1857,14 @@ async fn handle_rpc(
     State(rpc_impl): State<Arc<AetherRpcImpl>>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl axum::response::IntoResponse {
-    let method = payload.get("method").and_then(|m: &serde_json::Value| m.as_str()).unwrap_or("");
-    let id = payload.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let method = payload
+        .get("method")
+        .and_then(|m: &serde_json::Value| m.as_str())
+        .unwrap_or("");
+    let id = payload
+        .get("id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
 
     // Rate limiting per method
     if let Err(retry_after) = rpc_impl.rate_limiter.check(method.to_string()).await {
@@ -1713,260 +1877,254 @@ async fn handle_rpc(
             "id": id,
         }));
     }
-    
-    let result = match method {
-        "aether_getBalance" => {
-            let addr = payload.get("params").and_then(|p: &serde_json::Value| p.get(0)).and_then(|a: &serde_json::Value| a.as_str());
-            match addr {
-                Some(addr_str) => {
-                    match hex::decode(addr_str) {
-                        Ok(bytes) => {
-                            match bytes.try_into() {
-                                Ok(addr) => {
-                                    match rpc_impl.get_balance(addr).await {
-                                        Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
-                                        Err(e) => Err(e),
-                                    }
-                                }
-                                Err(_) => Err(RpcError("Invalid address".to_string())),
-                            }
-                        }
+
+    let result =
+        match method {
+            "aether_getBalance" => {
+                let addr = payload
+                    .get("params")
+                    .and_then(|p: &serde_json::Value| p.get(0))
+                    .and_then(|a: &serde_json::Value| a.as_str());
+                match addr {
+                    Some(addr_str) => match hex::decode(addr_str) {
+                        Ok(bytes) => match bytes.try_into() {
+                            Ok(addr) => match rpc_impl.get_balance(addr).await {
+                                Ok(response) => serde_json::to_value(response)
+                                    .map_err(|e| RpcError(e.to_string())),
+                                Err(e) => Err(e),
+                            },
+                            Err(_) => Err(RpcError("Invalid address".to_string())),
+                        },
                         Err(_) => Err(RpcError("Invalid hex address".to_string())),
-                    }
+                    },
+                    None => Err(RpcError("Missing address parameter".to_string())),
                 }
-                None => Err(RpcError("Missing address parameter".to_string())),
             }
-        }
-        "aether_sendTransaction" => {
-            let params = payload.get("params").cloned().unwrap_or(serde_json::Value::Array(vec![]));
-            match rpc_impl.send_transaction(params).await {
+            "aether_sendTransaction" => {
+                let params = payload
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Array(vec![]));
+                match rpc_impl.send_transaction(params).await {
+                    Ok(response) => {
+                        serde_json::to_value(response).map_err(|e| RpcError(e.to_string()))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            "aether_getDagStats" => match rpc_impl.get_dag_stats().await {
                 Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
                 Err(e) => Err(e),
-            }
-        }
-        "aether_getDagStats" => {
-            match rpc_impl.get_dag_stats().await {
+            },
+            "aether_getNetworkHashrate" => match rpc_impl.get_network_hashrate().await {
                 Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
                 Err(e) => Err(e),
-            }
-        }
-        "aether_getNetworkHashrate" => {
-            match rpc_impl.get_network_hashrate().await {
-                Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
-                Err(e) => Err(e),
-            }
-        }
-        "aether_getTransactionStatus" => {
-            let hash = payload.get("params").and_then(|p: &serde_json::Value| p.get(0)).and_then(|h: &serde_json::Value| h.as_str());
-            match hash {
-                Some(hash_str) => {
-                    match hex::decode(hash_str) {
-                        Ok(bytes) => {
-                            match bytes.try_into() {
-                                Ok(hash) => {
-                                    match rpc_impl.get_transaction_status(hash).await {
-                                        Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
-                                        Err(e) => Err(e),
-                                    }
-                                }
-                                Err(_) => Err(RpcError("Invalid hash".to_string())),
-                            }
-                        }
+            },
+            "aether_getTransactionStatus" => {
+                let hash = payload
+                    .get("params")
+                    .and_then(|p: &serde_json::Value| p.get(0))
+                    .and_then(|h: &serde_json::Value| h.as_str());
+                match hash {
+                    Some(hash_str) => match hex::decode(hash_str) {
+                        Ok(bytes) => match bytes.try_into() {
+                            Ok(hash) => match rpc_impl.get_transaction_status(hash).await {
+                                Ok(response) => serde_json::to_value(response)
+                                    .map_err(|e| RpcError(e.to_string())),
+                                Err(e) => Err(e),
+                            },
+                            Err(_) => Err(RpcError("Invalid hash".to_string())),
+                        },
                         Err(_) => Err(RpcError("Invalid hex hash".to_string())),
-                    }
+                    },
+                    None => Err(RpcError("Missing hash parameter".to_string())),
                 }
-                None => Err(RpcError("Missing hash parameter".to_string())),
             }
-        }
-        "aether_getRecentTransactions" => {
-            let limit = payload.get("params").and_then(|p: &serde_json::Value| p.get(0)).and_then(|l: &serde_json::Value| l.as_u64()).unwrap_or(10);
-            match rpc_impl.get_recent_transactions(limit).await {
+            "aether_getRecentTransactions" => {
+                let limit = payload
+                    .get("params")
+                    .and_then(|p: &serde_json::Value| p.get(0))
+                    .and_then(|l: &serde_json::Value| l.as_u64())
+                    .unwrap_or(10);
+                match rpc_impl.get_recent_transactions(limit).await {
+                    Ok(response) => {
+                        serde_json::to_value(response).map_err(|e| RpcError(e.to_string()))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            "aether_getTransactionHistory" => {
+                let address = payload
+                    .get("params")
+                    .and_then(|p: &serde_json::Value| p.get(0))
+                    .and_then(|a: &serde_json::Value| a.as_str());
+                match address {
+                    Some(addr_str) => {
+                        match rpc_impl.get_transaction_history(addr_str.to_string()).await {
+                            Ok(response) => {
+                                serde_json::to_value(response).map_err(|e| RpcError(e.to_string()))
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    None => Err(RpcError("Missing address parameter".to_string())),
+                }
+            }
+            "aether_getDagGraph" => match rpc_impl.get_dag_graph().await {
                 Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
                 Err(e) => Err(e),
-            }
-        }
-        "aether_getTransactionHistory" => {
-            let address = payload.get("params").and_then(|p: &serde_json::Value| p.get(0)).and_then(|a: &serde_json::Value| a.as_str());
-            match address {
-                Some(addr_str) => {
-                    match rpc_impl.get_transaction_history(addr_str.to_string()).await {
-                        Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
-                        Err(e) => Err(e),
-                    }
-                }
-                None => Err(RpcError("Missing address parameter".to_string())),
-            }
-        }
-        "aether_getDagGraph" => {
-            match rpc_impl.get_dag_graph().await {
-                Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
-                Err(e) => Err(e),
-            }
-        }
-        "aether_stakeTokens" => {
-            tracing::info!("🔒 Received aether_stakeTokens RPC call");
-            let addr = payload.get("params").and_then(|p: &serde_json::Value| p.get(0)).and_then(|a: &serde_json::Value| a.as_str());
-            let amount = payload.get("params").and_then(|p: &serde_json::Value| p.get(1)).and_then(|a: &serde_json::Value| a.as_u64());
-            tracing::info!("🔒 Parsed params: addr={:?}, amount={:?}", addr, amount);
-            match (addr, amount) {
-                (Some(addr_str), Some(amt)) => {
-                    match hex::decode(addr_str) {
-                        Ok(bytes) => {
-                            match bytes.try_into() {
-                                Ok(addr) => {
-                                    tracing::info!("🔒 Calling stake_tokens implementation");
-                                    match rpc_impl.stake_tokens(&addr, amt).await {
-                                        Ok(response) => {
-                                            tracing::info!("🔒 stake_tokens returned: {:?}", response);
-                                            serde_json::to_value(response).map_err(|e| RpcError(e.to_string()))
-                                        },
-                                        Err(e) => {
-                                            tracing::error!("🔒 stake_tokens error: {:?}", e);
-                                            Err(e)
-                                        },
+            },
+            "aether_stakeTokens" => {
+                tracing::info!("🔒 Received aether_stakeTokens RPC call");
+                let addr = payload
+                    .get("params")
+                    .and_then(|p: &serde_json::Value| p.get(0))
+                    .and_then(|a: &serde_json::Value| a.as_str());
+                let amount = payload
+                    .get("params")
+                    .and_then(|p: &serde_json::Value| p.get(1))
+                    .and_then(|a: &serde_json::Value| a.as_u64());
+                tracing::info!("🔒 Parsed params: addr={:?}, amount={:?}", addr, amount);
+                match (addr, amount) {
+                    (Some(addr_str), Some(amt)) => match hex::decode(addr_str) {
+                        Ok(bytes) => match bytes.try_into() {
+                            Ok(addr) => {
+                                tracing::info!("🔒 Calling stake_tokens implementation");
+                                match rpc_impl.stake_tokens(&addr, amt).await {
+                                    Ok(response) => {
+                                        tracing::info!("🔒 stake_tokens returned: {:?}", response);
+                                        serde_json::to_value(response)
+                                            .map_err(|e| RpcError(e.to_string()))
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("🔒 stake_tokens error: {:?}", e);
+                                        Err(e)
                                     }
                                 }
-                                Err(_) => {
-                                    tracing::error!("🔒 Invalid address conversion");
-                                    Err(RpcError("Invalid address".to_string()))
-                                },
                             }
-                        }
+                            Err(_) => {
+                                tracing::error!("🔒 Invalid address conversion");
+                                Err(RpcError("Invalid address".to_string()))
+                            }
+                        },
                         Err(_) => {
                             tracing::error!("🔒 Invalid hex address");
                             Err(RpcError("Invalid hex address".to_string()))
+                        }
+                    },
+                    _ => {
+                        tracing::error!("🔒 Missing address or amount parameter");
+                        Err(RpcError("Missing address or amount parameter".to_string()))
+                    }
+                }
+            }
+            "aether_unstakeTokens" => {
+                let addr = payload
+                    .get("params")
+                    .and_then(|p: &serde_json::Value| p.get(0))
+                    .and_then(|a: &serde_json::Value| a.as_str());
+                match addr {
+                    Some(addr_str) => match hex::decode(addr_str) {
+                        Ok(bytes) => match bytes.try_into() {
+                            Ok(addr) => match rpc_impl.unstake_tokens(&addr).await {
+                                Ok(response) => serde_json::to_value(response)
+                                    .map_err(|e| RpcError(e.to_string())),
+                                Err(e) => Err(e),
+                            },
+                            Err(_) => Err(RpcError("Invalid address".to_string())),
                         },
-                    }
-                }
-                _ => {
-                    tracing::error!("🔒 Missing address or amount parameter");
-                    Err(RpcError("Missing address or amount parameter".to_string()))
-                },
-            }
-        }
-        "aether_unstakeTokens" => {
-            let addr = payload.get("params").and_then(|p: &serde_json::Value| p.get(0)).and_then(|a: &serde_json::Value| a.as_str());
-            match addr {
-                Some(addr_str) => {
-                    match hex::decode(addr_str) {
-                        Ok(bytes) => {
-                            match bytes.try_into() {
-                                Ok(addr) => {
-                                    match rpc_impl.unstake_tokens(&addr).await {
-                                        Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
-                                        Err(e) => Err(e),
-                                    }
-                                }
-                                Err(_) => Err(RpcError("Invalid address".to_string())),
-                            }
-                        }
                         Err(_) => Err(RpcError("Invalid hex address".to_string())),
-                    }
+                    },
+                    None => Err(RpcError("Missing address parameter".to_string())),
                 }
-                None => Err(RpcError("Missing address parameter".to_string())),
             }
-        }
-        "aether_getStakingInfo" => {
-            let addr = payload.get("params").and_then(|p: &serde_json::Value| p.get(0)).and_then(|a: &serde_json::Value| a.as_str());
-            match addr {
-                Some(addr_str) => {
-                    match hex::decode(addr_str) {
-                        Ok(bytes) => {
-                            match bytes.try_into() {
-                                Ok(addr) => {
-                                    match rpc_impl.get_staking_info(&addr).await {
-                                        Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
-                                        Err(e) => Err(e),
-                                    }
-                                }
-                                Err(_) => Err(RpcError("Invalid address".to_string())),
-                            }
-                        }
+            "aether_getStakingInfo" => {
+                let addr = payload
+                    .get("params")
+                    .and_then(|p: &serde_json::Value| p.get(0))
+                    .and_then(|a: &serde_json::Value| a.as_str());
+                match addr {
+                    Some(addr_str) => match hex::decode(addr_str) {
+                        Ok(bytes) => match bytes.try_into() {
+                            Ok(addr) => match rpc_impl.get_staking_info(&addr).await {
+                                Ok(response) => serde_json::to_value(response)
+                                    .map_err(|e| RpcError(e.to_string())),
+                                Err(e) => Err(e),
+                            },
+                            Err(_) => Err(RpcError("Invalid address".to_string())),
+                        },
                         Err(_) => Err(RpcError("Invalid hex address".to_string())),
-                    }
+                    },
+                    None => Err(RpcError("Missing address parameter".to_string())),
                 }
-                None => Err(RpcError("Missing address parameter".to_string())),
             }
-        }
-        "aether_getAccountNonce" => {
-            let addr = payload.get("params").and_then(|p: &serde_json::Value| p.get(0)).and_then(|a: &serde_json::Value| a.as_str());
-            match addr {
-                Some(addr_str) => {
-                    match hex::decode(addr_str) {
-                        Ok(bytes) => {
-                            match bytes.try_into() {
-                                Ok(addr) => {
-                                    match rpc_impl.get_account_nonce(&addr).await {
-                                        Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
-                                        Err(e) => Err(e),
-                                    }
-                                }
-                                Err(_) => Err(RpcError("Invalid address".to_string())),
-                            }
-                        }
+            "aether_getAccountNonce" => {
+                let addr = payload
+                    .get("params")
+                    .and_then(|p: &serde_json::Value| p.get(0))
+                    .and_then(|a: &serde_json::Value| a.as_str());
+                match addr {
+                    Some(addr_str) => match hex::decode(addr_str) {
+                        Ok(bytes) => match bytes.try_into() {
+                            Ok(addr) => match rpc_impl.get_account_nonce(&addr).await {
+                                Ok(response) => serde_json::to_value(response)
+                                    .map_err(|e| RpcError(e.to_string())),
+                                Err(e) => Err(e),
+                            },
+                            Err(_) => Err(RpcError("Invalid address".to_string())),
+                        },
                         Err(_) => Err(RpcError("Invalid hex address".to_string())),
-                    }
+                    },
+                    None => Err(RpcError("Missing address parameter".to_string())),
                 }
-                None => Err(RpcError("Missing address parameter".to_string())),
             }
-        }
-        "aether_getTips" => {
-            match rpc_impl.get_tips().await {
+            "aether_getTips" => match rpc_impl.get_tips().await {
                 Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
                 Err(e) => Err(e),
-            }
-        }
-        "aether_getDagSnapshot" => {
-            match rpc_impl.get_dag_snapshot().await {
+            },
+            "aether_getDagSnapshot" => match rpc_impl.get_dag_snapshot().await {
                 Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
                 Err(e) => Err(e),
-            }
-        }
-        "aether_getMiningStatus" => {
-            match rpc_impl.get_mining_status().await {
+            },
+            "aether_getMiningStatus" => match rpc_impl.get_mining_status().await {
                 Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
                 Err(e) => Err(e),
-            }
-        }
-        "aether_startMining" => {
-            match rpc_impl.start_mining().await {
+            },
+            "aether_startMining" => match rpc_impl.start_mining().await {
                 Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
                 Err(e) => Err(e),
-            }
-        }
-        "aether_stopMining" => {
-            match rpc_impl.stop_mining().await {
+            },
+            "aether_stopMining" => match rpc_impl.stop_mining().await {
                 Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
                 Err(e) => Err(e),
-            }
-        }
-        "aether_faucet" => {
-            match payload.get("params").and_then(|p: &serde_json::Value| p.get(0)) {
-                Some(address_str) => {
-                    match hex::decode(address_str.as_str().unwrap_or("")) {
+            },
+            "aether_faucet" => {
+                match payload
+                    .get("params")
+                    .and_then(|p: &serde_json::Value| p.get(0))
+                {
+                    Some(address_str) => match hex::decode(address_str.as_str().unwrap_or("")) {
                         Ok(bytes) if bytes.len() == 32 => {
                             let mut address = [0u8; 32];
                             address.copy_from_slice(&bytes);
                             match rpc_impl.faucet(address).await {
-                                Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
+                                Ok(response) => serde_json::to_value(response)
+                                    .map_err(|e| RpcError(e.to_string())),
                                 Err(e) => Err(e),
                             }
                         }
                         _ => Err(RpcError("Invalid address format".to_string())),
-                    }
+                    },
+                    None => Err(RpcError("Missing address parameter".to_string())),
                 }
-                None => Err(RpcError("Missing address parameter".to_string())),
             }
-        }
-        "aether_createAccount" => {
-            match rpc_impl.create_account().await {
+            "aether_createAccount" => match rpc_impl.create_account().await {
                 Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
                 Err(e) => Err(e),
-            }
-        }
-        _ => Err(RpcError(format!("Method not found: {}", method))),
-    };
-    
+            },
+            _ => Err(RpcError(format!("Method not found: {}", method))),
+        };
+
     match result {
         Ok(response) => Json(serde_json::json!({
             "jsonrpc": "2.0",
@@ -1985,21 +2143,29 @@ async fn handle_rpc(
 }
 
 /// Handle explorer GET request
-async fn handle_explorer(
-    State(state): State<Arc<AetherRpcImpl>>,
-) -> Html<String> {
+async fn handle_explorer(State(state): State<Arc<AetherRpcImpl>>) -> Html<String> {
     // Fetch live stats
     let stats = state.get_dag_stats().await.unwrap_or(DagStatsResponse {
-        current_tps: 0.0, total_transactions: 0, tip_count: 0, epoch: 0, connected_peers: 0,
+        current_tps: 0.0,
+        total_transactions: 0,
+        tip_count: 0,
+        epoch: 0,
+        connected_peers: 0,
     });
-    let recent_txs = state.get_recent_transactions(10).await.unwrap_or_else(|_|
-        RecentTransactionsResponse { transactions: vec![], total_count: 0 }
-    );
+    let recent_txs =
+        state
+            .get_recent_transactions(10)
+            .await
+            .unwrap_or_else(|_| RecentTransactionsResponse {
+                transactions: vec![],
+                total_count: 0,
+            });
 
     let stats_json = serde_json::to_string(&stats).unwrap_or_default();
     let txs_json = serde_json::to_string(&recent_txs.transactions).unwrap_or_default();
 
-    Html(format!(r#"<!DOCTYPE html>
+    Html(format!(
+        r#"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -2181,16 +2347,16 @@ setInterval(async () => {{
 }}, 5000);
 </script>
 </body>
-</html>"#, 
-total = stats.total_transactions,
-tips = stats.tip_count,
-tps = format!("{:.2}", stats.current_tps),
-epoch = stats.epoch,
-peers = stats.connected_peers,
-tx_rows = if recent_txs.transactions.is_empty() {
-    r#"<tr><td colspan="6" style="text-align:center;color:#8b949e;padding:1rem;">No transactions yet</td></tr>"#.to_string()
-} else {
-    recent_txs.transactions.iter().map(|tx| {
+</html>"#,
+        total = stats.total_transactions,
+        tips = stats.tip_count,
+        tps = format!("{:.2}", stats.current_tps),
+        epoch = stats.epoch,
+        peers = stats.connected_peers,
+        tx_rows = if recent_txs.transactions.is_empty() {
+            r#"<tr><td colspan="6" style="text-align:center;color:#8b949e;padding:1rem;">No transactions yet</td></tr>"#.to_string()
+        } else {
+            recent_txs.transactions.iter().map(|tx| {
         let hash = hex::encode(&tx.tx_id);
         let sender = hex::encode(&tx.sender);
         let receiver = hex::encode(&tx.receiver);
@@ -2198,17 +2364,15 @@ tx_rows = if recent_txs.transactions.is_empty() {
         format!(r#"<tr><td class="hash">{:.16}...</td><td class="addr">{:.16}...</td><td class="addr">{:.16}...</td><td>{}</td><td>{}</td><td><span class="status confirmed">Confirmed</span></td></tr>"#,
             hash, sender, receiver, amount, tx.fee)
     }).collect::<Vec<_>>().join("\n")
-},
-stats_json = stats_json,
-txs_json = txs_json,
-dag_count = stats.total_transactions.min(50),
-))
+        },
+        stats_json = stats_json,
+        txs_json = txs_json,
+        dag_count = stats.total_transactions.min(50),
+    ))
 }
 
 /// Prometheus metrics endpoint
-async fn handle_metrics(
-    State(state): State<Arc<AetherRpcImpl>>,
-) -> String {
+async fn handle_metrics(State(state): State<Arc<AetherRpcImpl>>) -> String {
     let uptime = state.start_time.elapsed().as_secs();
     let dag = state.dag.read().await;
     let tx_count = dag.transaction_count();
@@ -2248,9 +2412,11 @@ async fn handle_metrics(
 
 /// Handle fallback - redirect to explorer
 async fn handle_fallback() -> Html<&'static str> {
-    Html(r#"<!DOCTYPE html>
+    Html(
+        r#"<!DOCTYPE html>
 <html>
 <head><meta http-equiv="refresh" content="0;url=/explorer"></head>
 <body>Redirecting to explorer...</body>
-</html>"#)
+</html>"#,
+    )
 }

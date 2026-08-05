@@ -4,10 +4,10 @@
 //! Uses IOTA-style tip selection with cumulative weight calculation.
 
 use crate::transaction::{Transaction, TransactionId};
+use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use rand::Rng;
 
 /// Represents a set of tip transactions (transactions with no children)
 #[derive(Debug, Clone)]
@@ -22,27 +22,27 @@ impl TipSet {
             tips: HashMap::new(),
         }
     }
-    
+
     /// Add a transaction to the tip set
     pub fn add(&mut self, tx: Transaction) {
         self.tips.insert(tx.id, tx);
     }
-    
+
     /// Remove a transaction from the tip set
     pub fn remove(&mut self, id: &TransactionId) {
         self.tips.remove(id);
     }
-    
+
     /// Get all tips
     pub fn get_tips(&self) -> Vec<&Transaction> {
         self.tips.values().collect()
     }
-    
+
     /// Get the number of tips
     pub fn len(&self) -> usize {
         self.tips.len()
     }
-    
+
     /// Check if tip set is empty
     pub fn is_empty(&self) -> bool {
         self.tips.is_empty()
@@ -107,16 +107,16 @@ impl Default for CumulativeWeightCache {
 pub struct ParentSelectionAlgorithm {
     /// Maximum age of a tip to be considered (in milliseconds)
     max_tip_age_ms: u64,
-    
+
     /// Minimum weight threshold for selection
     min_weight: f64,
-    
+
     /// Diversity factor (0.0 to 1.0) - higher means more diverse parents
     diversity_factor: f64,
-    
+
     /// Cumulative weight cache
     weight_cache: CumulativeWeightCache,
-    
+
     /// Random walk depth (how many steps to walk before selecting)
     walk_depth: usize,
 }
@@ -132,7 +132,7 @@ impl ParentSelectionAlgorithm {
             walk_depth: 10, // Default walk depth
         }
     }
-    
+
     /// Create with default parameters
     pub fn default() -> Self {
         Self {
@@ -143,7 +143,7 @@ impl ParentSelectionAlgorithm {
             walk_depth: 10,
         }
     }
-    
+
     /// Calculate cumulative weight of a transaction (with caching)
     /// Cumulative weight = number of transactions that reference this transaction directly or indirectly
     fn calculate_cumulative_weight(&self, id: TransactionId, dag: &DAG) -> u64 {
@@ -223,7 +223,12 @@ impl ParentSelectionAlgorithm {
 
     /// Check if two tips are in conflict (double spend)
     /// Returns true if they conflict
-    fn check_double_spend_conflict(&self, tip1: TransactionId, tip2: TransactionId, dag: &DAG) -> bool {
+    fn check_double_spend_conflict(
+        &self,
+        tip1: TransactionId,
+        tip2: TransactionId,
+        dag: &DAG,
+    ) -> bool {
         // Get transactions
         let tx1 = match dag.get_transaction(tip1) {
             Some(tx) => tx,
@@ -335,7 +340,7 @@ impl ParentSelectionAlgorithm {
 pub enum ParentSelectionError {
     #[error("No valid tips available")]
     NoValidTips,
-    
+
     #[error("DAG is empty")]
     DagEmpty,
 }
@@ -372,7 +377,9 @@ impl DAG {
     /// Check if a sender has a transaction with a specific nonce in the DAG
     /// Returns true if the sender already has a transaction with this nonce
     pub fn has_transaction_with_nonce(&self, sender: &[u8; 32], nonce: u64) -> bool {
-        self.transactions.values().any(|tx| &tx.sender == sender && tx.account_nonce == nonce)
+        self.transactions
+            .values()
+            .any(|tx| &tx.sender == sender && tx.account_nonce == nonce)
     }
 
     /// Check if a sender has a conflicting transaction (same nonce or overlapping spend)
@@ -383,7 +390,7 @@ impl DAG {
         // Check for same nonce (strict conflict)
         self.has_transaction_with_nonce(sender, nonce)
     }
-    
+
     /// Add a transaction to the DAG (REMOVED for zero-trust security)
     /// 🔒 ZERO TRUST: This method is REMOVED. Use add_transaction_validated ONLY.
     /// Economic policy: All transactions MUST be validated before insertion
@@ -418,42 +425,47 @@ impl DAG {
 
         // Check for sender conflict
         if self.has_sender_conflict(&tx.sender, tx.account_nonce) {
-            return Err("Sender conflict: only one pending transaction per sender allowed".to_string());
+            return Err(
+                "Sender conflict: only one pending transaction per sender allowed".to_string(),
+            );
         }
 
         // All validations passed - add transaction
         // If transaction has no parents (except genesis), automatically assign tips as parents
-        let tx_parents = if tx.parents.is_empty() || tx.parents.iter().all(|p| p.iter().all(|&b| b == 0)) {
-            let tips_vec: Vec<TransactionId> = self.tips.iter().cloned().collect();
+        let tx_parents =
+            if tx.parents.is_empty() || tx.parents.iter().all(|p| p.iter().all(|&b| b == 0)) {
+                let tips_vec: Vec<TransactionId> = self.tips.iter().cloned().collect();
 
-            if tips_vec.is_empty() {
-                [TransactionId::default(), TransactionId::default()]
-            } else {
-                use rand::seq::SliceRandom;
-                let mut rng = rand::thread_rng();
-                let selected: Vec<TransactionId> = tips_vec.choose_multiple(&mut rng, 2.min(tips_vec.len()))
-                    .into_iter()
-                    .cloned()
-                    .collect();
+                if tips_vec.is_empty() {
+                    [TransactionId::default(), TransactionId::default()]
+                } else {
+                    use rand::seq::SliceRandom;
+                    let mut rng = rand::thread_rng();
+                    let selected: Vec<TransactionId> = tips_vec
+                        .choose_multiple(&mut rng, 2.min(tips_vec.len()))
+                        .into_iter()
+                        .cloned()
+                        .collect();
 
-                let mut arr = [TransactionId::default(); 2];
-                for (i, tip) in selected.iter().enumerate() {
-                    if i < 2 {
-                        arr[i] = *tip;
+                    let mut arr = [TransactionId::default(); 2];
+                    for (i, tip) in selected.iter().enumerate() {
+                        if i < 2 {
+                            arr[i] = *tip;
+                        }
                     }
+                    arr
                 }
-                arr
-            }
-        } else {
-            tx.parents
-        };
+            } else {
+                tx.parents
+            };
 
         let tx_with_parents = Transaction {
             parents: tx_parents,
             ..tx
         };
 
-        self.transactions.insert(tx_with_parents.id, tx_with_parents.clone());
+        self.transactions
+            .insert(tx_with_parents.id, tx_with_parents.clone());
 
         for parent in &tx_with_parents.parents {
             if parent.iter().all(|&b| b == 0) {
@@ -481,10 +493,10 @@ impl DAG {
             hex::encode(tx_with_parents.id),
             self.tips.len()
         );
-        
+
         Ok(())
     }
-    
+
     /// Get a transaction by ID
     pub fn get_transaction(&self, id: TransactionId) -> Option<&Transaction> {
         self.transactions.get(&id)
@@ -521,12 +533,12 @@ impl DAG {
     pub fn get_ancestors(&self, id: TransactionId, max_depth: usize) -> HashSet<TransactionId> {
         let mut ancestors = HashSet::new();
         let mut queue = vec![(id, 0)];
-        
+
         while let Some((tx_id, depth)) = queue.pop() {
             if depth >= max_depth {
                 continue;
             }
-            
+
             if let Some(tx) = self.transactions.get(&tx_id) {
                 for parent in &tx.parents {
                     if ancestors.insert(*parent) {
@@ -535,10 +547,10 @@ impl DAG {
                 }
             }
         }
-        
+
         ancestors
     }
-    
+
     /// Check if a transaction is reachable from another (for cycle detection)
     pub fn is_reachable_from(&self, from: TransactionId, to: TransactionId) -> bool {
         let mut visited = HashSet::new();
@@ -595,7 +607,8 @@ impl DAG {
         // Randomly select up to 'count' tips
         use rand::seq::SliceRandom;
         let mut rng = rand::thread_rng();
-        tips_vec.choose_multiple(&mut rng, count)
+        tips_vec
+            .choose_multiple(&mut rng, count)
             .into_iter()
             .cloned()
             .collect()
@@ -606,7 +619,7 @@ impl DAG {
     pub fn get_tips_with_selector(&self) -> Vec<TransactionId> {
         let selector = ParentSelectionAlgorithm::default();
         let _tip_set = TipSet::new();
-        
+
         // Build tip set from current tips
         let mut tips = TipSet::new();
         for tip_id in &self.tips {
@@ -614,7 +627,7 @@ impl DAG {
                 tips.add(tx.clone());
             }
         }
-        
+
         // Select two parents using the new algorithm
         match selector.select_parents(&tips, self) {
             Ok(parents) => {
@@ -636,7 +649,11 @@ impl DAG {
                 self.tips.insert(*tx_id);
             }
         }
-        tracing::info!("Rebuilt tips: {} tips from {} transactions", self.tips.len(), self.transactions.len());
+        tracing::info!(
+            "Rebuilt tips: {} tips from {} transactions",
+            self.tips.len(),
+            self.transactions.len()
+        );
     }
 }
 
@@ -675,10 +692,10 @@ mod tests {
             vec![0u8; 64],
             vec![0u8; 32],
         );
-        
+
         tip_set.add(tx.clone());
         assert_eq!(tip_set.len(), 1);
-        
+
         tip_set.remove(&tx.id);
         assert!(tip_set.is_empty());
     }
@@ -696,7 +713,7 @@ mod tests {
         let algo = ParentSelectionAlgorithm::default();
         let tip_set = TipSet::new();
         let dag = DAG::new();
-        
+
         let result = algo.select_parents(&tip_set, &dag);
         assert!(result.is_ok());
         let parents = result.expect("Parent selection should succeed");
@@ -708,9 +725,9 @@ mod tests {
         let algo = ParentSelectionAlgorithm::default();
         let mut tip_set = TipSet::new();
         let mut dag = DAG::new();
-        
+
         let now = current_timestamp_ms();
-        
+
         // Create two tip transactions
         let mut tx1 = Transaction::new(
             [[0u8; 32]; 2],
@@ -725,7 +742,7 @@ mod tests {
             vec![0u8; 32],
         );
         tx1.weight = 10.0;
-        
+
         let mut tx2 = Transaction::new(
             [[0u8; 32]; 2],
             [3u8; 32],
@@ -739,16 +756,16 @@ mod tests {
             vec![0u8; 32],
         );
         tx2.weight = 5.0;
-        
+
         tip_set.add(tx1.clone());
         tip_set.add(tx2.clone());
-        
+
         // Add transaction to DAG (using validated method)
         dag.add_transaction_validated(tx1.clone()).unwrap();
-        
+
         let result = algo.select_parents(&tip_set, &dag);
         assert!(result.is_ok());
-        
+
         let parents = result.expect("Parent selection should succeed");
         // Should select a tip (tx1 or tx2) as first parent
         assert!(parents[0] == tx1.id || parents[0] == tx2.id);
@@ -759,9 +776,9 @@ mod tests {
         let algo = ParentSelectionAlgorithm::new(60_000, 0.0, 0.5);
         let mut tip_set = TipSet::new();
         let dag = DAG::new();
-        
+
         let old_time = current_timestamp_ms() - 120_000; // 2 minutes ago
-        
+
         let tx = Transaction::new(
             [[0u8; 32]; 2],
             [1u8; 32],
@@ -774,9 +791,9 @@ mod tests {
             vec![0u8; 64],
             vec![0u8; 32],
         );
-        
+
         tip_set.add(tx);
-        
+
         let result = algo.select_parents(&tip_set, &dag);
         assert!(matches!(result, Err(ParentSelectionError::NoValidTips)));
     }
@@ -796,9 +813,9 @@ mod tests {
             vec![0u8; 64],
             vec![0u8; 32],
         );
-        
+
         dag.add_transaction_validated(tx.clone()).unwrap();
-        
+
         assert!(dag.get_transaction(tx.id).is_some());
     }
 
@@ -845,7 +862,7 @@ mod tests {
     #[test]
     fn test_dag_reachability() {
         let mut dag = DAG::new();
-        
+
         let parent = Transaction::new(
             [[0u8; 32], [0u8; 32]],
             [1u8; 32],
@@ -858,7 +875,7 @@ mod tests {
             vec![0u8; 64],
             vec![0u8; 32],
         );
-        
+
         let child = Transaction::new(
             [parent.id, [0u8; 32]],
             [3u8; 32],
@@ -871,10 +888,10 @@ mod tests {
             vec![0u8; 64],
             vec![0u8; 32],
         );
-        
+
         dag.add_transaction_validated(parent.clone()).unwrap();
         dag.add_transaction_validated(child.clone()).unwrap();
-        
+
         assert!(dag.is_reachable_from(child.id, parent.id));
         assert!(!dag.is_reachable_from(parent.id, child.id));
     }

@@ -4,8 +4,8 @@ use crate::{
     genesis::{initialize_genesis, GenesisConfig, GENESIS_MESSAGE},
     json_storage::{ensure_data_dir, load_dag_from_json, save_dag_to_json},
     ledger::Ledger,
-    parent_selection::DAG,
     p2p::{P2PConfig, P2PNetwork},
+    parent_selection::DAG,
     pow::{DifficultyAdjuster, MicroPoW},
     rpc::{start_rpc_server, AetherRpcImpl, Mempool},
     storage::Storage,
@@ -138,20 +138,41 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     for (addr, balance) in &genesis_config.initial_balances {
         let addr_hex = hex::encode(addr);
         let current_balance = ledger.get_balance_hex(&addr_hex);
-        tracing::info!("🔍 Genesis check: {} -> current balance: {}", addr_hex, current_balance);
-        tracing::info!("🔍 Genesis config balance for {}: {} (raw)", addr_hex, balance);
+        tracing::info!(
+            "🔍 Genesis check: {} -> current balance: {}",
+            addr_hex,
+            current_balance
+        );
+        tracing::info!(
+            "🔍 Genesis config balance for {}: {} (raw)",
+            addr_hex,
+            balance
+        );
         if current_balance == 0 {
             ledger.set_balance(addr, *balance);
             initialized_count += 1;
-            tracing::info!("🌱 Genesis balance set for {}: {} AETH", addr_hex, *balance / 10_000_000_000);
+            tracing::info!(
+                "🌱 Genesis balance set for {}: {} AETH",
+                addr_hex,
+                *balance / 10_000_000_000
+            );
         }
     }
     if initialized_count > 0 {
-        tracing::info!("{}", format!("🌱 Genesis initialized: {} addresses with message: {}", initialized_count, GENESIS_MESSAGE).cyan());
+        tracing::info!(
+            "{}",
+            format!(
+                "🌱 Genesis initialized: {} addresses with message: {}",
+                initialized_count, GENESIS_MESSAGE
+            )
+            .cyan()
+        );
         let storage_read = storage.read().await;
         for (addr_hex, balance) in &ledger.balances {
             let addr_bytes = hex::decode(addr_hex)?;
-            let address: Address = addr_bytes.as_slice().try_into()
+            let address: Address = addr_bytes
+                .as_slice()
+                .try_into()
                 .map_err(|e| format!("Invalid address length: {}", e))?;
             storage_read.put_balance(address, *balance)?;
         }
@@ -197,7 +218,10 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
         if all_txs.is_empty() && dag_store_path.exists() {
             tracing::info!("📂 Sled empty, loading DAG state from JSON (legacy)...");
             let store = load_dag_from_json(&dag_store_path).await?;
-            tracing::info!("  Loaded {} transactions from dag.json", store.transactions.len());
+            tracing::info!(
+                "  Loaded {} transactions from dag.json",
+                store.transactions.len()
+            );
             for stored_tx in store.transactions {
                 let signature = if let Some(sig) = stored_tx.signature {
                     hex::decode(&sig).unwrap_or_else(|_| {
@@ -234,11 +258,15 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                 });
 
                 let parent0: [u8; 32] = parent0_bytes.clone().try_into().unwrap_or_else(|_| {
-                    tracing::warn!("Failed to convert parent0 to TransactionId, skipping transaction");
+                    tracing::warn!(
+                        "Failed to convert parent0 to TransactionId, skipping transaction"
+                    );
                     [0u8; 32]
                 });
                 let parent1: [u8; 32] = parent1_bytes.clone().try_into().unwrap_or_else(|_| {
-                    tracing::warn!("Failed to convert parent1 to TransactionId, skipping transaction");
+                    tracing::warn!(
+                        "Failed to convert parent1 to TransactionId, skipping transaction"
+                    );
                     [0u8; 32]
                 });
 
@@ -330,7 +358,9 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
 
         for (addr_hex, balance) in &balances {
             let addr_bytes = hex::decode(addr_hex)?;
-            let address: Address = addr_bytes.as_slice().try_into()
+            let address: Address = addr_bytes
+                .as_slice()
+                .try_into()
                 .map_err(|e| format!("Invalid address length: {}", e))?;
             ledger.set_balance(&address, *balance);
         }
@@ -353,8 +383,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
         )
     };
 
-    let orphans: Arc<RwLock<HashMap<[u8; 32], Transaction>>> =
-        Arc::new(RwLock::new(orphans));
+    let orphans: Arc<RwLock<HashMap<[u8; 32], Transaction>>> = Arc::new(RwLock::new(orphans));
     let missing_parent_hashes: Vec<Vec<u8>> = missing_parent_hashes;
 
     let dag: Arc<RwLock<DAG>> = Arc::new(RwLock::new(dag));
@@ -406,7 +435,10 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                     let _ = mempool_write.add_internal(tx).await;
                 }
             }
-            tracing::info!("💾 Loaded {} persisted mempool transactions", mempool_write.size());
+            tracing::info!(
+                "💾 Loaded {} persisted mempool transactions",
+                mempool_write.size()
+            );
         }
     }
     tracing::info!("✓ Mempool initialized");
@@ -753,7 +785,10 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                         {
                             let mut dag_write = mining_dag.write().await;
                             if let Err(e) = dag_write.add_transaction_validated(tx) {
-                                tracing::warn!("⚠️ Failed to add mempool transaction to DAG: {}", e);
+                                tracing::warn!(
+                                    "⚠️ Failed to add mempool transaction to DAG: {}",
+                                    e
+                                );
                                 continue;
                             }
                         }
