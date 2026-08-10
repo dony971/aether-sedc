@@ -5,8 +5,7 @@
 #define MyAppVersion "1.1.1"
 #define MyAppPublisher "Aether Team"
 #define MyAppURL "https://github.com/dony971/aether-sedc"
-#define MyAppExeName "aether-gui.exe"
-#define MyAppCliName "aether.exe"
+#define MyAppExeName "aether.exe"
 
 [Setup]
 AppId={{B8F4A3D1-9E2C-4A7F-8B6D-1C3E5F7A9B0D}
@@ -25,19 +24,17 @@ Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
-SetupIconFile=..\assets\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
 [Languages]
-Name: "english"; MessagesFile: "compiler:Default.iso"
-Name: "french"; MessagesFile: "compiler:Languages\French.iso"
+Name: "english"; MessagesFile: "compiler:Default.isl"
+Name: "french"; MessagesFile: "compiler:Languages\French.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"; Flags: checkablealone
 
 [Files]
 Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\target\release\{#MyAppCliName}"; DestDir: "{app}"; Flags: ignoreversion
 ; Optional: include additional assets
 ; Source: "..\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 
