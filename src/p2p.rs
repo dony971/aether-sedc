@@ -523,13 +523,21 @@ impl P2PNetwork {
         let (mut reader, mut writer) = socket.into_split();
 
         // Perform encrypted handshake (X25519 key exchange)
-        let key_bytes = match Self::handshake(&mut reader, &mut writer).await {
+        let key_bytes = match Self::handshake(&mut reader, &mut writer)
+            .await
+            .map_err(|e| e.to_string())
+        {
             Ok(k) => {
                 info!("🔐 P2P encrypted handshake complete with {}", addr);
                 k
             }
-            Err(e) => {
-                warn!("❌ P2P handshake failed with {}: {}", addr, e);
+            Err(msg) => {
+                warn!("❌ P2P handshake failed with {}: {}", addr, msg);
+                {
+                    let mut peers_lock = peers.write().await;
+                    peers_lock.remove(&addr);
+                }
+                known_peers.write().await.remove(&addr);
                 return;
             }
         };
@@ -855,15 +863,22 @@ impl P2PNetwork {
                             // Ignore pong
                         }
                         P2PMessage::Peers(peer_list) => {
-                            let known = known_peers.read().await;
-                            for peer_addr in &peer_list {
-                                if !known.contains(peer_addr)
-                                    && *peer_addr != local_addr
-                                    && !peers.read().await.contains_key(peer_addr)
-                                {
-                                    known_peers.write().await.insert(*peer_addr);
-                                    let _ = peer_discovery_tx.send(*peer_addr);
-                                }
+                            let to_add: Vec<SocketAddr> = {
+                                let known = known_peers.read().await;
+                                let peers_read = peers.read().await;
+                                peer_list
+                                    .iter()
+                                    .filter(|p| {
+                                        !known.contains(p)
+                                            && **p != local_addr
+                                            && !peers_read.contains_key(p)
+                                    })
+                                    .copied()
+                                    .collect()
+                            };
+                            for peer_addr in to_add {
+                                known_peers.write().await.insert(peer_addr);
+                                let _ = peer_discovery_tx.send(peer_addr);
                             }
                         }
                     }

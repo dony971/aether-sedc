@@ -648,6 +648,10 @@ fn run_gui(cfg: NodeConfig) -> eframe::Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
+
     let cli = Cli::parse_from(std::env::args_os());
 
     match &cli.command {
