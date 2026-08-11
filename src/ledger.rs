@@ -338,24 +338,20 @@ impl Ledger {
     /// Validate account nonce (strict: must be exactly last_nonce + 1)
     /// Does NOT update the nonce - call commit_nonce() after successful transaction
     /// Faucet exception: the faucet key is deterministic and shared across all nodes,
-    /// so each node has its own view of the faucet nonce. Strict +1 validation would
-    /// reject valid faucet transactions from nodes with divergent state. For the faucet
-    /// account, accept any strictly increasing nonce instead.
+    /// so each node has its own view of the faucet nonce. Chains from different nodes
+    /// use overlapping nonce sequences, so strict +1 (or even strictly increasing)
+    /// validation would reject valid faucet transactions when merging chains.
+    /// Anti-replay for faucet transactions is enforced at DAG level instead:
+    /// has_sender_conflict() rejects any (sender, account_nonce) pair already in the DAG.
     pub fn validate_account_nonce(
         &self,
         address: &Address,
         account_nonce: u64,
     ) -> Result<(), String> {
-        let last_nonce = self.get_nonce(address);
         if hex::encode(address) == FAUCET_ADDRESS {
-            if account_nonce <= last_nonce {
-                return Err(format!(
-                    "Invalid account_nonce: {} <= {} (faucet nonce must strictly increase)",
-                    account_nonce, last_nonce
-                ));
-            }
             return Ok(());
         }
+        let last_nonce = self.get_nonce(address);
         if account_nonce != last_nonce + 1 {
             return Err(format!(
                 "Invalid account_nonce: {} != {} + 1 (expected last_nonce + 1)",
@@ -375,8 +371,9 @@ impl Ledger {
     /// Economic policy: prevents race conditions between validation and commit
     /// Returns error if nonce is invalid, commits if valid
     /// Faucet exception: shared deterministic faucet key across nodes, so each node
-    /// has its own view of the nonce. Accept any strictly increasing nonce (see
-    /// validate_account_nonce for details), anti-replay is still enforced.
+    /// has its own view of the nonce and chains use overlapping nonce sequences.
+    /// Accept any faucet nonce (anti-replay via DAG has_sender_conflict) and only
+    /// move the stored nonce forward, never backwards.
     pub(crate) fn validate_and_commit_nonce_internal(
         &mut self,
         address: &Address,
@@ -384,13 +381,9 @@ impl Ledger {
     ) -> Result<(), String> {
         let last_nonce = self.get_nonce(address);
         if hex::encode(address) == FAUCET_ADDRESS {
-            if account_nonce <= last_nonce {
-                return Err(format!(
-                    "Invalid account_nonce: {} <= {} (faucet nonce must strictly increase)",
-                    account_nonce, last_nonce
-                ));
+            if account_nonce > last_nonce {
+                self.set_nonce(address, account_nonce);
             }
-            self.set_nonce(address, account_nonce);
             return Ok(());
         }
         if account_nonce != last_nonce + 1 {

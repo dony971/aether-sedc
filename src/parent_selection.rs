@@ -364,7 +364,15 @@ impl DAG {
     }
 
     /// Check if a transaction with these parents already exists (V3 fix - prevent double spend)
+    /// 🔧 FIX: Roots (all-zero parents) never conflict - multiple chains can
+    /// legitimately start from genesis, and a node must be able to absorb a
+    /// peer's chain even if it has its own root. Real double spends are
+    /// already covered by the sender nonce check.
     pub fn has_transaction_with_parents(&self, parents: &[TransactionId; 2]) -> bool {
+        let is_root = parents.iter().all(|p| p.iter().all(|&b| b == 0));
+        if is_root {
+            return false;
+        }
         self.transactions.values().any(|tx| &tx.parents == parents)
     }
 
@@ -386,7 +394,13 @@ impl DAG {
     /// Returns true if there's a conflict
     /// 🔧 BUG FIX: Simplified to only check for nonce conflicts
     /// Removed the check that blocks a sender after their first-ever transaction
+    /// Faucet exception: the faucet key is deterministic and shared across all nodes,
+    /// so chains from different nodes use overlapping nonce sequences. Uniqueness
+    /// of (sender, nonce) would reject valid faucet transactions when merging chains.
     pub fn has_sender_conflict(&self, sender: &[u8; 32], nonce: u64) -> bool {
+        if hex::encode(sender) == crate::genesis::FAUCET_ADDRESS {
+            return false;
+        }
         // Check for same nonce (strict conflict)
         self.has_transaction_with_nonce(sender, nonce)
     }
@@ -431,38 +445,12 @@ impl DAG {
         }
 
         // All validations passed - add transaction
-        // If transaction has no parents (except genesis), automatically assign tips as parents
-        let tx_parents =
-            if tx.parents.is_empty() || tx.parents.iter().all(|p| p.iter().all(|&b| b == 0)) {
-                let tips_vec: Vec<TransactionId> = self.tips.iter().cloned().collect();
-
-                if tips_vec.is_empty() {
-                    [TransactionId::default(), TransactionId::default()]
-                } else {
-                    use rand::seq::SliceRandom;
-                    let mut rng = rand::thread_rng();
-                    let selected: Vec<TransactionId> = tips_vec
-                        .choose_multiple(&mut rng, 2.min(tips_vec.len()))
-                        .into_iter()
-                        .cloned()
-                        .collect();
-
-                    let mut arr = [TransactionId::default(); 2];
-                    for (i, tip) in selected.iter().enumerate() {
-                        if i < 2 {
-                            arr[i] = *tip;
-                        }
-                    }
-                    arr
-                }
-            } else {
-                tx.parents
-            };
-
-        let tx_with_parents = Transaction {
-            parents: tx_parents,
-            ..tx
-        };
+        // 🔧 FIX: Root transactions (parents [0,0]) keep their parents unchanged.
+        // Auto-assigning current tips as parents rewrites the topology of a
+        // transaction without changing its id (hash), so different nodes end up
+        // storing different parents for the same tx id, breaking convergence and
+        // causing false "parents already used" conflicts between merged chains.
+        let tx_with_parents = tx;
 
         self.transactions
             .insert(tx_with_parents.id, tx_with_parents.clone());

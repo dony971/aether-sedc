@@ -1111,6 +1111,49 @@ impl AetherRpcImpl {
             }
         }
 
+        // 🔧 FIX: Re-request missing parents of unresolved orphans via P2P.
+        // Previously parents were only requested once when the orphan was
+        // first received - if that GetData was lost (peer not connected at
+        // that exact moment), the orphan stayed stuck forever. Re-request
+        // every cycle so chains converge.
+        {
+            let missing_parent_hashes: Vec<[u8; 32]> = {
+                let orphans = self.orphans.read().await;
+                let dag = self.dag.read().await;
+                let mut hashes: Vec<[u8; 32]> = Vec::new();
+                for (_tx_id, orphan) in orphans.iter() {
+                    for parent in orphan.parents.iter() {
+                        if *parent != [0u8; 32]
+                            && !dag.transactions().contains_key(parent)
+                            && !hashes.contains(parent)
+                        {
+                            hashes.push(*parent);
+                        }
+                        if hashes.len() >= 32 {
+                            break;
+                        }
+                    }
+                    if hashes.len() >= 32 {
+                        break;
+                    }
+                }
+                hashes
+            };
+
+            if !missing_parent_hashes.is_empty() {
+                for parent_hash in missing_parent_hashes {
+                    tracing::info!(
+                        "📡 Orphan Solver - Re-requesting missing parent via P2P: {}",
+                        hex::encode(&parent_hash[..8])
+                    );
+                    self.p2p_network
+                        .request_transaction(parent_hash.to_vec())
+                        .await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                }
+            }
+        }
+
         // Process resolved orphans
         for (tx_id, orphan) in orphans_to_process {
             tracing::info!(
