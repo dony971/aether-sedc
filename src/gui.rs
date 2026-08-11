@@ -575,12 +575,32 @@ async fn send_transaction_client(
     let signature = wallet.sign_transaction(&signed_tx)?;
     signed_tx.signature = signature.clone();
     let send_resp = client.post(rpc_url).json(&serde_json::json!({"jsonrpc":"2.0","method":"aether_sendTransaction","params":[hex::encode(bincode::serialize(&signed_tx)?)],"id":1})).send().await?;
-    if send_resp.status().is_success() {
-        println!("Transaction sent! Amount: {} to {}", amount, receiver_hex);
+    if let Ok(body) = send_resp.text().await {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(err) = json.get("error") {
+                eprintln!(
+                    "REJECTED by node: {}",
+                    err.get("message").and_then(|m| m.as_str()).unwrap_or(&body)
+                );
+                std::process::exit(1);
+            }
+            if let Some(result) = json.get("result") {
+                if let Some(status) = result.get("status").and_then(|s| s.as_str()) {
+                    if status != "accepted" && status != "in_mempool" {
+                        eprintln!("Not accepted: {} ({})", status, result);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            println!("Transaction sent! Amount: {} to {}", amount, receiver_hex);
+            return Ok(());
+        }
+        eprintln!("Failed: {}", body);
     } else {
-        eprintln!("Failed: {}", send_resp.text().await?);
-        std::process::exit(1);
+        eprintln!("Failed: no response body");
     }
+    std::process::exit(1);
+    #[allow(unreachable_code)]
     Ok(())
 }
 

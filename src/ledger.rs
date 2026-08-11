@@ -295,6 +295,29 @@ impl Ledger {
 
         // Phase 2: Calculate all final values first (no mutations yet)
         let new_from_balance = from_balance - total_deduction;
+        if from_hex == to_hex {
+            // Self-transfer: sender == receiver. Only the fee is burned;
+            // the amount cancels out. Must NOT re-credit the amount
+            // (previous bug: insert order re-added amount, creating money).
+            let (new_burn_balance, new_total_fees_burned) = if fee > 0 {
+                let new_burn = burn_balance
+                    .checked_add(fee)
+                    .ok_or_else(|| format!("Burn address overflow: {} + {}", burn_balance, fee))?;
+                let new_total = self.total_fees_burned.checked_add(fee).ok_or_else(|| {
+                    format!(
+                        "Total fees burned overflow: {} + {}",
+                        self.total_fees_burned, fee
+                    )
+                })?;
+                (new_burn, new_total)
+            } else {
+                (burn_balance, self.total_fees_burned)
+            };
+            self.balances.insert(from_hex, from_balance - fee);
+            self.balances.insert(burn_hex, new_burn_balance);
+            self.total_fees_burned = new_total_fees_burned;
+            return Ok(());
+        }
         let new_to_balance = to_balance
             .checked_add(amount)
             .ok_or_else(|| format!("Receiver balance overflow: {} + {}", to_balance, amount))?;

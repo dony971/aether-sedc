@@ -467,22 +467,40 @@ async fn send_transaction_client(
         }
     };
 
-    if response.status().is_success() {
-        println!("{}", "✓ Transaction sent & signed!".green());
-        println!("  Sender: {}", wallet.address_string().cyan());
-        println!("  Receiver: {}", receiver_hex.cyan());
-        println!("  Amount: {}", amount.to_string().cyan());
-        println!("  Fee: {}", fee.to_string().cyan());
-        println!("  Nonce: {}", nonce.to_string().cyan());
-        println!("  Signature: {}", hex::encode(&signature).cyan());
-    } else {
-        let error_text = response.text().await?;
+    // Parse RPC response (errors are returned as HTTP 200 with a JSON "error" field)
+    let body = response.text().await?;
+    let json: serde_json::Value = serde_json::from_str(&body)?;
+    if let Some(err) = json.get("error") {
         eprintln!(
             "{}",
-            format!("✗ Failed to send transaction: {}", error_text).red()
+            format!(
+                "✗ Transaction REJECTED by node: {}",
+                err.get("message").and_then(|m| m.as_str()).unwrap_or(&body)
+            )
+            .red()
         );
         std::process::exit(1);
     }
+    if let Some(result) = json.get("result") {
+        if let Some(status) = result.get("status").and_then(|s| s.as_str()) {
+            if status != "accepted" && status != "in_mempool" {
+                eprintln!(
+                    "{}",
+                    format!("✗ Transaction not accepted: {} ({})", status, result)
+                        .red()
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    println!("{}", "✓ Transaction sent & signed!".green());
+    println!("  Sender: {}", wallet.address_string().cyan());
+    println!("  Receiver: {}", receiver_hex.cyan());
+    println!("  Amount: {}", amount.to_string().cyan());
+    println!("  Fee: {}", fee.to_string().cyan());
+    println!("  Nonce: {}", nonce.to_string().cyan());
+    println!("  Signature: {}", hex::encode(&signature).cyan());
 
     Ok(())
 }
