@@ -40,9 +40,7 @@ jobs:
           path: target/release/aether${{ matrix.ext }}
       - name: Install Inno Setup (Windows)
         if: matrix.os == 'windows-latest'
-        run: |
-          iwr https://jrsoftware.org/download.php/is.exe -OutFile is.exe
-          ./is.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-
+        run: choco install innosetup -y --no-progress
       - name: Build Windows setup
         if: matrix.os == 'windows-latest'
         run: |
