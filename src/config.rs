@@ -40,6 +40,7 @@ pub struct NodeConfig {
     pub dns_seeds: Vec<String>,
     pub miner_address: Option<String>,
     pub reset: bool,
+    pub repair_ledger: bool,
 }
 
 impl Default for NodeConfig {
@@ -53,6 +54,7 @@ impl Default for NodeConfig {
             dns_seeds: Vec::new(),
             miner_address: None,
             reset: false,
+            repair_ledger: false,
         }
     }
 }

@@ -39,6 +39,9 @@ struct Cli {
     /// Run in daemon (headless) mode instead of GUI
     #[arg(long)]
     daemon: bool,
+    /// Rebuild the ledger (balances) from genesis + DAG replay on startup
+    #[arg(long)]
+    repair_ledger: bool,
 }
 
 #[derive(Subcommand)]
@@ -790,6 +793,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if cli.reset {
         cfg.reset = true;
+    }
+    if cli.repair_ledger {
+        cfg.repair_ledger = true;
     }
 
     if cli.daemon

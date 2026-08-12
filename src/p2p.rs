@@ -596,6 +596,12 @@ impl P2PNetwork {
             let _ = msg_sender.send(getinv_msg);
         }
 
+        // Also request the full inventory: tip-based sync can miss unconfirmed
+        // (weight-0) tips, so fetch the peer's complete hash set to reconcile.
+        if let Ok(sync_req) = bincode::serialize(&P2PMessage::SyncRequest) {
+            let _ = msg_sender.send(sync_req);
+        }
+
         // Mark peer as known
         known_peers.write().await.insert(addr);
 

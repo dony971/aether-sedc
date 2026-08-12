@@ -187,7 +187,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
 
     let (dag, consensus, balances, orphans, missing_parent_hashes) = {
         let genesis_config = GenesisConfig::default();
-        let (mut dag, consensus, balances, mut orphans_rebuilt, mut missing_parent_hashes) =
+        let (mut dag, consensus, _balances, mut orphans_rebuilt, mut missing_parent_hashes) =
             initialize_genesis(genesis_config);
 
         // 🔧 FIX (unified): Sled is the single source of truth for the DAG.
@@ -356,13 +356,90 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             );
         }
 
-        for (addr_hex, balance) in &balances {
-            let addr_bytes = hex::decode(addr_hex)?;
-            let address: Address = addr_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|e| format!("Invalid address length: {}", e))?;
-            ledger.set_balance(&address, *balance);
+        if cfg.repair_ledger {
+            // 🔧 --repair-ledger: rebuild ALL balances from genesis + topological
+            // DAG replay. The Sled balances are ignored (may be corrupt/stale),
+            // the DAG (single source of truth for transactions) is replayed to
+            // recompute every balance. Nonces are advanced to max(seen) so a
+            // valid tx is never dropped during the rebuild.
+            tracing::warn!("🔧 --repair-ledger: rebuilding balances from genesis + DAG replay");
+            ledger.balances.clear();
+            ledger.nonces.clear();
+            ledger.total_fees_burned = 0;
+            ledger.total_supply = 0;
+            let rebuild_genesis = GenesisConfig::default();
+            for (addr, balance) in &rebuild_genesis.initial_balances {
+                ledger.set_balance(addr, *balance);
+            }
+            let mut applied: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+            let mut pending: Vec<Transaction> = dag.transactions().values().cloned().collect();
+            let mut progress = true;
+            let mut applied_count = 0usize;
+            let mut rejected_count = 0usize;
+            while progress && !pending.is_empty() {
+                progress = false;
+                let mut still_pending = Vec::new();
+                for tx in pending {
+                    let parent0_ok = tx.parents[0] == [0u8; 32] || applied.contains(&tx.parents[0]);
+                    let parent1_ok = tx.parents[1] == [0u8; 32] || applied.contains(&tx.parents[1]);
+                    if !(parent0_ok && parent1_ok) {
+                        still_pending.push(tx);
+                        continue;
+                    }
+                    match ledger.transfer_internal(&tx.sender, &tx.receiver, tx.amount, tx.fee) {
+                        Ok(_) => {
+                            let sender_hex = hex::encode(tx.sender);
+                            let cur_nonce = ledger.nonces.get(&sender_hex).copied().unwrap_or(0);
+                            if tx.account_nonce > cur_nonce {
+                                ledger.set_nonce(&tx.sender, tx.account_nonce);
+                            }
+                            applied.insert(tx.id);
+                            applied_count += 1;
+                            tracing::debug!(
+                                "🔧 Replayed tx {}: {} -> {} amount={}",
+                                hex::encode(&tx.id[..8]),
+                                sender_hex,
+                                hex::encode(&tx.receiver[..8]),
+                                tx.amount
+                            );
+                        }
+                        Err(e) => {
+                            // Invalid tx (e.g. insufficient balance): skip without
+                            // blocking the rebuild, mark as applied to avoid loops.
+                            rejected_count += 1;
+                            tracing::warn!(
+                                "⚠️ Ledger replay skipped tx {}: {}",
+                                hex::encode(&tx.id[..8]),
+                                e
+                            );
+                            applied.insert(tx.id);
+                        }
+                    }
+                    progress = true;
+                }
+                pending = still_pending;
+            }
+
+            ledger.total_fees_burned = ledger.fee_burn_balance();
+            ledger.total_supply = ledger
+                .balances
+                .iter()
+                .filter(|(addr, _)| **addr != hex::encode(crate::ledger::FEE_BURN_ADDRESS))
+                .map(|(_, b)| *b)
+                .sum();
+            tracing::warn!(
+                "🔧 Ledger rebuilt: {} txs replayed, {} skipped, {} accounts, total supply {}",
+                applied_count,
+                rejected_count,
+                ledger.balances.len(),
+                ledger.total_supply
+            );
+        } else {
+            tracing::info!(
+                "✓ Ledger balances loaded from Sled ({} accounts, {} nonces)",
+                ledger.balances.len(),
+                ledger.nonces.len()
+            );
         }
         ledger.save().await?;
 

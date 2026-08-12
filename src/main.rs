@@ -56,6 +56,10 @@ struct Cli {
     /// Reset storage data on startup
     #[arg(long)]
     reset: bool,
+
+    /// Rebuild the ledger (balances) from genesis + DAG replay on startup
+    #[arg(long)]
+    repair_ledger: bool,
 }
 
 #[derive(Subcommand)]
@@ -284,6 +288,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if cli.reset {
         cfg.reset = true;
+    }
+    if cli.repair_ledger {
+        cfg.repair_ledger = true;
     }
 
     let handles = aether_unified::node::run_node(cfg).await?;
