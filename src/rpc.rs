@@ -1425,8 +1425,23 @@ impl AetherRpcImpl {
             hex::encode(address),
             amount
         );
-        let storage = self.storage.read().await;
 
+        // Phase 1: lock funds in the ledger (single source of truth for balances)
+        {
+            let mut ledger = self.ledger.write().await;
+            if let Err(e) = ledger.subtract_balance(address, amount) {
+                tracing::error!("❌ Stake failed: {}", e);
+                return Ok(StakingResponse {
+                    address: *address,
+                    staked_amount: 0,
+                    rewards_earned: 0,
+                    success: false,
+                });
+            }
+        }
+
+        // Phase 2: track staking position in storage
+        let storage = self.storage.read().await;
         match storage.stake_tokens(*address, amount) {
             Ok(_) => {
                 let staked_amount = storage.get_staked_amount(*address).unwrap_or(0);
@@ -1465,6 +1480,9 @@ impl AetherRpcImpl {
                 })
             }
             Err(e) => {
+                // Rollback the ledger lock (position tracking failed)
+                let mut ledger = self.ledger.write().await;
+                let _ = ledger.add_balance(address, amount);
                 tracing::error!("❌ Stake failed: {}", e);
                 Ok(StakingResponse {
                     address: *address,
@@ -1478,27 +1496,46 @@ impl AetherRpcImpl {
 
     /// Unstake tokens for an address
     pub async fn unstake_tokens(&self, address: &Address) -> Result<StakingResponse, RpcError> {
-        let storage = self.storage.read().await;
-
-        match storage.unstake_tokens(*address) {
-            Ok(total_return) => {
-                // Unregister from VQV consensus
-                self.consensus.write().await.unregister_validator(*address);
-                tracing::info!("✅ Validator unregistered: {}", hex::encode(address));
-                Ok(StakingResponse {
-                    address: *address,
-                    staked_amount: 0,
-                    rewards_earned: total_return,
-                    success: true,
-                })
+        // Phase 1: close the staking position and compute total return
+        let total_return = {
+            let storage = self.storage.read().await;
+            match storage.unstake_tokens(*address) {
+                Ok(total_return) => total_return,
+                Err(e) => {
+                    tracing::error!("❌ Unstake failed: {}", e);
+                    return Ok(StakingResponse {
+                        address: *address,
+                        staked_amount: 0,
+                        rewards_earned: 0,
+                        success: false,
+                    });
+                }
             }
-            Err(e) => Ok(StakingResponse {
+        };
+
+        // Phase 2: credit the ledger (single source of truth for balances)
+        let mut ledger = self.ledger.write().await;
+        if let Err(e) = ledger.add_balance(address, total_return) {
+            tracing::error!("❌ Unstake credit failed: {}", e);
+            return Ok(StakingResponse {
                 address: *address,
                 staked_amount: 0,
                 rewards_earned: 0,
                 success: false,
-            }),
+            });
         }
+        drop(ledger);
+
+        // Unregister from VQV consensus
+        self.consensus.write().await.unregister_validator(*address);
+        tracing::info!("✅ Validator unregistered: {}", hex::encode(address));
+        tracing::info!("✅ Unstake successful: returned {}", total_return);
+        Ok(StakingResponse {
+            address: *address,
+            staked_amount: 0,
+            rewards_earned: total_return,
+            success: true,
+        })
     }
 
     /// Get staking info for an address

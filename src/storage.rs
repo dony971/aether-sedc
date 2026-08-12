@@ -482,17 +482,14 @@ impl Storage {
 
     /// Stake tokens - move funds from main balance to staking
     pub fn stake_tokens(&self, address: Address, amount: u64) -> Result<(), StorageError> {
-        // Check if address has enough balance
-        let current_balance = self.get_balance(address)?;
-        if current_balance < amount {
+        // NOTE: Balance locking is done by the RPC layer via the ledger
+        // (single source of truth for balances). This only tracks the
+        // staking position (amount + rewards) in Sled.
+        if amount == 0 {
             return Err(StorageError::DatabaseError(
-                "Insufficient balance for staking".to_string(),
+                "Stake amount must be > 0".to_string(),
             ));
         }
-
-        // Deduct from main balance
-        let new_balance = current_balance - amount;
-        self.put_balance(address, new_balance)?;
 
         // Get or create staking position
         let current_timestamp = std::time::SystemTime::now()
@@ -520,7 +517,8 @@ impl Storage {
         Ok(())
     }
 
-    /// Unstake tokens - move funds from staking back to main balance
+    /// Unstake tokens - compute total return (staked + rewards)
+    /// NOTE: Balance crediting is done by the RPC layer via the ledger.
     pub fn unstake_tokens(&self, address: Address) -> Result<u64, StorageError> {
         let mut position =
             self.get_staking_position(address)
@@ -540,10 +538,6 @@ impl Storage {
 
         // Total to return = staked amount + rewards
         let total_return = position.staked_amount + position.rewards_earned;
-
-        // Add to main balance
-        let current_balance = self.get_balance(address)?;
-        self.put_balance(address, current_balance + total_return)?;
 
         // Remove staking position
         self.remove_staking_position(address)?;
