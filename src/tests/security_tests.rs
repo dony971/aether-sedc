@@ -95,13 +95,29 @@ mod double_spend_tests {
     use super::*;
 
     /// Test that double spends are prevented via parent checking
+    /// (non-genesis parents that are already used are rejected)
     #[tokio::test]
     async fn test_double_spend_prevention() {
         let mut dag = DAG::new();
         let addr = [1u8; 32];
 
-        // Create first transaction with genesis parents
-        let parents = [[0u8; 32], [0u8; 32]];
+        // First create a real (non-genesis) parent transaction
+        let parent = Transaction::new(
+            [[0u8; 32], [0u8; 32]],
+            [2u8; 32],
+            [9u8; 32],
+            0,
+            0,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+        dag.add_transaction_validated(parent.clone()).unwrap();
+
+        // Create first transaction referencing the real parent
+        let parents = [parent.id, [0u8; 32]];
         let tx1 = Transaction::new(
             parents,
             addr,
@@ -114,10 +130,9 @@ mod double_spend_tests {
             vec![0u8; 64],
             vec![1u8; 64],
         );
-
         dag.add_transaction_validated(tx1.clone()).unwrap();
 
-        // Try to create second transaction with same parents (double spend)
+        // Try to create second transaction with same (non-genesis) parents (double spend)
         let tx2 = Transaction::new(
             parents, // Same parents
             addr,
@@ -136,13 +151,13 @@ mod double_spend_tests {
         assert!(result.unwrap_err().contains("Double spend"));
     }
 
-    /// Test that sender conflict detection works
+    /// Test that sender conflict detection works (same sender + same nonce)
     #[tokio::test]
     async fn test_sender_conflict_detection() {
         let mut dag = DAG::new();
         let addr = [1u8; 32];
 
-        // Create first transaction with genesis parents
+        // Create first transaction from sender
         let tx1 = Transaction::new(
             [[0u8; 32], [0u8; 32]],
             addr,
@@ -155,13 +170,52 @@ mod double_spend_tests {
             vec![0u8; 64],
             vec![1u8; 64],
         );
-
         dag.add_transaction_validated(tx1.clone()).unwrap();
 
-        // Try to create second transaction from same sender (conflict)
+        // Try to create second transaction from same sender with same nonce (conflict)
         let tx2 = Transaction::new(
             [[0u8; 32], [0u8; 32]],
             addr, // Same sender
+            [5u8; 32],
+            50,
+            10,
+            1234567890,
+            0,
+            1, // Same nonce = replay / conflict
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+
+        let result = dag.add_transaction_validated(tx2);
+        assert!(result.is_err());
+        // The error will be about sender conflict
+    }
+
+    /// Test that distinct nonces from the same sender are NOT a conflict
+    /// (root parents are intentionally ignored so chains from peers can merge)
+    #[tokio::test]
+    async fn test_distinct_nonces_are_not_conflict() {
+        let mut dag = DAG::new();
+        let addr = [1u8; 32];
+
+        let tx1 = Transaction::new(
+            [[0u8; 32], [0u8; 32]],
+            addr,
+            [3u8; 32],
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+        dag.add_transaction_validated(tx1.clone()).unwrap();
+
+        // Same sender, different nonce -> accepted
+        let tx2 = Transaction::new(
+            [[0u8; 32], [0u8; 32]],
+            addr,
             [5u8; 32],
             50,
             10,
@@ -173,8 +227,7 @@ mod double_spend_tests {
         );
 
         let result = dag.add_transaction_validated(tx2);
-        assert!(result.is_err());
-        // The error will be about sender conflict
+        assert!(result.is_ok());
     }
 }
 
