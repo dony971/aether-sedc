@@ -107,6 +107,18 @@ impl Validator {
 /// Block identifier (32-byte hash)
 pub type BlockId = [u8; 32];
 
+/// A block reward queued for deferred settlement
+/// Rewards are only credited once the block has enough confirmations (finality)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingReward {
+    /// Validator/miner address that will receive the reward
+    pub validator: [u8; 32],
+    /// Reward amount in base units
+    pub reward: u64,
+    /// Block height at which the block was confirmed
+    pub block_height: u64,
+}
+
 /// Consensus state tracking
 /// This is the single source of truth for block height, reward distribution, and finality
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +131,8 @@ pub struct ConsensusState {
     pub rewarded_heights: std::collections::HashSet<u64>,
     /// Set of block IDs that have received rewards (fork-safe, persists across reorgs)
     pub rewarded_blocks: std::collections::HashSet<BlockId>,
+    /// Block rewards queued for deferred settlement once finality is reached
+    pub pending_rewards: std::collections::HashMap<BlockId, PendingReward>,
     /// Minimum confirmations required before reward (finality threshold)
     pub confirmation_threshold: u64,
 }
@@ -130,6 +144,7 @@ impl ConsensusState {
             current_height: 0,
             rewarded_heights: std::collections::HashSet::new(),
             rewarded_blocks: std::collections::HashSet::new(),
+            pending_rewards: std::collections::HashMap::new(),
             confirmation_threshold: 6, // 6 confirmations for finality (Bitcoin-like)
         }
     }
@@ -175,6 +190,61 @@ impl ConsensusState {
             "🔒 REWARD: Block {} marked as rewarded (fork-safe)",
             hex::encode(block_id)
         );
+    }
+
+    /// Queue a block reward for deferred settlement (finality-based)
+    /// The reward is only credited once the block has enough confirmations.
+    /// Returns an error if the block is already queued or already rewarded.
+    pub fn queue_pending_reward(
+        &mut self,
+        block_id: BlockId,
+        validator: [u8; 32],
+        reward: u64,
+        block_height: u64,
+    ) -> Result<(), String> {
+        if self.pending_rewards.contains_key(&block_id) {
+            return Err(format!(
+                "Security violation: block {} already queued for reward",
+                hex::encode(block_id)
+            ));
+        }
+        if self.rewarded_blocks.contains(&block_id) {
+            return Err(format!(
+                "Security violation: block {} already rewarded",
+                hex::encode(block_id)
+            ));
+        }
+        self.pending_rewards.insert(
+            block_id,
+            PendingReward {
+                validator,
+                reward,
+                block_height,
+            },
+        );
+        tracing::warn!(
+            "⏳ REWARD QUEUED: Block {} at height {} (reward: {}, finality: {} confirmations)",
+            hex::encode(block_id),
+            block_height,
+            reward,
+            self.confirmation_threshold
+        );
+        Ok(())
+    }
+
+    /// Collect all queued rewards that have reached finality
+    /// Returns (block_id, PendingReward) pairs ready to be credited
+    pub fn finalized_pending_rewards(&self) -> Vec<(BlockId, PendingReward)> {
+        self.pending_rewards
+            .iter()
+            .filter(|(_, pr)| self.is_finalized(pr.block_height, self.current_height))
+            .map(|(id, pr)| (*id, pr.clone()))
+            .collect()
+    }
+
+    /// Mark a queued reward as settled (credited) and remove it from the queue
+    pub fn settle_pending_reward(&mut self, block_id: &BlockId) {
+        self.pending_rewards.remove(block_id);
     }
 
     /// Validate and mark reward for a block (atomic operation, fork-safe)

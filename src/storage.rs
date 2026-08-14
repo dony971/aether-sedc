@@ -3,6 +3,7 @@
 //! Implements Sled persistence for transactions, DAG state, and wallet balances.
 //! Includes atomic writes, separate trees for balances and transactions, and migration from JSON.
 
+use crate::consensus::ConsensusState;
 use crate::transaction::{Address, Transaction, TransactionId};
 use serde::{Deserialize, Serialize};
 use sled::{Db, Transactional, Tree};
@@ -51,6 +52,7 @@ pub enum TreeName {
     Nonces,       // Account nonces for replay protection
     Orphans,      // Orphan transactions waiting for parents
     Mempool,      // Persistent mempool queue
+    Consensus,    // Consensus state (height, rewarded blocks, pending rewards)
 }
 
 impl TreeName {
@@ -64,6 +66,7 @@ impl TreeName {
             TreeName::Nonces => "nonces",
             TreeName::Orphans => "orphans",
             TreeName::Mempool => "mempool",
+            TreeName::Consensus => "consensus",
         }
     }
 }
@@ -80,6 +83,7 @@ pub struct Storage {
     nonces: Tree,
     orphans: Tree,
     mempool: Tree,
+    consensus: Tree,
 }
 
 /// Staking position structure
@@ -111,6 +115,7 @@ impl Storage {
         let nonces = db.open_tree(TreeName::Nonces.name())?;
         let orphans = db.open_tree(TreeName::Orphans.name())?;
         let mempool = db.open_tree(TreeName::Mempool.name())?;
+        let consensus = db.open_tree(TreeName::Consensus.name())?;
 
         Ok(Self {
             db,
@@ -122,6 +127,7 @@ impl Storage {
             nonces,
             orphans,
             mempool,
+            consensus,
         })
     }
 
@@ -136,6 +142,7 @@ impl Storage {
             TreeName::Nonces => &self.nonces,
             TreeName::Orphans => &self.orphans,
             TreeName::Mempool => &self.mempool,
+            TreeName::Consensus => &self.consensus,
         }
     }
 
@@ -694,6 +701,26 @@ impl Storage {
         let tree = self.tree(TreeName::Mempool);
         tree.remove(tx_id)?;
         Ok(())
+    }
+
+    /// Persist consensus state (height, rewarded blocks, pending rewards)
+    pub fn put_consensus_state(&self, state: &ConsensusState) -> Result<(), StorageError> {
+        let tree = self.tree(TreeName::Consensus);
+        let value = bincode::serialize(state)?;
+        tree.insert("state", value)?;
+        Ok(())
+    }
+
+    /// Load persisted consensus state
+    pub fn get_consensus_state(&self) -> Result<Option<ConsensusState>, StorageError> {
+        let tree = self.tree(TreeName::Consensus);
+        match tree.get("state")? {
+            Some(value) => {
+                let state = bincode::deserialize(&value)?;
+                Ok(Some(state))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Clear all mempool transactions

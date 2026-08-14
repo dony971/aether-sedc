@@ -190,13 +190,13 @@ impl TransactionProcessor {
             return Err(ProcessingError::DagError(format!("DAG add failed: {}", e)));
         }
 
-        // STEP 7: APPLY BLOCK REWARD IF CONFIGURED (AFTER DAG CONFIRMATION)
+        // STEP 7: QUEUE BLOCK REWARD IF CONFIGURED (AFTER DAG CONFIRMATION)
         // 🔒 ECONOMIC POLICY: "No reward without consensus truth"
         // 🔒 CRITICAL: Reward only given AFTER DAG confirmation (not before)
         // 🔒 CRITICAL: Uses consensus state (single source of truth for height)
         // 🔒 CRITICAL: Uses BlockId for fork-safe reward tracking
-        // 🔒 CRITICAL: Only rewards finalized blocks (has enough confirmations)
-        // This is the ONLY way to create new tokens in the system
+        // 🔒 CRITICAL: Rewards are deferred until the block is finalized
+        //   (has enough confirmations) - this is the ONLY way to create new tokens
         if let Some(validator_addr) = miner_address {
             // For now, use transaction ID as block ID (in production, this should be the actual block ID)
             let actual_block_id = block_id.unwrap_or(tx.id);
@@ -205,25 +205,55 @@ impl TransactionProcessor {
             consensus_state.increment_height();
             let block_height = consensus_state.get_height();
 
-            if let Err(e) = ledger.apply_block_reward(
-                validator_addr,
+            // Queue the reward for this block (deferred until finality)
+            let reward = crate::ledger::calculate_reward(block_height);
+            if let Err(e) = consensus_state.queue_pending_reward(
                 actual_block_id,
+                *validator_addr,
+                reward,
                 block_height,
-                consensus_state,
             ) {
-                tracing::error!("❌ Block reward failed (after DAG confirmation): {}", e);
-                // DAG was already added, but reward failed - this is a critical error
-                // In production, we might need to rollback DAG or handle this specially
-                tracing::error!(
-                    "❌ CRITICAL: DAG confirmed but reward failed - economic inconsistency"
-                );
+                tracing::error!("❌ Block reward queue failed (after DAG confirmation): {}", e);
                 return Err(ProcessingError::LedgerError(format!(
-                    "Block reward failed after DAG confirmation: {}",
+                    "Block reward queue failed after DAG confirmation: {}",
                     e
                 )));
             }
-            tracing::info!("💰 Block reward applied AFTER DAG confirmation (block_id: {}, height: {}, finalized: yes)", 
-                hex::encode(actual_block_id), block_height);
+
+            // Settle any previously queued rewards that have now reached finality
+            for (queued_block_id, pending) in consensus_state.finalized_pending_rewards() {
+                match ledger.apply_block_reward(
+                    &pending.validator,
+                    queued_block_id,
+                    pending.block_height,
+                    consensus_state,
+                ) {
+                    Ok(()) => {
+                        consensus_state.mark_block_rewarded(queued_block_id);
+                        consensus_state.settle_pending_reward(&queued_block_id);
+                        tracing::info!(
+                            "💰 Block reward SETTLED after finality: {} units to {} (block {}, height {})",
+                            pending.reward,
+                            hex::encode(pending.validator),
+                            hex::encode(queued_block_id),
+                            pending.block_height
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "❌ Block reward settle failed for block {}: {} (will retry)",
+                            hex::encode(queued_block_id),
+                            e
+                        );
+                    }
+                }
+            }
+            tracing::info!(
+                "💰 Block reward queued AFTER DAG confirmation (block_id: {}, height: {}, reward: {})",
+                hex::encode(actual_block_id),
+                block_height,
+                reward
+            );
         }
 
         // STEP 8: ADD TO MEMPOOL
@@ -263,6 +293,12 @@ impl TransactionProcessor {
             let storage_read = storage.read().await;
             if let Err(e) = storage_read.put_transaction(&tx) {
                 tracing::error!("❌ Failed to persist transaction to Sled: {}", e);
+            } else {
+                storage_read.flush().ok();
+            }
+            // Persist consensus state (height, rewarded blocks, pending rewards)
+            if let Err(e) = storage_read.put_consensus_state(consensus_state) {
+                tracing::error!("❌ Failed to persist consensus state to Sled: {}", e);
             } else {
                 storage_read.flush().ok();
             }

@@ -563,4 +563,46 @@ mod consensus_state_tests {
         // Block at height 100 is finalized at height 107
         assert!(consensus.is_finalized(100, 107));
     }
+
+    /// Test that deferred rewards are queued and only settled after finality
+    #[test]
+    fn test_deferred_reward_queue_and_settle() {
+        let mut consensus = ConsensusState::new();
+        let validator = [7u8; 32];
+        let block_id = [8u8; 32];
+
+        // Queue a reward at height 1 (not yet finalized)
+        consensus.queue_pending_reward(block_id, validator, 100_000_000_000, 1).unwrap();
+        assert!(consensus.finalized_pending_rewards().is_empty());
+
+        // Duplicate queue is rejected
+        assert!(consensus
+            .queue_pending_reward(block_id, validator, 100_000_000_000, 1)
+            .is_err());
+
+        // After 6 more blocks (height 7), the reward is finalized
+        consensus.current_height = 7;
+        let finalized = consensus.finalized_pending_rewards();
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].1.reward, 100_000_000_000);
+        assert_eq!(finalized[0].1.block_height, 1);
+        assert_eq!(finalized[0].1.validator, validator);
+
+        // Settle it: mark rewarded and remove from queue
+        consensus.mark_block_rewarded(block_id);
+        consensus.settle_pending_reward(&block_id);
+        assert!(consensus.finalized_pending_rewards().is_empty());
+        assert!(consensus.is_block_rewarded(&block_id));
+    }
+
+    /// Test that a reward queued for an already-rewarded block is rejected
+    #[test]
+    fn test_pending_reward_rejects_rewarded_block() {
+        let mut consensus = ConsensusState::new();
+        let block_id = [9u8; 32];
+
+        consensus.mark_block_rewarded(block_id);
+        let result = consensus.queue_pending_reward(block_id, [1u8; 32], 100, 0);
+        assert!(result.is_err());
+    }
 }

@@ -35,9 +35,11 @@ pub struct Ledger {
 /// This is a special address that no one controls, ensuring fees are permanently removed from circulation
 pub const FEE_BURN_ADDRESS: Address = [0xFFu8; 32];
 
-/// Maximum supply of AETH tokens (hard cap) — 21 million with 10 decimals
-/// 21,000,000 * 10^10 = 210,000,000,000,000,000 fits in u64 (max: ~18.44e18)
-pub const MAX_SUPPLY: u64 = 210_000_000_000_000_000;
+/// Maximum supply of AETH tokens (hard cap) — 1.8 billion with 10 decimals
+/// Genesis distributes ~1 billion AETH (faucet = 10^19 raw), so the cap must
+/// exceed that with headroom for block rewards. u64 max is ~18.44e18, so the
+/// highest safe value is 18,000,000,000 * 10^10 = 1.8e19.
+pub const MAX_SUPPLY: u64 = 18_000_000_000_000_000_000;
 
 /// Initial block reward (10 AETH)
 /// 10 AETH = 10 * 10^10 = 100,000,000,000 units (10 decimals)
@@ -1150,12 +1152,12 @@ mod tests {
 
     #[test]
     fn test_max_supply_constant() {
-        // Test that MAX_SUPPLY is set correctly (21,000,000 AETH)
-        assert_eq!(MAX_SUPPLY, 210_000_000_000_000_000);
+        // Test that MAX_SUPPLY is set correctly (1.8 billion AETH)
+        assert_eq!(MAX_SUPPLY, 18_000_000_000_000_000_000);
 
-        // Verify it's a reasonable value (21 million like Bitcoin)
+        // Verify it's a reasonable value (above the ~1 billion genesis supply)
         let max_supply_aeth = MAX_SUPPLY / 10_000_000_000;
-        assert_eq!(max_supply_aeth, 21_000_000);
+        assert!(max_supply_aeth > 1_000_000_000, "MAX_SUPPLY must exceed genesis supply");
 
         println!("✅ MAX_SUPPLY: {} AETH", max_supply_aeth);
     }

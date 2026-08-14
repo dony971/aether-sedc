@@ -791,6 +791,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .filter(|s| !s.is_empty())
             .collect();
     }
+    if cli.miner_address.is_some() {
+        cfg.miner_address = cli.miner_address.clone();
+    }
     if cli.reset {
         cfg.reset = true;
     }

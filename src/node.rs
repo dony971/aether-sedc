@@ -486,6 +486,50 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     let consensus: Arc<RwLock<VQVConsensus>> = Arc::new(RwLock::new(consensus));
     let _balances: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(balances));
 
+    // 🔧 Restore consensus state (height, rewarded blocks, pending rewards) from Sled.
+    // Without this, current_height restarts at 0 on every boot, so deferred block
+    // rewards would never reach finality across restarts.
+    {
+        let storage_read = storage.read().await;
+        match storage_read.get_consensus_state() {
+            Ok(Some(saved_state)) => {
+                {
+                    let mut consensus_write = consensus.write().await;
+                    *consensus_write.state_mut() = saved_state;
+                }
+                let (height, n_rewarded, n_pending) = {
+                    let consensus_read = consensus.read().await;
+                    let st = consensus_read.state();
+                    (
+                        st.current_height,
+                        st.rewarded_blocks.len(),
+                        st.pending_rewards.len(),
+                    )
+                };
+                tracing::info!(
+                    "💾 Consensus state restored: height={}, rewarded_blocks={}, pending_rewards={}",
+                    height,
+                    n_rewarded,
+                    n_pending
+                );
+            }
+            Ok(None) => {
+                // First boot: derive height from the DAG (each tx = one block)
+                let height = dag.read().await.transaction_count() as u64;
+                let mut consensus_write = consensus.write().await;
+                consensus_write.state_mut().current_height = height;
+                drop(consensus_write);
+                tracing::info!(
+                    "⚙️ Consensus state initialized from DAG: height={}",
+                    height
+                );
+            }
+            Err(e) => {
+                tracing::warn!("⚠️ Failed to load consensus state: {}", e);
+            }
+        }
+    }
+
     let ledger: Arc<RwLock<Ledger>> = Arc::new(RwLock::new(ledger));
 
     let ledger_for_save = ledger.clone();
