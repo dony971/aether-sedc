@@ -395,6 +395,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                             }
                             applied.insert(tx.id);
                             applied_count += 1;
+                            progress = true;
                             tracing::debug!(
                                 "🔧 Replayed tx {}: {} -> {} amount={}",
                                 hex::encode(&tx.id[..8]),
@@ -404,20 +405,38 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                             );
                         }
                         Err(e) => {
-                            // Invalid tx (e.g. insufficient balance): skip without
-                            // blocking the rebuild, mark as applied to avoid loops.
-                            rejected_count += 1;
-                            tracing::warn!(
-                                "⚠️ Ledger replay skipped tx {}: {}",
-                                hex::encode(&tx.id[..8]),
-                                e
-                            );
-                            applied.insert(tx.id);
+                            if e.starts_with("Insufficient balance") {
+                                // The sender may be credited by another tx that
+                                // appears later in the DAG iteration order.
+                                // Retry on the next pass instead of permanently
+                                // skipping (previous bug: a valid tx whose
+                                // credit arrived later was lost forever).
+                                still_pending.push(tx);
+                            } else {
+                                // Hard error (overflow, etc.): skip without
+                                // blocking the rebuild, mark as applied to
+                                // avoid infinite loops.
+                                rejected_count += 1;
+                                tracing::warn!(
+                                    "⚠️ Ledger replay skipped tx {}: {}",
+                                    hex::encode(&tx.id[..8]),
+                                    e
+                                );
+                                applied.insert(tx.id);
+                            }
                         }
                     }
-                    progress = true;
                 }
                 pending = still_pending;
+            }
+            // Txs still pending here were never satisfiable (parents missing
+            // or insufficient balance after full replay): report them.
+            for tx in &pending {
+                rejected_count += 1;
+                tracing::warn!(
+                    "⚠️ Ledger replay unresolved tx {}: parents missing or insufficient balance after full replay",
+                    hex::encode(&tx.id[..8])
+                );
             }
 
             ledger.total_fees_burned = ledger.fee_burn_balance();

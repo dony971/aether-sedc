@@ -1441,57 +1441,94 @@ impl AetherRpcImpl {
         }
 
         // Phase 2: track staking position in storage
-        let storage = self.storage.read().await;
-        match storage.stake_tokens(*address, amount) {
-            Ok(_) => {
-                let staked_amount = storage.get_staked_amount(*address).unwrap_or(0);
-                let rewards = storage.calculate_staking_reward(*address).unwrap_or(0);
-                // Bridge to VQV consensus — register as validator if min stake met
-                let min_stake = {
-                    let c = self.consensus.read().await;
-                    c.min_stake()
-                };
-                let max_stake = {
-                    let c = self.consensus.read().await;
-                    c.max_stake()
-                };
-                if staked_amount >= min_stake && staked_amount <= max_stake {
-                    let mut cons = self.consensus.write().await;
-                    let validator = Validator::new(*address, staked_amount, address.to_vec());
-                    if let Err(e) = cons.register_validator(validator) {
-                        tracing::warn!("⚠️ Validator registration skipped: {}", e);
-                    } else {
-                        tracing::info!(
-                            "✅ Address registered as VQV validator: {}",
-                            hex::encode(address)
-                        );
-                    }
+        let staking_ok = {
+            let storage = self.storage.read().await;
+            match storage.stake_tokens(*address, amount) {
+                Ok(_) => {
+                    // Persist the staking position immediately (survives restart)
+                    let _ = storage.flush();
+                    true
                 }
-                tracing::info!(
-                    "✅ Stake successful: staked_amount={}, rewards={}",
-                    staked_amount,
-                    rewards
-                );
-                Ok(StakingResponse {
-                    address: *address,
-                    staked_amount,
-                    rewards_earned: rewards,
-                    success: true,
-                })
+                Err(e) => {
+                    tracing::error!("❌ Stake failed: {}", e);
+                    false
+                }
             }
-            Err(e) => {
-                // Rollback the ledger lock (position tracking failed)
+        };
+        if !staking_ok {
+            // Rollback the ledger lock (position tracking failed)
+            let mut ledger = self.ledger.write().await;
+            let _ = ledger.add_balance(address, amount);
+            return Ok(StakingResponse {
+                address: *address,
+                staked_amount: 0,
+                rewards_earned: 0,
+                success: false,
+            });
+        }
+        // Persist the ledger balance lock immediately (survives restart).
+        // 🔧 FIX: without this, a stake was only applied in memory and silently
+        // lost on restart (ledger.save() is otherwise only called by
+        // TransactionProcessor / SyncEvent::SaveRequested).
+        {
+            let ledger = self.ledger.read().await;
+            // Consume the non-Send Result (Box<dyn Error>) immediately so no
+            // .await below (the rollback) breaks the Send bound of the handler.
+            let save_error = match ledger.save().await {
+                Ok(()) => None,
+                Err(e) => Some(e.to_string()),
+            };
+            drop(ledger);
+            if let Some(err_str) = save_error {
                 let mut ledger = self.ledger.write().await;
                 let _ = ledger.add_balance(address, amount);
-                tracing::error!("❌ Stake failed: {}", e);
-                Ok(StakingResponse {
+                tracing::error!("❌ Stake ledger persist failed, rolled back: {}", err_str);
+                return Ok(StakingResponse {
                     address: *address,
                     staked_amount: 0,
                     rewards_earned: 0,
                     success: false,
-                })
+                });
             }
         }
+        let (staked_amount, rewards) = {
+            let storage = self.storage.read().await;
+            (
+                storage.get_staked_amount(*address).unwrap_or(0),
+                storage.calculate_staking_reward(*address).unwrap_or(0),
+            )
+        };
+        // Bridge to VQV consensus — register as validator if min stake met
+        let min_stake = {
+            let c = self.consensus.read().await;
+            c.min_stake()
+        };
+        let max_stake = {
+            let c = self.consensus.read().await;
+            c.max_stake()
+        };
+        if staked_amount >= min_stake && staked_amount <= max_stake {
+            let mut cons = self.consensus.write().await;
+            let validator = Validator::new(*address, staked_amount, address.to_vec());
+            match cons.register_validator(validator) {
+                Err(e) => tracing::warn!("⚠️ Validator registration skipped: {}", e),
+                Ok(_) => tracing::info!(
+                    "✅ Address registered as VQV validator: {}",
+                    hex::encode(address)
+                ),
+            }
+        }
+        tracing::info!(
+            "✅ Stake successful: staked_amount={}, rewards={}",
+            staked_amount,
+            rewards
+        );
+        Ok(StakingResponse {
+            address: *address,
+            staked_amount,
+            rewards_earned: rewards,
+            success: true,
+        })
     }
 
     /// Unstake tokens for an address
@@ -1500,7 +1537,11 @@ impl AetherRpcImpl {
         let total_return = {
             let storage = self.storage.read().await;
             match storage.unstake_tokens(*address) {
-                Ok(total_return) => total_return,
+                Ok(total_return) => {
+                    // Persist the position removal immediately (survives restart)
+                    let _ = storage.flush();
+                    total_return
+                }
                 Err(e) => {
                     tracing::error!("❌ Unstake failed: {}", e);
                     return Ok(StakingResponse {
@@ -1525,6 +1566,22 @@ impl AetherRpcImpl {
             });
         }
         drop(ledger);
+
+        // Persist the ledger credit immediately (survives restart).
+        // 🔧 FIX: without this, an unstake was only applied in memory and
+        // silently lost on restart.
+        {
+            let ledger = self.ledger.read().await;
+            // Consume the non-Send Result (Box<dyn Error>) immediately.
+            let save_error = match ledger.save().await {
+                Ok(()) => None,
+                Err(e) => Some(e.to_string()),
+            };
+            drop(ledger);
+            if let Some(err_str) = save_error {
+                tracing::error!("❌ Unstake ledger persist failed: {}", err_str);
+            }
+        }
 
         // Unregister from VQV consensus
         self.consensus.write().await.unregister_validator(*address);
