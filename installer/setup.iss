@@ -2,7 +2,7 @@
 ; Requires Inno Setup 6+ (https://jrsoftware.org/isdl.php)
 
 #define MyAppName "AETHER SEDC"
-#define MyAppVersion "1.1.2"
+#define MyAppVersion "1.1.4"
 #define MyAppPublisher "Aether Team"
 #define MyAppURL "https://github.com/dony971/aether-sedc"
 #define MyAppExeName "aether.exe"
