@@ -160,7 +160,7 @@ dependencies = [
  "sha3",
  "sled",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.19",
  "tokio",
  "toml",
  "tower 0.4.13",
