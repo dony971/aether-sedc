@@ -625,7 +625,9 @@ mod consensus_state_tests {
         let block_id = [8u8; 32];
 
         // Queue a reward at height 1 (not yet finalized)
-        consensus.queue_pending_reward(block_id, validator, 100_000_000_000, 1).unwrap();
+        consensus
+            .queue_pending_reward(block_id, validator, 100_000_000_000, 1)
+            .unwrap();
         assert!(consensus.finalized_pending_rewards().is_empty());
 
         // Duplicate queue is rejected

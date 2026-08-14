@@ -493,8 +493,7 @@ async fn send_transaction_client(
             if status != "accepted" && status != "in_mempool" {
                 eprintln!(
                     "{}",
-                    format!("✗ Transaction not accepted: {} ({})", status, result)
-                        .red()
+                    format!("✗ Transaction not accepted: {} ({})", status, result).red()
                 );
                 std::process::exit(1);
             }

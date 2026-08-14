@@ -213,7 +213,10 @@ impl TransactionProcessor {
                 reward,
                 block_height,
             ) {
-                tracing::error!("❌ Block reward queue failed (after DAG confirmation): {}", e);
+                tracing::error!(
+                    "❌ Block reward queue failed (after DAG confirmation): {}",
+                    e
+                );
                 return Err(ProcessingError::LedgerError(format!(
                     "Block reward queue failed after DAG confirmation: {}",
                     e

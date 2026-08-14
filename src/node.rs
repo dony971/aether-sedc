@@ -519,10 +519,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                 let mut consensus_write = consensus.write().await;
                 consensus_write.state_mut().current_height = height;
                 drop(consensus_write);
-                tracing::info!(
-                    "⚙️ Consensus state initialized from DAG: height={}",
-                    height
-                );
+                tracing::info!("⚙️ Consensus state initialized from DAG: height={}", height);
             }
             Err(e) => {
                 tracing::warn!("⚠️ Failed to load consensus state: {}", e);

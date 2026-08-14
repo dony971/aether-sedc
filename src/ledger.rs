@@ -1157,7 +1157,10 @@ mod tests {
 
         // Verify it's a reasonable value (above the ~1 billion genesis supply)
         let max_supply_aeth = MAX_SUPPLY / 10_000_000_000;
-        assert!(max_supply_aeth > 1_000_000_000, "MAX_SUPPLY must exceed genesis supply");
+        assert!(
+            max_supply_aeth > 1_000_000_000,
+            "MAX_SUPPLY must exceed genesis supply"
+        );
 
         println!("✅ MAX_SUPPLY: {} AETH", max_supply_aeth);
     }
