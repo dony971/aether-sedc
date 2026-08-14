@@ -1,0 +1,9 @@
+# cargo-audit configuration
+# Ignore list:
+#   RUSTSEC-2026-0257 (webbrowser): Unix-only argument injection via BROWSER env
+#   var. The GUI target is Windows (no unix.rs path) and webbrowser is a
+#   transitive dep of eframe 0.27 (not upgradeable without a breaking GUI
+#   rewrite). URLs opened are wallet-internal (http://127.0.0.1), not
+#   attacker-controlled.
+[advisories]
+ignore = ["RUSTSEC-2026-0257"]

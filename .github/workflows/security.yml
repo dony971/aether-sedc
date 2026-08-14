@@ -1,6 +1,7 @@
 name: Security Audit
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: '0 0 * * 0'  # weekly
   push:
@@ -8,6 +9,7 @@ on:
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
+      - '.cargo/audit.toml'
 
 jobs:
   audit:
