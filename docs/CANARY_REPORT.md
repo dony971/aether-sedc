@@ -202,3 +202,68 @@ P2P sur le code gelé ; toute extension du réseau (nœuds 6-10, testeurs public
 fenêtre de stabilisation ~20:38) en attendant la décision opérateur.
 Le commit `b1b8376d6adbbf3607e57b7ab1ab198c12e3902f` reste immuable ; le correctif
 sera développé dans une nouvelle itération, re-gelée avant toute campagne.
+
+---
+
+## PHASE B4 — CORRECTION DU BOOTSTRAP/SYNC P2P (mandat opérateur, 2026-08-17 soir)
+
+### B4.1 Correctif committé (`24c61e3`, au-dessus du gel `b1b8376` — consensus intact)
+
+Analyse de logs du livelock (run B4, seed-1) : `park_orphan` re-demandait chaque
+parent manquant sans dédup ni backoff (2 req/orphelin) → le seed a répondu par
+**23 394 SyncResponses à 1 tx (~16/s)** qui ont affamé les rafales de 100 tx ;
+chaînes orphelines avancées de 1 niveau/10 s ; GetData servies en ordre
+HashMap arbitraire, répété à chaque cycle de 10 s.
+
+Correctif (bootstrap/sync uniquement, zéro changement de consensus) :
+- `sync_stats.rs` (nouveau) : compteurs `aether_getSyncStats` + `SyncContext`
+  (cooldown parent 2 s, backoff [2,5,15] s, `MAX_INFLIGHT_PARENTS` 4096,
+  `ORPHAN_TTL` 15 min, `ORPHAN_FIXPOINT_MAX_PASSES` 64, `TOPO_ORDER_CAP` 50 k).
+- `p2p.rs` : dédup Inventory/SyncResponse (DAG ∪ orphelins) ; GetData en ordre
+  **topologique** (Kahn) ; `partition_batch` (livrable/en attente, ordre-indépendant) ;
+  `request_transaction` dédupliquée avec backoff et ensemble borné.
+- `rpc.rs` : `process_orphans` en point fixe borné + purge TTL + retrait des
+  erreurs permanentes ; cap parents 32 → 128.
+- `node.rs` : `sync_progress` + log périodique des stats.
+
+### B4.2 Validation
+
+- `cargo test` : **154 PASS / 0 FAIL** (S1-S11, W1-W12 inchangés et verts).
+- `cargo fmt --check` : OK. `cargo clippy --all-targets` : 0 erreur.
+- `cargo audit` : 0 vulnérabilité (7 non maintenues autorisées, baseline).
+- Builds propres (clean + debug + release) : OK.
+
+### B4.3 Harnais de reproduction `canary_b4_repro.ps1` — 23/23 PASS
+
+| Cas | Résultat (RC B4 `8f04bb27…`) | Code gelé (réf.) |
+|---|---|---|
+| Jointure fraîche @100 | PASS (~50 s) | OK |
+| Jointure fraîche @224 | PASS (53 s) | OK |
+| Jointure fraîche @300 (relais inclus) | PASS (63-65 s) | — |
+| **Jointure fraîche @463** | **PASS (107 s)** | **FAIL : livelock (16/31 tx après 16 min, 11 159 rejets)** |
+| Jointure fraîche @500 | PASS (≈2 min) | — |
+| **@500 simultanées (2 nœuds)** | PASS (J5+J6, convergence complète) | — |
+| **Redémarrage en cours de bootstrap @800** | PASS (tué à 186/800, relancé, converge en 138 s) | — |
+| **@1000 avec churn de pair** (relais coupé puis relancé) | PASS (237 s ; relais resynchronisé) | — |
+
+Convergence vérifiée sur txset/DAG/tips/ledger/weights/supply **identiques au
+seed** (getDagGraph avec limite explicite — plafond par défaut 500 corrigé dans
+le monitor). Stats de synchronisation (ex. @1000) : `requested=2471
+received=1138 progress=11 batches=2670 orphan_created=1108 orphan_resolved=990
+orphan_purged=0 retries=990 parent_requested=2662 parent_deduped=2008
+dup_ignored=2043` — **zéro purge, zéro perte, toutes les bornes respectées**.
+
+### B4.4 RC B4
+
+- Commit : `24c61e3` · SHA256 binaire : `8f04bb278aed4fd11fc76f839dcadc58df8b1af97ee13db0b9fb620d9c5587ff`
+  (gel `b1b8376` : `f32723be…` inchangé — cf. `RELEASE_CANDIDATE.md` §8).
+- Réseau canary gelé toujours en observation (5 nœuds, 465 tx, monitor b2
+  divergence=0 sur 60 min). Note : reboot machine à 22:10 — réseau relancé à
+  l'identique (5 nœuds, 465 tx, convergés).
+
+### B4.5 Verdict attendu (mandat)
+
+> Campagne Phase A → B sur la RC B4 : **jointure @463 MUST PASS**, puis 500/1000,
+> batterie B1-B8, monitoring divergence=0. 🔴 STOP si B4 échoue ; 🟠 NOUVELLE
+> CORRECTION si régression ; 🟡 NOUVELLE RC + CANARY si tout passe. Jamais de
+> publication directe.
