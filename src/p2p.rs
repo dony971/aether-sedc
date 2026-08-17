@@ -19,6 +19,8 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
+use crate::sync_stats::{SyncContext, TOPO_ORDER_CAP};
+
 /// P2P handshake magic bytes ("AETH")
 const HANDSHAKE_MAGIC: [u8; 4] = [0x41, 0x45, 0x54, 0x48];
 
@@ -161,6 +163,10 @@ pub struct P2PNetwork {
     get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
     get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
     seen_transactions: Arc<RwLock<HashMap<Vec<u8>, SeenTxEntry>>>,
+    /// B4: shared bootstrap state (counters, parent-request dedup, orphan TTL)
+    sync_ctx: Arc<SyncContext>,
+    /// B4: true when the hash is already in the orphan store (sync dedup)
+    is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
 }
 
 impl P2PNetwork {
@@ -171,6 +177,8 @@ impl P2PNetwork {
         get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
         get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
+        sync_ctx: Arc<SyncContext>,
+        is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
     ) -> Self {
         Self {
             config,
@@ -182,6 +190,8 @@ impl P2PNetwork {
             get_transaction_by_hash,
             get_tips,
             seen_transactions: Arc::new(RwLock::new(HashMap::new())),
+            sync_ctx,
+            is_orphan,
         }
     }
 
@@ -197,6 +207,8 @@ impl P2PNetwork {
         let get_transaction_by_hash = Arc::clone(&self.get_transaction_by_hash);
         let get_tips = Arc::clone(&self.get_tips);
         let seen_transactions = Arc::clone(&self.seen_transactions);
+        let sync_ctx = Arc::clone(&self.sync_ctx);
+        let is_orphan = Arc::clone(&self.is_orphan);
         let local_addr = self.config.listen_addr;
         let known_peers = self.known_peers.clone();
         let (peer_discovery_tx, mut peer_discovery_rx) = mpsc::unbounded_channel::<SocketAddr>();
@@ -222,6 +234,8 @@ impl P2PNetwork {
                 get_tips,
                 seen_transactions,
                 peer_discovery_tx,
+                sync_ctx,
+                is_orphan,
             )
             .await;
         });
@@ -458,6 +472,8 @@ impl P2PNetwork {
         get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         seen_transactions: Arc<RwLock<HashMap<Vec<u8>, SeenTxEntry>>>,
         peer_discovery_tx: mpsc::UnboundedSender<SocketAddr>,
+        sync_ctx: Arc<SyncContext>,
+        is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
     ) {
         loop {
             match listener.accept().await {
@@ -488,6 +504,8 @@ impl P2PNetwork {
                     let seen_transactions = Arc::clone(&seen_transactions);
                     let peer_discovery_tx = peer_discovery_tx.clone();
                     let known_peers = known_peers.clone();
+                    let sync_ctx = Arc::clone(&sync_ctx);
+                    let is_orphan = Arc::clone(&is_orphan);
                     tokio::spawn(async move {
                         Self::handle_peer(
                             socket,
@@ -503,6 +521,8 @@ impl P2PNetwork {
                             msg_sender,
                             msg_receiver,
                             peer_discovery_tx,
+                            sync_ctx,
+                            is_orphan,
                         )
                         .await;
                     });
@@ -612,6 +632,8 @@ impl P2PNetwork {
         msg_sender: mpsc::UnboundedSender<Vec<u8>>,
         msg_receiver: mpsc::UnboundedReceiver<Vec<u8>>,
         peer_discovery_tx: mpsc::UnboundedSender<SocketAddr>,
+        sync_ctx: Arc<SyncContext>,
+        is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
     ) {
         // Split socket into read and write halves
         let (mut reader, mut writer) = socket.into_split();
@@ -821,17 +843,24 @@ impl P2PNetwork {
                             }
                         }
                         P2PMessage::Inventory(hashes) => {
-                            // Determine which hashes we need (bounded by MAX_INV_ITEMS)
+                            // Determine which hashes we need (bounded by MAX_INV_ITEMS).
+                            // B4: dedup against the DAG AND the orphan store: a tx
+                            // parked as an orphan is already tracked (its parents are
+                            // being requested), re-requesting it is pure waste.
                             let our_hashes = get_dag_hashes();
                             let our_hash_set: HashSet<Vec<u8>> = our_hashes.into_iter().collect();
                             let missing_hashes: Vec<Vec<u8>> = hashes
                                 .into_iter()
                                 .take(MAX_INV_ITEMS)
-                                .filter(|h| !our_hash_set.contains(h))
+                                .filter(|h| !our_hash_set.contains(h) && !is_orphan(h.as_slice()))
                                 .collect();
 
                             // Request missing transactions via GetData
                             if !missing_hashes.is_empty() {
+                                sync_ctx.stats.sync_requested.fetch_add(
+                                    missing_hashes.len() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                                 info!(
                                     "Requesting {} missing transactions from {}",
                                     missing_hashes.len(),
@@ -904,12 +933,29 @@ impl P2PNetwork {
                             }
                         }
                         P2PMessage::GetData(hashes) => {
-                            // Send requested transactions with pagination (max 100 per response)
+                            // B4: serve the requested transactions in DETERMINISTIC
+                            // DEPENDENCY order (parents before children, Kahn's
+                            // algorithm over the local DAG). Batches therefore
+                            // arrive ancestor-first no matter the request order, so
+                            // a joining node inserts most of them immediately
+                            // instead of parking deep chains of orphans.
                             const PAGE_SIZE: usize = 100;
+                            let topo = Self::topological_order(
+                                &*get_dag_hashes,
+                                &*get_transaction_by_hash,
+                            );
+                            let mut requested: Vec<Vec<u8>> =
+                                hashes.iter().take(PAGE_SIZE).cloned().collect();
+                            if let Some(order) = topo {
+                                let pos: HashMap<&Vec<u8>, usize> =
+                                    order.iter().enumerate().map(|(i, h)| (h, i)).collect();
+                                requested
+                                    .sort_by_key(|h| pos.get(h).copied().unwrap_or(usize::MAX));
+                            }
                             let mut tx_bytes_list = Vec::new();
 
-                            for hash in hashes.iter().take(PAGE_SIZE) {
-                                if let Some(tx) = get_transaction_by_hash(hash) {
+                            for hash in requested {
+                                if let Some(tx) = get_transaction_by_hash(&hash) {
                                     if let Ok(bytes) = bincode::serialize(&tx) {
                                         tx_bytes_list.push(bytes);
                                     }
@@ -944,47 +990,53 @@ impl P2PNetwork {
                             }
                         }
                         P2PMessage::SyncResponse(tx_bytes_list) => {
-                            // Download and add transactions in chronological order
-                            // (bounded by MAX_INV_ITEMS to avoid amplification)
-                            let mut downloaded_count = 0;
-                            let mut transactions: Vec<Transaction> = Vec::new();
-
+                            // B4: download and add transactions in dependency order
+                            // (bounded by MAX_INV_ITEMS to avoid amplification).
+                            // 1. Dedup against the DAG AND the orphan store: an
+                            //    orphan is already tracked and retried by the
+                            //    resolver (fixpoint in process_orphans), so
+                            //    re-delivering it is pure waste (this was the B4
+                            //    re-request amplification loop).
+                            // 2. Split the batch into (deliverable now) / (parents
+                            //    still missing) with dependency-aware passes: a tx
+                            //    whose parents are in the DAG or accepted earlier in
+                            //    this SAME batch is delivered immediately. The
+                            //    remaining txs go through the normal pipeline where
+                            //    they are parked as orphans and their parents are
+                            //    requested (bounded by the parent-request dedup).
+                            let mut pending: Vec<(Vec<u8>, Transaction)> = Vec::new();
                             for tx_bytes in tx_bytes_list.into_iter().take(MAX_INV_ITEMS) {
-                                // V-22 FIX: dedup by DAG membership, NOT by the
-                                // seen-transactions map. A tx marked "seen" but
-                                // never added to the DAG (dropped by a lock
-                                // error, evicted as residue, or parked in the
-                                // orphan queue) must be re-deliverable, otherwise
-                                // orphans whose parents were "seen" could never
-                                // be resolved and the node diverges forever.
                                 if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
-                                    if get_transaction_by_hash(&tx.id).is_some() {
+                                    if get_transaction_by_hash(&tx.id).is_some()
+                                        || is_orphan(&tx.id)
+                                    {
+                                        sync_ctx
+                                            .stats
+                                            .duplicate_ignored
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         continue;
                                     }
-                                    transactions.push(tx);
-                                    downloaded_count += 1;
+                                    pending.push((tx_bytes, tx));
                                 }
                             }
+                            sync_ctx.stats.sync_received.fetch_add(
+                                pending.len() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            sync_ctx
+                                .stats
+                                .sync_batches
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                            // Sort by timestamp (chronological order)
-                            transactions.sort_by_key(|tx| tx.timestamp);
+                            let (deliverable, waiting) =
+                                Self::partition_batch(pending, &*get_transaction_by_hash);
 
-                            // Add to DAG via channel (full validation will be done in main.rs)
-                            for tx in transactions {
-                                if let Ok(tx_bytes) = bincode::serialize(&tx) {
-                                    insert_seen(&seen_transactions, tx_bytes).await;
-                                }
+                            // Deliver in dependency order (throttled so the ledger
+                            // can breathe).
+                            for (tx_bytes, tx) in deliverable.into_iter().chain(waiting) {
+                                insert_seen(&seen_transactions, tx_bytes).await;
                                 let _ = tx_channel.send(tx);
-
-                                // Throttle: wait 50ms after each transaction to let ledger breathe
                                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                            }
-
-                            if downloaded_count > 0 {
-                                info!(
-                                    "[Sync] Downloaded {} missing transactions from {}",
-                                    downloaded_count, addr
-                                );
                             }
                         }
                         P2PMessage::Ping => {
@@ -1072,6 +1124,8 @@ impl P2PNetwork {
                 let get_transaction_by_hash = Arc::clone(&self.get_transaction_by_hash);
                 let get_tips = Arc::clone(&self.get_tips);
                 let seen_transactions = Arc::clone(&self.seen_transactions);
+                let sync_ctx = Arc::clone(&self.sync_ctx);
+                let is_orphan = Arc::clone(&self.is_orphan);
                 let peer_discovery_tx = {
                     let guard = self.peer_discovery_tx.lock().await;
                     guard.clone().unwrap_or_else(|| {
@@ -1094,6 +1148,8 @@ impl P2PNetwork {
                         msg_sender,
                         msg_receiver,
                         peer_discovery_tx,
+                        sync_ctx,
+                        is_orphan,
                     )
                     .await;
                 });
@@ -1151,8 +1207,141 @@ impl P2PNetwork {
         peers.keys().copied().collect()
     }
 
-    /// Request a specific transaction by hash from all peers
+    /// B4: deterministic dependency order of the local DAG (parents before
+    /// children, Kahn's algorithm with a sorted queue for a stable result).
+    /// Returns None above `TOPO_ORDER_CAP` (cost guard): the caller then falls
+    /// back to the request order.
+    fn topological_order(
+        get_dag_hashes: &(dyn Fn() -> Vec<Vec<u8>> + Send + Sync),
+        get_transaction_by_hash: &(dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync),
+    ) -> Option<Vec<Vec<u8>>> {
+        let hashes = get_dag_hashes();
+        if hashes.is_empty() || hashes.len() > TOPO_ORDER_CAP {
+            return None;
+        }
+        let mut indeg: HashMap<Vec<u8>, usize> = hashes.iter().map(|h| (h.clone(), 0)).collect();
+        let mut children: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
+        for h in &hashes {
+            if let Some(tx) = get_transaction_by_hash(h) {
+                for parent in tx.parents.iter() {
+                    if *parent == [0u8; 32] {
+                        continue;
+                    }
+                    if indeg.contains_key(parent.as_slice()) {
+                        *indeg.get_mut(parent.as_slice()).unwrap() += 1;
+                    }
+                    children.entry(parent.to_vec()).or_default().push(h.clone());
+                }
+            }
+        }
+        let mut queue: Vec<Vec<u8>> = indeg
+            .iter()
+            .filter(|(_, d)| **d == 0)
+            .map(|(h, _)| h.clone())
+            .collect();
+        queue.sort();
+        let mut order = Vec::with_capacity(hashes.len());
+        while let Some(h) = queue.pop() {
+            order.push(h.clone());
+            if let Some(kids) = children.get(&h) {
+                for kid in kids {
+                    let d = indeg.get_mut(kid).unwrap();
+                    *d -= 1;
+                    if *d == 0 {
+                        queue.push(kid.clone());
+                    }
+                }
+            }
+        }
+        if order.len() != hashes.len() {
+            // Cyclic references cannot exist (validation rejects them), but
+            // never return a partial order: fall back to the caller's order.
+            return None;
+        }
+        Some(order)
+    }
+
+    /// B4: split a sync batch into (deliverable now) / (waiting for parents)
+    /// using dependency-aware passes. A tx is deliverable when BOTH parents
+    /// are in the DAG or were accepted earlier in this batch (a parent that
+    /// is itself still waiting keeps the child waiting too). The result is
+    /// INDEPENDENT of the batch order: any permutation of the same tx set
+    /// with the same DAG yields the same partition.
+    fn partition_batch(
+        batch: Vec<(Vec<u8>, Transaction)>,
+        has_in_dag: &(dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync),
+    ) -> (Vec<(Vec<u8>, Transaction)>, Vec<(Vec<u8>, Transaction)>) {
+        use std::collections::HashSet;
+        let mut inserted: HashSet<[u8; 32]> = HashSet::new();
+        let mut pending = batch;
+        let mut deliverable = Vec::new();
+        loop {
+            let before = pending.len();
+            let mut still = Vec::new();
+            for item in pending {
+                let (_, tx) = &item;
+                let p0_ok = tx.parents[0] == [0u8; 32]
+                    || inserted.contains(&tx.parents[0])
+                    || has_in_dag(tx.parents[0].as_slice()).is_some();
+                let p1_ok = tx.parents[1] == [0u8; 32]
+                    || inserted.contains(&tx.parents[1])
+                    || has_in_dag(tx.parents[1].as_slice()).is_some();
+                if p0_ok && p1_ok {
+                    inserted.insert(tx.id);
+                    deliverable.push(item);
+                } else {
+                    still.push(item);
+                }
+            }
+            pending = still;
+            if pending.is_empty() || pending.len() == before {
+                break;
+            }
+        }
+        (deliverable, pending)
+    }
+
+    /// Request a specific transaction by hash from all peers.
+    ///
+    /// B4: bounded + backoff. The missing-parent set is deduplicated so a
+    /// parent is re-requested at most once per cooldown (escalating 2s/5s/15s
+    /// by attempt count). Previously every parked orphan re-requested its
+    /// parents unconditionally: the resulting 1-tx GetData flood starved the
+    /// real sync batches and the bootstrap froze (B4 livelock).
     pub async fn request_transaction(&self, hash: Vec<u8>) {
+        {
+            let mut reqs = self.sync_ctx.requested_parents.write().await;
+            if reqs.len() >= crate::sync_stats::MAX_INFLIGHT_PARENTS {
+                // Evict the least recently requested entry (bounded memory).
+                let oldest_key: Option<Vec<u8>> = reqs
+                    .iter()
+                    .min_by_key(|(_, (last, _))| *last)
+                    .map(|(k, _)| k.clone());
+                if let Some(key) = oldest_key {
+                    reqs.remove(&key);
+                }
+            }
+            let now = Instant::now();
+            if let Some((last, attempts)) = reqs.get_mut(&hash) {
+                let cooldown = crate::sync_stats::SyncContext::backoff_for(*attempts);
+                if now.duration_since(*last) < cooldown {
+                    self.sync_ctx
+                        .stats
+                        .parent_already_known
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+                *last = now;
+                *attempts += 1;
+            } else {
+                reqs.insert(hash.clone(), (now, 1));
+            }
+        }
+
+        self.sync_ctx
+            .stats
+            .parent_requested
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let msg = P2PMessage::GetData(vec![hash.clone()]);
         let msg_bytes = match bincode::serialize(&msg) {
             Ok(bytes) => bytes,
@@ -1429,6 +1618,8 @@ mod tests {
             Arc::new(|| vec![]),
             Arc::new(|_| None),
             Arc::new(|| vec![]),
+            Arc::new(crate::sync_stats::SyncContext::default()),
+            Arc::new(|_| false),
         );
 
         let tx = Transaction::new(
@@ -1452,5 +1643,172 @@ mod tests {
         // Check that it's in seen_transactions
         let seen = p2p.seen_transactions.read().await;
         assert!(seen.contains_key(&tx_bytes));
+    }
+
+    /// B4: partition_batch must be ORDER-INDEPENDENT. A chain A->B->C->D is
+    /// fully deliverable in parent-first order, and the same set in
+    /// child-first order must yield the SAME deliverable set (parents first).
+    #[test]
+    fn test_partition_batch_order_independent() {
+        let mk = |id: u8, parents: [[u8; 32]; 2]| -> Transaction {
+            Transaction::new(
+                parents,
+                [id; 32],
+                [id + 1; 32],
+                100,
+                10,
+                1234567890 + id as u64,
+                0,
+                1,
+                vec![0u8; 64],
+                vec![0u8; 32],
+            )
+        };
+        let genesis = [0u8; 32];
+        let a = mk(1, [genesis, genesis]);
+        let b = mk(2, [a.id, genesis]);
+        let c = mk(3, [b.id, genesis]);
+        let d = mk(4, [c.id, genesis]);
+
+        // DAG already contains genesis (and nothing else): lookup by id.
+        let has_in_dag = |id: &[u8]| -> Option<Transaction> {
+            let ids: [[u8; 32]; 4] = [a.id, b.id, c.id, d.id];
+            if ids.iter().any(|x| x.as_slice() == id) {
+                None
+            } else {
+                Some(a.clone())
+            }
+        };
+        let serialize = |tx: &Transaction| bincode::serialize(tx).unwrap();
+
+        // Parent-first order: everything deliverable.
+        let (del, wait) = P2PNetwork::partition_batch(
+            vec![
+                (serialize(&a), a.clone()),
+                (serialize(&b), b.clone()),
+                (serialize(&c), c.clone()),
+                (serialize(&d), d.clone()),
+            ],
+            &has_in_dag,
+        );
+        assert_eq!(del.len(), 4, "parent-first chain must be fully deliverable");
+        assert!(wait.is_empty());
+
+        // Child-first order: the SAME deliverable set. The head (a) is
+        // deliverable (parents = genesis); once inserted in-batch, b, c and d
+        // unlock in the same passes -> identical partition, no orphans.
+        let (del2, wait2) = P2PNetwork::partition_batch(
+            vec![
+                (serialize(&d), d.clone()),
+                (serialize(&c), c.clone()),
+                (serialize(&b), b.clone()),
+                (serialize(&a), a.clone()),
+            ],
+            &has_in_dag,
+        );
+        assert_eq!(del2.len(), 4, "child-first chain must also fully resolve");
+        assert!(wait2.is_empty());
+        let mut del_ids: Vec<[u8; 32]> = del.into_iter().map(|(_, t)| t.id).collect();
+        let mut del2_ids: Vec<[u8; 32]> = del2.into_iter().map(|(_, t)| t.id).collect();
+        del_ids.sort();
+        del2_ids.sort();
+        assert_eq!(
+            del_ids, del2_ids,
+            "deliverable set must be order-independent"
+        );
+
+        // Without the head (a missing from the DAG AND the batch): everything
+        // waits. Parents are requested via the orphan flow instead.
+        let (del3, wait3) = P2PNetwork::partition_batch(
+            vec![
+                (serialize(&d), d.clone()),
+                (serialize(&c), c.clone()),
+                (serialize(&b), b.clone()),
+            ],
+            &has_in_dag,
+        );
+        assert!(del3.is_empty(), "no head -> nothing deliverable in-batch");
+        assert_eq!(wait3.len(), 3, "all members wait for the missing parent");
+    }
+
+    /// B4: a diamond A->(B,C)->D: B and C are both deliverable once A is in
+    /// the DAG; D waits for both.
+    #[test]
+    fn test_partition_batch_diamond() {
+        let mk = |id: u8, parents: [[u8; 32]; 2]| -> Transaction {
+            Transaction::new(
+                parents,
+                [id; 32],
+                [id + 1; 32],
+                100,
+                10,
+                1234567890 + id as u64,
+                0,
+                1,
+                vec![0u8; 64],
+                vec![0u8; 32],
+            )
+        };
+        let genesis = [0u8; 32];
+        let a = mk(1, [genesis, genesis]);
+        let b = mk(2, [a.id, genesis]);
+        let c = mk(3, [a.id, genesis]);
+        let d = mk(4, [b.id, c.id]);
+
+        let has_in_dag = |id: &[u8]| -> Option<Transaction> {
+            let known: Vec<[u8; 32]> = vec![a.id, b.id, c.id, d.id];
+            if known.iter().any(|x| x.as_slice() == id) {
+                None
+            } else {
+                Some(a.clone())
+            }
+        };
+        let serialize = |tx: &Transaction| bincode::serialize(tx).unwrap();
+
+        // Arrive in worst order: D, C, B, A.
+        let (del, wait) = P2PNetwork::partition_batch(
+            vec![
+                (serialize(&d), d.clone()),
+                (serialize(&c), c.clone()),
+                (serialize(&b), b.clone()),
+                (serialize(&a), a.clone()),
+            ],
+            &has_in_dag,
+        );
+        // After the passes: A deliverable (parents=genesis); then B and C
+        // (parent A now inserted in-batch); D still waits for C/B? No: B and C
+        // are inserted, so D becomes deliverable in the same pass chain.
+        assert_eq!(del.len(), 4, "diamond must resolve fully in-batch");
+        assert!(wait.is_empty());
+    }
+
+    /// B4: parent-request dedup. Two immediate requests for the same parent
+    /// must produce ONE actual request; the second is counted as
+    /// already-known (backoff).
+    #[tokio::test]
+    async fn test_request_transaction_dedup() {
+        let (tx_channel, _tx_receiver) = mpsc::unbounded_channel::<Transaction>();
+        let ctx = Arc::new(crate::sync_stats::SyncContext::default());
+        let p2p = P2PNetwork::new(
+            P2PConfig::default(),
+            tx_channel,
+            Arc::new(|| vec![]),
+            Arc::new(|_| None),
+            Arc::new(|| vec![]),
+            ctx.clone(),
+            Arc::new(|_| false),
+        );
+
+        let hash = vec![0xABu8; 32];
+        p2p.request_transaction(hash.clone()).await;
+        p2p.request_transaction(hash.clone()).await;
+        p2p.request_transaction(hash).await;
+
+        let snap = ctx.stats.snapshot();
+        assert_eq!(snap.parent_requested, 1, "only the first request is sent");
+        assert_eq!(
+            snap.parent_already_known, 2,
+            "repeats within the cooldown are deduplicated"
+        );
     }
 }

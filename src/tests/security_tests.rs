@@ -723,9 +723,12 @@ mod malleability_tests {
                 Arc::new(|| vec![]),
                 Arc::new(|_| None),
                 Arc::new(|| vec![]),
+                Arc::new(crate::sync_stats::SyncContext::default()),
+                Arc::new(|_| false),
             )),
             Arc::new(RwLock::new(false)),
             Arc::new(RwLock::new(std::collections::HashMap::new())),
+            Arc::new(crate::sync_stats::SyncContext::default()),
         );
 
         // 2 MiB of zeros: way beyond the 1 MiB cap.

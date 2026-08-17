@@ -587,6 +587,8 @@ pub struct AetherRpcImpl {
     /// per-method budget (which would DoS every other client).
     rate_limiter_per_ip: RateLimiter,
     start_time: std::time::Instant,
+    /// B4: shared bootstrap state (counters, parent-request dedup, orphan TTL)
+    sync_ctx: Arc<crate::sync_stats::SyncContext>,
 }
 
 struct FeeOracle {
@@ -632,6 +634,7 @@ impl AetherRpcImpl {
         p2p_network: Arc<crate::p2p::P2PNetwork>,
         mining_enabled: Arc<RwLock<bool>>,
         orphans: Arc<RwLock<std::collections::HashMap<[u8; 32], Transaction>>>,
+        sync_ctx: Arc<crate::sync_stats::SyncContext>,
     ) -> Self {
         // Load the faucet secret key from a SERVER-ONLY file. The secret is
         // NEVER in the source code or distributed binary. Without the file the
@@ -652,6 +655,7 @@ impl AetherRpcImpl {
             rate_limiter: RateLimiter::new(200, 10), // 200 requests per 10s window
             rate_limiter_per_ip: RateLimiter::new(40, 10), // 40 requests per 10s per client IP
             start_time: std::time::Instant::now(),
+            sync_ctx,
         }
     }
 
@@ -1028,11 +1032,27 @@ impl AetherRpcImpl {
         // Also keep in memory for fast access.
         {
             let mut orphans = self.orphans.write().await;
+            if !orphans.contains_key(&tx.id) {
+                // Record the birth instant only for NEW orphans so re-delivery
+                // cannot reset the TTL (B4 safety net).
+                self.sync_ctx
+                    .orphan_births
+                    .write()
+                    .await
+                    .insert(tx.id, std::time::Instant::now());
+            }
             orphans.insert(tx.id, tx.clone());
         }
 
+        self.sync_ctx
+            .stats
+            .orphan_created
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         // Request the missing parents via P2P (each in its own task so one
-        // slow peer cannot block the others).
+        // slow peer cannot block the others). B4: request_transaction now
+        // deduplicates with an escalating backoff, so repeated orphans of the
+        // same tx cannot flood the peer with duplicate GetData.
         for parent in missing_parents {
             let p2p = self.p2p_network.clone();
             let parent_hash = parent.to_vec();
@@ -1049,10 +1069,19 @@ impl AetherRpcImpl {
         true
     }
 
-    /// Process orphans - retry transactions that were waiting for parents
+    /// Process orphans - retry transactions that were waiting for parents.
+    ///
+    /// B4: three changes fix the cold-start livelock:
+    /// 1. FIXPOINT resolution: resolving an orphan can unlock its children in
+    ///    the SAME cycle (previously one level per 10s cycle, which made deep
+    ///    chains stall for many minutes).
+    /// 2. TTL purge: orphans older than `ORPHAN_TTL` are removed (store +
+    ///    disk) so the store cannot fill with undeliverable junk; the periodic
+    ///    full sync re-fetches them when (and if) their parents arrive.
+    /// 3. The missing-parent re-requests now go through the deduplicated
+    ///    `request_transaction` (escalating backoff), so the 10s loop cannot
+    ///    re-flood the peers with duplicate GetData either.
     pub async fn process_orphans(&self) {
-        let mut orphans_to_process = Vec::new();
-
         // Load orphans from disk on startup
         // 🔧 FIX: use the main storage (data_dir/sled_db), NOT a new sled at
         // ledger_path.parent() which silently opened a different database at
@@ -1069,24 +1098,140 @@ impl AetherRpcImpl {
             }
         }
 
-        // Check which orphans can now be processed (parents available)
+        // B4: TTL purge (safety net).
         {
-            let orphans = self.orphans.read().await;
-            let dag = self.dag.read().await;
-
-            for (tx_id, orphan) in orphans.iter() {
-                let parent0_ok = orphan.parents[0] == [0u8; 32]
-                    || dag.transactions().contains_key(&orphan.parents[0]);
-                let parent1_ok = orphan.parents[1] == [0u8; 32]
-                    || dag.transactions().contains_key(&orphan.parents[1]);
-
-                if parent0_ok && parent1_ok {
-                    tracing::info!(
-                        "🔗 Orphan {} resolved - parents now available",
-                        hex::encode(&tx_id[..8])
-                    );
-                    orphans_to_process.push((*tx_id, orphan.clone()));
+            let stale_ids: Vec<[u8; 32]> = {
+                let births = self.sync_ctx.orphan_births.read().await;
+                births
+                    .iter()
+                    .filter(|(_, born)| born.elapsed() >= crate::sync_stats::ORPHAN_TTL)
+                    .map(|(id, _)| *id)
+                    .collect()
+            };
+            if !stale_ids.is_empty() {
+                let mut removed = 0;
+                {
+                    let mut orphans = self.orphans.write().await;
+                    let mut births = self.sync_ctx.orphan_births.write().await;
+                    for id in stale_ids {
+                        if orphans.remove(&id).is_some() {
+                            births.remove(&id);
+                            if let Ok(storage_guard) = self.storage.try_read() {
+                                let _ = storage_guard.remove_orphan(id);
+                            }
+                            removed += 1;
+                        }
+                    }
                 }
+                if removed > 0 {
+                    self.sync_ctx
+                        .stats
+                        .orphan_purged
+                        .fetch_add(removed, std::sync::atomic::Ordering::Relaxed);
+                    tracing::warn!(
+                        "🗑️ Purged {} orphans after TTL ({:?})",
+                        removed,
+                        crate::sync_stats::ORPHAN_TTL
+                    );
+                }
+            }
+        }
+
+        // B4: fixpoint resolution. Re-scan the store after every successful
+        // insertion so children unlocked by a parent are processed in the
+        // same cycle. `attempted` keeps the passes bounded: an orphan that
+        // failed with a temporary error is retried on the next 10s cycle.
+        let mut attempted: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        for _pass in 0..crate::sync_stats::ORPHAN_FIXPOINT_MAX_PASSES {
+            let mut candidates: Vec<([u8; 32], Transaction)> = Vec::new();
+            {
+                let orphans = self.orphans.read().await;
+                let dag = self.dag.read().await;
+
+                for (tx_id, orphan) in orphans.iter() {
+                    if attempted.contains(tx_id) {
+                        continue;
+                    }
+                    let parent0_ok = orphan.parents[0] == [0u8; 32]
+                        || dag.transactions().contains_key(&orphan.parents[0]);
+                    let parent1_ok = orphan.parents[1] == [0u8; 32]
+                        || dag.transactions().contains_key(&orphan.parents[1]);
+
+                    if parent0_ok && parent1_ok {
+                        candidates.push((*tx_id, orphan.clone()));
+                    }
+                }
+            }
+            if candidates.is_empty() {
+                break;
+            }
+
+            let mut any_resolved = false;
+            for (tx_id, orphan) in candidates {
+                attempted.insert(tx_id);
+                self.sync_ctx
+                    .stats
+                    .retry_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    "🔄 Re-processing orphan transaction: {}",
+                    hex::encode(&tx_id[..8])
+                );
+                match self.process_transaction(orphan, "Orphan").await {
+                    Ok(_) => {
+                        any_resolved = true;
+                        self.sync_ctx
+                            .stats
+                            .orphan_resolved
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::info!(
+                            "✅ Orphan transaction successfully processed: {}",
+                            hex::encode(&tx_id[..8])
+                        );
+                        // Remove from orphans on success
+                        let mut orphans = self.orphans.write().await;
+                        orphans.remove(&tx_id);
+                        drop(orphans);
+                        self.sync_ctx.orphan_births.write().await.remove(&tx_id);
+
+                        // Also remove from disk
+                        if let Ok(storage_guard) = self.storage.try_read() {
+                            let _ = storage_guard.remove_orphan(tx_id);
+                        }
+                    }
+                    Err(e) => {
+                        let error_msg = e.to_string();
+                        // Check if error is permanent (replay, double spend, etc.)
+                        let is_permanent = error_msg.contains("Duplicate transaction")
+                            || error_msg.contains("Double spend")
+                            || error_msg.contains("Sender conflict");
+
+                        if is_permanent {
+                            tracing::warn!(
+                                "🗑️ Orphan {} permanently invalid, removing from queue",
+                                hex::encode(&tx_id[..8])
+                            );
+                            let mut orphans = self.orphans.write().await;
+                            orphans.remove(&tx_id);
+                            drop(orphans);
+                            self.sync_ctx.orphan_births.write().await.remove(&tx_id);
+
+                            // Also remove from disk
+                            if let Ok(storage_guard) = self.storage.try_read() {
+                                let _ = storage_guard.remove_orphan(tx_id);
+                            }
+                        } else {
+                            // Temporary error (mempool full, lock error, etc.) - keep in queue
+                            tracing::info!(
+                                "📦 Orphan {} kept in queue (temporary error)",
+                                hex::encode(&tx_id[..8])
+                            );
+                        }
+                    }
+                }
+            }
+            if !any_resolved {
+                break;
             }
         }
 
@@ -1094,7 +1239,8 @@ impl AetherRpcImpl {
         // Previously parents were only requested once when the orphan was
         // first received - if that GetData was lost (peer not connected at
         // that exact moment), the orphan stayed stuck forever. Re-request
-        // every cycle so chains converge.
+        // every cycle so chains converge. B4: the requests themselves are
+        // deduplicated with an escalating backoff inside request_transaction.
         {
             let missing_parent_hashes: Vec<[u8; 32]> = {
                 let orphans = self.orphans.read().await;
@@ -1108,11 +1254,11 @@ impl AetherRpcImpl {
                         {
                             hashes.push(*parent);
                         }
-                        if hashes.len() >= 32 {
+                        if hashes.len() >= 128 {
                             break;
                         }
                     }
-                    if hashes.len() >= 32 {
+                    if hashes.len() >= 128 {
                         break;
                     }
                 }
@@ -1132,57 +1278,13 @@ impl AetherRpcImpl {
                 }
             }
         }
+    }
 
-        // Process resolved orphans
-        for (tx_id, orphan) in orphans_to_process {
-            tracing::info!(
-                "🔄 Re-processing orphan transaction: {}",
-                hex::encode(&tx_id[..8])
-            );
-            match self.process_transaction(orphan, "Orphan").await {
-                Ok(_) => {
-                    tracing::info!(
-                        "✅ Orphan transaction successfully processed: {}",
-                        hex::encode(&tx_id[..8])
-                    );
-                    // Remove from orphans on success
-                    let mut orphans = self.orphans.write().await;
-                    orphans.remove(&tx_id);
-
-                    // Also remove from disk
-                    if let Ok(storage_guard) = self.storage.try_read() {
-                        let _ = storage_guard.remove_orphan(tx_id);
-                    }
-                }
-                Err(e) => {
-                    let error_msg = e.to_string();
-                    // Check if error is permanent (replay, double spend, etc.)
-                    let is_permanent = error_msg.contains("Duplicate transaction")
-                        || error_msg.contains("Double spend")
-                        || error_msg.contains("Sender conflict");
-
-                    if is_permanent {
-                        tracing::warn!(
-                            "🗑️ Orphan {} permanently invalid, removing from queue",
-                            hex::encode(&tx_id[..8])
-                        );
-                        let mut orphans = self.orphans.write().await;
-                        orphans.remove(&tx_id);
-
-                        // Also remove from disk
-                        if let Ok(storage_guard) = self.storage.try_read() {
-                            let _ = storage_guard.remove_orphan(tx_id);
-                        }
-                    } else {
-                        // Temporary error (mempool full, lock error, etc.) - keep in queue
-                        tracing::info!(
-                            "📦 Orphan {} kept in queue (temporary error)",
-                            hex::encode(&tx_id[..8])
-                        );
-                    }
-                }
-            }
-        }
+    /// B4: bootstrap/sync counters (aether_getSyncStats). Used by the monitor
+    /// and the canary tests to demonstrate the invariant: orphans up ->
+    /// parents fetched -> orphans down -> DAG up -> convergence.
+    pub async fn get_sync_stats(&self) -> Result<crate::sync_stats::SyncStatsSnapshot, RpcError> {
+        Ok(self.sync_ctx.stats.snapshot())
     }
 
     /// Get DAG statistics
@@ -1706,6 +1808,7 @@ pub async fn start_rpc_server(
     p2p_network: Arc<crate::p2p::P2PNetwork>,
     mining_enabled: Arc<RwLock<bool>>,
     orphans: Arc<RwLock<std::collections::HashMap<[u8; 32], Transaction>>>,
+    sync_ctx: Arc<crate::sync_stats::SyncContext>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rpc_impl = Arc::new(AetherRpcImpl::new(
         dag,
@@ -1716,6 +1819,7 @@ pub async fn start_rpc_server(
         p2p_network,
         mining_enabled,
         orphans,
+        sync_ctx,
     ));
 
     // Log mempool config
@@ -1843,6 +1947,10 @@ async fn handle_rpc(
             }
         }
         "aether_getDagStats" => match rpc_impl.get_dag_stats().await {
+            Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
+            Err(e) => Err(e),
+        },
+        "aether_getSyncStats" => match rpc_impl.get_sync_stats().await {
             Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
             Err(e) => Err(e),
         },
@@ -2299,6 +2407,8 @@ mod tests {
             Arc::new(|| Vec::new()),
             Arc::new(|_| None),
             Arc::new(|| Vec::new()),
+            Arc::new(crate::sync_stats::SyncContext::default()),
+            Arc::new(|_| false),
         ));
         AetherRpcImpl::new(
             dag,
@@ -2309,6 +2419,7 @@ mod tests {
             p2p,
             Arc::new(RwLock::new(true)),
             Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(crate::sync_stats::SyncContext::default()),
         )
     }
 

@@ -421,6 +421,22 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             }
         });
 
+    // B4: shared bootstrap state (counters, parent-request dedup, orphan TTL).
+    let sync_ctx = Arc::new(crate::sync_stats::SyncContext::default());
+
+    // B4: sync dedup must also treat already-parked orphans as known (they are
+    // retried by the fixpoint resolver; re-delivering them was the request
+    // amplification loop of the B4 livelock).
+    let orphans_for_p2p = orphans.clone();
+    let is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> = Arc::new(move |hash: &[u8]| {
+        if let Ok(orphan_lock) = orphans_for_p2p.try_read() {
+            if let Ok(tx_id) = <[u8; 32]>::try_from(hash) {
+                return orphan_lock.contains_key(&tx_id);
+            }
+        }
+        false
+    });
+
     let p2p_config = P2PConfig {
         listen_addr: format!("0.0.0.0:{}", p2p_port)
             .parse()
@@ -436,6 +452,8 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
         get_dag_hashes,
         get_transaction_by_hash,
         get_tips,
+        sync_ctx.clone(),
+        is_orphan,
     ));
     tracing::info!("✅ P2P network initialized");
 
@@ -456,6 +474,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     let ledger_path_for_p2p = ledger_path.clone();
     let storage_for_p2p = storage.clone();
     let orphans_for_p2p = orphans.clone();
+    let sync_ctx_for_p2p = sync_ctx.clone();
 
     tokio::spawn(async move {
         tracing::info!("✅ P2P transaction receiver task spawned");
@@ -469,11 +488,18 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                 p2p_network_for_p2p.clone(),
                 Arc::new(RwLock::new(true)),
                 orphans_for_p2p.clone(),
+                sync_ctx_for_p2p.clone(),
             );
 
             match rpc_impl.process_transaction(tx, "P2P").await {
                 Ok(_) => {
                     tracing::info!("✅ P2P transaction accepted and processed");
+                    // B4: count DAG growth through the sync path and resolve
+                    // newly applicable orphans in the same cycle (fixpoint).
+                    sync_ctx_for_p2p
+                        .stats
+                        .sync_progress
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     rpc_impl.process_orphans().await;
                 }
                 Err(e) => {
@@ -513,6 +539,10 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     let mining_enabled_periodic = mining_enabled.clone();
     let dag_save_periodic = dag.clone();
     let dag_store_path_save_periodic = dag_store_path.clone();
+    let sync_ctx_periodic = sync_ctx.clone();
+    let last_stats_snapshot = Arc::new(std::sync::Mutex::new(
+        crate::sync_stats::SyncStatsSnapshot::default(),
+    ));
 
     tokio::spawn(async move {
         loop {
@@ -546,9 +576,36 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                 p2p_periodic.clone(),
                 mining_enabled_periodic.clone(),
                 orphans_periodic.clone(),
+                sync_ctx_periodic.clone(),
             );
 
             rpc_impl.process_orphans().await;
+
+            // B4: log the sync counters when they changed (bootstrap/join
+            // observability; the RPC endpoint exposes them on demand).
+            {
+                let snap = sync_ctx_periodic.stats.snapshot();
+                let mut last = last_stats_snapshot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if *last != snap {
+                    tracing::info!(
+                        "📊 sync requested={} received={} progress={} batches={} | orphans created={} resolved={} purged={} retries={} | parents requested={} deduped={} | dup_ignored={}",
+                        snap.sync_requested,
+                        snap.sync_received,
+                        snap.sync_progress,
+                        snap.sync_batches,
+                        snap.orphan_created,
+                        snap.orphan_resolved,
+                        snap.orphan_purged,
+                        snap.retry_count,
+                        snap.parent_requested,
+                        snap.parent_already_known,
+                        snap.duplicate_ignored
+                    );
+                    *last = snap;
+                }
+            }
 
             // V-22 FIX: periodic full reconciliation. The tip-based sync only
             // runs once at connection time; a node that missed transactions
@@ -571,6 +628,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     let rpc_storage = storage.clone();
     let mining_enabled_rpc = mining_enabled.clone();
     let rpc_orphans = orphans.clone();
+    let sync_ctx_rpc = sync_ctx.clone();
 
     tracing::info!("🔄 Spawning RPC Server task...");
     tokio::spawn(async move {
@@ -585,6 +643,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             rpc_p2p,
             mining_enabled_rpc,
             rpc_orphans,
+            sync_ctx_rpc,
         )
         .await
         {

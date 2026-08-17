@@ -16,6 +16,7 @@ pub mod p2p;
 pub mod parent_selection;
 pub mod rpc;
 pub mod storage;
+pub mod sync_stats;
 pub mod transaction;
 pub mod transaction_processor;
 pub mod validation;

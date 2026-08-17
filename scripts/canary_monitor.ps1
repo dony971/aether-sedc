@@ -51,7 +51,7 @@ function Fingerprint($port) {
         $n = (RpcCall $port "aether_getAccountNonce" @($a)).next_nonce
         $led += ($a + ":" + $b + ":" + $n)
     }
-    $graph = RpcCall $port "aether_getDagGraph" @()
+    $graph = RpcCall $port "aether_getDagGraph" @(10000)
     $txs = @(); $w = @(); $eds = @()
     if ($graph) {
         foreach ($nd in $graph.nodes) { $txs += HexId $nd.tx_id; $w += "$(HexId $nd.tx_id):$($nd.weight)" }
