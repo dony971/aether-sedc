@@ -181,12 +181,7 @@ impl TransactionValidator {
             }
         }
 
-        // Check for duplicate parents (double spend protection)
-        if dag.has_transaction_with_parents(&tx.parents) {
-            return Err(ValidationError::DoubleSpend);
-        }
-
-        // Check for sender conflict
+        // Check for sender conflict (canonical double-spend detector)
         if dag.has_sender_conflict(&tx.sender, tx.account_nonce) {
             return Err(ValidationError::SenderConflict);
         }
@@ -218,14 +213,6 @@ impl TransactionValidator {
             });
         }
 
-        // Check account nonce
-        if let Err(e) = ledger.validate_account_nonce(&tx.sender, tx.account_nonce) {
-            return Err(ValidationError::InvalidNonce {
-                expected: ledger.get_nonce(&tx.sender) + 1,
-                provided: tx.account_nonce,
-            });
-        }
-
         // Check minimum fee
         if tx.fee < min_fee {
             return Err(ValidationError::InsufficientFee {
@@ -233,6 +220,16 @@ impl TransactionValidator {
                 provided: tx.fee,
             });
         }
+
+        // NOTE: The account nonce is deliberately NOT validated here. Nonce
+        // checks against the live ledger state are arrival-order-dependent:
+        // a node that processed nonce 5,6,7 first would permanently reject a
+        // late but valid nonce-3 transaction that another node accepted -
+        // permanently diverging the two DAGs. Replay protection and
+        // double-spend prevention are instead enforced deterministically at
+        // the DAG level via the canonical (sender, account_nonce) conflict
+        // resolution (STEP 0 in the transaction processor), which is a pure
+        // function of the DAG and therefore identical on every node.
 
         Ok(())
     }
@@ -265,7 +262,6 @@ mod tests {
     use crate::ledger::Ledger;
     use crate::parent_selection::DAG;
     use crate::transaction::Transaction;
-    use tempfile::tempdir;
 
     #[test]
     fn test_validate_pure_valid() {
@@ -292,7 +288,7 @@ mod tests {
     fn test_validate_pure_overflow() {
         let validator = TransactionValidator::new();
         let mut dag = DAG::new();
-        let ledger = Ledger::new();
+        let _ledger = Ledger::new();
 
         let tx = Transaction::new(
             [[0u8; 32]; 2],
@@ -319,7 +315,7 @@ mod tests {
     #[test]
     fn test_validate_dag_genesis_parents_valid() {
         let validator = TransactionValidator::new();
-        let mut dag = DAG::new();
+        let dag = DAG::new();
         let _ledger = Ledger::new();
 
         // Transaction with genesis parents should be valid (not an orphan)
@@ -344,7 +340,7 @@ mod tests {
     #[test]
     fn test_validate_dag_missing_parent() {
         let validator = TransactionValidator::new();
-        let mut dag = DAG::new();
+        let dag = DAG::new();
         let _ledger = Ledger::new();
 
         // Use non-genesis parent that doesn't exist

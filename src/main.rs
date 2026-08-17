@@ -6,7 +6,7 @@
 use aether_unified::{
     config::NodeConfig,
     json_storage::save_dag_to_json,
-    transaction::{Address, Transaction},
+    transaction::{tips_to_parents, Address, Transaction},
     wallet::Wallet,
 };
 use clap::{Parser, Subcommand};
@@ -125,6 +125,16 @@ enum WalletAction {
     },
 }
 
+/// Prompt for a wallet encryption password on stdin.
+fn prompt_password() -> String {
+    print!("Enter password to encrypt wallet: ");
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    let mut password = String::new();
+    std::io::stdin().read_line(&mut password).ok();
+    password.trim().to_string()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -137,7 +147,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match &cli.command {
         Some(Commands::Keygen { path }) => {
             let wallet = Wallet::new();
-            wallet.to_file(path, None).await?;
+            let password = prompt_password();
+            if password.is_empty() {
+                eprintln!("{}", "Password cannot be empty".red());
+                std::process::exit(1);
+            }
+            wallet.to_file(path, Some(&password)).await?;
             println!("{}", "✓ Wallet generated and saved to".green());
             println!("  Path: {}", path.cyan());
             println!("  Address: {}", hex::encode(wallet.address()).cyan());
@@ -146,17 +161,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Wallet { action }) => match action {
             WalletAction::Create { path } => {
                 let wallet = Wallet::new_with_mnemonic();
-                print!("Enter password to encrypt wallet: ");
-                use std::io::Write;
-                std::io::stdout().flush()?;
-                let mut password = String::new();
-                std::io::stdin().read_line(&mut password)?;
-                let password = password.trim();
+                let password = prompt_password();
                 if password.is_empty() {
                     eprintln!("{}", "Password cannot be empty".red());
                     std::process::exit(1);
                 }
-                wallet.to_file(path, Some(password)).await?;
+                wallet.to_file(path, Some(&password)).await?;
                 println!("{}", "✓ Wallet generated and saved".green());
                 println!("  Path: {}", path.cyan());
                 println!("  Address: {}", wallet.address_string().cyan());
@@ -181,7 +191,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             WalletAction::Restore { path, mnemonic } => {
                 let wallet = Wallet::from_mnemonic(mnemonic)?;
-                wallet.to_file(path, None).await?;
+                let password = prompt_password();
+                if password.is_empty() {
+                    eprintln!("{}", "Password cannot be empty".red());
+                    std::process::exit(1);
+                }
+                wallet.to_file(path, Some(&password)).await?;
                 println!("{}", "✓ Wallet restored from mnemonic".green());
                 println!("  Path: {}", path.cyan());
                 println!("  Address: {}", wallet.address_string().cyan());
@@ -378,37 +393,60 @@ async fn send_transaction_client(
     });
 
     let parents = match client.post(rpc_url).json(&tips_payload).send().await {
-        Ok(response) => {
-            match response.json::<serde_json::Value>().await {
-                Ok(json) => {
-                    if let Some(result) = json.get("result") {
-                        if let Some(tips_data) = result.get("tips") {
-                            if let Some(tips_array) = tips_data.as_array() {
-                                let mut parent_ids = [[0u8; 32]; 2];
-                                for (i, tip) in tips_array.iter().take(2).enumerate() {
-                                    if let Some(tip_str) = tip.as_str() {
-                                        if let Ok(tip_bytes) = hex::decode(tip_str) {
-                                            if tip_bytes.len() == 32 {
-                                                parent_ids[i].copy_from_slice(&tip_bytes);
-                                            }
-                                        }
-                                    }
+        Ok(response) => match response.json::<serde_json::Value>().await {
+            Ok(json) => {
+                if let Some(result) = json.get("result") {
+                    if let Some(tips_data) = result.get("tips") {
+                        if let Some(tips_array) = tips_data.as_array() {
+                            // V-20 FIX: strict parsing. A malformed tips
+                            // payload is an ERROR, never a silent fallback to
+                            // genesis parents (which star-shaped the DAG and
+                            // broke consensus). Genesis parents are only
+                            // legitimate for an empty DAG.
+                            match tips_to_parents(tips_array) {
+                                Ok(parents) => parents,
+                                Err(e) => {
+                                    return Err(format!(
+                                        "Node returned malformed tips: {}. \
+                                         Refusing to send with genesis parents.",
+                                        e
+                                    )
+                                    .into())
                                 }
-                                parent_ids
-                            } else {
-                                [[0u8; 32]; 2] // Fallback to genesis
                             }
                         } else {
-                            [[0u8; 32]; 2] // Fallback to genesis
+                            return Err(
+                                "Node returned malformed tips payload (not an array)".into()
+                            );
                         }
                     } else {
-                        [[0u8; 32]; 2] // Fallback to genesis
+                        return Err("Node returned malformed tips payload (no tips field)".into());
                     }
+                } else {
+                    return Err("Node returned malformed tips payload (no result)".into());
                 }
-                Err(_) => [[0u8; 32]; 2], // Fallback to genesis on parse error
             }
+            Err(e) => {
+                // H6: strict by default — a transport/parse failure while
+                // fetching tips is an ERROR, never a silent fallback to
+                // genesis parents (which star-shaped the DAG). Only an empty
+                // DAG legitimately yields genesis parents via tips_to_parents.
+                return Err(format!(
+                    "Node returned unparseable tips response: {}. \
+                     Refusing to send with genesis parents.",
+                    e
+                )
+                .into());
+            }
+        },
+        Err(e) => {
+            return Err(format!(
+                "Could not reach node at {}: {}. \
+                 Refusing to send with genesis parents.",
+                rpc_url, e
+            )
+            .into())
         }
-        Err(_) => [[0u8; 32]; 2], // Fallback to genesis on RPC error
     };
 
     // Create transaction with proper parents from DAG tips

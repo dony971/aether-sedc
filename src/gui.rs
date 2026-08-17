@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use aether_unified::config::NodeConfig;
 use aether_unified::json_storage::save_dag_to_json;
-use aether_unified::transaction::Transaction;
+use aether_unified::transaction::{tips_to_parents, Transaction};
 use aether_unified::wallet::Wallet;
 
 #[derive(Parser)]
@@ -154,7 +154,6 @@ struct GuiState {
     address: String,
     wallet: bool,
     mnemonic: String,
-    secret_key: String,
 }
 
 impl Default for GuiState {
@@ -170,7 +169,6 @@ impl Default for GuiState {
             address: String::new(),
             wallet: false,
             mnemonic: String::new(),
-            secret_key: String::new(),
         }
     }
 }
@@ -414,7 +412,6 @@ impl AetherGui {
                     let mut s = self.state.lock().unwrap();
                     s.address = w.address_string();
                     s.wallet = true;
-                    s.secret_key = w.secret_key_hex.clone();
                     s.mnemonic = w.mnemonic.unwrap_or_default();
                     s.status = "Wallet created".to_string();
                     s.status_color = Color32::GREEN;
@@ -537,18 +534,13 @@ async fn send_transaction_client(
         .send()
         .await?;
     let tips_json: serde_json::Value = tips_resp.json().await?;
-    let mut parents = [[0u8; 32]; 2];
-    if let Some(tips) = tips_json["result"]["tips"].as_array() {
-        for (i, tip) in tips.iter().take(2).enumerate() {
-            if let Some(ts) = tip.as_str() {
-                if let Ok(tb) = hex::decode(ts) {
-                    if tb.len() == 32 {
-                        parents[i].copy_from_slice(&tb);
-                    }
-                }
-            }
-        }
-    }
+    // V-20 FIX: strict parsing. A malformed tips payload is an ERROR, never a
+    // silent fallback to genesis parents (which star-shaped the DAG and broke
+    // consensus). Genesis parents are only legitimate for an empty DAG.
+    let tips_array = tips_json["result"]["tips"]
+        .as_array()
+        .ok_or("Node returned malformed tips payload (not an array)")?;
+    let parents = tips_to_parents(tips_array).map_err(|e| format!("Malformed tips: {}", e))?;
     let tx = Transaction::new(
         parents,
         sender_address,
@@ -669,6 +661,16 @@ fn run_gui(cfg: NodeConfig) -> eframe::Result<()> {
     )
 }
 
+/// Prompt for a wallet encryption password on stdin.
+fn prompt_password() -> String {
+    use std::io::Write;
+    print!("Encrypt wallet password: ");
+    std::io::stdout().flush().ok();
+    let mut pw = String::new();
+    std::io::stdin().read_line(&mut pw).ok();
+    pw.trim().to_string()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -692,7 +694,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 Wallet::new()
             };
-            wallet.to_file(path, None).await?;
+            let pw = prompt_password();
+            if pw.is_empty() {
+                eprintln!("Password required to save an encrypted wallet");
+                std::process::exit(1);
+            }
+            wallet.to_file(path, Some(&pw)).await?;
             println!("Wallet saved to {}", path);
             println!("Address: {}", hex::encode(wallet.address()));
             return Ok(());
@@ -700,17 +707,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Wallet { action }) => match action {
             WalletAction::Create { path } => {
                 let wallet = Wallet::new_with_mnemonic();
-                print!("Encrypt wallet password: ");
-                use std::io::Write;
-                std::io::stdout().flush()?;
-                let mut pw = String::new();
-                std::io::stdin().read_line(&mut pw)?;
-                let pw = pw.trim();
+                let pw = prompt_password();
                 if pw.is_empty() {
                     eprintln!("Password required");
                     std::process::exit(1);
                 }
-                wallet.to_file(path, Some(pw)).await?;
+                wallet.to_file(path, Some(&pw)).await?;
                 println!("Wallet created at {}", path);
                 println!("Address: {}", wallet.address_string());
                 println!(
@@ -721,7 +723,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             WalletAction::Restore { path, mnemonic } => {
                 let wallet = Wallet::from_mnemonic(mnemonic)?;
-                wallet.to_file(path, None).await?;
+                let pw = prompt_password();
+                if pw.is_empty() {
+                    eprintln!("Password required");
+                    std::process::exit(1);
+                }
+                wallet.to_file(path, Some(&pw)).await?;
                 println!("Wallet restored at {}", path);
                 println!("Address: {}", wallet.address_string());
                 return Ok(());

@@ -37,3 +37,6 @@ Thumbs.db
 
 # Build
 dist/
+
+multi-node-logs/
+

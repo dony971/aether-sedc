@@ -1,0 +1,18 @@
+﻿{
+    "quorum_threshold":  0.67,
+    "units_per_aeth":  10000000000,
+    "emission_after_genesis":  "ZERO",
+    "fees":  "burned",
+    "max_supply":  "2000000000000000000",
+    "initial_difficulty":  1000,
+    "faucet_address":  "a19ee04cfaeaee20d74e59d066a178f3f9d0e69f48ffa001f8314ead507aabfb",
+    "founder_address":  "2ffab7975e84a8b6feb5e47534c8a14af10d0b09f946014437f32723347e60d4",
+    "genesis_hash":  "0000000000000000000000000000000000000000000000000000000000000000",
+    "faucet_allocation":  1000000000000000000,
+    "genesis_message":  "17/Aug/2026 - Aether: Trust is computed, not granted. V3 testnet release candidate: canonical genesis for P2P protocol v3 (structural weight, zero emission). Operator ceremony.",
+    "initial_supply":  "1000000100000000000",
+    "fee_burn_address":  "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "ceremony_date":  "2026-08-17",
+    "founder_allocation":  100000000000,
+    "network_id":  "59a4fc920c91f4583aa427b860b6c04b337f263ab421be05264346c2076baa69"
+}

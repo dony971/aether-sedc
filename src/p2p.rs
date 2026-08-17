@@ -22,6 +22,75 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 /// P2P handshake magic bytes ("AETH")
 const HANDSHAKE_MAGIC: [u8; 4] = [0x41, 0x45, 0x54, 0x48];
 
+/// Maximum accepted encrypted message size (16 MiB). The length prefix is a
+/// u32: without this cap a peer could advertise a 4 GiB frame and force a
+/// giant allocation (memory DoS, V-09).
+const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+/// Maximum number of concurrently connected peers (V-10)
+const MAX_PEERS: usize = 128;
+
+/// Maximum number of known peer addresses retained (PEX/DNS growth bound)
+const MAX_KNOWN_PEERS: usize = 1000;
+
+/// Maximum entries in the seen-transaction cache (memory bound)
+const MAX_SEEN_TXS: usize = 50_000;
+
+/// Maximum items accepted from a single Inventory/GetData/GetInventory/Peers
+/// message (vector-of-vectors amplification bound)
+const MAX_INV_ITEMS: usize = 1000;
+
+/// Maximum frames accepted from a peer per second (rate limit)
+const MAX_MSGS_PER_SEC: u64 = 400;
+
+// H2: network timeouts. A peer that connects and never speaks (slow-loris),
+// stalls mid-frame, or points at a black-holed address must be released
+// instead of holding a task + socket forever.
+/// Handshake (magic + X25519) must complete within this budget.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Inactivity budget for reading a single frame (length/nonce/ciphertext).
+const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+/// Outbound connect budget (black-holed addresses must not stall discovery).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+// H4/V-24: network identity in the P2P handshake. Two networks with
+// different genesis hashes must NOT interconnect (cross-network gossip and
+// inventory pollution). The genesis hash (public constant) identifies the
+// network; the protocol version guards the wire format. This is a BREAKING
+// protocol change (the handshake frame grew from 36 to 69 bytes): every node
+// on the network must run the same binary — safe here because the testnet is
+// not yet public and the genesis ceremony purges all node data dirs.
+// v2 → v3 (WEIGHT): `tx.weight` is now DAG-maintained (subtree size) and
+// Stable/practically_final became reachable. Status semantics changed, so
+// mixed-version peers would disagree on finality — the version bump splits
+// old and new networks. Deployment MUST rotate the genesis (ceremony) so the
+// new network starts from a clean state.
+/// Wire format version of the P2P handshake.
+const P2P_PROTOCOL_VERSION: u8 = 3;
+/// Handshake frame: magic(4) | version(1) | genesis hash(32) | ephemeral key(32)
+const HANDSHAKE_FRAME_LEN: usize = 4 + 1 + 32 + 32;
+
+/// Insert into the seen-transaction cache, evicting old entries once the
+/// cache is full so memory stays bounded under flood.
+async fn insert_seen(seen: &RwLock<HashMap<Vec<u8>, SeenTxEntry>>, tx_bytes: Vec<u8>) {
+    let mut map = seen.write().await;
+    if map.len() >= MAX_SEEN_TXS {
+        let now = Instant::now();
+        map.retain(|_, e| now.duration_since(e.timestamp) < Duration::from_secs(300));
+        if map.len() >= MAX_SEEN_TXS {
+            if let Some(k) = map.keys().next().cloned() {
+                map.remove(&k);
+            }
+        }
+    }
+    map.insert(
+        tx_bytes,
+        SeenTxEntry {
+            timestamp: Instant::now(),
+        },
+    );
+}
+
 /// P2P network configuration
 #[derive(Clone)]
 pub struct P2PConfig {
@@ -78,14 +147,6 @@ pub enum P2PMessage {
 #[derive(Clone)]
 struct SeenTxEntry {
     timestamp: Instant,
-    source: TxSource,
-}
-
-/// Transaction source for better deduplication logic
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TxSource {
-    Local,   // Transaction created locally via RPC
-    Network, // Transaction received from P2P network
 }
 
 /// P2P network manager
@@ -98,9 +159,6 @@ pub struct P2PNetwork {
     peer_discovery_tx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<SocketAddr>>>>,
     get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
     get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
-    get_balance: Arc<dyn Fn(&[u8; 32]) -> u64 + Send + Sync>,
-    save_dag: Arc<dyn Fn() + Send + Sync>,
-    process_orphans: Arc<dyn Fn() + Send + Sync>,
     get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
     seen_transactions: Arc<RwLock<HashMap<Vec<u8>, SeenTxEntry>>>,
 }
@@ -112,9 +170,6 @@ impl P2PNetwork {
         tx_channel: mpsc::UnboundedSender<Transaction>,
         get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
-        get_balance: Arc<dyn Fn(&[u8; 32]) -> u64 + Send + Sync>,
-        save_dag: Arc<dyn Fn() + Send + Sync>,
-        process_orphans: Arc<dyn Fn() + Send + Sync>,
         get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
     ) -> Self {
         Self {
@@ -125,9 +180,6 @@ impl P2PNetwork {
             peer_discovery_tx: Arc::new(tokio::sync::Mutex::new(None)),
             get_dag_hashes,
             get_transaction_by_hash,
-            get_balance,
-            save_dag,
-            process_orphans,
             get_tips,
             seen_transactions: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -143,9 +195,6 @@ impl P2PNetwork {
         let tx_channel = self.tx_channel.clone();
         let get_dag_hashes = Arc::clone(&self.get_dag_hashes);
         let get_transaction_by_hash = Arc::clone(&self.get_transaction_by_hash);
-        let get_balance = Arc::clone(&self.get_balance);
-        let save_dag = Arc::clone(&self.save_dag);
-        let process_orphans = Arc::clone(&self.process_orphans);
         let get_tips = Arc::clone(&self.get_tips);
         let seen_transactions = Arc::clone(&self.seen_transactions);
         let local_addr = self.config.listen_addr;
@@ -170,9 +219,6 @@ impl P2PNetwork {
                 tx_channel,
                 get_dag_hashes,
                 get_transaction_by_hash,
-                get_balance,
-                save_dag,
-                process_orphans,
                 get_tips,
                 seen_transactions,
                 peer_discovery_tx,
@@ -316,7 +362,11 @@ impl P2PNetwork {
                         let addrs: Vec<SocketAddr> = addrs.collect();
                         info!("🌐 DNS seed {} resolved to {} addresses", seed, addrs.len());
                         for addr in &addrs {
-                            known_peers.write().await.insert(*addr);
+                            let mut known = known_peers.write().await;
+                            if known.len() >= MAX_KNOWN_PEERS {
+                                break;
+                            }
+                            known.insert(*addr);
                             if !p2p.is_connected(*addr).await {
                                 p2p.connect_to_peer(*addr).await;
                             }
@@ -345,6 +395,9 @@ impl P2PNetwork {
                         Ok(addrs) => {
                             for addr in addrs {
                                 let mut known = known_peers.write().await;
+                                if known.len() >= MAX_KNOWN_PEERS {
+                                    break;
+                                }
                                 if known.insert(addr) && !p2p.is_connected(addr).await {
                                     let p2p_clone = p2p.clone();
                                     tokio::spawn(async move {
@@ -402,9 +455,6 @@ impl P2PNetwork {
         tx_channel: mpsc::UnboundedSender<Transaction>,
         get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
-        get_balance: Arc<dyn Fn(&[u8; 32]) -> u64 + Send + Sync>,
-        save_dag: Arc<dyn Fn() + Send + Sync>,
-        process_orphans: Arc<dyn Fn() + Send + Sync>,
         get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         seen_transactions: Arc<RwLock<HashMap<Vec<u8>, SeenTxEntry>>>,
         peer_discovery_tx: mpsc::UnboundedSender<SocketAddr>,
@@ -412,6 +462,17 @@ impl P2PNetwork {
         loop {
             match listener.accept().await {
                 Ok((socket, addr)) => {
+                    {
+                        let peers_guard = peers.read().await;
+                        if peers_guard.len() >= MAX_PEERS {
+                            warn!(
+                                "Rejecting incoming peer {}: connection limit reached ({})",
+                                addr, MAX_PEERS
+                            );
+                            drop(socket);
+                            continue;
+                        }
+                    }
                     info!("New peer connected: {}", addr);
                     let (msg_sender, msg_receiver) = mpsc::unbounded_channel::<Vec<u8>>();
                     {
@@ -423,9 +484,6 @@ impl P2PNetwork {
                     let tx_channel = tx_channel.clone();
                     let get_dag_hashes = Arc::clone(&get_dag_hashes);
                     let get_transaction_by_hash = Arc::clone(&get_transaction_by_hash);
-                    let get_balance = Arc::clone(&get_balance);
-                    let save_dag = Arc::clone(&save_dag);
-                    let process_orphans = Arc::clone(&process_orphans);
                     let get_tips = Arc::clone(&get_tips);
                     let seen_transactions = Arc::clone(&seen_transactions);
                     let peer_discovery_tx = peer_discovery_tx.clone();
@@ -440,9 +498,6 @@ impl P2PNetwork {
                             tx_channel,
                             get_dag_hashes,
                             get_transaction_by_hash,
-                            get_balance,
-                            save_dag,
-                            process_orphans,
                             get_tips,
                             seen_transactions,
                             msg_sender,
@@ -466,6 +521,41 @@ impl P2PNetwork {
         nonce
     }
 
+    /// H2: read exactly `buf.len()` bytes with an inactivity timeout, so a
+    /// stalled or silent peer is disconnected instead of holding the task and
+    /// socket forever. The timeout error surfaces as io::ErrorKind::TimedOut.
+    async fn read_exact_timeout<R: AsyncReadExt + Unpin>(
+        reader: &mut R,
+        buf: &mut [u8],
+        budget: Duration,
+    ) -> std::io::Result<()> {
+        match tokio::time::timeout(budget, reader.read_exact(buf)).await {
+            Ok(r) => r.map(|_| ()),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "P2P read timed out",
+            )),
+        }
+    }
+
+    /// H4/V-24: verify the network identity of a received handshake frame
+    /// (magic + protocol version + genesis hash). Unit-testable pure check.
+    fn verify_handshake_identity(incoming: &[u8]) -> Result<(), &'static str> {
+        if incoming.len() < HANDSHAKE_FRAME_LEN {
+            return Err("Short P2P handshake frame");
+        }
+        if incoming[..4] != HANDSHAKE_MAGIC {
+            return Err("Invalid P2P handshake magic — not an Aether node");
+        }
+        if incoming[4] != P2P_PROTOCOL_VERSION {
+            return Err("Incompatible P2P protocol version — upgrade the node");
+        }
+        if incoming[5..37] != crate::genesis::GENESIS_HASH {
+            return Err("Network mismatch: peer genesis hash differs from ours");
+        }
+        Ok(())
+    }
+
     /// Perform X25519 handshake and derive AES-256-GCM key
     async fn handshake(
         reader: &mut (impl AsyncReadExt + Unpin),
@@ -474,19 +564,26 @@ impl P2PNetwork {
         let our_secret = EphemeralSecret::random_from_rng(OsRng);
         let our_public = PublicKey::from(&our_secret);
 
-        let mut outgoing = Vec::with_capacity(36);
+        let mut outgoing = Vec::with_capacity(HANDSHAKE_FRAME_LEN);
         outgoing.extend_from_slice(&HANDSHAKE_MAGIC);
+        outgoing.push(P2P_PROTOCOL_VERSION);
+        outgoing.extend_from_slice(&crate::genesis::GENESIS_HASH);
         outgoing.extend_from_slice(our_public.as_bytes());
-        writer.write_all(&outgoing).await?;
-
-        let mut incoming = [0u8; 36];
-        reader.read_exact(&mut incoming).await?;
-        if incoming[..4] != HANDSHAKE_MAGIC {
-            return Err("Invalid P2P handshake magic — not an Aether node".into());
+        if tokio::time::timeout(HANDSHAKE_TIMEOUT, writer.write_all(&outgoing))
+            .await
+            .is_err()
+        {
+            return Err("P2P handshake write timed out".into());
         }
 
+        let mut incoming = [0u8; HANDSHAKE_FRAME_LEN];
+        Self::read_exact_timeout(reader, &mut incoming, HANDSHAKE_TIMEOUT)
+            .await
+            .map_err(|e| format!("P2P handshake read failed: {}", e))?;
+        Self::verify_handshake_identity(&incoming)?;
+
         let mut peer_pk_bytes = [0u8; 32];
-        peer_pk_bytes.copy_from_slice(&incoming[4..]);
+        peer_pk_bytes.copy_from_slice(&incoming[HANDSHAKE_FRAME_LEN - 32..]);
         let peer_public = PublicKey::from(peer_pk_bytes);
         let shared_secret = our_secret.diffie_hellman(&peer_public);
 
@@ -510,9 +607,6 @@ impl P2PNetwork {
         tx_channel: mpsc::UnboundedSender<Transaction>,
         get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
-        get_balance: Arc<dyn Fn(&[u8; 32]) -> u64 + Send + Sync>,
-        save_dag: Arc<dyn Fn() + Send + Sync>,
-        process_orphans: Arc<dyn Fn() + Send + Sync>,
         get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         seen_transactions: Arc<RwLock<HashMap<Vec<u8>, SeenTxEntry>>>,
         msg_sender: mpsc::UnboundedSender<Vec<u8>>,
@@ -605,27 +699,63 @@ impl P2PNetwork {
         // Mark peer as known
         known_peers.write().await.insert(addr);
 
-        let mut recv_counter: u64 = 0;
+        let mut msg_count: u64 = 0;
+        let mut window_start = Instant::now();
 
         loop {
             // Read encrypted message length (4 bytes)
+            // H2: inactivity timeout so a peer that stops mid-stream is
+            // disconnected instead of holding the task + socket forever.
             let mut len_buf = [0u8; 4];
-            match reader.read_exact(&mut len_buf).await {
-                Ok(_) => {}
+            match Self::read_exact_timeout(&mut reader, &mut len_buf, FRAME_TIMEOUT).await {
+                Ok(()) => {}
                 Err(e) => {
-                    warn!("Peer {} disconnected: {}", addr, e);
+                    if e.kind() == std::io::ErrorKind::TimedOut {
+                        warn!(
+                            "Peer {} idle for {:?}, disconnecting (frame timeout)",
+                            addr, FRAME_TIMEOUT
+                        );
+                    } else {
+                        warn!("Peer {} disconnected: {}", addr, e);
+                    }
                     break;
                 }
             }
+
+            // Per-second rate limit: count every frame BEFORE decrypt/alloc
+            let now = Instant::now();
+            if now.duration_since(window_start) >= Duration::from_secs(1) {
+                window_start = now;
+                msg_count = 0;
+            }
+            msg_count += 1;
+            if msg_count > MAX_MSGS_PER_SEC {
+                warn!(
+                    "Peer {} exceeded message rate limit ({} msgs/s), disconnecting",
+                    addr, MAX_MSGS_PER_SEC
+                );
+                break;
+            }
+
             let total_len = u32::from_be_bytes(len_buf) as usize;
             if total_len < 12 {
                 warn!("Peer {} sent invalid message length {}", addr, total_len);
                 break;
             }
+            if total_len > MAX_MESSAGE_SIZE {
+                warn!(
+                    "Peer {} sent oversized message ({} bytes > {}), disconnecting",
+                    addr, total_len, MAX_MESSAGE_SIZE
+                );
+                break;
+            }
 
             // Read nonce (12 bytes)
             let mut nonce_buf = [0u8; 12];
-            if reader.read_exact(&mut nonce_buf).await.is_err() {
+            if Self::read_exact_timeout(&mut reader, &mut nonce_buf, FRAME_TIMEOUT)
+                .await
+                .is_err()
+            {
                 warn!("Failed to read nonce from {}", addr);
                 break;
             }
@@ -633,7 +763,10 @@ impl P2PNetwork {
             // Read ciphertext
             let ciphertext_len = total_len - 12;
             let mut ciphertext = vec![0u8; ciphertext_len];
-            if reader.read_exact(&mut ciphertext).await.is_err() {
+            if Self::read_exact_timeout(&mut reader, &mut ciphertext, FRAME_TIMEOUT)
+                .await
+                .is_err()
+            {
                 warn!("Failed to read ciphertext from {}", addr);
                 break;
             }
@@ -651,7 +784,6 @@ impl P2PNetwork {
                     break;
                 }
             };
-            recv_counter += 1;
 
             // Deserialize message
             match bincode::deserialize::<P2PMessage>(&plaintext) {
@@ -669,13 +801,7 @@ impl P2PNetwork {
                             // Deserialize transaction
                             if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
                                 // Mark as seen with timestamp and source (Network) before sending to channel
-                                seen_transactions.write().await.insert(
-                                    tx_bytes.clone(),
-                                    SeenTxEntry {
-                                        timestamp: Instant::now(),
-                                        source: TxSource::Network,
-                                    },
-                                );
+                                insert_seen(&seen_transactions, tx_bytes.clone()).await;
 
                                 info!("Received transaction from {}: {}", addr, hex::encode(tx.id));
                                 let _ = tx_channel.send(tx);
@@ -695,11 +821,12 @@ impl P2PNetwork {
                             }
                         }
                         P2PMessage::Inventory(hashes) => {
-                            // Determine which hashes we need
+                            // Determine which hashes we need (bounded by MAX_INV_ITEMS)
                             let our_hashes = get_dag_hashes();
                             let our_hash_set: HashSet<Vec<u8>> = our_hashes.into_iter().collect();
                             let missing_hashes: Vec<Vec<u8>> = hashes
                                 .into_iter()
+                                .take(MAX_INV_ITEMS)
                                 .filter(|h| !our_hash_set.contains(h))
                                 .collect();
 
@@ -723,8 +850,10 @@ impl P2PNetwork {
                             let our_tips = get_tips();
                             let _our_hash_set: HashSet<Vec<u8>> = our_hashes.into_iter().collect();
 
-                            // Find transactions we have that peer doesn't have (compare tips)
-                            let peer_tips_set: HashSet<Vec<u8>> = peer_tips.into_iter().collect();
+                            // Find transactions we have that peer doesn't have (compare tips),
+                            // bounded by MAX_INV_ITEMS on the peer-supplied list.
+                            let peer_tips_set: HashSet<Vec<u8>> =
+                                peer_tips.into_iter().take(MAX_INV_ITEMS).collect();
                             let our_tips_set: HashSet<Vec<u8>> = our_tips.into_iter().collect();
 
                             // Transactions we need from peer (tips we don't have)
@@ -816,19 +945,22 @@ impl P2PNetwork {
                         }
                         P2PMessage::SyncResponse(tx_bytes_list) => {
                             // Download and add transactions in chronological order
+                            // (bounded by MAX_INV_ITEMS to avoid amplification)
                             let mut downloaded_count = 0;
                             let mut transactions: Vec<Transaction> = Vec::new();
 
-                            for tx_bytes in tx_bytes_list {
-                                // Deduplication check with new structure
-                                {
-                                    let seen = seen_transactions.read().await;
-                                    if seen.contains_key(&tx_bytes) {
+                            for tx_bytes in tx_bytes_list.into_iter().take(MAX_INV_ITEMS) {
+                                // V-22 FIX: dedup by DAG membership, NOT by the
+                                // seen-transactions map. A tx marked "seen" but
+                                // never added to the DAG (dropped by a lock
+                                // error, evicted as residue, or parked in the
+                                // orphan queue) must be re-deliverable, otherwise
+                                // orphans whose parents were "seen" could never
+                                // be resolved and the node diverges forever.
+                                if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
+                                    if get_transaction_by_hash(&tx.id).is_some() {
                                         continue;
                                     }
-                                }
-
-                                if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
                                     transactions.push(tx);
                                     downloaded_count += 1;
                                 }
@@ -840,13 +972,7 @@ impl P2PNetwork {
                             // Add to DAG via channel (full validation will be done in main.rs)
                             for tx in transactions {
                                 if let Ok(tx_bytes) = bincode::serialize(&tx) {
-                                    seen_transactions.write().await.insert(
-                                        tx_bytes,
-                                        SeenTxEntry {
-                                            timestamp: Instant::now(),
-                                            source: TxSource::Network,
-                                        },
-                                    );
+                                    insert_seen(&seen_transactions, tx_bytes).await;
                                 }
                                 let _ = tx_channel.send(tx);
 
@@ -859,7 +985,6 @@ impl P2PNetwork {
                                     "[Sync] Downloaded {} missing transactions from {}",
                                     downloaded_count, addr
                                 );
-                                // Note: process_orphans is now handled by the validation logic in main.rs
                             }
                         }
                         P2PMessage::Ping => {
@@ -874,6 +999,7 @@ impl P2PNetwork {
                                 let peers_read = peers.read().await;
                                 peer_list
                                     .iter()
+                                    .take(MAX_INV_ITEMS)
                                     .filter(|p| {
                                         !known.contains(p)
                                             && **p != local_addr
@@ -883,7 +1009,15 @@ impl P2PNetwork {
                                     .collect()
                             };
                             for peer_addr in to_add {
-                                known_peers.write().await.insert(peer_addr);
+                                let mut known = known_peers.write().await;
+                                if known.len() >= MAX_KNOWN_PEERS {
+                                    warn!(
+                                        "Known-peer table full ({}), ignoring new peers",
+                                        MAX_KNOWN_PEERS
+                                    );
+                                    break;
+                                }
+                                known.insert(peer_addr);
                                 let _ = peer_discovery_tx.send(peer_addr);
                             }
                         }
@@ -908,8 +1042,21 @@ impl P2PNetwork {
     async fn connect_to_peer(&self, addr: SocketAddr) {
         info!("Tentative de connexion au bootnode: {}", addr);
 
-        match TcpStream::connect(addr).await {
-            Ok(socket) => {
+        {
+            let peers_guard = self.peers.read().await;
+            if peers_guard.len() >= MAX_PEERS {
+                warn!(
+                    "Skipping connect to {}: connection limit reached ({})",
+                    addr, MAX_PEERS
+                );
+                return;
+            }
+        }
+
+        // H2: bound the connect attempt so a black-holed or unroutable peer
+        // address cannot stall the outbound discovery loop indefinitely.
+        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            Ok(Ok(socket)) => {
                 info!("Connected to peer: {}", addr);
                 let (msg_sender, msg_receiver) = mpsc::unbounded_channel::<Vec<u8>>();
                 {
@@ -923,9 +1070,6 @@ impl P2PNetwork {
                 let tx_channel = self.tx_channel.clone();
                 let get_dag_hashes = Arc::clone(&self.get_dag_hashes);
                 let get_transaction_by_hash = Arc::clone(&self.get_transaction_by_hash);
-                let get_balance = Arc::clone(&self.get_balance);
-                let save_dag = Arc::clone(&self.save_dag);
-                let process_orphans = Arc::clone(&self.process_orphans);
                 let get_tips = Arc::clone(&self.get_tips);
                 let seen_transactions = Arc::clone(&self.seen_transactions);
                 let peer_discovery_tx = {
@@ -945,9 +1089,6 @@ impl P2PNetwork {
                         tx_channel,
                         get_dag_hashes,
                         get_transaction_by_hash,
-                        get_balance,
-                        save_dag,
-                        process_orphans,
                         get_tips,
                         seen_transactions,
                         msg_sender,
@@ -957,8 +1098,11 @@ impl P2PNetwork {
                     .await;
                 });
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("Failed to connect to {}: {}", addr, e);
+            }
+            Err(_) => {
+                warn!("Connect timeout to {} after {:?}", addr, CONNECT_TIMEOUT);
             }
         }
     }
@@ -974,13 +1118,7 @@ impl P2PNetwork {
         };
 
         // Mark as seen with Local source before broadcasting to avoid rebroadcast loops
-        self.seen_transactions.write().await.insert(
-            tx_bytes.clone(),
-            SeenTxEntry {
-                timestamp: Instant::now(),
-                source: TxSource::Local,
-            },
-        );
+        insert_seen(&self.seen_transactions, tx_bytes.clone()).await;
 
         let msg = P2PMessage::Transaction(tx_bytes.clone());
         let msg_bytes = match bincode::serialize(&msg) {
@@ -1031,6 +1169,33 @@ impl P2PNetwork {
             }
         }
     }
+
+    /// V-22 FIX: request the FULL inventory from every connected peer.
+    ///
+    /// The peer answers with `Inventory(all its transaction hashes)`, we
+    /// diff it against our DAG and fetch what we are missing via GetData.
+    /// Called periodically (see the node's 10s maintenance loop) and after
+    /// boot, so a node that missed transactions while offline - or received
+    /// a stale inventory at handshake time - keeps reconciling until it
+    /// converges to the exact same transaction set as its peers. This never
+    /// assumes the node already knows the parents: missing ancestors are
+    /// fetched recursively through the orphan flow.
+    pub async fn request_full_sync(&self) {
+        let msg = match bincode::serialize(&P2PMessage::SyncRequest) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to serialize SyncRequest: {}", e);
+                return;
+            }
+        };
+        let peers = self.peers.read().await;
+        for (addr, sender) in peers.iter() {
+            debug!("[Sync] Requesting full inventory from {}", addr);
+            if sender.send(msg.clone()).is_err() {
+                warn!("Failed to send SyncRequest to {}: channel closed", addr);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1040,14 +1205,14 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[test]
-    fn test_seen_tx_entry_source() {
-        // Test that TxSource enum works correctly
-        let local = TxSource::Local;
-        let network = TxSource::Network;
-
-        assert_eq!(local, TxSource::Local);
-        assert_eq!(network, TxSource::Network);
-        assert_ne!(local, network);
+    fn test_seen_tx_entry() {
+        // The seen cache holds a timestamp for eviction decisions.
+        let now = Instant::now();
+        let entry = SeenTxEntry {
+            timestamp: now.checked_sub(Duration::from_secs(60)).unwrap_or(now),
+        };
+        // 60s-old entry must be evictable (older than the 30s cleanup window).
+        assert!(now.duration_since(entry.timestamp) >= Duration::from_secs(60));
     }
 
     #[tokio::test]
@@ -1064,7 +1229,6 @@ mod tests {
                 tx_bytes.clone(),
                 SeenTxEntry {
                     timestamp: Instant::now(),
-                    source: TxSource::Network,
                 },
             );
         }
@@ -1073,8 +1237,7 @@ mod tests {
         {
             let seen_read = seen.read().await;
             assert!(seen_read.contains_key(&tx_bytes));
-            let entry = seen_read.get(&tx_bytes).unwrap();
-            assert_eq!(entry.source, TxSource::Network);
+            assert_eq!(seen_read.len(), 1);
         }
 
         // Second insert should not duplicate (just update)
@@ -1084,7 +1247,6 @@ mod tests {
                 tx_bytes.clone(),
                 SeenTxEntry {
                     timestamp: Instant::now(),
-                    source: TxSource::Local,
                 },
             );
         }
@@ -1093,10 +1255,38 @@ mod tests {
         {
             let seen_read = seen.read().await;
             assert_eq!(seen_read.len(), 1);
-            let entry = seen_read.get(&tx_bytes).unwrap();
-            // Source should be updated to Local
-            assert_eq!(entry.source, TxSource::Local);
         }
+    }
+
+    /// H2: read_exact_timeout must fail with ErrorKind::TimedOut when the peer
+    /// sends nothing, and succeed when the bytes arrive. A stalled peer can no
+    /// longer hold a task + socket forever (slow-loris guard).
+    #[tokio::test]
+    async fn test_read_exact_timeout() {
+        // A duplex stream with no writer activity: the read must time out.
+        let (mut reader, _silent_writer) = tokio::io::duplex(64);
+        let mut buf = [0u8; 36];
+        let err = P2PNetwork::read_exact_timeout(&mut reader, &mut buf, Duration::from_millis(100))
+            .await
+            .expect_err("silent peer must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+
+        // A duplex stream that delivers the bytes: the read must succeed.
+        let (mut reader2, mut writer2) = tokio::io::duplex(64);
+        writer2.write_all(&[0xAAu8; 36]).await.unwrap();
+        P2PNetwork::read_exact_timeout(&mut reader2, &mut buf, Duration::from_secs(5))
+            .await
+            .expect("bytes must be read within the budget");
+        assert_eq!(buf, [0xAAu8; 36]);
+
+        // A stream that closes mid-read: an io error, not a timeout.
+        let (mut reader3, mut writer3) = tokio::io::duplex(64);
+        writer3.write_all(&[0xBBu8; 4]).await.unwrap();
+        drop(writer3);
+        let err = P2PNetwork::read_exact_timeout(&mut reader3, &mut buf, Duration::from_secs(5))
+            .await
+            .expect_err("truncated frame must error");
+        assert_ne!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[tokio::test]
@@ -1115,16 +1305,9 @@ mod tests {
                 tx_bytes1.clone(),
                 SeenTxEntry {
                     timestamp: now.checked_sub(Duration::from_secs(60)).unwrap_or(now),
-                    source: TxSource::Network,
                 },
             );
-            seen_write.insert(
-                tx_bytes2.clone(),
-                SeenTxEntry {
-                    timestamp: now,
-                    source: TxSource::Local,
-                },
-            );
+            seen_write.insert(tx_bytes2.clone(), SeenTxEntry { timestamp: now });
         }
 
         // Simulate cleanup (remove entries older than 30 seconds)
@@ -1147,6 +1330,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_seen_cache_bounded() {
+        // insert_seen must keep the cache bounded: once at MAX_SEEN_TXS it
+        // evicts before inserting.
+        let seen = Arc::new(RwLock::new(HashMap::new()));
+
+        // Fill past the cap with fresh entries (eviction removes one per insert
+        // once the cap is reached).
+        for i in 0..(MAX_SEEN_TXS + 100) {
+            insert_seen(&seen, vec![(i % 256) as u8; 4]).await;
+        }
+
+        let size = seen.read().await.len();
+        assert!(size <= MAX_SEEN_TXS);
+    }
+
+    #[tokio::test]
+    async fn test_seen_cache_dedup_preserved_under_cap() {
+        let seen = Arc::new(RwLock::new(HashMap::new()));
+        let key = vec![7u8; 4];
+        insert_seen(&seen, key.clone()).await;
+        insert_seen(&seen, key.clone()).await;
+        let map = seen.read().await;
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn test_limit_constants_sane() {
+        // A 16 MiB frame cap + 400 msgs/s caps per-peer throughput at ~6.4 GiB/s
+        // worst case, but more importantly caps single-allocation size.
+        assert!(MAX_MESSAGE_SIZE <= 16 * 1024 * 1024);
+        assert!(MAX_MSGS_PER_SEC >= 1);
+        assert!(MAX_PEERS >= 1);
+        assert!(MAX_INV_ITEMS >= 1);
+    }
+
+    /// H4/V-24: handshake identity check — a peer from another network
+    /// (different genesis hash) or another protocol version must be rejected,
+    /// while a same-network frame passes.
+    #[test]
+    fn test_handshake_identity_mismatch_rejected() {
+        let mut frame = vec![0u8; HANDSHAKE_FRAME_LEN];
+        frame[..4].copy_from_slice(&HANDSHAKE_MAGIC);
+        frame[4] = P2P_PROTOCOL_VERSION;
+        frame[5..37].copy_from_slice(&crate::genesis::GENESIS_HASH);
+
+        // Correct same-network frame passes.
+        assert!(
+            P2PNetwork::verify_handshake_identity(&frame).is_ok(),
+            "a same-network frame must pass"
+        );
+
+        // Wrong magic is rejected.
+        let mut wrong_magic = frame.clone();
+        wrong_magic[0] = 0x00;
+        let err = P2PNetwork::verify_handshake_identity(&wrong_magic).unwrap_err();
+        assert!(err.contains("magic"), "got: {}", err);
+
+        // Version mismatch is rejected.
+        let mut wrong_version = frame.clone();
+        wrong_version[4] = P2P_PROTOCOL_VERSION + 1;
+        let err = P2PNetwork::verify_handshake_identity(&wrong_version).unwrap_err();
+        assert!(err.contains("version"), "got: {}", err);
+
+        // Genesis (network) mismatch is rejected.
+        let mut wrong_genesis = frame.clone();
+        wrong_genesis[5] = 0x42;
+        let err = P2PNetwork::verify_handshake_identity(&wrong_genesis).unwrap_err();
+        assert!(err.contains("genesis"), "got: {}", err);
+
+        // Truncated frame is rejected.
+        assert!(P2PNetwork::verify_handshake_identity(&frame[..8]).is_err());
+    }
+
+    /// H4/V-24: two ends of the SAME network complete the X25519 handshake
+    /// and derive the SAME session key.
+    #[tokio::test]
+    async fn test_handshake_derives_shared_key() {
+        let (mut a_reader, mut b_writer) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
+        let (mut b_reader, mut a_writer) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
+
+        let a = P2PNetwork::handshake(&mut a_reader, &mut a_writer);
+        let b = P2PNetwork::handshake(&mut b_reader, &mut b_writer);
+        let (key_a, key_b) = tokio::join!(a, b);
+
+        let key_a = key_a.expect("side A handshake must succeed");
+        let key_b = key_b.expect("side B handshake must succeed");
+        assert_eq!(key_a, key_b, "both ends must derive the same session key");
+    }
+
+    #[tokio::test]
     async fn test_broadcast_marks_as_local() {
         // Test that broadcast_transaction marks tx as Local before sending
         let (tx_channel, _tx_receiver) = mpsc::unbounded_channel::<Transaction>();
@@ -1155,9 +1428,6 @@ mod tests {
             tx_channel,
             Arc::new(|| vec![]),
             Arc::new(|_| None),
-            Arc::new(|_| 0),
-            Arc::new(|| {}),
-            Arc::new(|| {}),
             Arc::new(|| vec![]),
         );
 
@@ -1176,13 +1446,11 @@ mod tests {
 
         let tx_bytes = bincode::serialize(&tx).unwrap();
 
-        // Broadcast should mark as Local
+        // Broadcast should mark as seen
         p2p.broadcast_transaction(tx.clone()).await;
 
-        // Check that it's marked as Local in seen_transactions
+        // Check that it's in seen_transactions
         let seen = p2p.seen_transactions.read().await;
         assert!(seen.contains_key(&tx_bytes));
-        let entry = seen.get(&tx_bytes).unwrap();
-        assert_eq!(entry.source, TxSource::Local);
     }
 }

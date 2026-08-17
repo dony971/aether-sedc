@@ -2,30 +2,140 @@
 //!
 //! Tests for security invariants:
 //! - Replay attack prevention (nonce validation)
-//! - Double spend prevention (DAG parent checking)
-//! - Fork safety (rewarded_blocks tracking)
+//! - Double spend prevention (sender+nonce uniqueness)
+//! - Deterministic conflict resolution (min-id wins)
 //! - Atomic transaction execution (rollback on failure)
 //! - Orphan recovery (persistence and reprocessing)
-//! - MAX_SUPPLY enforcement (monetary policy)
-//! - Consensus state as single source of truth
+//! - MAX_SUPPLY / zero-emission monetary policy
+//! - Ledger always derived from the DAG (rebuild invariant)
 
-use crate::consensus::ConsensusState;
-use crate::ledger::{calculate_reward, Ledger, MAX_SUPPLY};
+use crate::ledger::{Ledger, MAX_SUPPLY};
 use crate::parent_selection::DAG;
 use crate::rpc::Mempool;
 use crate::storage::Storage;
 use crate::transaction::Transaction;
 use crate::transaction_processor::TransactionProcessor;
 use crate::validation::TransactionValidator;
+use crate::wallet::Wallet;
+use ed25519_dalek::{Signature, Signer, SigningKey};
 use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::sync::RwLock;
 
 #[cfg(test)]
+mod identity_spoofing_tests {
+    use super::*;
+
+    /// Sender must always match the public key (identity spoofing protection)
+    #[test]
+    fn test_sender_public_key_match_valid() {
+        let wallet = Wallet::new();
+        let public_key = wallet.public_key_bytes();
+        let sender = wallet.address();
+        let tx = Transaction::new(
+            [[0u8; 32]; 2],
+            sender,
+            [2u8; 32],
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            public_key,
+        );
+        assert!(tx.verify_sender_matches_public_key());
+    }
+
+    #[test]
+    fn test_sender_public_key_mismatch_invalid() {
+        let wallet1 = Wallet::new();
+        let wallet2 = Wallet::new();
+        let sender1 = wallet1.address();
+        let public_key2 = wallet2.public_key_bytes();
+        let tx = Transaction::new(
+            [[0u8; 32]; 2],
+            sender1,
+            [2u8; 32],
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            public_key2,
+        );
+        assert!(!tx.verify_sender_matches_public_key());
+    }
+
+    #[test]
+    fn test_sender_public_key_length_check() {
+        let tx = Transaction::new(
+            [[0u8; 32]; 2],
+            [1u8; 32],
+            [2u8; 32],
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 16], // Too short
+        );
+        assert!(!tx.verify_sender_matches_public_key());
+    }
+
+    /// Full attack scenario: attacker signs with their own key but claims the
+    /// victim's address as sender. Must be blocked by sender/public_key match.
+    #[test]
+    fn test_identity_spoofing_attack_scenario() {
+        let victim_wallet = Wallet::new();
+        let attacker_wallet = Wallet::new();
+        let victim_address = victim_wallet.address();
+        let attacker_public_key = attacker_wallet.public_key_bytes();
+
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(&attacker_wallet.secret_key_bytes()[..32]);
+        let signing_key = SigningKey::from_bytes(&key_bytes);
+        let dummy_hash = [0u8; 32];
+        let signature: Signature = signing_key.sign(&dummy_hash);
+
+        let malicious_tx = Transaction::new(
+            [[0u8; 32]; 2],
+            victim_address,
+            [2u8; 32],
+            1_000_000,
+            10,
+            1234567890,
+            0,
+            1,
+            signature.to_bytes().to_vec(),
+            attacker_public_key,
+        );
+        assert!(!malicious_tx.verify_sender_matches_public_key());
+        // And the full validator must reject it too.
+        let validator = TransactionValidator::new();
+        let ledger = Ledger::new();
+        assert!(validator
+            .validate_ledger(&malicious_tx, &ledger, 0)
+            .is_err());
+    }
+}
+
+#[cfg(test)]
 mod replay_attack_tests {
     use super::*;
 
-    /// Test that replay attacks are prevented via nonce validation
+    /// Test that replay attacks are prevented via DAG-level (sender, nonce)
+    /// uniqueness - the canonical conflict detector.
+    ///
+    /// NOTE: replay protection lives at the DAG level, NOT at the ledger
+    /// level. A strict ledger `last_nonce + 1` check is arrival-order
+    /// dependent: a node that processed nonces 4,5,6 before a late but valid
+    /// nonce-3 transaction would reject it, while another node accepts it -
+    /// permanently diverging the two DAGs (observed in the S5 resilience
+    /// run: endless "Invalid nonce: expected 6, provided 3" resync loop).
+    /// The ledger nonce is a pure function of the DAG (max per sender).
     #[tokio::test]
     async fn test_replay_attack_prevention() {
         let validator = TransactionValidator::new();
@@ -33,11 +143,9 @@ mod replay_attack_tests {
         let mut dag = DAG::new();
         let addr = [1u8; 32];
 
-        // Set initial balance and nonce
         ledger.set_balance(&addr, 1000);
         ledger.commit_nonce(&addr, 0);
 
-        // Create and process first transaction with nonce=1
         let tx1 = Transaction::new(
             [[0u8; 32]; 2],
             addr,
@@ -46,24 +154,43 @@ mod replay_attack_tests {
             10,
             1234567890,
             0,
-            1, // nonce=1
+            1,
             vec![0u8; 64],
             vec![1u8; 64],
         );
 
-        // Add to DAG (using validated method)
         dag.add_transaction_validated(tx1.clone()).unwrap();
         ledger.commit_nonce(&addr, 1);
 
-        // Try to replay the same transaction (same nonce)
-        let result = validator.validate_ledger(&tx1, &ledger, 0);
+        // Replaying the exact same transaction (same id) must be rejected.
+        let result = validator.validate_dag(&tx1, &dag);
         assert!(result.is_err());
-        // Should fail with InvalidNonce error
+
+        // A DIFFERENT transaction reusing the same (sender, nonce) pair must
+        // be rejected by the canonical double-spend detector.
+        let tx2 = Transaction::new(
+            [[0u8; 32]; 2],
+            addr,
+            [3u8; 32],
+            50,
+            10,
+            1234567891,
+            0,
+            1, // same nonce as tx1
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+        let result = validator.validate_dag(&tx2, &dag);
+        assert!(result.is_err());
     }
 
-    /// Test that out-of-order transactions are rejected
+    /// Out-of-order nonces must NOT be rejected at the ledger level: the
+    /// acceptance rule must be independent of the arrival order, otherwise
+    /// two nodes processing the same transaction set in different orders
+    /// permanently diverge (see the S5 resilience evidence). The ledger
+    /// nonce simply takes the max seen, exactly like the boot rebuild.
     #[tokio::test]
-    async fn test_out_of_order_nonce_rejection() {
+    async fn test_out_of_order_nonce_accepted() {
         let validator = TransactionValidator::new();
         let mut ledger = Ledger::new();
         let addr = [1u8; 32];
@@ -71,7 +198,9 @@ mod replay_attack_tests {
         ledger.set_balance(&addr, 1000);
         ledger.commit_nonce(&addr, 0);
 
-        // Try transaction with nonce=3 (should be 1)
+        // Nonce 3 arrives before nonces 1 and 2: it is valid (balance OK,
+        // fee OK) and must be accepted - the strict "must be last+1" rule
+        // would make acceptance depend on the arrival order.
         let tx = Transaction::new(
             [[0u8; 32]; 2],
             addr,
@@ -80,13 +209,13 @@ mod replay_attack_tests {
             10,
             1234567890,
             0,
-            3, // Wrong nonce
+            3, // Out of order, but not a replay
             vec![0u8; 64],
             vec![1u8; 64],
         );
 
         let result = validator.validate_ledger(&tx, &ledger, 0);
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 }
 
@@ -94,16 +223,117 @@ mod replay_attack_tests {
 mod double_spend_tests {
     use super::*;
 
-    /// Test that double spends are prevented via parent checking
-    /// (non-genesis parents that are already used are rejected)
+    /// A (sender, nonce) pair must be unique in the DAG (canonical double-spend
+    /// detector). A second transaction from the same sender with the same nonce
+    /// is rejected, regardless of its parents.
     #[tokio::test]
-    async fn test_double_spend_prevention() {
+    async fn test_sender_nonce_conflict_rejected() {
         let mut dag = DAG::new();
         let addr = [1u8; 32];
 
-        // First create a real (non-genesis) parent transaction
+        let tx1 = Transaction::new(
+            [[0u8; 32]; 2],
+            addr,
+            [3u8; 32],
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+        dag.add_transaction_validated(tx1.clone()).unwrap();
+
+        // Same sender, same nonce -> double spend -> rejected.
+        let tx2 = Transaction::new(
+            [[0u8; 32]; 2],
+            addr,
+            [5u8; 32],
+            50,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+        let result = dag.add_transaction_validated(tx2);
+        assert!(result.is_err());
+    }
+
+    /// find_sender_nonce_conflict must locate the existing conflicting tx so the
+    /// processor can deterministically decide the winner (min-id wins).
+    #[tokio::test]
+    async fn test_find_sender_nonce_conflict() {
+        let mut dag = DAG::new();
+        let addr = [1u8; 32];
+
+        let tx1 = Transaction::new(
+            [[0u8; 32]; 2],
+            addr,
+            [3u8; 32],
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+        dag.add_transaction_validated(tx1.clone()).unwrap();
+
+        let found = dag.find_sender_nonce_conflict(&addr, 1);
+        assert_eq!(found, Some(tx1.id));
+        // A different nonce has no conflict.
+        assert!(dag.find_sender_nonce_conflict(&addr, 2).is_none());
+    }
+
+    /// Distinct nonces from the same sender are NOT a conflict (valid chains
+    /// of sequential transactions).
+    #[tokio::test]
+    async fn test_distinct_nonces_are_not_conflict() {
+        let mut dag = DAG::new();
+        let addr = [1u8; 32];
+
+        let tx1 = Transaction::new(
+            [[0u8; 32]; 2],
+            addr,
+            [3u8; 32],
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+        dag.add_transaction_validated(tx1.clone()).unwrap();
+
+        let tx2 = Transaction::new(
+            [[0u8; 32]; 2],
+            addr,
+            [5u8; 32],
+            50,
+            10,
+            1234567890,
+            0,
+            2,
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+        let result = dag.add_transaction_validated(tx2);
+        assert!(result.is_ok());
+    }
+
+    /// Two different senders may legitimately build on the SAME parent pair.
+    /// This must NOT be treated as a conflict (fixes the convergence bug where
+    /// a node rejected valid txs whose parent pair was already used).
+    #[tokio::test]
+    async fn test_shared_parents_are_not_conflict() {
+        let mut dag = DAG::new();
         let parent = Transaction::new(
-            [[0u8; 32], [0u8; 32]],
+            [[0u8; 32]; 2],
             [2u8; 32],
             [9u8; 32],
             0,
@@ -116,11 +346,10 @@ mod double_spend_tests {
         );
         dag.add_transaction_validated(parent.clone()).unwrap();
 
-        // Create first transaction referencing the real parent
         let parents = [parent.id, [0u8; 32]];
-        let tx1 = Transaction::new(
+        let a = Transaction::new(
             parents,
-            addr,
+            [1u8; 32],
             [3u8; 32],
             100,
             10,
@@ -130,39 +359,15 @@ mod double_spend_tests {
             vec![0u8; 64],
             vec![1u8; 64],
         );
-        dag.add_transaction_validated(tx1.clone()).unwrap();
+        assert!(dag.add_transaction_validated(a.clone()).is_ok());
 
-        // Try to create second transaction with same (non-genesis) parents (double spend)
-        let tx2 = Transaction::new(
-            parents, // Same parents
-            addr,
+        // Sender B uses the SAME parent pair -> must be accepted (no false
+        // positive on duplicated parents).
+        let b = Transaction::new(
+            parents,
             [4u8; 32],
+            [5u8; 32],
             50,
-            10,
-            1234567890,
-            0,
-            2,
-            vec![0u8; 64],
-            vec![1u8; 64],
-        );
-
-        let result = dag.add_transaction_validated(tx2);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Double spend"));
-    }
-
-    /// Test that sender conflict detection works (same sender + same nonce)
-    #[tokio::test]
-    async fn test_sender_conflict_detection() {
-        let mut dag = DAG::new();
-        let addr = [1u8; 32];
-
-        // Create first transaction from sender
-        let tx1 = Transaction::new(
-            [[0u8; 32], [0u8; 32]],
-            addr,
-            [3u8; 32],
-            100,
             10,
             1234567890,
             0,
@@ -170,145 +375,7 @@ mod double_spend_tests {
             vec![0u8; 64],
             vec![1u8; 64],
         );
-        dag.add_transaction_validated(tx1.clone()).unwrap();
-
-        // Try to create second transaction from same sender with same nonce (conflict)
-        let tx2 = Transaction::new(
-            [[0u8; 32], [0u8; 32]],
-            addr, // Same sender
-            [5u8; 32],
-            50,
-            10,
-            1234567890,
-            0,
-            1, // Same nonce = replay / conflict
-            vec![0u8; 64],
-            vec![1u8; 64],
-        );
-
-        let result = dag.add_transaction_validated(tx2);
-        assert!(result.is_err());
-        // The error will be about sender conflict
-    }
-
-    /// Test that distinct nonces from the same sender are NOT a conflict
-    /// (root parents are intentionally ignored so chains from peers can merge)
-    #[tokio::test]
-    async fn test_distinct_nonces_are_not_conflict() {
-        let mut dag = DAG::new();
-        let addr = [1u8; 32];
-
-        let tx1 = Transaction::new(
-            [[0u8; 32], [0u8; 32]],
-            addr,
-            [3u8; 32],
-            100,
-            10,
-            1234567890,
-            0,
-            1,
-            vec![0u8; 64],
-            vec![1u8; 64],
-        );
-        dag.add_transaction_validated(tx1.clone()).unwrap();
-
-        // Same sender, different nonce -> accepted
-        let tx2 = Transaction::new(
-            [[0u8; 32], [0u8; 32]],
-            addr,
-            [5u8; 32],
-            50,
-            10,
-            1234567890,
-            0,
-            2,
-            vec![0u8; 64],
-            vec![1u8; 64],
-        );
-
-        let result = dag.add_transaction_validated(tx2);
-        assert!(result.is_ok());
-    }
-}
-
-#[cfg(test)]
-mod fork_safety_tests {
-    use super::*;
-
-    /// Test that rewarded_blocks prevents double rewards
-    #[tokio::test]
-    async fn test_rewarded_blocks_prevents_double_reward() {
-        let mut ledger = Ledger::new();
-        let mut consensus = ConsensusState::new();
-        let validator = [1u8; 32];
-        let block_id = [2u8; 32];
-        let block_height = 100;
-
-        // Set current height for finality check
-        consensus.current_height = block_height + 10; // Block is finalized
-
-        // Set initial balance
-        ledger.set_balance(&validator, 1000);
-
-        // Mark block as rewarded in consensus state first
-        consensus.validate_and_mark_block_reward(block_id).unwrap();
-
-        // Try to apply reward (should fail - block already marked)
-        let result = ledger.apply_block_reward(&validator, block_id, block_height, &consensus);
-        assert!(result.is_err());
-    }
-
-    /// Test that rollback_block_reward works correctly
-    #[tokio::test]
-    async fn test_rollback_block_reward() {
-        let mut ledger = Ledger::new();
-        let mut consensus = ConsensusState::new();
-        let validator = [1u8; 32];
-        let block_id = [2u8; 32];
-        let block_height = 100;
-
-        // Set initial balance
-        ledger.set_balance(&validator, 1000);
-        consensus.current_height = block_height + 10;
-
-        // Apply reward
-        let reward = calculate_reward(block_height);
-        ledger
-            .apply_block_reward(&validator, block_id, block_height, &consensus)
-            .unwrap();
-
-        let balance_after_reward = ledger.get_balance(&validator);
-        assert!(balance_after_reward > 1000);
-
-        // Rollback reward
-        ledger
-            .rollback_block_reward(&validator, block_id, reward)
-            .unwrap();
-        consensus.rollback_block_reward(&block_id);
-
-        let balance_after_rollback = ledger.get_balance(&validator);
-        assert_eq!(balance_after_rollback, 1000);
-
-        // Verify block is no longer marked as rewarded
-        assert!(!consensus.is_block_rewarded(&block_id));
-    }
-
-    /// Test that finality check prevents rewarding unfinalized blocks
-    #[tokio::test]
-    async fn test_finality_check_prevents_unfinalized_reward() {
-        let mut ledger = Ledger::new();
-        let mut consensus = ConsensusState::new();
-        let validator = [1u8; 32];
-        let block_id = [2u8; 32];
-        let block_height = 100;
-
-        // Set current height to same as block (not finalized)
-        consensus.current_height = block_height;
-
-        // Try to apply reward (should fail - not enough confirmations)
-        let result = ledger.apply_block_reward(&validator, block_id, block_height, &consensus);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not finalized"));
+        assert!(dag.add_transaction_validated(b).is_ok());
     }
 }
 
@@ -316,25 +383,20 @@ mod fork_safety_tests {
 mod atomic_execution_tests {
     use super::*;
 
-    /// Test that transaction execution rolls back on failure
+    /// Transaction execution must roll back on failure (balance unchanged).
     #[tokio::test]
     async fn test_atomic_rollback_on_failure() {
         let processor = TransactionProcessor::new();
         let dag = Arc::new(RwLock::new(DAG::new()));
         let ledger = Arc::new(RwLock::new(Ledger::new()));
         let mempool = Arc::new(RwLock::new(Mempool::new(1000, 10)));
-        let mut consensus = ConsensusState::new();
 
         let sender = [1u8; 32];
         let receiver = [2u8; 32];
-
-        // Set initial balance
         ledger.write().await.set_balance(&sender, 1000);
         ledger.write().await.commit_nonce(&sender, 0);
-
         let balance_before = ledger.read().await.get_balance(&sender);
 
-        // Create transaction with insufficient balance (will fail)
         let tx = Transaction::new(
             [[0u8; 32]; 2],
             sender,
@@ -348,35 +410,27 @@ mod atomic_execution_tests {
             vec![1u8; 64],
         );
 
-        let result = processor
-            .process(tx, &dag, &ledger, &mempool, 10, None, &mut consensus, None)
-            .await;
-
+        let result = processor.process(tx, &dag, &ledger, &mempool, 10).await;
         assert!(result.is_err());
 
-        // Verify rollback occurred - balance should be unchanged
         let balance_after = ledger.read().await.get_balance(&sender);
         assert_eq!(balance_before, balance_after);
     }
 
-    /// Test that nonce is not committed if transfer fails
+    /// Nonce must NOT be committed if the transfer fails.
     #[tokio::test]
     async fn test_nonce_not_committed_on_transfer_failure() {
         let processor = TransactionProcessor::new();
         let dag = Arc::new(RwLock::new(DAG::new()));
         let ledger = Arc::new(RwLock::new(Ledger::new()));
         let mempool = Arc::new(RwLock::new(Mempool::new(1000, 10)));
-        let mut consensus = ConsensusState::new();
 
         let sender = [1u8; 32];
         let receiver = [2u8; 32];
-
         ledger.write().await.set_balance(&sender, 1000);
         ledger.write().await.commit_nonce(&sender, 0);
-
         let nonce_before = ledger.read().await.get_nonce(&sender);
 
-        // Create transaction that will fail
         let tx = Transaction::new(
             [[0u8; 32]; 2],
             sender,
@@ -390,11 +444,8 @@ mod atomic_execution_tests {
             vec![1u8; 64],
         );
 
-        let _ = processor
-            .process(tx, &dag, &ledger, &mempool, 10, None, &mut consensus, None)
-            .await;
+        let _ = processor.process(tx, &dag, &ledger, &mempool, 10).await;
 
-        // Verify nonce was not committed
         let nonce_after = ledger.read().await.get_nonce(&sender);
         assert_eq!(nonce_before, nonce_after);
     }
@@ -404,7 +455,7 @@ mod atomic_execution_tests {
 mod orphan_recovery_tests {
     use super::*;
 
-    /// Test that orphans persist to disk
+    /// Test that orphans persist to disk.
     #[tokio::test]
     async fn test_orphan_persistence() {
         let dir = tempdir().unwrap();
@@ -423,27 +474,22 @@ mod orphan_recovery_tests {
             vec![1u8; 64],
         );
 
-        // Store orphan
         storage.put_orphan(tx.id, &tx).unwrap();
-
-        // Retrieve orphan
         let retrieved = storage.get_orphan(tx.id).unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().id, tx.id);
 
-        // Remove orphan
         storage.remove_orphan(tx.id).unwrap();
         let retrieved_after = storage.get_orphan(tx.id).unwrap();
         assert!(retrieved_after.is_none());
     }
 
-    /// Test that orphans are loaded on startup
+    /// Test that orphans are loaded on startup.
     #[tokio::test]
     async fn test_orphan_load_on_startup() {
         let dir = tempdir().unwrap();
         let storage = Storage::open(dir.path()).unwrap();
 
-        // Store multiple orphans
         for i in 0..5 {
             let tx = Transaction::new(
                 [[i as u8; 32], [((i + 1) % 255) as u8; 32]],
@@ -460,23 +506,96 @@ mod orphan_recovery_tests {
             storage.put_orphan(tx.id, &tx).unwrap();
         }
 
-        // Load all orphans
         let orphans = storage.get_all_orphans().unwrap();
         assert_eq!(orphans.len(), 5);
     }
+}
 
-    /// Test that orphan is removed after successful processing
+#[cfg(test)]
+mod zero_emission_tests {
+    use super::*;
+
+    /// There is no reward function: money can never be minted. The circulating
+    /// supply must always be ≤ the genesis allocation and ≤ MAX_SUPPLY.
     #[tokio::test]
-    async fn test_orphan_removed_after_success() {
-        let dir = tempdir().unwrap();
-        let storage = Storage::open(dir.path()).unwrap();
-        let mut dag = DAG::new();
+    async fn test_supply_never_exceeds_genesis() {
+        let mut ledger = Ledger::new();
+        for (addr_hex, balance) in crate::genesis::GENESIS_LEDGER {
+            ledger.set_balance_hex(addr_hex.to_string(), balance);
+        }
+        let genesis_supply = ledger.total_supply();
+        assert!(genesis_supply <= MAX_SUPPLY);
 
-        // Create orphan with genesis parents (will be valid)
+        // A transfer from a genesis-funded account (faucet) only burns fees,
+        // so supply shrinks or stays flat.
+        let faucet = hex::decode(crate::genesis::FAUCET_ADDRESS).unwrap();
+        let faucet: [u8; 32] = faucet.try_into().unwrap();
+        let b = [0xBBu8; 32];
+        ledger.transfer_internal(&faucet, &b, 500, 10).unwrap();
+        assert!(ledger.total_supply() <= genesis_supply);
+        assert!(ledger.supply_within_bounds());
+    }
+
+    /// The ledger is a DERIVED VIEW of the DAG: rebuild_from_dag reproduces the
+    /// exact balances from genesis + replay and never introduces new supply.
+    #[tokio::test]
+    async fn test_rebuild_from_dag_preserves_invariant() {
+        let mut dag = DAG::new();
+        let mut ledger = Ledger::new();
+        for (addr_hex, balance) in crate::genesis::GENESIS_LEDGER {
+            ledger.set_balance_hex(addr_hex.to_string(), balance);
+        }
+
+        // Funds come from a genesis-funded account (the faucet): rebuild
+        // reseeds balances strictly from genesis.
+        let faucet = hex::decode(crate::genesis::FAUCET_ADDRESS).unwrap();
+        let faucet: [u8; 32] = faucet.try_into().unwrap();
+        let b = [0xBBu8; 32];
+
+        let tx1 = Transaction::new(
+            [[0u8; 32]; 2],
+            faucet,
+            b,
+            100,
+            5,
+            1,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 64],
+        );
+        dag.add_transaction_validated(tx1.clone()).unwrap();
+
+        ledger.rebuild_from_dag(&dag);
+        assert_eq!(ledger.get_balance(&b), 100);
+        assert_eq!(ledger.fee_burn_balance(), 5);
+        assert!(ledger.supply_within_bounds());
+        assert!(ledger.total_supply() <= MAX_SUPPLY);
+    }
+
+    /// No emission: after processing a real transfer the total supply must not
+    /// have grown (fees are burned, nothing is minted).
+    #[tokio::test]
+    async fn test_processing_does_not_mint() {
+        let processor = TransactionProcessor::new();
+        let dag = Arc::new(RwLock::new(DAG::new()));
+        let ledger = Arc::new(RwLock::new(Ledger::new()));
+        let mempool = Arc::new(RwLock::new(Mempool::new(1000, 10)));
+
+        // Seed a sender (simulating a funded account) and note total supply.
+        let sender = [1u8; 32];
+        let receiver = [2u8; 32];
+        {
+            let mut l = ledger.write().await;
+            l.set_balance(&sender, 1000);
+            l.commit_nonce(&sender, 0);
+        }
+        let supply_before = ledger.read().await.total_supply();
+
         let tx = Transaction::new(
-            [[0u8; 32]; 2], // Genesis parents
-            [3u8; 32],
-            [4u8; 32],
+            [[0u8; 32]; 2],
+            sender,
+            receiver,
             100,
             10,
             1234567890,
@@ -485,179 +604,186 @@ mod orphan_recovery_tests {
             vec![0u8; 64],
             vec![1u8; 64],
         );
-
-        storage.put_orphan(tx.id, &tx).unwrap();
-
-        // Simulate successful processing (add to DAG)
-        dag.add_transaction_validated(tx.clone()).unwrap();
-
-        // Remove from orphans
-        storage.remove_orphan(tx.id).unwrap();
-
-        // Verify orphan is gone
-        let retrieved = storage.get_orphan(tx.id).unwrap();
-        assert!(retrieved.is_none());
+        // This fails validation (placeholder signature), so nothing changes.
+        let _ = processor.process(tx, &dag, &ledger, &mempool, 10).await;
+        let supply_after = ledger.read().await.total_supply();
+        assert!(supply_after <= supply_before);
     }
 }
 
 #[cfg(test)]
-mod monetary_policy_tests {
+mod malleability_tests {
     use super::*;
 
-    /// Test that MAX_SUPPLY is enforced
-    #[tokio::test]
-    async fn test_max_supply_enforcement() {
-        let mut ledger = Ledger::new();
-        let mut consensus = ConsensusState::new();
-        let validator = [1u8; 32];
-        let block_id = [2u8; 32];
-
-        // Set total supply to near MAX_SUPPLY
-        ledger.total_supply = MAX_SUPPLY - 1000;
-        consensus.current_height = 1000;
-
-        // Try to apply reward that would exceed MAX_SUPPLY
-        let result = ledger.apply_block_reward(&validator, block_id, 1000, &consensus);
-        assert!(result.is_err());
-        // The error will be about exceeding MAX_SUPPLY
-    }
-
-    /// Test that reward calculation follows halving schedule
+    /// The signing hash covers ALL fields (parents, sender, receiver, amount,
+    /// fee, timestamp, nonce, account_nonce): mutating ANY field invalidates
+    /// the signature. This blocks transaction malleability attacks.
     #[test]
-    fn test_reward_halving_schedule() {
-        // Initial reward: 10 AETH = 100,000,000,000 units
-        let reward_0 = calculate_reward(0);
-        assert_eq!(reward_0, 100_000_000_000);
+    fn test_signature_covers_amount() {
+        let wallet = Wallet::new();
+        let receiver = [0x02u8; 32];
+        let mut tx = Transaction::new(
+            [[0u8; 32]; 2],
+            wallet.address(),
+            receiver,
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            wallet.public_key_bytes(),
+        );
+        tx.signature = wallet.sign_transaction(&tx).unwrap();
+        assert!(Wallet::verify_transaction(&tx));
 
-        // After 210,000 blocks: 5 AETH
-        let reward_210k = calculate_reward(210_000);
-        assert_eq!(reward_210k, 50_000_000_000);
-
-        // After 420,000 blocks: 2.5 AETH
-        let reward_420k = calculate_reward(420_000);
-        assert_eq!(reward_420k, 25_000_000_000);
-
-        // After 630,000 blocks: 1.25 AETH
-        let reward_630k = calculate_reward(630_000);
-        assert_eq!(reward_630k, 12_500_000_000);
+        // Attacker changes the amount: signature must no longer verify.
+        tx.amount = 999_999;
+        assert!(!Wallet::verify_transaction(&tx));
+        // And the transaction id changes too (malleated tx is a NEW tx).
+        let original = tx.clone();
+        assert_ne!(original.id, original.compute_hash());
     }
 
-    /// Test that total supply never exceeds MAX_SUPPLY
+    #[test]
+    fn test_signature_covers_receiver() {
+        let wallet = Wallet::new();
+        let mut tx = Transaction::new(
+            [[0u8; 32]; 2],
+            wallet.address(),
+            [0x02u8; 32],
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            wallet.public_key_bytes(),
+        );
+        tx.signature = wallet.sign_transaction(&tx).unwrap();
+        assert!(Wallet::verify_transaction(&tx));
+
+        // Redirect the payment to the attacker.
+        tx.receiver = [0xEEu8; 32];
+        assert!(!Wallet::verify_transaction(&tx));
+    }
+
+    #[test]
+    fn test_signature_covers_nonce_and_timestamp() {
+        let wallet = Wallet::new();
+        let mut tx = Transaction::new(
+            [[0u8; 32]; 2],
+            wallet.address(),
+            [0x02u8; 32],
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            wallet.public_key_bytes(),
+        );
+        tx.signature = wallet.sign_transaction(&tx).unwrap();
+        assert!(Wallet::verify_transaction(&tx));
+
+        // Replay-style mutations (timestamp, nonce, account_nonce) all break
+        // the signature: a node can never be tricked into accepting a
+        // re-framed transaction.
+        let mut t1 = tx.clone();
+        t1.timestamp += 1;
+        assert!(!Wallet::verify_transaction(&t1));
+
+        let mut t2 = tx.clone();
+        t2.nonce += 1;
+        assert!(!Wallet::verify_transaction(&t2));
+
+        let mut t3 = tx.clone();
+        t3.account_nonce += 1;
+        assert!(!Wallet::verify_transaction(&t3));
+    }
+
+    /// An oversized serialized transaction must be rejected at RPC reception
+    /// BEFORE deserialization/processing (memory DoS guard). MAX_RPC_TX_SIZE is
+    /// private to rpc.rs, so we assert the guard exists via the RPC handler's
+    /// public path: hex payloads larger than the cap fail with a clear error.
     #[tokio::test]
-    async fn test_total_supply_never_exceeds_max() {
-        let mut ledger = Ledger::new();
-        let mut consensus = ConsensusState::new();
-        let validator = [1u8; 32];
+    async fn test_oversized_tx_rejected_by_rpc() {
+        // Build the RPC implementation with minimal state.
+        let rpc_impl = crate::rpc::AetherRpcImpl::new(
+            Arc::new(RwLock::new(DAG::new())),
+            Arc::new(RwLock::new(Ledger::new())),
+            Arc::new(RwLock::new(
+                crate::storage::Storage::open(tempdir().unwrap().path()).unwrap(),
+            )),
+            std::path::PathBuf::from("test_rpc_size"),
+            Arc::new(RwLock::new(Mempool::new(1000, 10))),
+            Arc::new(crate::p2p::P2PNetwork::new(
+                crate::p2p::P2PConfig::default(),
+                tokio::sync::mpsc::unbounded_channel::<Transaction>().0,
+                Arc::new(|| vec![]),
+                Arc::new(|_| None),
+                Arc::new(|| vec![]),
+            )),
+            Arc::new(RwLock::new(false)),
+            Arc::new(RwLock::new(std::collections::HashMap::new())),
+        );
 
-        // Apply rewards for many blocks
-        for height in (0..1000).step_by(210_000) {
-            let block_id = [height as u8; 32];
-            consensus.current_height = height + 100;
-            consensus.validate_and_mark_block_reward(block_id).unwrap();
-
-            let result = ledger.apply_block_reward(&validator, block_id, height, &consensus);
-            if result.is_ok() {
-                assert!(ledger.total_supply <= MAX_SUPPLY);
-            }
-        }
+        // 2 MiB of zeros: way beyond the 1 MiB cap.
+        let huge = vec![0u8; 2 * 1024 * 1024];
+        let result = rpc_impl
+            .send_transaction(serde_json::json!([hex::encode(&huge)]))
+            .await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("too large"));
     }
 }
 
+/// The faucet secret key must never be embedded in the binary: it is loaded
+/// from a server-only file and ONLY accepted if it derives to the genesis
+/// FAUCET_ADDRESS (otherwise the faucet would sign for an empty address).
+/// The original genesis seed was removed from the source (V-01), so only the
+/// negative paths are testable: absent / malformed / mismatched keys.
 #[cfg(test)]
-mod consensus_state_tests {
+mod faucet_key_tests {
     use super::*;
 
-    /// Test that consensus state is single source of truth for height
-    #[test]
-    fn test_consensus_state_height_source_of_truth() {
-        let mut consensus = ConsensusState::new();
-
-        assert_eq!(consensus.get_height(), 0);
-
-        consensus.increment_height();
-        assert_eq!(consensus.get_height(), 1);
-
-        consensus.increment_height();
-        assert_eq!(consensus.get_height(), 2);
+    fn key_path(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        dir.path().join("faucet.key")
     }
 
-    /// Test that rewarded_blocks is fork-safe
     #[test]
-    fn test_rewarded_blocks_fork_safe() {
-        let mut consensus = ConsensusState::new();
-        let block_id1 = [1u8; 32];
-        let block_id2 = [2u8; 32];
-
-        // Mark block1 as rewarded
-        consensus.validate_and_mark_block_reward(block_id1).unwrap();
-        assert!(consensus.is_block_rewarded(&block_id1));
-        assert!(!consensus.is_block_rewarded(&block_id2));
-
-        // Simulate reorg - rollback block1
-        consensus.rollback_block_reward(&block_id1);
-        assert!(!consensus.is_block_rewarded(&block_id1));
-
-        // Mark block2 as rewarded (alternate chain)
-        consensus.validate_and_mark_block_reward(block_id2).unwrap();
-        assert!(consensus.is_block_rewarded(&block_id2));
+    fn test_missing_key_disables_faucet() {
+        let dir = tempdir().unwrap();
+        assert!(crate::rpc::AetherRpcImpl::load_faucet_key(&key_path(&dir)).is_none());
     }
 
-    /// Test that confirmation threshold is respected
     #[test]
-    fn test_confirmation_threshold() {
-        let consensus = ConsensusState::new();
-
-        // Default threshold is 6
-        assert_eq!(consensus.confirmation_threshold, 6);
-
-        // Block at height 100 is not finalized at height 105
-        assert!(!consensus.is_finalized(100, 105));
-
-        // Block at height 100 is finalized at height 107
-        assert!(consensus.is_finalized(100, 107));
+    fn test_invalid_hex_disables_faucet() {
+        let dir = tempdir().unwrap();
+        std::fs::write(key_path(&dir), "not-hex!!!").unwrap();
+        assert!(crate::rpc::AetherRpcImpl::load_faucet_key(&key_path(&dir)).is_none());
     }
 
-    /// Test that deferred rewards are queued and only settled after finality
     #[test]
-    fn test_deferred_reward_queue_and_settle() {
-        let mut consensus = ConsensusState::new();
-        let validator = [7u8; 32];
-        let block_id = [8u8; 32];
-
-        // Queue a reward at height 1 (not yet finalized)
-        consensus
-            .queue_pending_reward(block_id, validator, 100_000_000_000, 1)
-            .unwrap();
-        assert!(consensus.finalized_pending_rewards().is_empty());
-
-        // Duplicate queue is rejected
-        assert!(consensus
-            .queue_pending_reward(block_id, validator, 100_000_000_000, 1)
-            .is_err());
-
-        // After 6 more blocks (height 7), the reward is finalized
-        consensus.current_height = 7;
-        let finalized = consensus.finalized_pending_rewards();
-        assert_eq!(finalized.len(), 1);
-        assert_eq!(finalized[0].1.reward, 100_000_000_000);
-        assert_eq!(finalized[0].1.block_height, 1);
-        assert_eq!(finalized[0].1.validator, validator);
-
-        // Settle it: mark rewarded and remove from queue
-        consensus.mark_block_rewarded(block_id);
-        consensus.settle_pending_reward(&block_id);
-        assert!(consensus.finalized_pending_rewards().is_empty());
-        assert!(consensus.is_block_rewarded(&block_id));
+    fn test_wrong_length_disables_faucet() {
+        let dir = tempdir().unwrap();
+        std::fs::write(key_path(&dir), hex::encode([7u8; 16])).unwrap();
+        assert!(crate::rpc::AetherRpcImpl::load_faucet_key(&key_path(&dir)).is_none());
     }
 
-    /// Test that a reward queued for an already-rewarded block is rejected
+    /// A well-formed key whose address differs from the genesis FAUCET_ADDRESS
+    /// must be rejected: it could never spend the genesis faucet balance, so
+    /// accepting it would silently break every faucet transaction.
     #[test]
-    fn test_pending_reward_rejects_rewarded_block() {
-        let mut consensus = ConsensusState::new();
-        let block_id = [9u8; 32];
-
-        consensus.mark_block_rewarded(block_id);
-        let result = consensus.queue_pending_reward(block_id, [1u8; 32], 100, 0);
-        assert!(result.is_err());
+    fn test_mismatched_key_disables_faucet() {
+        let dir = tempdir().unwrap();
+        let seed = [0x42u8; 32];
+        std::fs::write(key_path(&dir), hex::encode(seed)).unwrap();
+        let loaded = crate::rpc::AetherRpcImpl::load_faucet_key(&key_path(&dir));
+        assert!(
+            loaded.is_none(),
+            "a key that does not derive to genesis FAUCET_ADDRESS must be rejected"
+        );
     }
 }

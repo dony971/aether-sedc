@@ -2,16 +2,13 @@
 //!
 //! Implements JSON-RPC server for external communication using jsonrpsee with Axum integration.
 
-use crate::consensus::VQVConsensus;
-use crate::consensus::Validator;
-use crate::genesis::FAUCET_SECRET_KEY;
 use crate::ledger::Ledger;
 use crate::parent_selection::DAG;
 use crate::transaction::{Address, Transaction, TransactionId};
-use crate::transaction_processor::TransactionProcessor;
-use crate::SyncEvent;
+use crate::transaction_processor::{ProcessingError, TransactionProcessor};
+use crate::validation::ValidationError;
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     response::Html,
     routing::{get, post},
     Json, Router,
@@ -22,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{RwLock, Semaphore};
 use tower_http::cors::CorsLayer;
 
 /// Token bucket rate limiter (sliding window per key)
@@ -35,6 +32,15 @@ pub struct RateLimiter {
     /// Per-key state: (count, window_start)
     buckets: Arc<RwLock<HashMap<String, (u32, Instant)>>>,
 }
+
+/// Maximum serialized transaction size accepted via RPC (memory DoS guard).
+/// A legitimate signed transaction is a few hundred bytes (1 MiB is generous).
+const MAX_RPC_TX_SIZE: usize = 1024 * 1024;
+
+/// H1: maximum number of parked orphans (memory + Sled). Orphans are only
+/// stored AFTER the pure validation gate (PoW + signature), but the store
+/// must still be bounded so a determined attacker cannot grow it forever.
+const MAX_ORPHANS: usize = 50_000;
 
 impl RateLimiter {
     pub fn new(max_requests: u32, window_secs: u64) -> Self {
@@ -81,7 +87,8 @@ impl std::error::Error for RpcError {}
 pub struct BalanceResponse {
     pub address: Address,
     pub balance: u64,
-    pub mining_rewards: u64,
+    // §J (purged): `mining_rewards` was always 0 (no mining rewards exist in
+    // this tokenomics — zero emission); removed from the RPC surface.
 }
 
 /// Transaction response
@@ -102,12 +109,8 @@ pub struct DagStatsResponse {
     pub connected_peers: u32,
 }
 
-/// Hashrate response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HashrateResponse {
-    pub hashrate: String,
-    pub difficulty: u64,
-}
+// §J (purged): HashrateResponse + get_network_hashrate were placeholders
+// returning a fixed string — no caller (explorer, GUI, harness) used them.
 
 /// Global status - canonical status all nodes converge on
 /// Economic policy: quorum-based weighted convergence for safety + liveness
@@ -138,139 +141,11 @@ pub enum GlobalStatus {
     Finalized,
 }
 
-/// Node status report for quorum-based reconciliation
-#[derive(Debug, Clone, Copy)]
-pub struct NodeStatusReport {
-    pub weight: f64,
-    pub local_status: LocalStatus,
-    pub consensus_status: ConsensusStatus,
-}
-
-/// Quorum-based global status resolver
-/// Economic policy: safety via quorum, liveness via majority fallback
-pub struct GlobalStatusResolver {
-    /// Minimum weight required for quorum (default 2/3)
-    quorum_threshold: f64,
-    /// Minimum weight required for majority fallback (default 1/2)
-    majority_threshold: f64,
-}
-
-impl GlobalStatusResolver {
-    /// Create new resolver with default thresholds
-    pub fn new() -> Self {
-        Self {
-            quorum_threshold: 0.67,   // 2/3 for safety
-            majority_threshold: 0.50, // 1/2 for liveness
-        }
-    }
-
-    /// Create resolver with custom thresholds
-    pub fn with_thresholds(quorum: f64, majority: f64) -> Self {
-        Self {
-            quorum_threshold: quorum,
-            majority_threshold: majority,
-        }
-    }
-
-    /// Reconcile multiple node statuses into single global status
-    /// Economic policy: quorum-based weighted convergence
-    pub fn reconcile_quorum(&self, reports: &[NodeStatusReport]) -> GlobalStatus {
-        if reports.is_empty() {
-            return GlobalStatus::Unknown;
-        }
-
-        let total_weight: f64 = reports.iter().map(|r| r.weight).sum();
-        if total_weight == 0.0 {
-            return GlobalStatus::Unknown;
-        }
-
-        // Calculate weight for each status level (ascending)
-        let mut weight_unknown = 0.0;
-        let mut weight_pending = 0.0;
-        let mut weight_unconfirmed = 0.0;
-        let mut weight_confirmed = 0.0;
-        let mut weight_stable = 0.0;
-        let mut weight_finalized = 0.0;
-
-        for report in reports {
-            let global = GlobalStatusResolver::reconcile_single(
-                report.local_status,
-                report.consensus_status,
-            );
-            match global {
-                GlobalStatus::Unknown => weight_unknown += report.weight,
-                GlobalStatus::Pending => weight_pending += report.weight,
-                GlobalStatus::Unconfirmed => weight_unconfirmed += report.weight,
-                GlobalStatus::Confirmed => weight_confirmed += report.weight,
-                GlobalStatus::Stable => weight_stable += report.weight,
-                GlobalStatus::Finalized => weight_finalized += report.weight,
-            }
-        }
-
-        // Normalize weights
-        let w_unknown = weight_unknown / total_weight;
-        let w_pending = weight_pending / total_weight;
-        let w_unconfirmed = weight_unconfirmed / total_weight;
-        let w_confirmed = weight_confirmed / total_weight;
-        let w_stable = weight_stable / total_weight;
-        let w_finalized = weight_finalized / total_weight;
-
-        // Check for quorum at each level (highest first)
-        // Finalized requires explicit VQV votes - not just weight
-        if w_finalized >= self.quorum_threshold {
-            GlobalStatus::Finalized
-        } else if w_stable >= self.quorum_threshold {
-            GlobalStatus::Stable
-        } else if w_confirmed >= self.quorum_threshold {
-            GlobalStatus::Confirmed
-        } else if w_unconfirmed >= self.quorum_threshold {
-            GlobalStatus::Unconfirmed
-        } else if w_pending >= self.quorum_threshold {
-            GlobalStatus::Pending
-        } else if w_unknown >= self.quorum_threshold {
-            GlobalStatus::Unknown
-        } else {
-            // No quorum - use majority fallback for liveness
-            if w_finalized >= self.majority_threshold {
-                GlobalStatus::Finalized
-            } else if w_stable >= self.majority_threshold {
-                GlobalStatus::Stable
-            } else if w_confirmed >= self.majority_threshold {
-                GlobalStatus::Confirmed
-            } else if w_unconfirmed >= self.majority_threshold {
-                GlobalStatus::Unconfirmed
-            } else if w_pending >= self.majority_threshold {
-                GlobalStatus::Pending
-            } else {
-                // Default to unknown if no majority
-                GlobalStatus::Unknown
-            }
-        }
-    }
-
-    /// Reconcile single node's local and consensus status
-    /// Economic policy: conservative convergence for single node
-    pub fn reconcile_single(local: LocalStatus, consensus: ConsensusStatus) -> GlobalStatus {
-        match local {
-            LocalStatus::Unknown => GlobalStatus::Unknown,
-            LocalStatus::Orphan => GlobalStatus::Pending,
-            LocalStatus::InMempool => GlobalStatus::Pending,
-            LocalStatus::InLocalDag => match consensus {
-                ConsensusStatus::Unconfirmed => GlobalStatus::Unconfirmed,
-                ConsensusStatus::Confirmed => GlobalStatus::Confirmed,
-                ConsensusStatus::Stable => GlobalStatus::Stable,
-                ConsensusStatus::Finalized => GlobalStatus::Finalized,
-            },
-        }
-    }
-}
-
-impl Default for GlobalStatusResolver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
+// §J (purged): NodeStatusReport + GlobalStatusResolver::reconcile_quorum were
+// VQV vestiges — never called by any production code path. Only the single-
+// node reconciliation (GlobalStatus::reconcile_single) is live (see
+// get_transaction_status). GlobalStatus itself remains, as it is part of the
+// transaction status RPC surface.
 impl GlobalStatus {
     /// Minimum number of references for "confirmed" status
     pub const MIN_CONFIRMATIONS: usize = 3;
@@ -297,9 +172,24 @@ impl GlobalStatus {
 
     /// Reconcile local and consensus status into global status (single node)
     /// Economic policy: conservative convergence - choose minimum certainty
-    /// For multi-node reconciliation, use GlobalStatusResolver::reconcile_quorum
     pub fn reconcile(local: LocalStatus, consensus: ConsensusStatus) -> Self {
-        GlobalStatusResolver::reconcile_single(local, consensus)
+        Self::reconcile_single(local, consensus)
+    }
+
+    /// Reconcile single node's local and consensus status
+    /// Economic policy: conservative convergence for single node
+    pub fn reconcile_single(local: LocalStatus, consensus: ConsensusStatus) -> Self {
+        match local {
+            LocalStatus::Unknown => Self::Unknown,
+            LocalStatus::Orphan => Self::Pending,
+            LocalStatus::InMempool => Self::Pending,
+            LocalStatus::InLocalDag => match consensus {
+                ConsensusStatus::Unconfirmed => Self::Unconfirmed,
+                ConsensusStatus::Confirmed => Self::Confirmed,
+                ConsensusStatus::Stable => Self::Stable,
+                ConsensusStatus::Finalized => Self::Finalized,
+            },
+        }
     }
 }
 
@@ -467,22 +357,8 @@ pub struct TransactionHistoryResponse {
     pub total_count: usize,
 }
 
-/// Staking response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StakingResponse {
-    pub address: Address,
-    pub staked_amount: u64,
-    pub rewards_earned: u64,
-    pub success: bool,
-}
-
-/// Staking info response
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StakingInfoResponse {
-    pub staked_amount: u64,
-    pub rewards_earned: u64,
-    pub has_staked: bool,
-}
+// §J (purged): StakingResponse / StakingInfoResponse were VQV vestiges — no
+// RPC dispatch, no caller anywhere in the tree.
 
 /// Account nonce response
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -490,32 +366,6 @@ pub struct AccountNonceResponse {
     pub address: Address,
     pub current_nonce: u64,
     pub next_nonce: u64,
-}
-
-/// Transaction finality states (practical finality semantics)
-/// Economic policy: transactions progress through these states as they gain consensus confidence
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransactionFinality {
-    /// Accepted locally: in mempool and DAG, but not yet confirmed by network
-    /// Economic impact: ledger committed, fees burned, but may be reorganized
-    Accepted,
-    /// Visible in DAG: confirmed by network, but not yet final
-    /// Economic impact: stable, but theoretical reorganization possible
-    Confirmed,
-    /// Economically stable: sufficient tips/confirmations for practical finality
-    /// Economic impact: reorganization extremely unlikely, can be considered final for most use cases
-    EconomicallyStable,
-    /// Finalized: confirmed by consensus mechanism (VQV votes)
-    /// Economic impact: irreversible, guaranteed by protocol
-    Finalized,
-}
-
-impl TransactionFinality {
-    /// Check if transaction is considered "final" for practical purposes
-    /// Economic policy: EconomicallyStable and Finalized are both practically final
-    pub fn is_practically_final(&self) -> bool {
-        matches!(self, Self::EconomicallyStable | Self::Finalized)
-    }
 }
 
 /// Mempool for transaction queuing with economic priority
@@ -663,9 +513,12 @@ pub struct DagEdge {
 }
 
 /// Tips response
+/// V-20 FIX: tips are canonical hex strings (see transaction::encode_id),
+/// NEVER raw byte arrays. Numeric arrays broke every client (CLI, GUI) which
+/// silently fell back to genesis parents [0,0] and turned the DAG into a star.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TipsResponse {
-    pub tips: Vec<TransactionId>,
+    pub tips: Vec<String>,
     pub count: usize,
 }
 
@@ -717,21 +570,22 @@ pub struct CreateAccountResponse {
 
 /// RPC server implementation
 pub struct AetherRpcImpl {
-    consensus: Arc<RwLock<VQVConsensus>>,
     dag: Arc<RwLock<DAG>>,
     ledger: Arc<RwLock<Ledger>>,
     storage: Arc<RwLock<crate::storage::Storage>>,
-    ledger_path: std::path::PathBuf,
     mempool: Arc<RwLock<Mempool>>,
     p2p_network: Arc<crate::p2p::P2PNetwork>,
-    save_tx: mpsc::Sender<SyncEvent>,
     mining_enabled: Arc<RwLock<bool>>,
-    miner_address: Option<Address>,
     orphans: Arc<RwLock<std::collections::HashMap<[u8; 32], Transaction>>>,
     faucet_cooldowns: Arc<RwLock<std::collections::HashMap<[u8; 32], std::time::Instant>>>,
     fee_oracle: Arc<RwLock<FeeOracle>>,
-    faucet_key: SigningKey,
+    /// Faucet signing key, loaded from a SERVER-ONLY file (`data_dir/faucet.key`)
+    /// at startup. `None` means the faucet is disabled (no secret in the source).
+    faucet_key: Option<SigningKey>,
     rate_limiter: RateLimiter,
+    /// H3: per-client-IP budget so a single attacker cannot exhaust the shared
+    /// per-method budget (which would DoS every other client).
+    rate_limiter_per_ip: RateLimiter,
     start_time: std::time::Instant,
 }
 
@@ -770,40 +624,118 @@ impl FeeOracle {
 impl AetherRpcImpl {
     /// Create new RPC implementation
     pub fn new(
-        consensus: Arc<RwLock<VQVConsensus>>,
         dag: Arc<RwLock<DAG>>,
         ledger: Arc<RwLock<Ledger>>,
         storage: Arc<RwLock<crate::storage::Storage>>,
         ledger_path: std::path::PathBuf,
         mempool: Arc<RwLock<Mempool>>,
         p2p_network: Arc<crate::p2p::P2PNetwork>,
-        save_tx: mpsc::Sender<SyncEvent>,
         mining_enabled: Arc<RwLock<bool>>,
-        miner_address: Option<Address>,
         orphans: Arc<RwLock<std::collections::HashMap<[u8; 32], Transaction>>>,
     ) -> Self {
-        let faucet_seed = hex::decode(FAUCET_SECRET_KEY).expect("Invalid faucet secret key hex");
-        let mut faucet_key_bytes = [0u8; 32];
-        faucet_key_bytes.copy_from_slice(&faucet_seed);
-        let faucet_key = SigningKey::from_bytes(&faucet_key_bytes);
+        // Load the faucet secret key from a SERVER-ONLY file. The secret is
+        // NEVER in the source code or distributed binary. Without the file the
+        // faucet endpoint is disabled. The genesis still funds FAUCET_ADDRESS
+        // (public), but only an operator holding the key can spend it.
+        let faucet_key = Self::load_faucet_key(&ledger_path);
         Self {
-            consensus,
             dag,
             ledger,
             storage,
-            ledger_path,
             mempool,
             p2p_network,
-            save_tx,
             mining_enabled,
-            miner_address,
             orphans,
             faucet_cooldowns: Arc::new(RwLock::new(std::collections::HashMap::new())),
             fee_oracle: Arc::new(RwLock::new(FeeOracle::new())),
             faucet_key,
             rate_limiter: RateLimiter::new(200, 10), // 200 requests per 10s window
+            rate_limiter_per_ip: RateLimiter::new(40, 10), // 40 requests per 10s per client IP
             start_time: std::time::Instant::now(),
         }
+    }
+
+    /// Load the faucet signing key from `data_dir/faucet.key` (a 64-char hex
+    /// Ed25519 secret key, one line). Returns `None` (faucet disabled) if the
+    /// file is absent, invalid, or does NOT match the genesis faucet address.
+    /// The genesis credits `FAUCET_ADDRESS` (a public constant): only the key
+    /// whose public key derives to that exact address can spend those funds.
+    ///
+    /// Warning messages are emitted at most once per key file path so that
+    /// repeated constructions (per-RPC-request impls) cannot flood the logs.
+    pub(crate) fn load_faucet_key(ledger_path: &std::path::Path) -> Option<SigningKey> {
+        use std::sync::OnceLock;
+        static WARNED: OnceLock<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>> =
+            OnceLock::new();
+        fn warn_once(key_file: &std::path::Path, msg: String) {
+            let warned = WARNED.get_or_init(Default::default);
+            let mut set = warned.lock().unwrap_or_else(|e| e.into_inner());
+            if set.insert(key_file.to_path_buf()) {
+                tracing::warn!("{msg}");
+            }
+        }
+
+        let data_dir = ledger_path.parent()?;
+        let key_file = data_dir.join("faucet.key");
+        let Ok(content) = std::fs::read_to_string(&key_file) else {
+            warn_once(
+                &key_file,
+                format!("🔒 Faucet disabled: no faucet.key at {:?}", key_file),
+            );
+            return None;
+        };
+        let trimmed = content.trim();
+        let Ok(seed_hex) = hex::decode(trimmed) else {
+            warn_once(
+                &key_file,
+                "🔒 Faucet disabled: invalid faucet.key hex".to_string(),
+            );
+            return None;
+        };
+        if seed_hex.len() != 32 {
+            warn_once(
+                &key_file,
+                "🔒 Faucet disabled: faucet.key must be 32 bytes".to_string(),
+            );
+            return None;
+        }
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&seed_hex);
+        let key = SigningKey::from_bytes(&bytes);
+
+        // The faucet can only spend the GENESIS faucet balance. The provided
+        // key must therefore derive to FAUCET_ADDRESS; otherwise every faucet
+        // transaction would be rejected (address with zero balance).
+        let verifying_key = key.verifying_key();
+        let mut derived_addr = [0u8; 32];
+        derived_addr.copy_from_slice(&verifying_key.to_bytes()[..32]);
+        let expected_addr: [u8; 32] = match hex::decode(crate::genesis::FAUCET_ADDRESS) {
+            Ok(bytes) if bytes.len() == 32 => {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&bytes);
+                a
+            }
+            _ => {
+                warn_once(
+                    &key_file,
+                    "🔒 Faucet disabled: invalid genesis FAUCET_ADDRESS constant".to_string(),
+                );
+                return None;
+            }
+        };
+        if derived_addr != expected_addr {
+            warn_once(
+                &key_file,
+                format!(
+                    "🔒 Faucet disabled: faucet.key does not match genesis FAUCET_ADDRESS (derived {}, expected {})\n   The genesis credits FAUCET_ADDRESS; only the original genesis key can spend it.",
+                    hex::encode(derived_addr),
+                    crate::genesis::FAUCET_ADDRESS
+                ),
+            );
+            return None;
+        }
+        tracing::info!("🔑 Faucet key loaded from {:?}", key_file);
+        Some(key)
     }
 
     /// Get balance for an address
@@ -811,11 +743,7 @@ impl AetherRpcImpl {
         let ledger = self.ledger.read().await;
 
         let balance = ledger.get_balance(&address);
-        Ok(BalanceResponse {
-            address,
-            balance,
-            mining_rewards: 0,
-        })
+        Ok(BalanceResponse { address, balance })
     }
 
     /// Send a transaction
@@ -823,7 +751,7 @@ impl AetherRpcImpl {
         &self,
         params: serde_json::Value,
     ) -> Result<TransactionResponse, RpcError> {
-        tracing::error!("RAW RPC PARAMS RECEIVED: {:?}", params);
+        tracing::debug!("RAW RPC PARAMS RECEIVED: {:?}", params);
 
         // Parse params manually - expect array with single string
         let tx_data: String = match params {
@@ -849,8 +777,9 @@ impl AetherRpcImpl {
         tracing::info!("📨 Received RPC send_transaction request");
         tracing::debug!("Transaction data length: {} bytes", tx_data.len());
 
-        // Log raw hex payload
-        tracing::info!("Raw hex: {}", tx_data);
+        // H7: the full payload only at debug level (log-amplification guard:
+        // an attacker flooding invalid submissions must not balloon the logs).
+        tracing::debug!("Raw hex: {}", tx_data);
         tracing::debug!("Payload RPC reçu: {}", tx_data);
 
         // Step 1: Reception - Parse transaction from hex string (SDK sends hex-encoded bincode)
@@ -865,6 +794,21 @@ impl AetherRpcImpl {
                 return Err(RpcError(format!("Invalid hex data: {}", e)));
             }
         };
+
+        // Size cap BEFORE deserialization: a legitimate Aether transaction is a
+        // few hundred bytes. Reject oversized submissions (memory DoS guard).
+        if tx_bytes.len() > MAX_RPC_TX_SIZE {
+            tracing::warn!(
+                "❌ Reception - Oversized transaction: {} bytes (max {})",
+                tx_bytes.len(),
+                MAX_RPC_TX_SIZE
+            );
+            return Err(RpcError(format!(
+                "Transaction too large: {} bytes (max {})",
+                tx_bytes.len(),
+                MAX_RPC_TX_SIZE
+            )));
+        }
 
         // Step 2: Parsing - Deserialize transaction using bincode (same format as GUI)
         let tx: Transaction = match bincode::deserialize::<Transaction>(&tx_bytes) {
@@ -909,109 +853,48 @@ impl AetherRpcImpl {
         // - TEMPORARILY DEFERRED: Mempool full, lock contention -> retry later
         // - ACCEPTED: Passes all validation, committed to ledger and DAG -> pending confirmation
 
-        // Validation logs
-        tracing::info!(
+        // Validation logs (H7: debug level — 8 info lines per tx was a
+        // log-amplification vector under sustained invalid submissions).
+        tracing::debug!(
             "🔍 Processing transaction [{}] - Sender: {}",
             source,
             hex::encode(tx.sender)
         );
-        tracing::info!(
+        tracing::debug!(
             "🔍 Processing transaction [{}] - Receiver: {}",
             source,
             hex::encode(tx.receiver)
         );
-        tracing::info!(
+        tracing::debug!(
             "🔍 Processing transaction [{}] - Amount: {}",
             source,
             tx.amount
         );
-        tracing::info!("🔍 Processing transaction [{}] - Fee: {}", source, tx.fee);
-        tracing::info!(
+        tracing::debug!("🔍 Processing transaction [{}] - Fee: {}", source, tx.fee);
+        tracing::debug!(
             "🔍 Processing transaction [{}] - Parents: [{}, {}]",
             source,
             hex::encode(tx.parents[0]),
             hex::encode(tx.parents[1])
         );
-        tracing::info!(
+        tracing::debug!(
             "🔍 Processing transaction [{}] - PoW Nonce: {}",
             source,
             tx.nonce
         );
-        tracing::info!(
+        tracing::debug!(
             "🔍 Processing transaction [{}] - Account Nonce: {}",
             source,
             tx.account_nonce
         );
 
-        // STEP 1: CHECK FOR MISSING PARENTS (orphan handling - before full validation)
-        // This is a special case: valid transactions with missing parents are stored as orphans
-        let dag = match self.dag.try_read() {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!("❌ DAG lock error: {}", e);
-                return Err(RpcError("DAG lock error".to_string()));
-            }
-        };
-
-        let mut missing_parents = Vec::new();
-        for (i, parent) in tx.parents.iter().enumerate() {
-            let is_genesis = *parent == [0u8; 32];
-            if !is_genesis && !dag.transactions().contains_key(parent) {
-                tracing::warn!(
-                    "⚠️ Parent {} missing: {} - requesting via P2P",
-                    i,
-                    hex::encode(parent)
-                );
-                missing_parents.push((i, parent.clone()));
-
-                // Request missing parent via P2P
-                let parent_hash = parent.to_vec();
-                let p2p = self.p2p_network.clone();
-                tokio::spawn(async move {
-                    tracing::info!(
-                        "📡 P2P - Requesting missing parent: {}",
-                        hex::encode(&parent_hash)
-                    );
-                    p2p.request_transaction(parent_hash).await;
-                });
-            }
-        }
-
-        // VALID BUT NOT ACCEPTABLE: If parents are missing, store as orphan
-        if !missing_parents.is_empty() {
-            drop(dag);
-
-            // Persist orphan to disk (survives restart)
-            // 🔧 FIX: use the main storage (data_dir/sled_db), NOT a new sled at
-            // ledger_path.parent() which silently opened a different database at
-            // the data-dir root, leaving orphans invisible to the node's DAG.
-            if let Ok(storage_guard) = self.storage.try_read() {
-                if let Err(e) = storage_guard.put_orphan(tx.id, &tx) {
-                    tracing::error!("❌ Failed to persist orphan to storage: {}", e);
-                }
-            }
-
-            // Also keep in memory for fast access
-            {
-                let mut orphans = self.orphans.write().await;
-                orphans.insert(tx.id, tx.clone());
-                tracing::info!(
-                    "📦 Orphan stored: {} (missing {} parent(s)) - persisted to disk",
-                    hex::encode(tx.id),
-                    missing_parents.len()
-                );
-            }
-
-            return Err(RpcError(format!(
-                "Transaction has {} missing parent(s). Stored as orphan and requesting via P2P. Please retry in a few seconds.",
-                missing_parents.len()
-            )));
-        }
-        drop(dag);
-
         // STEP 2: USE TRANSACTION PROCESSOR (ZERO TRUST SINGLE ENTRY POINT)
-        // 🔒 All validation and state mutations go through TransactionProcessor
-        // 🔒 CRITICAL: Block reward uses consensus state (single source of truth for height)
+        // 🔒 All validation and state mutations go through TransactionProcessor.
+        // 🪙 Monetary policy: ZERO EMISSION - the processor never mints tokens.
+        // H1: orphan handling (missing parents) now lives INSIDE the processor,
+        // AFTER the pure validation gate (PoW + signature). It returns
+        // ProcessingError::Orphan(missing) and we park it below — never
+        // before, so unvalidated garbage cannot fill the orphan store.
         let processor = TransactionProcessor::new();
         let mempool = self.mempool.read().await;
         let mempool_occupancy = mempool.size() as f64 / mempool.max_size() as f64;
@@ -1027,27 +910,36 @@ impl AetherRpcImpl {
             mempool_write.set_min_fee(min_fee);
         }
 
-        let miner_addr = self.miner_address.as_ref();
+        // V-22 FIX: retry transient LOCK CONTENTION instead of dropping the
+        // transaction. The processor uses try_write() so it can fail with
+        // LockError whenever another task (P2P channel, orphan solver, another
+        // RPC send) holds the DAG/ledger/mempool locks. Before this fix the
+        // tx was lost forever: it never entered the DAG, and the peer-side
+        // seen-transactions dedup meant a later resync never re-delivered it.
+        let mut lock_attempts = 0;
+        let result = loop {
+            match processor
+                .process(tx.clone(), &self.dag, &self.ledger, &self.mempool, min_fee)
+                .await
+            {
+                Ok(_) => break Ok(()),
+                Err(ProcessingError::LockError(_)) if lock_attempts < 20 => {
+                    lock_attempts += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(25 * lock_attempts as u64))
+                        .await;
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        if lock_attempts > 0 {
+            tracing::info!(
+                "🔁 Lock contention retried {} time(s) for tx {}",
+                lock_attempts,
+                hex::encode(tx.id)
+            );
+        }
 
-        // Get consensus state (single source of truth for block height)
-        let mut consensus = self.consensus.write().await;
-        let consensus_state = consensus.state_mut();
-        // Use transaction ID as block ID (in production, this should be the actual block ID from consensus)
-        let block_id = Some(tx.id);
-
-        match processor
-            .process(
-                tx.clone(),
-                &self.dag,
-                &self.ledger,
-                &self.mempool,
-                min_fee,
-                miner_addr,
-                consensus_state,
-                block_id,
-            )
-            .await
-        {
+        match result {
             Ok(_) => {
                 tracing::info!("✅ Transaction processed successfully via TransactionProcessor");
                 // 💾 Persist to mempool storage
@@ -1063,11 +955,98 @@ impl AetherRpcImpl {
                         .to_string(),
                 })
             }
+            Err(ProcessingError::Orphan(missing_parents)) => {
+                // H1: the transaction passed the pure gate (PoW + signature)
+                // but its parents are not in the DAG yet. Park it (bounded)
+                // and re-request the parents over P2P.
+                if self.park_orphan(tx, &missing_parents).await {
+                    Err(RpcError(format!(
+                        "Transaction has {} missing parent(s). Stored as orphan and requesting via P2P. Please retry in a few seconds.",
+                        missing_parents.len()
+                    )))
+                } else {
+                    Err(RpcError(format!(
+                        "Orphan limit reached ({}). Transaction rejected.",
+                        MAX_ORPHANS
+                    )))
+                }
+            }
+            Err(ProcessingError::ValidationFailed(ValidationError::MissingParent {
+                parent_id,
+                ..
+            })) => {
+                // Defensive: unreachable in the current flow (the orphan gate
+                // and validate_dag run under the same DAG read lock), but keep
+                // the behavior identical if a future refactor reorders them.
+                let missing = vec![parent_id];
+                if self.park_orphan(tx, &missing).await {
+                    Err(RpcError(format!(
+                        "Transaction has {} missing parent(s). Stored as orphan and requesting via P2P. Please retry in a few seconds.",
+                        missing.len()
+                    )))
+                } else {
+                    Err(RpcError(format!(
+                        "Orphan limit reached ({}). Transaction rejected.",
+                        MAX_ORPHANS
+                    )))
+                }
+            }
             Err(e) => {
                 tracing::error!("❌ Transaction processing failed: {}", e);
                 Err(RpcError(e.to_string()))
             }
         }
+    }
+
+    /// H1: persist a pure-validated orphan (PoW + signature already checked by
+    /// the processor) under a hard cap, and request the missing parents over
+    /// P2P. Returns false when the orphan store is full (nothing persisted).
+    async fn park_orphan(&self, tx: Transaction, missing_parents: &[[u8; 32]]) -> bool {
+        // Cap: never let the orphan store grow without bound.
+        {
+            let orphans = self.orphans.read().await;
+            if orphans.len() >= MAX_ORPHANS {
+                tracing::warn!(
+                    "⛔ Orphan limit reached ({}), rejecting orphan {}",
+                    MAX_ORPHANS,
+                    hex::encode(&tx.id[..8])
+                );
+                return false;
+            }
+        }
+
+        // Persist to disk (survives restart). Use the main storage
+        // (data_dir/sled_db), NOT a fresh sled at ledger_path.parent() which
+        // silently opened a different database at the data-dir root, leaving
+        // orphans invisible to the node's DAG.
+        if let Ok(storage_guard) = self.storage.try_read() {
+            if let Err(e) = storage_guard.put_orphan(tx.id, &tx) {
+                tracing::error!("❌ Failed to persist orphan to storage: {}", e);
+            }
+        }
+
+        // Also keep in memory for fast access.
+        {
+            let mut orphans = self.orphans.write().await;
+            orphans.insert(tx.id, tx.clone());
+        }
+
+        // Request the missing parents via P2P (each in its own task so one
+        // slow peer cannot block the others).
+        for parent in missing_parents {
+            let p2p = self.p2p_network.clone();
+            let parent_hash = parent.to_vec();
+            tokio::spawn(async move {
+                p2p.request_transaction(parent_hash).await;
+            });
+        }
+
+        tracing::info!(
+            "📦 Orphan stored: {} (missing {} parent(s)) - persisted to disk",
+            hex::encode(&tx.id),
+            missing_parents.len()
+        );
+        true
     }
 
     /// Process orphans - retry transactions that were waiting for parents
@@ -1209,14 +1188,15 @@ impl AetherRpcImpl {
     /// Get DAG statistics
     pub async fn get_dag_stats(&self) -> Result<DagStatsResponse, RpcError> {
         let dag = self.dag.read().await;
-        let consensus = self.consensus.read().await;
 
         let total_transactions = dag.transaction_count() as u64;
         let tip_count = dag.tip_count();
-        let epoch = consensus.current_epoch();
+        // Height = number of accepted transactions in the DAG (each accepted tx
+        // is one consensus step). The DAG is the single source of truth.
+        let height = total_transactions;
+        let epoch = 0u64;
         let connected_peers = self.p2p_network.peer_count().await as u32;
 
-        let height = consensus.state().get_height();
         let current_tps = if height > 0 {
             total_transactions as f64 / height.max(1) as f64
         } else {
@@ -1229,18 +1209,6 @@ impl AetherRpcImpl {
             tip_count,
             epoch,
             connected_peers,
-        })
-    }
-
-    /// Get network hashrate (simplified placeholder for now)
-    pub async fn get_network_hashrate(&self) -> Result<HashrateResponse, RpcError> {
-        // For now, return a placeholder based on base difficulty
-        // In production, this would calculate from recent transaction nonces
-        let estimated_hashrate = 100 * 1000; // difficulty * 1000
-
-        Ok(HashrateResponse {
-            hashrate: format!("{} H/s", estimated_hashrate),
-            difficulty: 100, // Base difficulty
         })
     }
 
@@ -1375,9 +1343,13 @@ impl AetherRpcImpl {
     }
 
     /// Get transaction history for a specific address
+    /// H3: bounded result — an optional `limit` (default 100, max 1000) caps
+    /// the response size so repeated calls cannot amplify memory usage on a
+    /// large DAG. The total match count is still reported exactly.
     pub async fn get_transaction_history(
         &self,
         address: String,
+        limit: Option<u64>,
     ) -> Result<TransactionHistoryResponse, RpcError> {
         let dag = self.dag.read().await;
 
@@ -1388,11 +1360,14 @@ impl AetherRpcImpl {
             .try_into()
             .map_err(|_| RpcError("Invalid address length".to_string()))?;
 
+        let limit = limit.unwrap_or(100).min(1000) as usize;
+
         // Filter transactions where address is sender or receiver
         let transactions: Vec<TransactionHistoryItem> = dag
             .transactions()
             .values()
             .filter(|tx| tx.sender == address_array || tx.receiver == address_array)
+            .take(limit)
             .map(|tx| {
                 let is_incoming = tx.receiver == address_array;
                 TransactionHistoryItem {
@@ -1406,217 +1381,16 @@ impl AetherRpcImpl {
             })
             .collect();
 
-        let total_count = transactions.len();
+        let total_count = dag
+            .transactions()
+            .values()
+            .filter(|tx| tx.sender == address_array || tx.receiver == address_array)
+            .count();
 
         Ok(TransactionHistoryResponse {
             transactions,
             total_count,
         })
-    }
-
-    /// Stake tokens for an address
-    pub async fn stake_tokens(
-        &self,
-        address: &Address,
-        amount: u64,
-    ) -> Result<StakingResponse, RpcError> {
-        tracing::info!(
-            "🔒 Stake request: address={}, amount={}",
-            hex::encode(address),
-            amount
-        );
-
-        // Phase 1: lock funds in the ledger (single source of truth for balances)
-        {
-            let mut ledger = self.ledger.write().await;
-            if let Err(e) = ledger.subtract_balance(address, amount) {
-                tracing::error!("❌ Stake failed: {}", e);
-                return Ok(StakingResponse {
-                    address: *address,
-                    staked_amount: 0,
-                    rewards_earned: 0,
-                    success: false,
-                });
-            }
-        }
-
-        // Phase 2: track staking position in storage
-        let staking_ok = {
-            let storage = self.storage.read().await;
-            match storage.stake_tokens(*address, amount) {
-                Ok(_) => {
-                    // Persist the staking position immediately (survives restart)
-                    let _ = storage.flush();
-                    true
-                }
-                Err(e) => {
-                    tracing::error!("❌ Stake failed: {}", e);
-                    false
-                }
-            }
-        };
-        if !staking_ok {
-            // Rollback the ledger lock (position tracking failed)
-            let mut ledger = self.ledger.write().await;
-            let _ = ledger.add_balance(address, amount);
-            return Ok(StakingResponse {
-                address: *address,
-                staked_amount: 0,
-                rewards_earned: 0,
-                success: false,
-            });
-        }
-        // Persist the ledger balance lock immediately (survives restart).
-        // 🔧 FIX: without this, a stake was only applied in memory and silently
-        // lost on restart (ledger.save() is otherwise only called by
-        // TransactionProcessor / SyncEvent::SaveRequested).
-        {
-            let ledger = self.ledger.read().await;
-            // Consume the non-Send Result (Box<dyn Error>) immediately so no
-            // .await below (the rollback) breaks the Send bound of the handler.
-            let save_error = match ledger.save().await {
-                Ok(()) => None,
-                Err(e) => Some(e.to_string()),
-            };
-            drop(ledger);
-            if let Some(err_str) = save_error {
-                let mut ledger = self.ledger.write().await;
-                let _ = ledger.add_balance(address, amount);
-                tracing::error!("❌ Stake ledger persist failed, rolled back: {}", err_str);
-                return Ok(StakingResponse {
-                    address: *address,
-                    staked_amount: 0,
-                    rewards_earned: 0,
-                    success: false,
-                });
-            }
-        }
-        let (staked_amount, rewards) = {
-            let storage = self.storage.read().await;
-            (
-                storage.get_staked_amount(*address).unwrap_or(0),
-                storage.calculate_staking_reward(*address).unwrap_or(0),
-            )
-        };
-        // Bridge to VQV consensus — register as validator if min stake met
-        let min_stake = {
-            let c = self.consensus.read().await;
-            c.min_stake()
-        };
-        let max_stake = {
-            let c = self.consensus.read().await;
-            c.max_stake()
-        };
-        if staked_amount >= min_stake && staked_amount <= max_stake {
-            let mut cons = self.consensus.write().await;
-            let validator = Validator::new(*address, staked_amount, address.to_vec());
-            match cons.register_validator(validator) {
-                Err(e) => tracing::warn!("⚠️ Validator registration skipped: {}", e),
-                Ok(_) => tracing::info!(
-                    "✅ Address registered as VQV validator: {}",
-                    hex::encode(address)
-                ),
-            }
-        }
-        tracing::info!(
-            "✅ Stake successful: staked_amount={}, rewards={}",
-            staked_amount,
-            rewards
-        );
-        Ok(StakingResponse {
-            address: *address,
-            staked_amount,
-            rewards_earned: rewards,
-            success: true,
-        })
-    }
-
-    /// Unstake tokens for an address
-    pub async fn unstake_tokens(&self, address: &Address) -> Result<StakingResponse, RpcError> {
-        // Phase 1: close the staking position and compute total return
-        let total_return = {
-            let storage = self.storage.read().await;
-            match storage.unstake_tokens(*address) {
-                Ok(total_return) => {
-                    // Persist the position removal immediately (survives restart)
-                    let _ = storage.flush();
-                    total_return
-                }
-                Err(e) => {
-                    tracing::error!("❌ Unstake failed: {}", e);
-                    return Ok(StakingResponse {
-                        address: *address,
-                        staked_amount: 0,
-                        rewards_earned: 0,
-                        success: false,
-                    });
-                }
-            }
-        };
-
-        // Phase 2: credit the ledger (single source of truth for balances)
-        let mut ledger = self.ledger.write().await;
-        if let Err(e) = ledger.add_balance(address, total_return) {
-            tracing::error!("❌ Unstake credit failed: {}", e);
-            return Ok(StakingResponse {
-                address: *address,
-                staked_amount: 0,
-                rewards_earned: 0,
-                success: false,
-            });
-        }
-        drop(ledger);
-
-        // Persist the ledger credit immediately (survives restart).
-        // 🔧 FIX: without this, an unstake was only applied in memory and
-        // silently lost on restart.
-        {
-            let ledger = self.ledger.read().await;
-            // Consume the non-Send Result (Box<dyn Error>) immediately.
-            let save_error = match ledger.save().await {
-                Ok(()) => None,
-                Err(e) => Some(e.to_string()),
-            };
-            drop(ledger);
-            if let Some(err_str) = save_error {
-                tracing::error!("❌ Unstake ledger persist failed: {}", err_str);
-            }
-        }
-
-        // Unregister from VQV consensus
-        self.consensus.write().await.unregister_validator(*address);
-        tracing::info!("✅ Validator unregistered: {}", hex::encode(address));
-        tracing::info!("✅ Unstake successful: returned {}", total_return);
-        Ok(StakingResponse {
-            address: *address,
-            staked_amount: 0,
-            rewards_earned: total_return,
-            success: true,
-        })
-    }
-
-    /// Get staking info for an address
-    pub async fn get_staking_info(
-        &self,
-        address: &Address,
-    ) -> Result<StakingInfoResponse, RpcError> {
-        let storage = self.storage.read().await;
-
-        if storage.has_staked_tokens(*address) {
-            let staked_amount = storage.get_staked_amount(*address).unwrap_or(0);
-            let rewards = storage.calculate_staking_reward(*address).unwrap_or(0);
-            Ok(StakingInfoResponse {
-                staked_amount,
-                rewards_earned: rewards,
-                has_staked: true,
-            })
-        } else {
-            Ok(StakingInfoResponse {
-                staked_amount: 0,
-                rewards_earned: 0,
-                has_staked: false,
-            })
-        }
     }
 
     /// Get account nonce for an address
@@ -1637,9 +1411,15 @@ impl AetherRpcImpl {
     }
 
     /// Get DAG graph for visualization
-    pub async fn get_dag_graph(&self) -> Result<DagGraphResponse, RpcError> {
+    /// H3: bounded result — an optional `limit` (default 500, max 5000) caps
+    /// the number of nodes serialized so one caller cannot force an O(DAG)
+    /// response on a large graph. Edges reference included nodes only.
+    pub async fn get_dag_graph(&self, limit: Option<u64>) -> Result<DagGraphResponse, RpcError> {
         let dag = self.dag.read().await;
-        let transactions: Vec<&Transaction> = dag.transactions().values().collect();
+        let limit = limit.unwrap_or(500).min(5000) as usize;
+        let transactions: Vec<&Transaction> = dag.transactions().values().take(limit).collect();
+        let included: std::collections::HashSet<TransactionId> =
+            transactions.iter().map(|tx| tx.id).collect();
 
         let nodes: Vec<DagNode> = transactions
             .iter()
@@ -1656,7 +1436,7 @@ impl AetherRpcImpl {
         let mut edges: Vec<DagEdge> = Vec::new();
         for tx in transactions.iter() {
             for parent in &tx.parents {
-                if !parent.is_empty() {
+                if !parent.is_empty() && included.contains(parent) {
                     edges.push(DagEdge {
                         from: *parent,
                         to: tx.id,
@@ -1691,6 +1471,12 @@ impl AetherRpcImpl {
             tips.push([0u8; 32]); // GENESIS_HASH
         }
 
+        // V-20 FIX: serialize tips in the canonical hex form so the CLI, the
+        // GUI and any external tool can decode them losslessly. Raw byte
+        // arrays made `tip.as_str()` return None on every client, which
+        // silently fell back to genesis parents and star-shaped DAGs.
+        let tips: Vec<String> = tips.iter().map(crate::transaction::encode_id).collect();
+
         let count = tips.len();
 
         tracing::debug!(
@@ -1706,37 +1492,15 @@ impl AetherRpcImpl {
     pub async fn get_dag_snapshot(&self) -> Result<DagSnapshotResponse, RpcError> {
         let dag = self.dag.read().await;
 
-        // Helper function to calculate cumulative weight
-        fn calculate_cumulative_weight(id: TransactionId, dag: &DAG) -> f64 {
-            let mut visited = std::collections::HashSet::new();
-            let mut queue = vec![id];
-            let mut weight = 0u64;
-
-            while let Some(current_id) = queue.pop() {
-                if !visited.insert(current_id) {
-                    continue;
-                }
-
-                weight += 1;
-
-                // Add children to queue
-                if let Some(children) = dag.children().get(&current_id) {
-                    for child in children {
-                        queue.push(*child);
-                    }
-                }
-            }
-
-            weight as f64
-        }
-
+        // Cumulative weight is maintained on the DAG itself (tx.weight =
+        // subtree size), so the snapshot reads the stored value directly.
         // Get last 100 transactions
         let transactions: Vec<TransactionSnapshot> = dag
             .transactions()
             .values()
             .take(100)
             .map(|tx| {
-                let cumulative_weight = calculate_cumulative_weight(tx.id, &dag);
+                let cumulative_weight = tx.weight.max(0.0);
                 let signature_valid = crate::wallet::Wallet::verify_transaction(tx);
 
                 TransactionSnapshot {
@@ -1777,33 +1541,51 @@ impl AetherRpcImpl {
         })
     }
 
-    /// Start mining
-    pub async fn start_mining(&self) -> Result<String, RpcError> {
-        let mut mining = self.mining_enabled.write().await;
-        *mining = true;
-        Ok("Mining started".to_string())
-    }
-
-    /// Stop mining
-    pub async fn stop_mining(&self) -> Result<String, RpcError> {
-        let mut mining = self.mining_enabled.write().await;
-        *mining = false;
-        Ok("Mining stopped".to_string())
+    /// H5: check a faucet cooldown while evicting all entries older than the
+    /// window (bounded memory: the map can only hold one entry per distinct
+    /// address active within the window). Returns the remaining seconds if the
+    /// address is still cooling down, `None` otherwise.
+    fn check_and_evict_cooldowns(
+        cooldowns: &mut std::collections::HashMap<[u8; 32], std::time::Instant>,
+        address: &Address,
+        window: std::time::Duration,
+    ) -> Option<u64> {
+        let now = std::time::Instant::now();
+        cooldowns.retain(|_, last| now.duration_since(*last) < window);
+        cooldowns
+            .get(address)
+            .map(|last| window.as_secs().saturating_sub(last.elapsed().as_secs()))
     }
 
     /// Faucet - give test funds via a real DAG transaction
     pub async fn faucet(&self, address: Address) -> Result<FaucetResponse, RpcError> {
-        // Rate limit: one request per 60s per address
+        // The faucet secret key lives in a server-only file. Without it the
+        // faucet is disabled: no operator has handed us the key, so we must
+        // not issue funds (fixes V-01: key removed from source).
+        let faucet_key = match self.faucet_key.as_ref() {
+            Some(k) => k,
+            None => {
+                return Err(RpcError(
+                    "Faucet disabled: no faucet.key on this node".to_string(),
+                ))
+            }
+        };
+
+        // Rate limit: one request per 60s per address.
+        // H5: stale entries are evicted on every check so the map is bounded
+        // by the number of DISTINCT addresses claimed within the last window
+        // (itself bounded by the faucet rate) instead of growing forever.
         {
             let mut cooldowns = self.faucet_cooldowns.write().await;
-            if let Some(last) = cooldowns.get(&address) {
-                if last.elapsed() < std::time::Duration::from_secs(60) {
-                    let remaining = 60 - last.elapsed().as_secs();
-                    return Err(RpcError(format!(
-                        "Rate limited. Try again in {}s",
-                        remaining
-                    )));
-                }
+            if let Some(remaining) = Self::check_and_evict_cooldowns(
+                &mut cooldowns,
+                &address,
+                std::time::Duration::from_secs(60),
+            ) {
+                return Err(RpcError(format!(
+                    "Rate limited. Try again in {}s",
+                    remaining
+                )));
             }
             cooldowns.insert(address, std::time::Instant::now());
         }
@@ -1811,8 +1593,8 @@ impl AetherRpcImpl {
         let amount = 100_000_000_000u64; // 10 AETH in smallest unit
         let fee = 1u64;
 
-        // Get faucet address and public key
-        let verifying_key = self.faucet_key.verifying_key();
+        // Get faucet address and public key (derived from the loaded key).
+        let verifying_key = faucet_key.verifying_key();
         let faucet_pk_bytes = verifying_key.to_bytes();
         let mut faucet_addr = [0u8; 32];
         faucet_addr.copy_from_slice(&faucet_pk_bytes[..32]);
@@ -1868,7 +1650,7 @@ impl AetherRpcImpl {
 
         // Sign with faucet key
         let signing_hash = tx.compute_signing_hash();
-        let signature = self.faucet_key.sign(&signing_hash);
+        let signature = faucet_key.sign(&signing_hash);
         tx.signature = signature.to_bytes().to_vec();
         tx.id = tx.compute_hash();
 
@@ -1916,29 +1698,23 @@ impl AetherRpcImpl {
 /// Start RPC server
 pub async fn start_rpc_server(
     addr: SocketAddr,
-    consensus: Arc<RwLock<VQVConsensus>>,
     dag: Arc<RwLock<DAG>>,
     ledger: Arc<RwLock<Ledger>>,
     storage: Arc<RwLock<crate::storage::Storage>>,
     ledger_path: std::path::PathBuf,
     mempool: Arc<RwLock<Mempool>>,
     p2p_network: Arc<crate::p2p::P2PNetwork>,
-    save_tx: mpsc::Sender<SyncEvent>,
     mining_enabled: Arc<RwLock<bool>>,
-    miner_address: Option<Address>,
     orphans: Arc<RwLock<std::collections::HashMap<[u8; 32], Transaction>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rpc_impl = Arc::new(AetherRpcImpl::new(
-        consensus,
         dag,
         ledger,
         storage,
         ledger_path,
         mempool.clone(),
         p2p_network,
-        save_tx,
         mining_enabled,
-        miner_address,
         orphans,
     ));
 
@@ -1984,7 +1760,11 @@ pub async fn start_rpc_server(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("✅ RPC + Explorer server listening on http://{}", addr);
 
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -1992,6 +1772,7 @@ pub async fn start_rpc_server(
 /// Handle JSON-RPC POST requests
 async fn handle_rpc(
     State(rpc_impl): State<Arc<AetherRpcImpl>>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl axum::response::IntoResponse {
     let method = payload
@@ -2003,7 +1784,21 @@ async fn handle_rpc(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
-    // Rate limiting per method
+    // H3: rate limit per client IP first (a single attacker must not be able
+    // to exhaust the shared per-method budget), then per method globally.
+    let ip_key = format!("{}|{}", remote_addr.ip(), method);
+    if let Err(retry_after) = rpc_impl.rate_limiter_per_ip.check(ip_key).await {
+        return Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32000,
+                "message": format!("Rate limited. Retry after {}s", retry_after)
+            },
+            "id": id,
+        }));
+    }
+
+    // Rate limiting per method (global shared budget, defense in depth)
     if let Err(retry_after) = rpc_impl.rate_limiter.check(method.to_string()).await {
         return Json(serde_json::json!({
             "jsonrpc": "2.0",
@@ -2015,252 +1810,171 @@ async fn handle_rpc(
         }));
     }
 
-    let result =
-        match method {
-            "aether_getBalance" => {
-                let addr = payload
-                    .get("params")
-                    .and_then(|p: &serde_json::Value| p.get(0))
-                    .and_then(|a: &serde_json::Value| a.as_str());
-                match addr {
-                    Some(addr_str) => match hex::decode(addr_str) {
-                        Ok(bytes) => match bytes.try_into() {
-                            Ok(addr) => match rpc_impl.get_balance(addr).await {
-                                Ok(response) => serde_json::to_value(response)
-                                    .map_err(|e| RpcError(e.to_string())),
-                                Err(e) => Err(e),
-                            },
-                            Err(_) => Err(RpcError("Invalid address".to_string())),
+    let result = match method {
+        "aether_getBalance" => {
+            let addr = payload
+                .get("params")
+                .and_then(|p: &serde_json::Value| p.get(0))
+                .and_then(|a: &serde_json::Value| a.as_str());
+            match addr {
+                Some(addr_str) => match hex::decode(addr_str) {
+                    Ok(bytes) => match bytes.try_into() {
+                        Ok(addr) => match rpc_impl.get_balance(addr).await {
+                            Ok(response) => {
+                                serde_json::to_value(response).map_err(|e| RpcError(e.to_string()))
+                            }
+                            Err(e) => Err(e),
                         },
-                        Err(_) => Err(RpcError("Invalid hex address".to_string())),
+                        Err(_) => Err(RpcError("Invalid address".to_string())),
                     },
-                    None => Err(RpcError("Missing address parameter".to_string())),
-                }
+                    Err(_) => Err(RpcError("Invalid hex address".to_string())),
+                },
+                None => Err(RpcError("Missing address parameter".to_string())),
             }
-            "aether_sendTransaction" => {
-                let params = payload
-                    .get("params")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Array(vec![]));
-                match rpc_impl.send_transaction(params).await {
-                    Ok(response) => {
-                        serde_json::to_value(response).map_err(|e| RpcError(e.to_string()))
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            "aether_getDagStats" => match rpc_impl.get_dag_stats().await {
+        }
+        "aether_sendTransaction" => {
+            let params = payload
+                .get("params")
+                .cloned()
+                .unwrap_or(serde_json::Value::Array(vec![]));
+            match rpc_impl.send_transaction(params).await {
                 Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
                 Err(e) => Err(e),
-            },
-            "aether_getNetworkHashrate" => match rpc_impl.get_network_hashrate().await {
+            }
+        }
+        "aether_getDagStats" => match rpc_impl.get_dag_stats().await {
+            Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
+            Err(e) => Err(e),
+        },
+        "aether_getTransactionStatus" => {
+            let hash = payload
+                .get("params")
+                .and_then(|p: &serde_json::Value| p.get(0))
+                .and_then(|h: &serde_json::Value| h.as_str());
+            match hash {
+                Some(hash_str) => match hex::decode(hash_str) {
+                    Ok(bytes) => match bytes.try_into() {
+                        Ok(hash) => match rpc_impl.get_transaction_status(hash).await {
+                            Ok(response) => {
+                                serde_json::to_value(response).map_err(|e| RpcError(e.to_string()))
+                            }
+                            Err(e) => Err(e),
+                        },
+                        Err(_) => Err(RpcError("Invalid hash".to_string())),
+                    },
+                    Err(_) => Err(RpcError("Invalid hex hash".to_string())),
+                },
+                None => Err(RpcError("Missing hash parameter".to_string())),
+            }
+        }
+        "aether_getRecentTransactions" => {
+            let limit = payload
+                .get("params")
+                .and_then(|p: &serde_json::Value| p.get(0))
+                .and_then(|l: &serde_json::Value| l.as_u64())
+                .unwrap_or(10);
+            match rpc_impl.get_recent_transactions(limit).await {
                 Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
                 Err(e) => Err(e),
-            },
-            "aether_getTransactionStatus" => {
-                let hash = payload
-                    .get("params")
-                    .and_then(|p: &serde_json::Value| p.get(0))
-                    .and_then(|h: &serde_json::Value| h.as_str());
-                match hash {
-                    Some(hash_str) => match hex::decode(hash_str) {
-                        Ok(bytes) => match bytes.try_into() {
-                            Ok(hash) => match rpc_impl.get_transaction_status(hash).await {
-                                Ok(response) => serde_json::to_value(response)
-                                    .map_err(|e| RpcError(e.to_string())),
-                                Err(e) => Err(e),
-                            },
-                            Err(_) => Err(RpcError("Invalid hash".to_string())),
-                        },
-                        Err(_) => Err(RpcError("Invalid hex hash".to_string())),
-                    },
-                    None => Err(RpcError("Missing hash parameter".to_string())),
-                }
             }
-            "aether_getRecentTransactions" => {
-                let limit = payload
-                    .get("params")
-                    .and_then(|p: &serde_json::Value| p.get(0))
-                    .and_then(|l: &serde_json::Value| l.as_u64())
-                    .unwrap_or(10);
-                match rpc_impl.get_recent_transactions(limit).await {
-                    Ok(response) => {
-                        serde_json::to_value(response).map_err(|e| RpcError(e.to_string()))
+        }
+        "aether_getTransactionHistory" => {
+            let address = payload
+                .get("params")
+                .and_then(|p: &serde_json::Value| p.get(0))
+                .and_then(|a: &serde_json::Value| a.as_str());
+            // H3: optional limit (index 1), e.g. params:["<addr>", 100].
+            let limit = payload
+                .get("params")
+                .and_then(|p: &serde_json::Value| p.get(1))
+                .and_then(|l: &serde_json::Value| l.as_u64());
+            match address {
+                Some(addr_str) => {
+                    match rpc_impl
+                        .get_transaction_history(addr_str.to_string(), limit)
+                        .await
+                    {
+                        Ok(response) => {
+                            serde_json::to_value(response).map_err(|e| RpcError(e.to_string()))
+                        }
+                        Err(e) => Err(e),
                     }
-                    Err(e) => Err(e),
                 }
+                None => Err(RpcError("Missing address parameter".to_string())),
             }
-            "aether_getTransactionHistory" => {
-                let address = payload
-                    .get("params")
-                    .and_then(|p: &serde_json::Value| p.get(0))
-                    .and_then(|a: &serde_json::Value| a.as_str());
-                match address {
-                    Some(addr_str) => {
-                        match rpc_impl.get_transaction_history(addr_str.to_string()).await {
+        }
+        "aether_getDagGraph" => {
+            // H3: optional limit, e.g. params:[50] (the explorer already
+            // sends this). No params means the default (500).
+            let limit = payload
+                .get("params")
+                .and_then(|p: &serde_json::Value| p.get(0))
+                .and_then(|l: &serde_json::Value| l.as_u64());
+            match rpc_impl.get_dag_graph(limit).await {
+                Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
+                Err(e) => Err(e),
+            }
+        }
+        "aether_getAccountNonce" => {
+            let addr = payload
+                .get("params")
+                .and_then(|p: &serde_json::Value| p.get(0))
+                .and_then(|a: &serde_json::Value| a.as_str());
+            match addr {
+                Some(addr_str) => match hex::decode(addr_str) {
+                    Ok(bytes) => match bytes.try_into() {
+                        Ok(addr) => match rpc_impl.get_account_nonce(&addr).await {
+                            Ok(response) => {
+                                serde_json::to_value(response).map_err(|e| RpcError(e.to_string()))
+                            }
+                            Err(e) => Err(e),
+                        },
+                        Err(_) => Err(RpcError("Invalid address".to_string())),
+                    },
+                    Err(_) => Err(RpcError("Invalid hex address".to_string())),
+                },
+                None => Err(RpcError("Missing address parameter".to_string())),
+            }
+        }
+        "aether_getTips" => match rpc_impl.get_tips().await {
+            Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
+            Err(e) => Err(e),
+        },
+        "aether_getDagSnapshot" => match rpc_impl.get_dag_snapshot().await {
+            Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
+            Err(e) => Err(e),
+        },
+        "aether_getMiningStatus" => match rpc_impl.get_mining_status().await {
+            Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
+            Err(e) => Err(e),
+        },
+        "aether_faucet" => {
+            match payload
+                .get("params")
+                .and_then(|p: &serde_json::Value| p.get(0))
+            {
+                Some(address_str) => match hex::decode(address_str.as_str().unwrap_or("")) {
+                    Ok(bytes) if bytes.len() == 32 => {
+                        let mut address = [0u8; 32];
+                        address.copy_from_slice(&bytes);
+                        match rpc_impl.faucet(address).await {
                             Ok(response) => {
                                 serde_json::to_value(response).map_err(|e| RpcError(e.to_string()))
                             }
                             Err(e) => Err(e),
                         }
                     }
-                    None => Err(RpcError("Missing address parameter".to_string())),
-                }
+                    _ => Err(RpcError("Invalid address format".to_string())),
+                },
+                None => Err(RpcError("Missing address parameter".to_string())),
             }
-            "aether_getDagGraph" => match rpc_impl.get_dag_graph().await {
-                Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
-                Err(e) => Err(e),
-            },
-            "aether_stakeTokens" => {
-                tracing::info!("🔒 Received aether_stakeTokens RPC call");
-                let addr = payload
-                    .get("params")
-                    .and_then(|p: &serde_json::Value| p.get(0))
-                    .and_then(|a: &serde_json::Value| a.as_str());
-                let amount = payload
-                    .get("params")
-                    .and_then(|p: &serde_json::Value| p.get(1))
-                    .and_then(|a: &serde_json::Value| a.as_u64());
-                tracing::info!("🔒 Parsed params: addr={:?}, amount={:?}", addr, amount);
-                match (addr, amount) {
-                    (Some(addr_str), Some(amt)) => match hex::decode(addr_str) {
-                        Ok(bytes) => match bytes.try_into() {
-                            Ok(addr) => {
-                                tracing::info!("🔒 Calling stake_tokens implementation");
-                                match rpc_impl.stake_tokens(&addr, amt).await {
-                                    Ok(response) => {
-                                        tracing::info!("🔒 stake_tokens returned: {:?}", response);
-                                        serde_json::to_value(response)
-                                            .map_err(|e| RpcError(e.to_string()))
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("🔒 stake_tokens error: {:?}", e);
-                                        Err(e)
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                tracing::error!("🔒 Invalid address conversion");
-                                Err(RpcError("Invalid address".to_string()))
-                            }
-                        },
-                        Err(_) => {
-                            tracing::error!("🔒 Invalid hex address");
-                            Err(RpcError("Invalid hex address".to_string()))
-                        }
-                    },
-                    _ => {
-                        tracing::error!("🔒 Missing address or amount parameter");
-                        Err(RpcError("Missing address or amount parameter".to_string()))
-                    }
-                }
-            }
-            "aether_unstakeTokens" => {
-                let addr = payload
-                    .get("params")
-                    .and_then(|p: &serde_json::Value| p.get(0))
-                    .and_then(|a: &serde_json::Value| a.as_str());
-                match addr {
-                    Some(addr_str) => match hex::decode(addr_str) {
-                        Ok(bytes) => match bytes.try_into() {
-                            Ok(addr) => match rpc_impl.unstake_tokens(&addr).await {
-                                Ok(response) => serde_json::to_value(response)
-                                    .map_err(|e| RpcError(e.to_string())),
-                                Err(e) => Err(e),
-                            },
-                            Err(_) => Err(RpcError("Invalid address".to_string())),
-                        },
-                        Err(_) => Err(RpcError("Invalid hex address".to_string())),
-                    },
-                    None => Err(RpcError("Missing address parameter".to_string())),
-                }
-            }
-            "aether_getStakingInfo" => {
-                let addr = payload
-                    .get("params")
-                    .and_then(|p: &serde_json::Value| p.get(0))
-                    .and_then(|a: &serde_json::Value| a.as_str());
-                match addr {
-                    Some(addr_str) => match hex::decode(addr_str) {
-                        Ok(bytes) => match bytes.try_into() {
-                            Ok(addr) => match rpc_impl.get_staking_info(&addr).await {
-                                Ok(response) => serde_json::to_value(response)
-                                    .map_err(|e| RpcError(e.to_string())),
-                                Err(e) => Err(e),
-                            },
-                            Err(_) => Err(RpcError("Invalid address".to_string())),
-                        },
-                        Err(_) => Err(RpcError("Invalid hex address".to_string())),
-                    },
-                    None => Err(RpcError("Missing address parameter".to_string())),
-                }
-            }
-            "aether_getAccountNonce" => {
-                let addr = payload
-                    .get("params")
-                    .and_then(|p: &serde_json::Value| p.get(0))
-                    .and_then(|a: &serde_json::Value| a.as_str());
-                match addr {
-                    Some(addr_str) => match hex::decode(addr_str) {
-                        Ok(bytes) => match bytes.try_into() {
-                            Ok(addr) => match rpc_impl.get_account_nonce(&addr).await {
-                                Ok(response) => serde_json::to_value(response)
-                                    .map_err(|e| RpcError(e.to_string())),
-                                Err(e) => Err(e),
-                            },
-                            Err(_) => Err(RpcError("Invalid address".to_string())),
-                        },
-                        Err(_) => Err(RpcError("Invalid hex address".to_string())),
-                    },
-                    None => Err(RpcError("Missing address parameter".to_string())),
-                }
-            }
-            "aether_getTips" => match rpc_impl.get_tips().await {
-                Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
-                Err(e) => Err(e),
-            },
-            "aether_getDagSnapshot" => match rpc_impl.get_dag_snapshot().await {
-                Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
-                Err(e) => Err(e),
-            },
-            "aether_getMiningStatus" => match rpc_impl.get_mining_status().await {
-                Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
-                Err(e) => Err(e),
-            },
-            "aether_startMining" => match rpc_impl.start_mining().await {
-                Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
-                Err(e) => Err(e),
-            },
-            "aether_stopMining" => match rpc_impl.stop_mining().await {
-                Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
-                Err(e) => Err(e),
-            },
-            "aether_faucet" => {
-                match payload
-                    .get("params")
-                    .and_then(|p: &serde_json::Value| p.get(0))
-                {
-                    Some(address_str) => match hex::decode(address_str.as_str().unwrap_or("")) {
-                        Ok(bytes) if bytes.len() == 32 => {
-                            let mut address = [0u8; 32];
-                            address.copy_from_slice(&bytes);
-                            match rpc_impl.faucet(address).await {
-                                Ok(response) => serde_json::to_value(response)
-                                    .map_err(|e| RpcError(e.to_string())),
-                                Err(e) => Err(e),
-                            }
-                        }
-                        _ => Err(RpcError("Invalid address format".to_string())),
-                    },
-                    None => Err(RpcError("Missing address parameter".to_string())),
-                }
-            }
-            "aether_createAccount" => match rpc_impl.create_account().await {
-                Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
-                Err(e) => Err(e),
-            },
-            _ => Err(RpcError(format!("Method not found: {}", method))),
-        };
+        }
+        "aether_createAccount" => match rpc_impl.create_account().await {
+            Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
+            Err(e) => Err(e),
+        },
+        _ => Err(RpcError(format!("Method not found: {}", method))),
+    };
 
     match result {
         Ok(response) => Json(serde_json::json!({
@@ -2543,7 +2257,8 @@ async fn handle_metrics(State(state): State<Arc<AetherRpcImpl>>) -> String {
          \n\
          # HELP aether_node_info Static node metadata\n\
          # TYPE aether_node_info gauge\n\
-         aether_node_info{{node_type=\"miner\",version=\"1.0.0\"}} 1\n"
+         aether_node_info{{node_type=\"full\",version=\"{}\"}} 1\n",
+        env!("CARGO_PKG_VERSION")
     )
 }
 
@@ -2556,4 +2271,701 @@ async fn handle_fallback() -> Html<&'static str> {
 <body>Redirecting to explorer...</body>
 </html>"#,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::p2p::P2PConfig;
+    use crate::parent_selection::DAG;
+    use crate::transaction::Transaction;
+    use crate::P2PNetwork;
+
+    fn test_rpc_impl(dir: &std::path::Path) -> AetherRpcImpl {
+        let dag = Arc::new(RwLock::new(DAG::new()));
+        let ledger = Arc::new(RwLock::new(Ledger::new()));
+        let storage = Arc::new(RwLock::new(
+            crate::storage::Storage::open(dir.join("sled")).unwrap(),
+        ));
+        let mempool = Arc::new(RwLock::new(Mempool::new(1000, 10)));
+        let (tx_channel, _rx) = tokio::sync::mpsc::unbounded_channel::<Transaction>();
+        let p2p = Arc::new(P2PNetwork::new(
+            P2PConfig {
+                listen_addr: "0.0.0.0:0".parse().unwrap(),
+                bootnodes: vec![],
+                dns_seeds: vec![],
+            },
+            tx_channel,
+            Arc::new(|| Vec::new()),
+            Arc::new(|_| None),
+            Arc::new(|| Vec::new()),
+        ));
+        AetherRpcImpl::new(
+            dag,
+            ledger,
+            storage,
+            dir.join("ledger.json"),
+            mempool,
+            p2p,
+            Arc::new(RwLock::new(true)),
+            Arc::new(RwLock::new(HashMap::new())),
+        )
+    }
+
+    /// V-20: aether_getTips must return canonical hex strings, never raw
+    /// byte arrays. The JSON shape must be exactly what the CLI and the GUI
+    /// parse (`tip.as_str()` + hex decode), so tips can be used as parents
+    /// of a new transaction without lossy conversion.
+    #[tokio::test]
+    async fn test_get_tips_returns_hex_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+
+        // Empty DAG: the genesis fallback is still a canonical hex string.
+        let resp = rpc.get_tips().await.unwrap();
+        assert_eq!(resp.count, 1);
+        assert_eq!(resp.tips.len(), 1);
+        assert_eq!(resp.tips[0], "00".repeat(32));
+
+        // JSON serialization: strings, never numeric arrays (the V-20 bug).
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(json["tips"][0].is_string());
+
+        // A real transaction: the tip is its id in canonical hex form.
+        let tx = Transaction::new(
+            [[0u8; 32]; 2],
+            [1u8; 32],
+            [2u8; 32],
+            100,
+            10,
+            1,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 64],
+        );
+        rpc.dag
+            .write()
+            .await
+            .add_transaction_validated(tx.clone())
+            .unwrap();
+
+        let resp2 = rpc.get_tips().await.unwrap();
+        assert_eq!(resp2.tips.len(), 1);
+        assert_eq!(resp2.tips[0], crate::transaction::encode_id(&tx.id));
+
+        // Round-trip: hex tip -> bytes -> used as parent of a new tx.
+        let tip_bytes = crate::transaction::decode_id(&resp2.tips[0]).unwrap();
+        assert_eq!(tip_bytes, tx.id);
+        let child = Transaction::new(
+            [tip_bytes, [0u8; 32]],
+            [3u8; 32],
+            [4u8; 32],
+            10,
+            1,
+            2,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 64],
+        );
+        rpc.dag
+            .write()
+            .await
+            .add_transaction_validated(child.clone())
+            .unwrap();
+        assert_eq!(child.parents[0], tx.id);
+    }
+
+    /// V-20: a node compatibility check - two nodes holding the same DAG
+    /// must return the exact same tips payload (byte-for-byte identical
+    /// JSON after serialization).
+    #[tokio::test]
+    async fn test_get_tips_identical_across_nodes() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let rpc1 = test_rpc_impl(dir1.path());
+        let rpc2 = test_rpc_impl(dir2.path());
+
+        let tx = Transaction::new(
+            [[0u8; 32]; 2],
+            [1u8; 32],
+            [2u8; 32],
+            100,
+            10,
+            1,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 64],
+        );
+        rpc1.dag
+            .write()
+            .await
+            .add_transaction_validated(tx.clone())
+            .unwrap();
+        rpc2.dag
+            .write()
+            .await
+            .add_transaction_validated(tx)
+            .unwrap();
+
+        let resp1 = rpc1.get_tips().await.unwrap();
+        let resp2 = rpc2.get_tips().await.unwrap();
+        assert_eq!(
+            serde_json::to_string(&resp1).unwrap(),
+            serde_json::to_string(&resp2).unwrap()
+        );
+    }
+
+    /// H1: a transaction with missing parents and NO valid PoW/signature must
+    /// be rejected by process_transaction WITHOUT being parked as an orphan
+    /// (neither in memory nor on disk). Before H1 this exact payload was
+    /// persisted forever, letting anyone fill disk/memory and spam P2P.
+    #[tokio::test]
+    async fn test_orphan_without_pow_not_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+
+        // Missing parents + NO PoW (nonce 0) + NO valid signature.
+        let tx = Transaction::new(
+            [[0xAAu8; 32], [0xBBu8; 32]],
+            [1u8; 32],
+            [2u8; 32],
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+
+        let result = rpc.process_transaction(tx, "RPC-test").await;
+        assert!(result.is_err());
+        assert!(
+            !result.err().unwrap().to_string().contains("orphan"),
+            "a garbage transaction must not be treated as an orphan"
+        );
+
+        // Nothing parked in memory...
+        let orphans = rpc.orphans.read().await;
+        assert_eq!(orphans.len(), 0, "no orphan may be parked without PoW");
+        drop(orphans);
+
+        // ...and nothing persisted to disk.
+        let storage = rpc.storage.read().await;
+        let disk = storage.get_all_orphans().unwrap();
+        assert_eq!(disk.len(), 0, "no orphan may be persisted without PoW");
+    }
+
+    /// H1: a transaction with missing parents that PASSES the pure gate
+    /// (valid PoW + signature) is parked as an orphan (memory + disk) and the
+    /// friendly error is returned to the submitter.
+    #[tokio::test]
+    async fn test_valid_orphan_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+
+        let tx = crate::tests::signed_mined_orphan_tx();
+
+        let result = rpc.process_transaction(tx.clone(), "RPC-test").await;
+        let err = result.expect_err("missing parents must not be accepted");
+        assert!(
+            err.to_string().contains("missing parent"),
+            "expected the friendly orphan error, got: {}",
+            err
+        );
+
+        let orphans = rpc.orphans.read().await;
+        assert!(
+            orphans.contains_key(&tx.id),
+            "valid orphan must be parked in memory"
+        );
+        drop(orphans);
+
+        let storage = rpc.storage.read().await;
+        let disk = storage.get_all_orphans().unwrap();
+        assert!(
+            disk.iter().any(|o| o.id == tx.id),
+            "valid orphan must be persisted to disk"
+        );
+    }
+
+    /// H1: the orphan store is capped — beyond MAX_ORPHANS entries, new
+    /// orphans are rejected and NOT persisted anywhere.
+    #[tokio::test]
+    async fn test_orphan_cap_rejects_beyond_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+
+        // Pre-fill the in-memory orphan map up to the cap (direct insertion;
+        // the PoW gate itself is covered by the tests above).
+        {
+            let mut orphans = rpc.orphans.write().await;
+            for i in 0..MAX_ORPHANS {
+                let mut key = [0u8; 32];
+                key[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                orphans.insert(
+                    key,
+                    Transaction::new(
+                        [[0u8; 32]; 2],
+                        key,
+                        [2u8; 32],
+                        1,
+                        1,
+                        i as u64,
+                        0,
+                        i as u64,
+                        vec![0u8; 64],
+                        vec![0u8; 64],
+                    ),
+                );
+            }
+        }
+
+        // A valid orphan (PoW + signature) submitted when the store is full.
+        let tx = crate::tests::signed_mined_orphan_tx();
+
+        let result = rpc.process_transaction(tx.clone(), "RPC-test").await;
+        let err = result.expect_err("orphan must be rejected when the store is full");
+        assert!(
+            err.to_string().to_lowercase().contains("orphan limit"),
+            "expected an orphan-limit rejection, got: {}",
+            err
+        );
+
+        // Nothing new in memory...
+        let orphans = rpc.orphans.read().await;
+        assert_eq!(orphans.len(), MAX_ORPHANS, "orphan store must stay capped");
+        assert!(
+            !orphans.contains_key(&tx.id),
+            "the overflowing orphan must not be parked"
+        );
+        drop(orphans);
+
+        // ...and nothing persisted to disk.
+        let storage = rpc.storage.read().await;
+        let disk = storage.get_all_orphans().unwrap();
+        assert!(
+            !disk.iter().any(|o| o.id == tx.id),
+            "the overflowing orphan must not be persisted"
+        );
+    }
+
+    /// H3: the per-IP rate limiter isolates clients — one IP exhausting its
+    /// budget must NOT affect another IP.
+    #[tokio::test]
+    async fn test_per_ip_rate_limit_isolation() {
+        let limiter = RateLimiter::new(3, 10);
+        let ip_a = format!("{}|aether_getDagStats", "192.0.2.1");
+        let ip_b = format!("{}|aether_getDagStats", "192.0.2.2");
+
+        // IP A exhausts its budget (3/10s).
+        assert!(limiter.check(ip_a.clone()).await.is_ok());
+        assert!(limiter.check(ip_a.clone()).await.is_ok());
+        assert!(limiter.check(ip_a.clone()).await.is_ok());
+        assert!(limiter.check(ip_a.clone()).await.is_err());
+
+        // IP B is unaffected.
+        assert!(limiter.check(ip_b.clone()).await.is_ok());
+        assert!(limiter.check(ip_b.clone()).await.is_ok());
+        assert!(limiter.check(ip_b.clone()).await.is_ok());
+        assert!(limiter.check(ip_b).await.is_err());
+
+        // A different method from IP A has its own bucket.
+        let other_method = format!("{}|aether_getBalance", "192.0.2.1");
+        assert!(limiter.check(other_method).await.is_ok());
+    }
+
+    /// P1+WEIGHT: the consensus path with the REAL weight implemented. The DAG
+    /// maintains `tx.weight` = subtree size (itself + all descendants) on
+    /// every mutation. The status ladder is now fully reachable:
+    /// Unconfirmed (0 refs) → Confirmed (≥3 direct refs) → Stable (weight ≥ 5).
+    /// This pins the honest ladder end-to-end on the real status API.
+    #[tokio::test]
+    async fn test_consensus_path_real_status_ladder() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+
+        // A valid tx added through the DAG acceptance API.
+        let sender = [0x31u8; 32];
+        let tx = Transaction::new(
+            [[0u8; 32]; 2],
+            sender,
+            [0x32u8; 32],
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+        let tx_id = tx.id;
+        rpc.dag
+            .write()
+            .await
+            .add_transaction_validated(tx.clone())
+            .unwrap();
+
+        // 1) Freshly accepted: InLocalDag + Unconfirmed (0 references),
+        //    weight = 1 (own subtree).
+        let status = rpc.determine_transaction_status(tx_id).await;
+        assert_eq!(status.local_status, LocalStatus::InLocalDag);
+        assert_eq!(status.consensus_status, ConsensusStatus::Unconfirmed);
+        assert!(!status.practically_final);
+        {
+            let dag = rpc.dag.read().await;
+            assert_eq!(dag.get_transaction(tx_id).unwrap().weight, 1.0);
+        }
+
+        // 2) Three children referencing it → weight 4 → Confirmed (3 refs,
+        //    still < STABILITY_THRESHOLD 5).
+        for i in 0..3u8 {
+            let child = Transaction::new(
+                [tx_id, [0u8; 32]],
+                [0x41u8 + i; 32],
+                [0x51u8; 32],
+                10,
+                10,
+                1234567890,
+                0,
+                1,
+                vec![0u8; 64],
+                vec![1u8; 64],
+            );
+            rpc.dag
+                .write()
+                .await
+                .add_transaction_validated(child)
+                .unwrap();
+        }
+        let status = rpc.determine_transaction_status(tx_id).await;
+        assert_eq!(status.consensus_status, ConsensusStatus::Confirmed);
+        assert!(!status.practically_final);
+        {
+            let dag = rpc.dag.read().await;
+            assert_eq!(dag.get_transaction(tx_id).unwrap().weight, 4.0);
+        }
+
+        // 3) A fourth child pushes the subtree to 5 → Stable, organically
+        //    (the DAG wrote the weight, no code special-cased it).
+        let fourth = Transaction::new(
+            [tx_id, [0u8; 32]],
+            [0x44u8; 32],
+            [0x52u8; 32],
+            10,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+        let fourth_id = fourth.id;
+        rpc.dag
+            .write()
+            .await
+            .add_transaction_validated(fourth)
+            .unwrap();
+        let status = rpc.determine_transaction_status(tx_id).await;
+        assert_eq!(status.consensus_status, ConsensusStatus::Stable);
+        assert!(
+            status.practically_final,
+            "practically_final = Stable|Finalized — Stable is now reachable"
+        );
+        {
+            let dag = rpc.dag.read().await;
+            assert_eq!(dag.get_transaction(tx_id).unwrap().weight, 5.0);
+        }
+
+        // 4) A grandchild under one child propagates: tx → 6, child → 2.
+        let grandchild = Transaction::new(
+            [fourth_id, [0u8; 32]],
+            [0x61u8; 32],
+            [0x62u8; 32],
+            10,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+        rpc.dag
+            .write()
+            .await
+            .add_transaction_validated(grandchild)
+            .unwrap();
+        let dag = rpc.dag.read().await;
+        assert_eq!(dag.get_transaction(tx_id).unwrap().weight, 6.0);
+        assert_eq!(dag.get_transaction(fourth_id).unwrap().weight, 2.0);
+    }
+
+    /// P3: orphan auto-resubmission cycle. An orphan parked by the RPC path is
+    /// automatically re-processed by `process_orphans` once its parents arrive
+    /// in the DAG (node.rs triggers it after every accepted P2P transaction
+    /// and every 10s periodic cycle). The re-processing goes through the FULL
+    /// gate again (PoW + signature + DAG + ledger) and success removes the
+    /// orphan from memory AND from Sled.
+    #[tokio::test]
+    async fn test_orphan_auto_resubmission_cycle() {
+        use crate::wallet::Wallet;
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+
+        let wallet = Wallet::from_secret_key(
+            "6b0d2c3e4f5a60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef",
+        )
+        .expect("fixed test key");
+        let sender = wallet.address();
+        let pk = wallet.public_key_bytes();
+
+        // Fund the sender through the real DAG -> ledger path (faucet -> sender).
+        let faucet: [u8; 32] = hex::decode(crate::genesis::FAUCET_ADDRESS)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let funding = Transaction::new(
+            [[0u8; 32]; 2],
+            faucet,
+            sender,
+            5000,
+            5,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+        rpc.dag
+            .write()
+            .await
+            .add_transaction_validated(funding.clone())
+            .unwrap();
+        let dag_read = rpc.dag.read().await;
+        rpc.ledger.write().await.rebuild_from_dag(&dag_read);
+        drop(dag_read);
+        assert_eq!(rpc.ledger.read().await.get_balance(&sender), 5000);
+
+        // Parent P: a transaction that will arrive LATER. Its id is
+        // deterministic (hash of all fields), so the orphan can reference it
+        // before it exists.
+        let parent = Transaction::new(
+            [[0u8; 32]; 2],
+            [0x33u8; 32],
+            [0x44u8; 32],
+            1,
+            1,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 32],
+        );
+
+        // Orphan O references the not-yet-arrived parent P (mined + signed).
+        let mut orphan = Transaction::new(
+            [parent.id, [0u8; 32]],
+            sender,
+            [0x22u8; 32],
+            100,
+            1000,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            pk,
+        );
+        orphan.nonce = orphan.mine_nonce(20);
+        orphan.signature = wallet.sign_transaction(&orphan).expect("sign");
+        orphan.id = orphan.compute_hash();
+        assert!(orphan.verify_pow(20));
+        assert!(Wallet::verify_transaction(&orphan));
+
+        // 1) Park: O is rejected as an orphan and persisted (memory + Sled).
+        let result = rpc.process_transaction(orphan.clone(), "Test").await;
+        assert!(result.is_err(), "missing parents must reject the tx");
+        {
+            let orphans = rpc.orphans.read().await;
+            assert!(
+                orphans.contains_key(&orphan.id),
+                "orphan must be parked in memory"
+            );
+        }
+        assert!(
+            rpc.dag.read().await.get_transaction(orphan.id).is_none(),
+            "orphan must NOT enter the DAG while its parents are missing"
+        );
+        {
+            let storage = rpc.storage.read().await;
+            assert!(
+                storage.get_orphan(orphan.id).unwrap().is_some(),
+                "orphan must be persisted to Sled"
+            );
+        }
+
+        // 2) The parent finally arrives (P2P delivery / full sync).
+        rpc.dag
+            .write()
+            .await
+            .add_transaction_validated(parent.clone())
+            .unwrap();
+
+        // 3) Auto-resubmission: process_orphans re-processes O through the
+        // FULL gate and clears it from memory and disk.
+        rpc.process_orphans().await;
+
+        assert!(
+            rpc.dag.read().await.get_transaction(orphan.id).is_some(),
+            "orphan must now be in the DAG"
+        );
+        {
+            let orphans = rpc.orphans.read().await;
+            assert!(
+                !orphans.contains_key(&orphan.id),
+                "resolved orphan must be removed from memory"
+            );
+        }
+        {
+            let storage = rpc.storage.read().await;
+            assert!(
+                storage.get_orphan(orphan.id).unwrap().is_none(),
+                "resolved orphan must be removed from Sled"
+            );
+        }
+        assert_eq!(
+            rpc.ledger.read().await.get_balance(&sender),
+            5000 - 100 - 1000,
+            "the resolved orphan must be applied to the ledger"
+        );
+
+        // 4) The consensus status now reports the tx as in the local DAG.
+        let status = rpc.determine_transaction_status(orphan.id).await;
+        assert_eq!(
+            status.local_status,
+            LocalStatus::InMempool,
+            "an accepted tx is in both mempool and DAG; the status precedence \
+             is orphans -> mempool -> DAG, so InMempool is the honest result"
+        );
+    }
+
+    /// H5: faucet cooldown eviction — stale entries are purged on every check,
+    /// so the map cannot grow unbounded, and a cooled-down address is allowed.
+    #[test]
+    fn test_faucet_cooldown_evicts_stale() {
+        use std::collections::HashMap;
+        let mut cooldowns: HashMap<[u8; 32], std::time::Instant> = HashMap::new();
+        let addr_a = [0xAAu8; 32];
+        let addr_b = [0xBBu8; 32];
+
+        // A stale entry (older than the window) plus a fresh one.
+        let now = std::time::Instant::now();
+        cooldowns.insert(addr_a, now - std::time::Duration::from_secs(61));
+        cooldowns.insert(addr_b, now);
+        assert_eq!(cooldowns.len(), 2);
+
+        // Checking addr_a evicts it and reports no cooldown.
+        let window = std::time::Duration::from_secs(60);
+        let remaining = AetherRpcImpl::check_and_evict_cooldowns(&mut cooldowns, &addr_a, window);
+        assert!(remaining.is_none(), "stale entry must be evicted");
+        assert_eq!(
+            cooldowns.len(),
+            1,
+            "stale entry must be removed from the map"
+        );
+
+        // The fresh entry still cools down.
+        let remaining = AetherRpcImpl::check_and_evict_cooldowns(&mut cooldowns, &addr_b, window);
+        assert!(remaining.is_some(), "fresh entry must still be in cooldown");
+        assert!(remaining.unwrap() <= 60);
+    }
+
+    /// H3: get_dag_graph is bounded — a limit larger than the DAG returns the
+    /// whole DAG, a small limit returns at most that many nodes, and edges
+    /// never reference nodes outside the returned set.
+    #[tokio::test]
+    async fn test_get_dag_graph_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+
+        // Insert 20 txs chained on a genesis root.
+        let mut prev = [0u8; 32];
+        for i in 0..20u8 {
+            let tx = Transaction::new(
+                [prev, [0u8; 32]],
+                [0x11u8; 32],
+                [0x22u8; 32],
+                1,
+                1,
+                i as u64,
+                0,
+                i as u64,
+                vec![0u8; 64],
+                vec![0u8; 64],
+            );
+            prev = tx.id;
+            rpc.dag.write().await.add_transaction_validated(tx).unwrap();
+        }
+
+        // No limit: whole DAG (20 nodes).
+        let full = rpc.get_dag_graph(None).await.unwrap();
+        assert_eq!(full.nodes.len(), 20);
+        assert_eq!(full.total_transactions, 20);
+
+        // Small limit: at most that many nodes, edges only among them.
+        let small = rpc.get_dag_graph(Some(10)).await.unwrap();
+        assert!(small.nodes.len() <= 10);
+        assert_eq!(small.total_transactions, small.nodes.len());
+        let included: std::collections::HashSet<[u8; 32]> =
+            small.nodes.iter().map(|n| n.tx_id).collect();
+        for edge in &small.edges {
+            assert!(included.contains(&edge.from), "edge.from must be included");
+            assert!(included.contains(&edge.to), "edge.to must be included");
+        }
+    }
+
+    /// H3: get_transaction_history is bounded — a small limit caps the
+    /// returned items while total_count stays exact.
+    #[tokio::test]
+    async fn test_get_transaction_history_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+
+        // 25 transactions from the same sender.
+        let sender = [0xABu8; 32];
+        let mut prev = [0u8; 32];
+        for i in 0..25u8 {
+            let tx = Transaction::new(
+                [prev, [0u8; 32]],
+                sender,
+                [0xCDu8; 32],
+                1,
+                1,
+                i as u64,
+                0,
+                i as u64,
+                vec![0u8; 64],
+                vec![0u8; 64],
+            );
+            prev = tx.id;
+            rpc.dag.write().await.add_transaction_validated(tx).unwrap();
+        }
+
+        let addr_hex = hex::encode(sender);
+        let full = rpc
+            .get_transaction_history(addr_hex.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(full.total_count, 25);
+        assert_eq!(full.transactions.len(), 25);
+
+        let bounded = rpc
+            .get_transaction_history(addr_hex.clone(), Some(5))
+            .await
+            .unwrap();
+        assert_eq!(bounded.total_count, 25, "total must stay exact");
+        assert_eq!(bounded.transactions.len(), 5, "response must be capped");
+    }
 }

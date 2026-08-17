@@ -1,7 +1,5 @@
-use crate::consensus::{VQVConsensus, Validator};
 use crate::parent_selection::DAG;
 use crate::transaction::{Address, Transaction, TransactionId};
-use hex;
 use std::collections::HashMap;
 
 /// Genesis block ID (hash of 64 zeros)
@@ -9,30 +7,47 @@ pub const GENESIS_HASH: TransactionId = [0u8; 32];
 
 /// Genesis message containing a news headline to prove launch date
 /// "23/Apr/2026 - Aether: Trust is computed, not granted. Le Monde 21/04/2026: L'Aether naît du chaos numérique."
-pub const GENESIS_MESSAGE: &str = "23/Apr/2026 - Aether: Trust is computed, not granted. Le Monde 21/04/2026: L'Aether naît du chaos numérique.";
+/// ROTATION 2026-08-16: the legacy faucet key was compromised; new canonical
+/// genesis issued by the operator ceremony (see docs/CEREMONIE_GENESIS.md).
+/// ROTATION 2026-08-17 (V3 RELEASE CANDIDATE): canonical genesis for P2P
+/// protocol v3 (structural weight, zero emission). Ceremony keys generated
+/// offline; secrets never stored in the repository.
+pub const GENESIS_MESSAGE: &str = "17/Aug/2026 - Aether: Trust is computed, not granted. V3 testnet release candidate: canonical genesis for P2P protocol v3 (structural weight, zero emission). Operator ceremony.";
 
-/// Aether Founder address (receives 1M AETH at genesis)
-/// Derived from public key: 1de352e44cd333672593f2334a730e180aaf290de89aa16d480de594e34e2961
+/// Monetary precision: 1 AETH = 10^10 base units.
+pub const UNITS_PER_AETH: u64 = 10_000_000_000;
+
+/// Aether Founder address (receives the initial founder allocation at genesis).
+/// This is a PUBLIC address (derived from a public key). No secret is present
+/// in the source code or distributed binary.
 pub const FOUNDER_ADDRESS: &str =
-    "3d17ace653283dbd9aeba6e0d4684795a800e9da952cb682bb67cd970cbe1b3e";
+    "2ffab7975e84a8b6feb5e47534c8a14af10d0b09f946014437f32723347e60d4";
 
-/// Faucet address (deterministic from sha256("aether-faucet-v1") via Ed25519)
-pub const FAUCET_ADDRESS: &str = "5579ae9096f1ae55bfd6fd88155fad09c59ab8ccb61c8a297b5d1027ea4ca916";
+/// Faucet address. This is a PUBLIC address only. The matching SECRET KEY is
+/// NOT in the source or the distributed binary: it must be supplied at runtime
+/// by the node operator in a server-only file (`data_dir/faucet.key`) so that
+/// only operators who hold the key can serve testnet faucet funds. Nodes
+/// without that file simply disable the faucet endpoint.
+pub const FAUCET_ADDRESS: &str = "a19ee04cfaeaee20d74e59d066a178f3f9d0e69f48ffa001f8314ead507aabfb";
 
-/// Faucet secret key hex (deterministic, for testnet only)
-pub const FAUCET_SECRET_KEY: &str =
-    "fa5979dd7273d55c6b5f2028ab166dc3163f90ac9f68da28b79a1fe0f06c45b8";
-
-/// Faucet public key hex
+/// Faucet public key hex (public information, no secret).
 pub const FAUCET_PUBLIC_KEY: &str =
-    "5579ae9096f1ae55bfd6fd88155fad09c59ab8ccb61c8a297b5d1027ea4ca916";
+    "a19ee04cfaeaee20d74e59d066a178f3f9d0e69f48ffa001f8314ead507aabfb";
 
-/// Genesis ledger with initial token distribution
-/// 10 AETH = 100,000,000,000 units (10 decimals)
+/// Genesis ledger with the initial token distribution (FIXED SUPPLY).
+/// Aether's monetary policy: emission is ZERO after genesis; the total supply
+/// is the genesis allocation and can only decrease through fee burning.
+///   - Founder: 10 AETH
+///   - Faucet : 100,000,000 AETH (bounded testnet fund, spent via signed txs)
 pub const GENESIS_LEDGER: [(&str, u64); 2] = [
-    (FOUNDER_ADDRESS, 100_000_000_000_u64), // 10 AETH for founder
-    (FAUCET_ADDRESS, 10_000_000_000_000_000_000_u64), // 1M AETH for faucet (10^18 units)
+    (FOUNDER_ADDRESS, 100_000_000_000_u64),          // 10 AETH
+    (FAUCET_ADDRESS, 1_000_000_000_000_000_000_u64), // 100,000,000 AETH
 ];
+
+/// Maximum supply invariant (hard bound). With zero emission the supply can
+/// never exceed the genesis allocation; this constant is kept as a defensive
+/// invariant check against any accidental supply inflation.
+pub const MAX_SUPPLY: u64 = 2_000_000_000_000_000_000; // 200,000,000 AETH
 
 /// Genesis configuration
 #[derive(Debug, Clone)]
@@ -42,9 +57,6 @@ pub struct GenesisConfig {
 
     /// Initial difficulty
     pub initial_difficulty: u64,
-
-    /// Initial validators
-    pub initial_validators: Vec<Address>,
 
     /// Initial token distribution (address -> balance)
     pub initial_balances: HashMap<Address, u64>,
@@ -70,15 +82,9 @@ impl Default for GenesisConfig {
             initial_balances.insert(addr, balance);
         }
 
-        let founder_addr = hex::decode(FOUNDER_ADDRESS).expect("Invalid founder address hex");
-        let mut founder = [0u8; 32];
-        founder.copy_from_slice(&founder_addr);
-        let initial_validators = vec![founder];
-
         Self {
             timestamp,
             initial_difficulty: 1000,
-            initial_validators,
             initial_balances,
         }
     }
@@ -96,18 +102,18 @@ pub fn genesis_hash() -> TransactionId {
     [0u8; 32]
 }
 
-/// Initialize the DAG with genesis
+/// Initialize the DAG with genesis balances.
+/// Returns: (DAG, balances map keyed by hex address, orphan map, missing parents)
 pub fn initialize_genesis(
     config: GenesisConfig,
 ) -> (
     DAG,
-    VQVConsensus,
     HashMap<String, u64>,
     HashMap<[u8; 32], Transaction>,
     Vec<Vec<u8>>,
 ) {
-    let mut dag = DAG::new();
-    let mut orphans = HashMap::new();
+    let dag = DAG::new();
+    let orphans = HashMap::new();
     let missing_parent_hashes = Vec::new();
 
     let mut balances = HashMap::new();
@@ -115,17 +121,6 @@ pub fn initialize_genesis(
         balances.insert(addr_hex.to_string(), balance);
     }
 
-    let validators: Vec<Validator> = config
-        .initial_validators
-        .iter()
-        .map(|addr| {
-            let mut pk = [0u8; 32];
-            pk.copy_from_slice(&addr[..32]);
-            Validator::new(*addr, 100_000, pk.to_vec())
-        })
-        .collect();
-
-    let consensus = VQVConsensus::default();
-
-    (dag, consensus, balances, orphans, missing_parent_hashes)
+    let _ = config;
+    (dag, balances, orphans, missing_parent_hashes)
 }

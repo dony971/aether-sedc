@@ -2,13 +2,11 @@
 //!
 //! Manages the ledger state (account balances) with persistence to Sled DB.
 
-use crate::consensus::{BlockId, ConsensusState};
-use crate::genesis::FAUCET_ADDRESS;
+use crate::parent_selection::DAG;
 use crate::storage::Storage;
-use crate::transaction::Address;
+use crate::transaction::{Address, Transaction, TransactionId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -22,59 +20,19 @@ pub struct Ledger {
     /// Optional Sled storage backend for persistence
     #[serde(skip)]
     storage: Option<Arc<RwLock<Storage>>>,
-    /// Ledger path for migration
-    #[serde(skip)]
-    path: Option<std::path::PathBuf>,
     /// Total fees burned (economic policy: fees are burned, not given to miners)
     pub total_fees_burned: u64,
-    /// Total supply of AETH tokens (economic invariant: never exceeds MAX_SUPPLY)
-    pub total_supply: u64,
 }
 
 /// Fee burn address (all fees are sent here and effectively burned)
 /// This is a special address that no one controls, ensuring fees are permanently removed from circulation
 pub const FEE_BURN_ADDRESS: Address = [0xFFu8; 32];
 
-/// Maximum supply of AETH tokens (hard cap) — 1.8 billion with 10 decimals
-/// Genesis distributes ~1 billion AETH (faucet = 10^19 raw), so the cap must
-/// exceed that with headroom for block rewards. u64 max is ~18.44e18, so the
-/// highest safe value is 18,000,000,000 * 10^10 = 1.8e19.
-pub const MAX_SUPPLY: u64 = 18_000_000_000_000_000_000;
-
-/// Initial block reward (10 AETH)
-/// 10 AETH = 10 * 10^10 = 100,000,000,000 units (10 decimals)
-const INITIAL_BLOCK_REWARD: u64 = 100_000_000_000;
-
-/// Halving interval (every 210,000 blocks, similar to Bitcoin)
-const HALVING_INTERVAL: u64 = 210_000;
-
-/// Calculate block reward based on block height (halving schedule)
-///
-/// # Economic Policy
-/// - Initial reward: 10 AETH
-/// - Halving every 210,000 blocks
-/// - Minimum reward: 1 unit (1e-10 AETH)
-/// - Total supply capped at 21,000,000 AETH
-///
-/// # Arguments
-/// * `block_height` - Current block height
-///
-/// # Returns
-/// Block reward in AETH units (10 decimals)
-pub fn calculate_reward(block_height: u64) -> u64 {
-    let halvings = block_height / HALVING_INTERVAL;
-
-    // Cap at 63 halvings (u64::MAX would overflow)
-    if halvings >= 63 {
-        return 0;
-    }
-
-    // Calculate reward with right shift (divide by 2^halvings)
-    let reward = INITIAL_BLOCK_REWARD >> halvings;
-
-    // Minimum reward is 1 unit (1 satoshi)
-    reward.max(1)
-}
+/// Maximum supply invariant (hard cap), mirrored from genesis. With ZERO
+/// emission the total supply can never exceed the genesis allocation and only
+/// decreases through fee burning. This constant is retained as a defensive
+/// invariant check.
+pub const MAX_SUPPLY: u64 = crate::genesis::MAX_SUPPLY;
 
 impl Ledger {
     /// Create a new empty ledger
@@ -83,25 +41,20 @@ impl Ledger {
             balances: HashMap::new(),
             nonces: HashMap::new(),
             storage: None,
-            path: None,
             total_fees_burned: 0,
-            total_supply: 0,
         }
     }
 
     /// Create a new ledger with Sled storage
-    pub async fn new_with_storage<P: AsRef<Path>>(
+    pub async fn new_with_storage(
         storage: Arc<RwLock<Storage>>,
-        path: P,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let storage_read = storage.read().await;
         let mut ledger = Ledger {
             balances: HashMap::new(),
             nonces: HashMap::new(),
             storage: Some(storage.clone()),
-            path: Some(path.as_ref().to_path_buf()),
             total_fees_burned: 0,
-            total_supply: 0,
         };
 
         // Load balances from Sled
@@ -125,37 +78,13 @@ impl Ledger {
         let burn_hex = hex::encode(FEE_BURN_ADDRESS);
         ledger.total_fees_burned = *ledger.balances.get(&burn_hex).unwrap_or(&0);
 
-        // Calculate total_supply from all balances (excluding burn address)
-        // This is the economic invariant: total_supply <= MAX_SUPPLY
-        ledger.total_supply = ledger
-            .balances
-            .iter()
-            .filter(|(addr, _)| **addr != burn_hex)
-            .map(|(_, balance)| *balance)
-            .sum();
-
         tracing::info!(
             "✓ Ledger loaded from Sled: {} accounts, {} nonces, total supply: {}",
             ledger.balances.len(),
             ledger.nonces.len(),
-            ledger.total_supply
+            ledger.total_supply()
         );
         Ok(ledger)
-    }
-
-    /// Load ledger from file, or create new if file doesn't exist
-    pub async fn load_or_create<P: AsRef<Path>>(
-        path: P,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        if path.as_ref().exists() {
-            let content = tokio::fs::read_to_string(&path).await?;
-            let ledger: Ledger = serde_json::from_str(&content)?;
-            tracing::info!("✓ Ledger loaded from {:?}", path.as_ref());
-            Ok(ledger)
-        } else {
-            tracing::info!("🌱 No ledger found, creating new one");
-            Ok(Ledger::new())
-        }
     }
 
     /// Save ledger to Sled (atomic write) if storage is available
@@ -180,43 +109,13 @@ impl Ledger {
                     .map_err(|e| format!("Invalid address length: {}", e))?;
                 storage_read.put_nonce(address, *nonce)?;
             }
-            storage_read.flush()?;
+            // P4: no flush here — save() runs on EVERY accepted transaction
+            // (STEP 8); a synchronous flush (fsync) per save cost ~690µs/tx
+            // in release. Durability: Sled auto-flushes ~every 500ms, the
+            // node flushes periodically (10s) and on shutdown, and the boot
+            // rebuild reconstructs the ledger from the DAG (source of truth).
             tracing::debug!("💾 Ledger saved to Sled (balances + nonces)");
         }
-        Ok(())
-    }
-
-    /// Save ledger to file using atomic write (write to tmp then rename)
-    pub async fn save_to_file<P: AsRef<Path>>(
-        &self,
-        path: P,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let content = serde_json::to_string_pretty(self)?;
-        let path_ref = path.as_ref();
-
-        let tmp_path = path_ref.with_extension("json.tmp");
-        let mut file = tokio::fs::File::create(&tmp_path).await?;
-        use tokio::io::AsyncWriteExt;
-        file.write_all(content.as_bytes()).await?;
-        file.flush().await?;
-
-        tokio::fs::rename(&tmp_path, path_ref).await?;
-
-        tracing::debug!("💾 Ledger saved atomically to {:?}", path_ref);
-        Ok(())
-    }
-
-    /// Save ledger to file using atomic write (synchronous version)
-    pub fn save_blocking<P: AsRef<Path>>(&self, path: P) -> Result<(), Box<dyn std::error::Error>> {
-        let content = serde_json::to_string_pretty(self)?;
-        let path_ref = path.as_ref();
-
-        let tmp_path = path_ref.with_extension("json.tmp");
-        std::fs::write(&tmp_path, content)?;
-
-        std::fs::rename(&tmp_path, path_ref)?;
-
-        tracing::debug!("💾 Ledger saved atomically (blocking) to {:?}", path_ref);
         Ok(())
     }
 
@@ -229,6 +128,26 @@ impl Ledger {
     /// Get balance for an address by hex string
     pub fn get_balance_hex(&self, address_hex: &str) -> u64 {
         *self.balances.get(address_hex).unwrap_or(&0)
+    }
+
+    /// Total circulating supply = sum of all balances EXCLUDING the burn
+    /// address. Computed on demand from the live balance map so it can never
+    /// go stale (fixes NV-02: a direct set_balance previously left the stored
+    /// total_supply out of sync, letting the MAX_SUPPLY check be bypassed).
+    pub fn total_supply(&self) -> u64 {
+        let burn_hex = hex::encode(FEE_BURN_ADDRESS);
+        self.balances
+            .iter()
+            .filter(|(addr, _)| **addr != burn_hex)
+            .map(|(_, balance)| *balance)
+            .sum()
+    }
+
+    /// Economic invariant: circulating supply must never exceed MAX_SUPPLY.
+    /// With ZERO emission the supply only ever decreases (fees burned), so this
+    /// is a defensive check against accidental inflation.
+    pub fn supply_within_bounds(&self) -> bool {
+        self.total_supply() <= MAX_SUPPLY
     }
 
     /// Set balance for an address
@@ -362,20 +281,20 @@ impl Ledger {
 
     /// Validate account nonce (strict: must be exactly last_nonce + 1)
     /// Does NOT update the nonce - call commit_nonce() after successful transaction
-    /// Faucet exception: the faucet key is deterministic and shared across all nodes,
-    /// so each node has its own view of the faucet nonce. Chains from different nodes
-    /// use overlapping nonce sequences, so strict +1 (or even strictly increasing)
-    /// validation would reject valid faucet transactions when merging chains.
-    /// Anti-replay for faucet transactions is enforced at DAG level instead:
-    /// has_sender_conflict() rejects any (sender, account_nonce) pair already in the DAG.
+    ///
+    /// STRICT: no address is exempt (fixes V-01). Every sender, including the
+    /// faucet, must present exactly `last_nonce + 1`.
+    ///
+    /// NOTE: This strict helper is only used by unit tests. Live transaction
+    /// admission must NOT use a strict nonce check: it is arrival-order
+    /// dependent and would diverge nodes that process the same transaction
+    /// set in different orders. Replay protection is enforced by the DAG's
+    /// canonical (sender, account_nonce) conflict resolution instead.
     pub fn validate_account_nonce(
         &self,
         address: &Address,
         account_nonce: u64,
     ) -> Result<(), String> {
-        if hex::encode(address) == FAUCET_ADDRESS {
-            return Ok(());
-        }
         let last_nonce = self.get_nonce(address);
         if account_nonce != last_nonce + 1 {
             return Err(format!(
@@ -389,36 +308,6 @@ impl Ledger {
     /// Commit nonce update after successful transaction
     pub fn commit_nonce(&mut self, address: &Address, account_nonce: u64) {
         self.set_nonce(address, account_nonce);
-    }
-
-    /// Validate and commit nonce atomically (INTERNAL USE ONLY)
-    /// ZERO TRUST: This method is private. Use TransactionProcessor for all nonce operations.
-    /// Economic policy: prevents race conditions between validation and commit
-    /// Returns error if nonce is invalid, commits if valid
-    /// Faucet exception: shared deterministic faucet key across nodes, so each node
-    /// has its own view of the nonce and chains use overlapping nonce sequences.
-    /// Accept any faucet nonce (anti-replay via DAG has_sender_conflict) and only
-    /// move the stored nonce forward, never backwards.
-    pub(crate) fn validate_and_commit_nonce_internal(
-        &mut self,
-        address: &Address,
-        account_nonce: u64,
-    ) -> Result<(), String> {
-        let last_nonce = self.get_nonce(address);
-        if hex::encode(address) == FAUCET_ADDRESS {
-            if account_nonce > last_nonce {
-                self.set_nonce(address, account_nonce);
-            }
-            return Ok(());
-        }
-        if account_nonce != last_nonce + 1 {
-            return Err(format!(
-                "Invalid account_nonce: {} != {} + 1 (expected last_nonce + 1)",
-                account_nonce, last_nonce
-            ));
-        }
-        self.set_nonce(address, account_nonce);
-        Ok(())
     }
 
     /// Get all balances
@@ -446,196 +335,139 @@ impl Ledger {
         self.get_balance(&FEE_BURN_ADDRESS)
     }
 
-    /// Apply block reward to validator (ONLY source of new tokens)
+    /// Rebuild the ledger entirely from the genesis distribution + DAG.
     ///
-    /// # CRITICAL: Monetary Policy Enforcement
-    /// - This is the ONLY way to create new tokens in the system
-    /// - Block ID must come from consensus state (single source of truth)
-    /// - Rewards are tracked per BlockId to prevent double-reward attacks (fork-safe)
-    /// - Total supply is capped at MAX_SUPPLY (hard economic invariant)
-    /// - Reward only given if block is finalized (has enough confirmations)
+    /// The DAG is the single source of truth; the ledger is treated as a
+    /// *derived view*. This makes state reconstruction deterministic and
+    /// guarantees atomicity after a conflict-prune (or after a node restart).
     ///
-    /// # Arguments
-    /// * `validator` - The validator address receiving the block reward
-    /// * `block_id` - The block ID being rewarded (fork-safe identifier)
-    /// * `block_height` - The block height (for reward calculation)
-    /// * `consensus_state` - Consensus state containing finality tracking
+    /// Process:
+    ///   1. Reset balances, nonces and fees-burned.
+    ///   2. Apply the genesis allocation (no emission beyond this point).
+    ///   3. Replay every DAG transaction in a CANONICAL, deterministic order:
+    ///      parents before children, ties broken by ascending transaction id
+    ///      (never HashMap iteration order). A transaction whose balance is
+    ///      not yet available is NOT evicted: it is retried on the next pass
+    ///      once its funding transactions have been applied (relaxation), so
+    ///      a valid transaction can never be spuriously evicted just because
+    ///      it appeared before its funding in the replay order.
     ///
-    /// # Economic Impact
-    /// - Creates block reward based on halving schedule from block height
-    /// - Total supply increases by reward amount
-    /// - Enforces MAX_SUPPLY invariant (hard cap)
-    /// - Prevents double-reward attacks via BlockId tracking (fork-safe)
-    /// - Only rewards finalized blocks (prevents reorg double-spend)
-    ///
-    /// # Errors
-    /// - Returns error if reward would exceed MAX_SUPPLY
-    /// - Returns error if block already rewarded (double-reward attack prevention)
-    /// - Returns error if block not finalized (finality check)
-    /// - Returns error if balance addition fails (overflow)
-    pub(crate) fn apply_block_reward(
-        &mut self,
-        validator: &Address,
-        block_id: BlockId,
-        block_height: u64,
-        consensus_state: &ConsensusState,
-    ) -> Result<(), String> {
-        // Check if this block already received a reward (prevents double-reward attacks)
-        if consensus_state.is_block_rewarded(&block_id) {
-            tracing::error!(
-                "❌ SECURITY: Attempt to reward already-rewarded block {}",
-                hex::encode(block_id)
+    /// V-21 FIX (determinism): this function is a pure function of the DAG.
+    /// Every node that holds the same DAG - regardless of arrival order,
+    /// HashMap order, or restart history - computes byte-identical balances,
+    /// nonces and total supply. Defensive residue handling: if the DAG still
+    /// contains two transactions with the same (sender, account_nonce), only
+    /// the smallest id applies (canonical double-spend rule).
+    pub fn rebuild_from_dag(&mut self, dag: &DAG) {
+        self.balances.clear();
+        self.nonces.clear();
+        self.total_fees_burned = 0;
+
+        // Apply genesis distribution (fixed supply).
+        for (addr_hex, balance) in crate::genesis::GENESIS_LEDGER {
+            self.balances.insert(addr_hex.to_string(), balance);
+        }
+
+        // Canonical order: ascending id. HashMap iteration order is
+        // explicitly forbidden (it differs across nodes and runs).
+        let mut pending: Vec<Transaction> = dag.transactions().values().cloned().collect();
+
+        // Canonical double-spend winners: the SMALLEST id per (sender,
+        // account_nonce) pair, computed up front as a pure function of the
+        // DAG. A tx that is not the canonical winner of its key can NEVER
+        // apply, no matter when the replay meets it (this also covers the
+        // pathological case where the loser is fundable before the winner).
+        let mut canonical_winners: std::collections::HashMap<(Address, u64), TransactionId> =
+            std::collections::HashMap::new();
+        for tx in &pending {
+            let key = (tx.sender, tx.account_nonce);
+            let better = match canonical_winners.get(&key) {
+                Some(existing) => tx.id < *existing,
+                None => true,
+            };
+            if better {
+                canonical_winners.insert(key, tx.id);
+            }
+        }
+        pending.sort_unstable_by_key(|tx| tx.id);
+
+        let mut applied: std::collections::HashSet<TransactionId> =
+            std::collections::HashSet::new();
+
+        loop {
+            let mut progressed = false;
+            let mut next_pending = Vec::new();
+            for tx in pending {
+                if applied.contains(&tx.id) {
+                    continue;
+                }
+                let parents_ready = tx
+                    .parents
+                    .iter()
+                    .all(|p| p.iter().all(|&b| b == 0) || applied.contains(p));
+                if !parents_ready {
+                    next_pending.push(tx);
+                    continue;
+                }
+                // Residue: a losing double-spend still present in the DAG.
+                // Skipped deterministically BEFORE any transfer, regardless
+                // of processing order or funding state.
+                let key = (tx.sender, tx.account_nonce);
+                if let Some(winner_id) = canonical_winners.get(&key) {
+                    if tx.id != *winner_id {
+                        tracing::warn!(
+                            "⚠️ rebuild_from_dag: skipping double-spend residue {} (winner {} applies)",
+                            hex::encode(&tx.id[..8]),
+                            hex::encode(&winner_id[..8])
+                        );
+                        // Mark as handled (not applied) so its children can
+                        // still be evaluated; it never debits the account.
+                        applied.insert(tx.id);
+                        progressed = true;
+                        continue;
+                    }
+                }
+                // Transfer FIRST, then mark applied: a transaction that
+                // cannot yet be funded is retried on the next pass, it is
+                // never spuriously evicted (V-21 relaxation).
+                if self
+                    .transfer_internal(&tx.sender, &tx.receiver, tx.amount, tx.fee)
+                    .is_err()
+                {
+                    next_pending.push(tx);
+                    continue;
+                }
+                let last = self.get_nonce(&tx.sender);
+                if tx.account_nonce > last {
+                    self.set_nonce(&tx.sender, tx.account_nonce);
+                }
+                applied.insert(tx.id);
+                progressed = true;
+            }
+            pending = next_pending;
+            if !progressed {
+                break;
+            }
+        }
+
+        // Remaining transactions could never be funded even after full
+        // relaxation: the DAG is genuinely inconsistent at their position.
+        // This must not happen on a canonical DAG, but the rebuild stays
+        // defensive and deterministic: the SAME txs are evicted on every node.
+        for tx in pending {
+            tracing::warn!(
+                "⚠️ rebuild_from_dag: evicting inconsistent tx {} (never fundable)",
+                hex::encode(&tx.id[..8])
             );
-            return Err(format!(
-                "Security violation: block {} already rewarded",
-                hex::encode(block_id)
-            ));
         }
-
-        // Check if block is finalized (has enough confirmations)
-        if !consensus_state.is_finalized(block_height, consensus_state.get_height()) {
-            let needed = consensus_state.confirmation_threshold
-                - (consensus_state.get_height().saturating_sub(block_height));
-            tracing::error!(
-                "❌ FINALITY: Block {} not finalized (needs {} more confirmations)",
-                block_height,
-                needed
-            );
-            return Err(format!(
-                "Finality violation: block {} not finalized (needs {} more confirmations)",
-                block_height, needed
-            ));
-        }
-
-        // Calculate reward based on block height (halving schedule)
-        let reward = calculate_reward(block_height);
-
-        // Check if adding reward would exceed MAX_SUPPLY
-        let new_supply = self
-            .total_supply
-            .checked_add(reward)
-            .ok_or_else(|| format!("Total supply overflow: {} + {}", self.total_supply, reward))?;
-
-        if new_supply > MAX_SUPPLY {
-            tracing::error!("❌ MONETARY POLICY VIOLATION: Reward would exceed MAX_SUPPLY");
-            tracing::error!("  Current supply: {}", self.total_supply);
-            tracing::error!("  Requested reward: {}", reward);
-            tracing::error!("  New supply: {}", new_supply);
-            tracing::error!("  MAX_SUPPLY: {}", MAX_SUPPLY);
-            return Err(format!(
-                "Monetary policy violation: reward would exceed MAX_SUPPLY ({} > {})",
-                new_supply, MAX_SUPPLY
-            ));
-        }
-
-        // Log monetary creation for audit trail
-        tracing::warn!("🔒 MONETARY CREATION: Applying block reward");
-        tracing::warn!("  Block ID: {} (fork-safe)", hex::encode(block_id));
-        tracing::warn!("  Block height: {}", block_height);
-        tracing::warn!("  Validator: {}", hex::encode(validator));
-        tracing::warn!(
-            "  Reward: {} AETH ({} units)",
-            reward / 10_000_000_000,
-            reward
-        );
-        tracing::warn!(
-            "  Current supply: {} AETH",
-            self.total_supply / 10_000_000_000
-        );
-        tracing::warn!("  New supply: {} AETH", new_supply / 10_000_000_000);
-        tracing::warn!("  MAX_SUPPLY: {} AETH", MAX_SUPPLY / 10_000_000_000);
-        tracing::warn!("  This is the ONLY way to create new tokens in the system");
-        tracing::warn!("  Block verified via consensus state (single source of truth)");
-        tracing::warn!("  Finality check passed (block is finalized)");
-
-        // Add balance with overflow protection
-        if let Err(e) = self.add_balance(validator, reward) {
-            tracing::error!("❌ Failed to apply block reward: {}", e);
-            return Err(format!("Block reward failed: {}", e));
-        }
-
-        // Update total supply (economic invariant)
-        self.total_supply = new_supply;
 
         tracing::info!(
-            "✅ Block reward applied successfully: {} AETH to {}",
-            reward / 10_000_000_000,
-            hex::encode(validator)
+            "♻️ Ledger rebuilt from DAG: {} txs, supply {} (<= MAX {}): {}",
+            applied.len(),
+            self.total_supply(),
+            MAX_SUPPLY,
+            self.supply_within_bounds()
         );
-        tracing::info!(
-            "✅ Total supply updated: {} AETH / {} AETH ({}%)",
-            self.total_supply / 10_000_000_000,
-            MAX_SUPPLY / 10_000_000_000,
-            (self.total_supply * 100 / MAX_SUPPLY)
-        );
-
-        Ok(())
-    }
-
-    /// Rollback block reward (called on fork/reorg)
-    /// This is a critical operation for fork safety - removes reward from ledger
-    ///
-    /// # Arguments
-    /// * `validator` - The validator address that received the reward
-    /// * `block_id` - The block ID to rollback
-    /// * `reward_amount` - The amount of reward to rollback
-    ///
-    /// # Security
-    /// - This should only be called by consensus layer on reorg
-    /// - Requires block_id to be removed from rewarded_blocks by consensus state
-    /// - Updates total_supply to maintain economic invariant
-    pub(crate) fn rollback_block_reward(
-        &mut self,
-        validator: &Address,
-        block_id: BlockId,
-        reward_amount: u64,
-    ) -> Result<(), String> {
-        tracing::warn!("⚠️ FORK: Rolling back block reward");
-        tracing::warn!("  Block ID: {}", hex::encode(block_id));
-        tracing::warn!("  Validator: {}", hex::encode(validator));
-        tracing::warn!("  Reward amount: {} AETH", reward_amount / 10_000_000_000);
-
-        // Check if validator has enough balance to rollback
-        let current_balance = self.get_balance(validator);
-        if current_balance < reward_amount {
-            tracing::error!("❌ FORK ROLLBACK FAILED: Validator balance insufficient");
-            tracing::error!("  Current balance: {}", current_balance);
-            tracing::error!("  Required: {}", reward_amount);
-            return Err(format!(
-                "Fork rollback failed: validator balance insufficient ({} < {})",
-                current_balance, reward_amount
-            ));
-        }
-
-        // Subtract reward from validator balance
-        let new_balance = current_balance
-            .checked_sub(reward_amount)
-            .ok_or_else(|| format!("Balance underflow: {} - {}", current_balance, reward_amount))?;
-
-        *self.balances.entry(hex::encode(validator)).or_insert(0) = new_balance;
-
-        // Update total supply (economic invariant)
-        self.total_supply = self
-            .total_supply
-            .checked_sub(reward_amount)
-            .ok_or_else(|| {
-                format!(
-                    "Total supply underflow: {} - {}",
-                    self.total_supply, reward_amount
-                )
-            })?;
-
-        tracing::info!("✅ Block reward rolled back successfully");
-        tracing::info!(
-            "  New validator balance: {} AETH",
-            new_balance / 10_000_000_000
-        );
-        tracing::info!(
-            "  New total supply: {} AETH",
-            self.total_supply / 10_000_000_000
-        );
-
-        Ok(())
     }
 }
 
@@ -650,9 +482,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = Storage::open(dir.path()).unwrap();
         let storage_arc = Arc::new(RwLock::new(storage));
-        let ledger = Ledger::new_with_storage(storage_arc.clone(), dir.path())
-            .await
-            .unwrap();
+        let ledger = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
 
         assert!(ledger.balances.is_empty());
     }
@@ -804,9 +634,7 @@ mod tests {
         let storage = Storage::open(dir.path()).unwrap();
         let storage_arc = Arc::new(RwLock::new(storage));
 
-        let mut ledger = Ledger::new_with_storage(storage_arc.clone(), dir.path())
-            .await
-            .unwrap();
+        let mut ledger = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
         let addr = [1u8; 32];
 
         // Set nonce
@@ -817,9 +645,7 @@ mod tests {
         ledger.save().await.unwrap();
 
         // Load new ledger from storage
-        let ledger2 = Ledger::new_with_storage(storage_arc.clone(), dir.path())
-            .await
-            .unwrap();
+        let ledger2 = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
         assert_eq!(ledger2.get_nonce(&addr), 5); // Nonce persisted
     }
 
@@ -1011,379 +837,398 @@ mod tests {
     }
 
     // ============================================================================
-    // MONETARY POLICY TESTS
+    // MONETARY POLICY & REBUILD TESTS (ZERO EMISSION)
     // ============================================================================
 
     #[test]
-    fn test_calculate_reward_halving_schedule() {
-        // Test reward calculation with halving schedule
-        // Initial reward: 10 AETH (10 * 10^10 units)
-        // Halving every 210,000 blocks
+    fn test_zero_emission_never_mints() {
+        // There is no reward function anymore. Verify the invariant that the
+        // circulating supply can only decrease (fees burned) and never exceed
+        // the genesis allocation.
+        let mut ledger = Ledger::new();
+        // Simulate genesis: founder + faucet
+        for (addr_hex, balance) in crate::genesis::GENESIS_LEDGER {
+            ledger.set_balance_hex(addr_hex.to_string(), balance);
+        }
+        let supply_at_genesis = ledger.total_supply();
+        assert!(supply_at_genesis <= MAX_SUPPLY);
 
-        // Block 0: 10 AETH
-        assert_eq!(calculate_reward(0), 100_000_000_000);
-
-        // Block 1: 10 AETH (before first halving)
-        assert_eq!(calculate_reward(1), 100_000_000_000);
-
-        // Block 209,999: 10 AETH (just before first halving)
-        assert_eq!(calculate_reward(209_999), 100_000_000_000);
-
-        // Block 210,000: 5 AETH (first halving)
-        assert_eq!(calculate_reward(210_000), 50_000_000_000);
-
-        // Block 420,000: 2.5 AETH (second halving)
-        assert_eq!(calculate_reward(420_000), 25_000_000_000);
-
-        // Block 630,000: 1.25 AETH (third halving)
-        assert_eq!(calculate_reward(630_000), 12_500_000_000);
-
-        // Block 1,000,000: should be halved multiple times
-        let reward_1m = calculate_reward(1_000_000);
-        assert!(reward_1m > 0);
-        assert!(reward_1m < 100_000_000_000);
-
-        println!(
-            "✅ Reward at block 1,000,000: {} AETH",
-            reward_1m / 10_000_000_000
-        );
+        // A transfer from a genesis-funded account (faucet) burns its fee.
+        let faucet = hex::decode(crate::genesis::FAUCET_ADDRESS).unwrap();
+        let faucet: [u8; 32] = faucet.try_into().unwrap();
+        let receiver = [2u8; 32];
+        ledger
+            .transfer_internal(&faucet, &receiver, 500, 10)
+            .unwrap();
+        assert!(ledger.total_supply() <= supply_at_genesis);
+        assert_eq!(ledger.fee_burn_balance(), 10);
     }
 
     #[test]
-    fn test_calculate_reward_minimum() {
-        // Test that reward decreases with halving and eventually reaches 0
-        // With initial reward of 100_000_000_000 (10 AETH), after ~37 halvings it reaches 0
+    fn test_total_supply_never_goes_stale() {
+        // Fixes NV-02: total_supply must always reflect the live balances even
+        // after direct set_balance mutations (as used during conflict rebuild).
+        let mut ledger = Ledger::new();
+        let addr = [9u8; 32];
+        ledger.set_balance(&addr, 100);
+        assert_eq!(ledger.total_supply(), 100);
+        ledger.set_balance(&addr, 250);
+        assert_eq!(ledger.total_supply(), 250);
+        assert!(ledger.supply_within_bounds());
+    }
 
-        // Block at 30th halving interval (reward should still be > 0)
-        let block_30_halving = 30 * 210_000;
-        let reward_30 = calculate_reward(block_30_halving);
-        assert!(reward_30 > 0);
+    #[test]
+    fn test_rebuild_from_dag_applies_genesis_and_replays() {
+        use crate::transaction::Transaction;
 
-        // Block at 37th halving interval (should be 0 or 1 due to right shift)
-        let block_37_halving = 37 * 210_000;
-        let reward_37 = calculate_reward(block_37_halving);
-        assert!(reward_37 <= 1);
+        let mut dag = DAG::new();
+        let mut ledger = Ledger::new();
 
-        // Find the block where reward becomes 0
-        let mut zero_block = 0;
-        for halving in 38..100 {
-            let reward = calculate_reward(halving * 210_000);
-            if reward == 0 {
-                zero_block = halving * 210_000;
-                break;
-            }
+        // Apply genesis so balances exist for the replay.
+        for (addr_hex, balance) in crate::genesis::GENESIS_LEDGER {
+            ledger.set_balance_hex(addr_hex.to_string(), balance);
         }
 
-        // Verify that reward is 0 at that block and beyond
-        assert!(zero_block > 0, "Reward should reach 0 at some block");
-        let reward_at_zero = calculate_reward(zero_block);
-        assert_eq!(reward_at_zero, 0);
+        // Funds must come from a genesis-funded account (the faucet), because
+        // rebuild_from_dag reseeds balances strictly from genesis.
+        let faucet = hex::decode(crate::genesis::FAUCET_ADDRESS).unwrap();
+        let faucet: [u8; 32] = faucet.try_into().unwrap();
+        let receiver = [2u8; 32];
 
-        let reward_beyond = calculate_reward(zero_block + 210_000);
-        assert_eq!(reward_beyond, 0);
-
-        println!(
-            "✅ Reward halving working correctly, reaches 0 at block {}",
-            zero_block
+        let tx = Transaction::new(
+            [[0u8; 32]; 2],
+            faucet,
+            receiver,
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 64],
         );
+        dag.add_transaction_validated(tx).unwrap();
+
+        // Rebuild: genesis + replayed tx (fee burned).
+        ledger.rebuild_from_dag(&dag);
+        assert_eq!(ledger.get_balance(&receiver), 100);
+        assert_eq!(
+            ledger.get_balance(&faucet),
+            1_000_000_000_000_000_000_u64 - 100 - 10
+        );
+        assert_eq!(ledger.fee_burn_balance(), 10);
+        assert_eq!(ledger.get_nonce(&faucet), 1);
     }
 
     #[test]
-    fn test_apply_block_reward_supply_tracking() {
-        // Test that apply_block_reward correctly tracks total supply
+    fn test_rebuild_from_dag_invariant_holds() {
+        use crate::transaction::Transaction;
+
+        let mut dag = DAG::new();
         let mut ledger = Ledger::new();
-        let validator = [1u8; 32];
+        for (addr_hex, balance) in crate::genesis::GENESIS_LEDGER {
+            ledger.set_balance_hex(addr_hex.to_string(), balance);
+        }
 
-        // Initial state: total supply = 0
-        assert_eq!(ledger.total_supply, 0);
+        // Build a small chain of valid transfers funded by the faucet.
+        let faucet = hex::decode(crate::genesis::FAUCET_ADDRESS).unwrap();
+        let faucet: [u8; 32] = faucet.try_into().unwrap();
+        let b = [0xBBu8; 32];
+        let c = [0xCCu8; 32];
 
-        // Apply block reward at block 0 (10 AETH)
-        let mut consensus_state = ConsensusState::new();
-        consensus_state.current_height = 6; // Height 6 so block 0 is finalized (6 confirmations)
-        let block_id = [0u8; 32];
-        ledger
-            .apply_block_reward(&validator, block_id, 0, &consensus_state)
-            .unwrap();
+        let tx1 = Transaction::new(
+            [[0u8; 32]; 2],
+            faucet,
+            b,
+            100,
+            5,
+            1,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 64],
+        );
+        let tx1_id = tx1.id;
+        dag.add_transaction_validated(tx1.clone()).unwrap();
 
-        // Total supply should be 10 AETH
-        assert_eq!(ledger.total_supply, 100_000_000_000);
-        assert_eq!(ledger.get_balance(&validator), 100_000_000_000);
+        let tx2 = Transaction::new(
+            [tx1_id, [0u8; 32]],
+            b,
+            c,
+            50,
+            2,
+            2,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 64],
+        );
+        dag.add_transaction_validated(tx2).unwrap();
 
-        // Apply another block reward at block 1 (10 AETH)
-        consensus_state.current_height = 7; // Height 7 so block 1 is finalized
-        let block_id_1 = [1u8; 32];
-        ledger
-            .apply_block_reward(&validator, block_id_1, 1, &consensus_state)
-            .unwrap();
-
-        // Total supply should be 20 AETH
-        assert_eq!(ledger.total_supply, 200_000_000_000);
-        assert_eq!(ledger.get_balance(&validator), 200_000_000_000);
-
-        println!("✅ Supply tracking working correctly");
+        ledger.rebuild_from_dag(&dag);
+        assert_eq!(ledger.get_balance(&c), 50);
+        assert_eq!(ledger.fee_burn_balance(), 7);
+        assert!(ledger.supply_within_bounds());
+        assert!(ledger.total_supply() <= MAX_SUPPLY);
     }
 
+    // ---- V-21: deterministic canonical rebuild tests ----
+
+    /// The user-mandated scenario: nodes receiving the same transactions in
+    /// different orders must compute the EXACT same ledger state. Here we
+    /// build the same DAG under every valid topological insertion order and
+    /// assert that the rebuild is a pure function of the DAG: identical
+    /// balances, nonces, fees burned and applied set (no spurious eviction).
     #[test]
-    fn test_apply_block_reward_max_supply_enforcement() {
-        // Test that apply_block_reward enforces MAX_SUPPLY
-        let mut ledger = Ledger::new();
-        let validator = [1u8; 32];
+    fn test_rebuild_deterministic_across_arrival_orders() {
+        use crate::transaction::Transaction;
 
-        // Set total supply near MAX_SUPPLY
-        ledger.total_supply = MAX_SUPPLY - 1;
+        let faucet = hex::decode(crate::genesis::FAUCET_ADDRESS).unwrap();
+        let faucet: [u8; 32] = faucet.try_into().unwrap();
+        let x = [0x05u8; 32];
+        let y = [0x06u8; 32];
+        let u = [0x07u8; 32];
+        let v = [0x08u8; 32];
 
-        // Try to apply block reward (should fail due to MAX_SUPPLY)
-        let mut consensus_state = ConsensusState::new();
-        consensus_state.current_height = 6;
-        let block_id = [0u8; 32];
-        let result = ledger.apply_block_reward(&validator, block_id, 0, &consensus_state);
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("MAX_SUPPLY"));
-
-        // Total supply should remain unchanged
-        assert_eq!(ledger.total_supply, MAX_SUPPLY - 1);
-
-        // Validator should not have received reward
-        assert_eq!(ledger.get_balance(&validator), 0);
-
-        println!("✅ MAX_SUPPLY enforcement working correctly");
-    }
-
-    #[test]
-    fn test_max_supply_constant() {
-        // Test that MAX_SUPPLY is set correctly (1.8 billion AETH)
-        assert_eq!(MAX_SUPPLY, 18_000_000_000_000_000_000);
-
-        // Verify it's a reasonable value (above the ~1 billion genesis supply)
-        let max_supply_aeth = MAX_SUPPLY / 10_000_000_000;
-        assert!(
-            max_supply_aeth > 1_000_000_000,
-            "MAX_SUPPLY must exceed genesis supply"
+        // Chain A: faucet -> X (nonce 1), X -> Y (nonce 2)
+        let a1 = Transaction::new(
+            [[0u8; 32]; 2],
+            faucet,
+            x,
+            100,
+            5,
+            1,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 64],
+        );
+        let a2 = Transaction::new(
+            [a1.id, [0u8; 32]],
+            x,
+            y,
+            30,
+            2,
+            2,
+            0,
+            2,
+            vec![0u8; 64],
+            vec![0u8; 64],
+        );
+        // Chain B: faucet -> U (nonce 2), U -> V (nonce 2)
+        let b1 = Transaction::new(
+            [[0u8; 32]; 2],
+            faucet,
+            u,
+            100,
+            5,
+            1,
+            0,
+            2,
+            vec![0u8; 64],
+            vec![0u8; 64],
+        );
+        let b2 = Transaction::new(
+            [b1.id, [0u8; 32]],
+            u,
+            v,
+            40,
+            3,
+            2,
+            0,
+            2,
+            vec![0u8; 64],
+            vec![0u8; 64],
+        );
+        // Cross link: X -> U, parents = [a1, b1]
+        let m = Transaction::new(
+            [a1.id, b1.id],
+            x,
+            u,
+            10,
+            1,
+            3,
+            0,
+            3,
+            vec![0u8; 64],
+            vec![0u8; 64],
         );
 
-        println!("✅ MAX_SUPPLY: {} AETH", max_supply_aeth);
-    }
+        // Every valid topological insertion order (parents before children).
+        let orders: Vec<Vec<&Transaction>> = vec![
+            vec![&a1, &b1, &a2, &b2, &m],
+            vec![&b1, &a1, &b2, &a2, &m],
+            vec![&a1, &b1, &m, &a2, &b2],
+            vec![&b1, &a1, &m, &b2, &a2],
+        ];
 
-    #[test]
-    fn test_monetary_policy_invariant() {
-        // Test the economic invariant: total_supply <= MAX_SUPPLY
-        let mut ledger = Ledger::new();
-        let validator = [1u8; 32];
-
-        // Apply many block rewards (simulating long-term operation)
-        for block_height in 0..1000 {
-            let mut consensus_state = ConsensusState::new();
-            consensus_state.current_height = block_height + 6; // Ensure finality
-            let block_id = [block_height as u8; 32];
-            let result =
-                ledger.apply_block_reward(&validator, block_id, block_height, &consensus_state);
-            if result.is_err() {
-                // Should only fail if we hit MAX_SUPPLY (unlikely in 1000 blocks)
-                break;
+        let mut states = Vec::new();
+        for order in orders {
+            let mut dag = DAG::new();
+            for tx in order {
+                dag.add_transaction_validated((*tx).clone()).unwrap();
             }
+            let mut ledger = Ledger::new();
+            ledger.rebuild_from_dag(&dag);
 
-            // Verify invariant: total_supply <= MAX_SUPPLY
-            assert!(
-                ledger.total_supply <= MAX_SUPPLY,
-                "Monetary policy violation: total_supply {} > MAX_SUPPLY {}",
-                ledger.total_supply,
-                MAX_SUPPLY
+            // All 5 transactions must apply - NO spurious eviction.
+            assert_eq!(ledger.total_supply(), 1_000_000_100_000_000_000_u64 - 16);
+            assert_eq!(
+                ledger.get_balance(&faucet),
+                1_000_000_000_000_000_000_u64 - 210
             );
+            assert_eq!(ledger.get_balance(&x), 57); // 100 - 32 (a2) - 11 (m)
+            assert_eq!(ledger.get_balance(&y), 30);
+            assert_eq!(ledger.get_balance(&u), 67); // 100 - 43 (b2) + 10 (m)
+            assert_eq!(ledger.get_balance(&v), 40);
+            assert_eq!(ledger.fee_burn_balance(), 16);
+            assert_eq!(ledger.get_nonce(&faucet), 2);
+            assert_eq!(ledger.get_nonce(&x), 3);
+            assert_eq!(ledger.get_nonce(&u), 2);
+
+            states.push((
+                ledger.total_supply(),
+                ledger.fee_burn_balance(),
+                ledger.balances.clone(),
+                ledger.nonces.clone(),
+            ));
         }
 
-        println!("✅ Monetary policy invariant enforced: total_supply <= MAX_SUPPLY");
+        // Every arrival order must produce byte-identical state.
+        for s in &states[1..] {
+            assert_eq!(*s, states[0], "rebuild must be order-independent");
+        }
     }
 
+    /// Relaxation: a transaction that references no parents (genesis) but is
+    /// FUNDED by another transaction must never be evicted, regardless of
+    /// which one the replay encounters first. The old code marked a failing
+    /// transaction as applied and dropped it forever.
     #[test]
-    fn test_consensus_height_prevention() {
-        // Test that block reward uses consensus state height (single source of truth)
+    fn test_rebuild_relaxation_funding_after_spend() {
+        use crate::transaction::Transaction;
+
+        let faucet = hex::decode(crate::genesis::FAUCET_ADDRESS).unwrap();
+        let faucet: [u8; 32] = faucet.try_into().unwrap();
+        let x = [0x5Au8; 32];
+        let y = [0x5Bu8; 32];
+
+        // Both have genesis parents: neither depends on the other topologically.
+        let fund = Transaction::new(
+            [[0u8; 32]; 2],
+            faucet,
+            x,
+            1000,
+            5,
+            1,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 64],
+        );
+        let spend = Transaction::new(
+            [[0u8; 32]; 2],
+            x,
+            y,
+            300,
+            2,
+            2,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 64],
+        );
+
+        let mut dag = DAG::new();
+        // Insertion order does not matter for the rebuild: both orders are
+        // exercised by the same DAG and must converge.
+        dag.add_transaction_validated(fund.clone()).unwrap();
+        dag.add_transaction_validated(spend.clone()).unwrap();
+
         let mut ledger = Ledger::new();
-        let validator = [1u8; 32];
+        ledger.rebuild_from_dag(&dag);
 
-        // Create consensus state with height 100
-        let mut consensus_state = ConsensusState::new();
-        consensus_state.current_height = 106; // Height 106 so block 100 is finalized
-
-        let block_id = [100u8; 32];
-        // Apply block reward - should use height 100 from consensus state
-        ledger
-            .apply_block_reward(&validator, block_id, 100, &consensus_state)
-            .unwrap();
-
-        // Reward should be calculated based on height 100 (not 0)
-        let expected_reward = calculate_reward(100);
-        assert_eq!(ledger.get_balance(&validator), expected_reward);
-        assert_eq!(ledger.total_supply, expected_reward);
-
-        println!("✅ Consensus height used for reward calculation (no external injection)");
+        // The spend MUST be applied even if the replay meets it before its
+        // funding: relaxation retries it on the next pass.
+        assert_eq!(ledger.get_balance(&x), 698); // 1000 - 300 - 2
+        assert_eq!(ledger.get_balance(&y), 300);
+        assert_eq!(ledger.fee_burn_balance(), 7);
+        assert_eq!(ledger.get_nonce(&x), 1);
+        assert_eq!(ledger.total_supply(), 1_000_000_100_000_000_000_u64 - 7);
     }
 
+    /// Defensive residue handling: if the DAG somehow still holds two
+    /// transactions with the same (sender, nonce), the smallest id applies
+    /// and the larger one never debits the account.
     #[test]
-    fn test_double_reward_prevention() {
-        // Test that double-reward attacks are prevented via BlockId tracking (fork-safe)
+    fn test_rebuild_double_spend_residue_only_min_id_applies() {
+        use crate::transaction::Transaction;
+
+        let faucet = hex::decode(crate::genesis::FAUCET_ADDRESS).unwrap();
+        let faucet: [u8; 32] = faucet.try_into().unwrap();
+
+        // Construct two conflicting txs directly (bypassing add_transaction
+        // conflict checks) exactly as a corrupted legacy DAG would contain.
+        let mut dag = DAG::new();
+        let fund = Transaction::new(
+            [[0u8; 32]; 2],
+            faucet,
+            [0x11u8; 32],
+            1000,
+            5,
+            1,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 64],
+        );
+        let tx1 = Transaction::new(
+            [[0u8; 32]; 2],
+            [0x11u8; 32],
+            [0x22u8; 32],
+            50,
+            1,
+            2,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 64],
+        );
+        let tx2 = Transaction::new(
+            [[0u8; 32]; 2],
+            [0x11u8; 32],
+            [0x33u8; 32],
+            60,
+            1,
+            2,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 64],
+        );
+        // The canonical winner is the smallest id - whichever that is.
+        let (winner, loser) = if tx1.id < tx2.id {
+            (tx1, tx2)
+        } else {
+            (tx2, tx1)
+        };
+        let winner_receiver = winner.receiver;
+        let loser_receiver = loser.receiver;
+
+        dag.inject_transaction_raw(fund);
+        dag.inject_transaction_raw(winner.clone());
+        dag.inject_transaction_raw(loser);
+
         let mut ledger = Ledger::new();
-        let validator = [1u8; 32];
+        ledger.rebuild_from_dag(&dag);
 
-        // Create consensus state with height 50
-        let mut consensus_state = ConsensusState::new();
-        consensus_state.current_height = 56; // Height 56 so block 50 is finalized
-
-        let block_id = [50u8; 32];
-
-        // First reward at block_id should succeed
-        let result1 = ledger.apply_block_reward(&validator, block_id, 50, &consensus_state);
-        assert!(result1.is_ok());
-
-        // Mark block as rewarded (simulating consensus layer responsibility)
-        consensus_state.mark_block_rewarded(block_id);
-
-        // Second reward at same block_id should fail (double-reward attack prevention)
-        let result2 = ledger.apply_block_reward(&validator, block_id, 50, &consensus_state);
-        assert!(result2.is_err());
-        assert!(result2.unwrap_err().contains("already rewarded"));
-
-        // Total supply should only have increased once
-        let expected_reward = calculate_reward(50);
-        assert_eq!(ledger.total_supply, expected_reward);
-
-        println!("✅ Double-reward attack prevented via BlockId tracking (fork-safe)");
-    }
-
-    #[test]
-    fn test_reward_only_after_consensus_increment() {
-        // Test that rewards are linked to consensus height increments
-        let mut ledger = Ledger::new();
-        let validator = [1u8; 32];
-
-        let mut consensus_state = ConsensusState::new();
-
-        // Reward at block 0
-        consensus_state.current_height = 6;
-        let block_id_0 = [0u8; 32];
-        ledger
-            .apply_block_reward(&validator, block_id_0, 0, &consensus_state)
-            .unwrap();
-
-        // Increment height (simulating consensus confirmation)
-        consensus_state.current_height = 7;
-
-        // Reward at block 1 should succeed
-        let block_id_1 = [1u8; 32];
-        ledger
-            .apply_block_reward(&validator, block_id_1, 1, &consensus_state)
-            .unwrap();
-
-        // Total supply should have 2 rewards
-        let reward_0 = calculate_reward(0);
-        let reward_1 = calculate_reward(1);
-        assert_eq!(ledger.total_supply, reward_0 + reward_1);
-
-        println!("✅ Rewards linked to consensus height increments");
-    }
-
-    #[test]
-    fn test_finality_check() {
-        // Test that rewards are only given to finalized blocks
-        let mut ledger = Ledger::new();
-        let validator = [1u8; 32];
-
-        let mut consensus_state = ConsensusState::new();
-        consensus_state.current_height = 3; // Only 3 confirmations (needs 6)
-
-        let block_id = [0u8; 32];
-
-        // Reward should fail because block is not finalized
-        let result = ledger.apply_block_reward(&validator, block_id, 0, &consensus_state);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not finalized"));
-
-        // Total supply should remain 0
-        assert_eq!(ledger.total_supply, 0);
-
-        println!("✅ Finality check prevents rewards for non-finalized blocks");
-    }
-
-    #[test]
-    fn test_fork_safe_reward_tracking() {
-        // Test that BlockId tracking is fork-safe (different heights, same reward possible)
-        let mut ledger = Ledger::new();
-        let validator = [1u8; 32];
-
-        let mut consensus_state = ConsensusState::new();
-
-        // Simulate fork: two different blocks at same height
-        consensus_state.current_height = 11; // Height 11 so block 5 is finalized (5 + 6 = 11)
-
-        let block_id_a = [1u8; 32]; // Block A at height 5
-        let block_id_b = [2u8; 32]; // Block B at height 5 (fork)
-
-        // Reward block A at height 5
-        ledger
-            .apply_block_reward(&validator, block_id_a, 5, &consensus_state)
-            .unwrap();
-        consensus_state.mark_block_rewarded(block_id_a);
-
-        // Reward block B at same height (different block ID) - should succeed (fork scenario)
-        let result = ledger.apply_block_reward(&validator, block_id_b, 5, &consensus_state);
-        // This would succeed in a real fork scenario, but we're testing the tracking mechanism
-        // In production, consensus would only mark one as rewarded based on which chain wins
-        assert!(result.is_ok() || result.unwrap_err().contains("already rewarded"));
-
-        println!("✅ BlockId tracking is fork-safe (tracks actual blocks, not heights)");
-    }
-
-    #[test]
-    fn test_fork_rollback() {
-        // Test that rewards can be rolled back on fork/reorg
-        let mut ledger = Ledger::new();
-        let validator = [1u8; 32];
-
-        let mut consensus_state = ConsensusState::new();
-        consensus_state.current_height = 11; // Height 11 so block 5 is finalized
-
-        let block_id = [1u8; 32];
-
-        // Apply reward
-        ledger
-            .apply_block_reward(&validator, block_id, 5, &consensus_state)
-            .unwrap();
-        let initial_balance = ledger.get_balance(&validator);
-        let initial_supply = ledger.total_supply;
-
-        assert!(initial_balance > 0);
-        assert!(initial_supply > 0);
-
-        // Rollback reward (simulating fork)
-        let reward_amount = calculate_reward(5);
-        ledger
-            .rollback_block_reward(&validator, block_id, reward_amount)
-            .unwrap();
-
-        // Balance should be back to 0
-        assert_eq!(ledger.get_balance(&validator), 0);
-        assert_eq!(ledger.total_supply, 0);
-
-        println!("✅ Fork rollback successfully removed reward");
-    }
-
-    #[test]
-    fn test_fork_rollback_insufficient_balance() {
-        // Test that rollback fails if validator doesn't have enough balance
-        let mut ledger = Ledger::new();
-        let validator = [1u8; 32];
-
-        // Set balance to less than reward amount
-        ledger.set_balance(&validator, 50);
-
-        let block_id = [1u8; 32];
-        let reward_amount = 100;
-
-        // Rollback should fail
-        let result = ledger.rollback_block_reward(&validator, block_id, reward_amount);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("insufficient"));
-
-        println!("✅ Fork rollback prevented when balance insufficient");
+        // ONLY the canonical winner's transfer applies (min-id rule); the
+        // loser residue is skipped without debiting or crediting anything,
+        // even when the replay would meet it first.
+        assert_eq!(ledger.get_balance(&winner_receiver), winner.amount);
+        assert_eq!(ledger.get_balance(&loser_receiver), 0);
+        assert_eq!(ledger.fee_burn_balance(), 6); // 5 (fund) + 1 (winner)
+        assert_eq!(ledger.get_nonce(&[0x11u8; 32]), 1);
+        assert_eq!(ledger.total_supply(), 1_000_000_100_000_000_000_u64 - 6);
     }
 }

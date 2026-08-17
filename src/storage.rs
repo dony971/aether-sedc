@@ -3,9 +3,7 @@
 //! Implements Sled persistence for transactions, DAG state, and wallet balances.
 //! Includes atomic writes, separate trees for balances and transactions, and migration from JSON.
 
-use crate::consensus::ConsensusState;
 use crate::transaction::{Address, Transaction, TransactionId};
-use serde::{Deserialize, Serialize};
 use sled::{Db, Transactional, Tree};
 use std::collections::HashMap;
 use std::path::Path;
@@ -48,11 +46,9 @@ pub enum TreeName {
     Balances,
     Metadata,
     AddressIndex, // Index transactions by sender/receiver address
-    Staking,      // Staking positions and rewards
     Nonces,       // Account nonces for replay protection
     Orphans,      // Orphan transactions waiting for parents
     Mempool,      // Persistent mempool queue
-    Consensus,    // Consensus state (height, rewarded blocks, pending rewards)
 }
 
 impl TreeName {
@@ -62,11 +58,9 @@ impl TreeName {
             TreeName::Balances => "balances",
             TreeName::Metadata => "metadata",
             TreeName::AddressIndex => "address_index",
-            TreeName::Staking => "staking",
             TreeName::Nonces => "nonces",
             TreeName::Orphans => "orphans",
             TreeName::Mempool => "mempool",
-            TreeName::Consensus => "consensus",
         }
     }
 }
@@ -79,26 +73,9 @@ pub struct Storage {
     balances: Tree,
     metadata: Tree,
     address_index: Tree,
-    staking: Tree,
     nonces: Tree,
     orphans: Tree,
     mempool: Tree,
-    consensus: Tree,
-}
-
-/// Staking position structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StakingPosition {
-    /// Address of the staker
-    pub address: Address,
-    /// Amount staked (in base units, 18 decimals)
-    pub staked_amount: u64,
-    /// Timestamp when staking started
-    pub start_timestamp: u64,
-    /// Total rewards earned so far
-    pub rewards_earned: u64,
-    /// Last rewards calculation timestamp
-    pub last_reward_timestamp: u64,
 }
 
 impl Storage {
@@ -111,11 +88,9 @@ impl Storage {
         let balances = db.open_tree(TreeName::Balances.name())?;
         let metadata = db.open_tree(TreeName::Metadata.name())?;
         let address_index = db.open_tree(TreeName::AddressIndex.name())?;
-        let staking = db.open_tree(TreeName::Staking.name())?;
         let nonces = db.open_tree(TreeName::Nonces.name())?;
         let orphans = db.open_tree(TreeName::Orphans.name())?;
         let mempool = db.open_tree(TreeName::Mempool.name())?;
-        let consensus = db.open_tree(TreeName::Consensus.name())?;
 
         Ok(Self {
             db,
@@ -123,11 +98,9 @@ impl Storage {
             balances,
             metadata,
             address_index,
-            staking,
             nonces,
             orphans,
             mempool,
-            consensus,
         })
     }
 
@@ -138,11 +111,9 @@ impl Storage {
             TreeName::Balances => &self.balances,
             TreeName::Metadata => &self.metadata,
             TreeName::AddressIndex => &self.address_index,
-            TreeName::Staking => &self.staking,
             TreeName::Nonces => &self.nonces,
             TreeName::Orphans => &self.orphans,
             TreeName::Mempool => &self.mempool,
-            TreeName::Consensus => &self.consensus,
         }
     }
 
@@ -485,147 +456,6 @@ impl Storage {
         Ok(())
     }
 
-    // ==================== STAKING FUNCTIONS ====================
-
-    /// Stake tokens - move funds from main balance to staking
-    pub fn stake_tokens(&self, address: Address, amount: u64) -> Result<(), StorageError> {
-        // NOTE: Balance locking is done by the RPC layer via the ledger
-        // (single source of truth for balances). This only tracks the
-        // staking position (amount + rewards) in Sled.
-        if amount == 0 {
-            return Err(StorageError::DatabaseError(
-                "Stake amount must be > 0".to_string(),
-            ));
-        }
-
-        // Get or create staking position
-        let current_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or(std::time::Duration::from_secs(0))
-            .as_secs();
-
-        let mut position = self
-            .get_staking_position(address)
-            .unwrap_or(StakingPosition {
-                address,
-                staked_amount: 0,
-                start_timestamp: current_timestamp,
-                rewards_earned: 0,
-                last_reward_timestamp: current_timestamp,
-            });
-
-        // Update position
-        position.staked_amount += amount;
-        position.last_reward_timestamp = current_timestamp;
-
-        // Save position
-        self.put_staking_position(&position)?;
-
-        Ok(())
-    }
-
-    /// Unstake tokens - compute total return (staked + rewards)
-    /// NOTE: Balance crediting is done by the RPC layer via the ledger.
-    pub fn unstake_tokens(&self, address: Address) -> Result<u64, StorageError> {
-        let mut position =
-            self.get_staking_position(address)
-                .ok_or(StorageError::DatabaseError(
-                    "No staking position found".to_string(),
-                ))?;
-
-        // Calculate final rewards
-        let current_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or(std::time::Duration::from_secs(0))
-            .as_secs();
-
-        let additional_rewards =
-            self.calculate_staking_reward_internal(&position, current_timestamp);
-        position.rewards_earned += additional_rewards;
-
-        // Total to return = staked amount + rewards
-        let total_return = position.staked_amount + position.rewards_earned;
-
-        // Remove staking position
-        self.remove_staking_position(address)?;
-
-        Ok(total_return)
-    }
-
-    /// Get staking position for an address
-    pub fn get_staking_position(&self, address: Address) -> Option<StakingPosition> {
-        let tree = self.tree(TreeName::Staking);
-        let value = tree.get(address).ok()??;
-        let position: StakingPosition = bincode::deserialize(&value).ok()?;
-        Some(position)
-    }
-
-    /// Put staking position
-    fn put_staking_position(&self, position: &StakingPosition) -> Result<(), StorageError> {
-        let tree = self.tree(TreeName::Staking);
-        let value = bincode::serialize(position)?;
-        tree.insert(position.address, value)?;
-        Ok(())
-    }
-
-    /// Remove staking position
-    fn remove_staking_position(&self, address: Address) -> Result<(), StorageError> {
-        let tree = self.tree(TreeName::Staking);
-        tree.remove(address)?;
-        Ok(())
-    }
-
-    /// Calculate staking reward for an address (5% annual, calculated per block)
-    pub fn calculate_staking_reward(&self, address: Address) -> Result<u64, StorageError> {
-        let position = self
-            .get_staking_position(address)
-            .ok_or(StorageError::DatabaseError(
-                "No staking position found".to_string(),
-            ))?;
-
-        let current_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or(std::time::Duration::from_secs(0))
-            .as_secs();
-
-        let total_rewards = self.calculate_staking_reward_internal(&position, current_timestamp);
-        Ok(total_rewards)
-    }
-
-    /// Internal reward calculation
-    fn calculate_staking_reward_internal(
-        &self,
-        position: &StakingPosition,
-        current_timestamp: u64,
-    ) -> u64 {
-        // 5% annual reward = 0.05 per year
-        // Calculate time elapsed in seconds
-        let time_elapsed = current_timestamp.saturating_sub(position.last_reward_timestamp);
-
-        // Convert to years (assuming 365.25 days per year)
-        let years_elapsed = time_elapsed as f64 / (365.25 * 24.0 * 3600.0);
-
-        // Calculate reward: staked_amount * 0.05 * years_elapsed
-        let reward = position.staked_amount as f64 * 0.05 * years_elapsed;
-
-        reward as u64
-    }
-
-    /// Get total staked amount for an address
-    pub fn get_staked_amount(&self, address: Address) -> Result<u64, StorageError> {
-        let position = self
-            .get_staking_position(address)
-            .ok_or(StorageError::DatabaseError(
-                "No staking position found".to_string(),
-            ))?;
-        Ok(position.staked_amount)
-    }
-
-    /// Check if an address has staked tokens
-    pub fn has_staked_tokens(&self, address: Address) -> bool {
-        self.get_staking_position(address).is_some()
-    }
-
     // ==================== NONCE FUNCTIONS ====================
 
     /// Store account nonce for replay protection
@@ -703,26 +533,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Persist consensus state (height, rewarded blocks, pending rewards)
-    pub fn put_consensus_state(&self, state: &ConsensusState) -> Result<(), StorageError> {
-        let tree = self.tree(TreeName::Consensus);
-        let value = bincode::serialize(state)?;
-        tree.insert("state", value)?;
-        Ok(())
-    }
-
-    /// Load persisted consensus state
-    pub fn get_consensus_state(&self) -> Result<Option<ConsensusState>, StorageError> {
-        let tree = self.tree(TreeName::Consensus);
-        match tree.get("state")? {
-            Some(value) => {
-                let state = bincode::deserialize(&value)?;
-                Ok(Some(state))
-            }
-            None => Ok(None),
-        }
-    }
-
     /// Clear all mempool transactions
     pub fn clear_mempool(&self) -> Result<(), StorageError> {
         let tree = self.tree(TreeName::Mempool);
@@ -777,7 +587,7 @@ mod tests {
     #[test]
     fn test_storage_open() {
         let dir = tempdir().unwrap();
-        let storage = Storage::open(dir.path()).unwrap();
+        let _storage = Storage::open(dir.path()).unwrap();
         assert!(true);
     }
 
@@ -805,6 +615,88 @@ mod tests {
         assert_eq!(retrieved.id, tx.id);
         assert_eq!(retrieved.sender, tx.sender);
         assert_eq!(retrieved.receiver, tx.receiver);
+    }
+
+    /// P5: the persistence contract is bincode 1.3 (pinned in Cargo.toml —
+    /// semver forbids a silent upgrade to bincode 2, whose default encoding
+    /// differs). A transaction written by one Storage instance must be
+    /// byte-identical after a fresh instance reopens the same Sled database.
+    /// This pins the on-disk format so a future field addition/removal/
+    /// reorder in `Transaction` (which would silently break the format)
+    /// requires an explicit, intentional decision.
+    #[test]
+    fn test_bincode_persistence_round_trip_across_reopen() {
+        let dir = tempdir().unwrap();
+
+        let mut tx = Transaction::new(
+            [[0xABu8; 32], [0xCDu8; 32]],
+            [1u8; 32],
+            [2u8; 32],
+            100,
+            10,
+            1234567890,
+            424242,
+            7,
+            vec![0x11u8; 64],
+            vec![0x22u8; 32],
+        );
+        tx.weight = 12.5; // a non-default value: the format must preserve it
+
+        let (bytes_written, bytes_read_back) = {
+            let storage = Storage::open(dir.path()).unwrap();
+            storage.put_transaction(&tx).unwrap();
+            // Byte-for-byte capture of the serialized form on disk.
+            let serialized = bincode::serialize(&tx).unwrap();
+            let retrieved = storage.get_transaction(tx.id).unwrap();
+            (serialized, bincode::serialize(&retrieved).unwrap())
+        };
+        assert_eq!(
+            bytes_written, bytes_read_back,
+            "the in-memory round trip must be byte-identical"
+        );
+
+        // Fresh instance on the same database (simulates a node restart).
+        let storage2 = Storage::open(dir.path()).unwrap();
+        let reloaded = storage2.get_transaction(tx.id).unwrap();
+        assert_eq!(reloaded.id, tx.id);
+        assert_eq!(reloaded.parents, tx.parents);
+        assert_eq!(reloaded.sender, tx.sender);
+        assert_eq!(reloaded.receiver, tx.receiver);
+        assert_eq!(reloaded.amount, tx.amount);
+        assert_eq!(reloaded.fee, tx.fee);
+        assert_eq!(reloaded.timestamp, tx.timestamp);
+        assert_eq!(reloaded.nonce, tx.nonce);
+        assert_eq!(reloaded.account_nonce, tx.account_nonce);
+        assert_eq!(reloaded.signature, tx.signature);
+        assert_eq!(reloaded.public_key, tx.public_key);
+        assert_eq!(
+            reloaded.weight, tx.weight,
+            "weight must survive serialization"
+        );
+        assert_eq!(
+            bincode::serialize(&reloaded).unwrap(),
+            bytes_written,
+            "the reopened instance must read the exact bytes that were written"
+        );
+        drop(storage2);
+
+        // Orphans and mempool txs share the same serialization contract.
+        // (Sled holds an exclusive lock per open instance — drop before reopen.)
+        let storage3 = Storage::open(dir.path()).unwrap();
+        storage3.put_orphan(tx.id, &tx).unwrap();
+        storage3.put_mempool_tx(&tx).unwrap();
+        drop(storage3);
+        let storage4 = Storage::open(dir.path()).unwrap();
+        let orphan = storage4.get_orphan(tx.id).unwrap().unwrap();
+        let mempool_txs = storage4.load_mempool_txs().unwrap();
+        let mempool_tx = mempool_txs
+            .iter()
+            .find(|t| t.id == tx.id)
+            .expect("mempool tx must survive reopen");
+        assert_eq!(orphan.id, tx.id);
+        assert_eq!(mempool_tx.id, tx.id);
+        assert_eq!(orphan.weight, tx.weight);
+        assert_eq!(mempool_tx.weight, tx.weight);
     }
 
     #[test]

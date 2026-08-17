@@ -13,6 +13,46 @@ pub type TransactionId = [u8; 32];
 /// Address type (256-bit)
 pub type Address = [u8; 32];
 
+/// Canonical textual form of a transaction id or address (lowercase hex, 64 chars).
+///
+/// V-20 FIX: every serialization boundary (RPC, CLI, GUI, P2P, storage,
+/// explorer) MUST use this exact format. Byte arrays serialized as numeric
+/// JSON arrays (`[32, 219, ...]`) are explicitly forbidden: they broke
+/// `aether_getTips`, silently degraded every client to genesis parents
+/// `[0,0]` and turned the DAG into a star. Any component that parses a tip
+/// uses `decode_id`, so a tip round-trips losslessly.
+pub fn encode_id(id: &[u8; 32]) -> String {
+    hex::encode(id)
+}
+
+/// Parse the canonical textual form (64 lowercase/uppercase hex chars) back
+/// into bytes. Returns `None` for anything else (wrong length, non-hex, or
+/// a non-string JSON value).
+pub fn decode_id(s: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(s).ok()?;
+    bytes.try_into().ok()
+}
+
+/// Parse the `"tips"` array of an `aether_getTips` response into at most two
+/// parent ids for a new transaction.
+///
+/// V-20 FIX: strict parsing. A malformed entry is an ERROR, never a silent
+/// fallback to genesis parents. Genesis parents `[0,0]` are only returned
+/// when the array is empty (empty DAG), which is the only legitimate case
+/// for a transaction to reference genesis directly.
+pub fn tips_to_parents(tips_array: &[serde_json::Value]) -> Result<[TransactionId; 2], String> {
+    let mut parents = [[0u8; 32]; 2];
+    for (i, tip) in tips_array.iter().take(2).enumerate() {
+        let tip_str = tip
+            .as_str()
+            .ok_or_else(|| format!("Malformed tip at index {}: not a hex string", i))?;
+        let bytes = decode_id(tip_str)
+            .ok_or_else(|| format!("Malformed tip at index {}: invalid hex id", i))?;
+        parents[i] = bytes;
+    }
+    Ok(parents)
+}
+
 /// Core transaction structure for the DAG
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Transaction {
@@ -109,16 +149,32 @@ impl Transaction {
         hasher.finalize().into()
     }
 
-    /// Compute the signing hash (excludes signature and public_key)
-    /// This is what should be signed, not the full hash
-    /// Order: Sender + Receiver + Amount + Account Nonce (for replay protection)
+    /// Compute the signing hash (excludes only the signature and public_key,
+    /// which cannot authenticate themselves).
+    ///
+    /// This is what should be signed. It MUST cover every field that has an
+    /// economic or consensus influence, otherwise an attacker could mutate an
+    /// unsigned field without invalidating the signature (malleability):
+    ///   - parents        (DAG topology / conflict resolution)
+    ///   - sender, receiver, amount, fee  (economic flow)
+    ///   - timestamp      (ordering hints)
+    ///   - nonce          (Micro-PoW proof)
+    ///   - account_nonce  (replay protection)
+    ///
+    /// Note: `nonce` is included, which requires mining to happen BEFORE
+    /// signing. Both the CLI (`main.rs`) and the GUI (`gui.rs`) already mine
+    /// the nonce before signing, so this is compatible.
     pub fn compute_signing_hash(&self) -> TransactionId {
         let mut hasher = blake3::Hasher::new();
 
-        // Hash only: Sender + Receiver + Amount + Account Nonce
+        hasher.update(&self.parents[0]);
+        hasher.update(&self.parents[1]);
         hasher.update(&self.sender);
         hasher.update(&self.receiver);
         hasher.update(&self.amount.to_le_bytes());
+        hasher.update(&self.fee.to_le_bytes());
+        hasher.update(&self.timestamp.to_le_bytes());
+        hasher.update(&self.nonce.to_le_bytes());
         hasher.update(&self.account_nonce.to_le_bytes());
 
         hasher.finalize().into()
@@ -290,12 +346,14 @@ impl Transaction {
     }
 
     /// Calculate PoW hash for a transaction with a specific nonce
-    /// This is used for mining the nonce to meet difficulty requirements
+    /// This is used for mining the nonce to meet difficulty requirements.
+    ///
+    /// Covers every data field EXCEPT signature/public_key (so PoW can be
+    /// computed before signing). `account_nonce` is included so a single PoW
+    /// proof cannot be reused across different nonce values.
     pub fn calculate_pow_hash(&self, nonce: u64) -> TransactionId {
         let mut hasher = blake3::Hasher::new();
 
-        // Hash only data fields, NOT signature or public_key
-        // This ensures PoW can be computed before signing
         hasher.update(&self.parents[0]);
         hasher.update(&self.parents[1]);
         hasher.update(&self.sender);
@@ -304,6 +362,7 @@ impl Transaction {
         hasher.update(&self.fee.to_le_bytes());
         hasher.update(&self.timestamp.to_le_bytes());
         hasher.update(&nonce.to_le_bytes());
+        hasher.update(&self.account_nonce.to_le_bytes());
 
         hasher.finalize().into()
     }
@@ -375,10 +434,12 @@ impl Transaction {
         }
     }
 
-    /// Get the current PoW difficulty (can be adjusted based on network conditions)
-    /// Default difficulty is 16 bits (4 hex zeros)
+    /// Get the current PoW difficulty (anti-spam requirement)
+    /// Default difficulty is 20 bits (5 hex zeros): ~1M hashes average.
+    /// This makes spam non-trivial (≈ms of CPU per tx for honest users)
+    /// while remaining cheap for legitimate transactions.
     pub fn default_difficulty() -> u8 {
-        16 // 16 leading zero bits = 4 hex zeros (e.g., 0000...)
+        20
     }
 
     /// Verify that the sender address matches the public key
@@ -496,7 +557,6 @@ impl fmt::Display for Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
 
     #[test]
     fn test_transaction_creation() {
@@ -739,5 +799,93 @@ mod tests {
 
         // Should be exactly 32 bytes (BLAKE3 output)
         assert_eq!(hash1.len(), 32);
+    }
+
+    // ---- V-20: canonical hex id serialization tests ----
+
+    #[test]
+    fn test_encode_id_returns_lowercase_hex_64_chars() {
+        let id: TransactionId = [
+            0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x11,
+            0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+            0x00, 0x01, 0x02, 0x03,
+        ];
+        let s = encode_id(&id);
+        assert_eq!(s.len(), 64);
+        assert_eq!(
+            s,
+            "abcdef0123456789deadbeef00112233445566778899aabbccddeeff00010203"
+        );
+    }
+
+    #[test]
+    fn test_decode_id_roundtrip() {
+        let id: TransactionId = [
+            0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x11,
+            0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+            0x00, 0x01, 0x02, 0x03,
+        ];
+        let s = encode_id(&id);
+        let decoded = decode_id(&s).expect("valid hex must decode");
+        assert_eq!(decoded, id);
+        // bytes -> hex -> bytes must be the identity
+        assert_eq!(encode_id(&decoded), s);
+    }
+
+    #[test]
+    fn test_decode_id_accepts_uppercase_hex() {
+        let id: TransactionId = [0xab; 32];
+        let upper = encode_id(&id).to_uppercase();
+        assert_eq!(decode_id(&upper).expect("uppercase hex must decode"), id);
+    }
+
+    #[test]
+    fn test_decode_id_rejects_invalid_inputs() {
+        // Wrong length
+        assert!(decode_id("abcd").is_none());
+        assert!(decode_id(&"00".repeat(33)).is_none());
+        // Non-hex characters
+        assert!(decode_id(&"zz".repeat(32)).is_none());
+        // Empty
+        assert!(decode_id("").is_none());
+    }
+
+    #[test]
+    fn test_tips_to_parents_uses_tips_as_parents() {
+        let tip1: TransactionId = [1u8; 32];
+        let tip2: TransactionId = [2u8; 32];
+        let tips = serde_json::json!([encode_id(&tip1), encode_id(&tip2), encode_id(&[3u8; 32]),]);
+        let array = tips.as_array().unwrap();
+        let parents = tips_to_parents(array).expect("valid tips must parse");
+        assert_eq!(parents, [tip1, tip2]);
+    }
+
+    #[test]
+    fn test_tips_to_parents_empty_is_genesis() {
+        let parents = tips_to_parents(&[]).expect("empty tips is legitimate");
+        assert_eq!(parents, [[0u8; 32]; 2]);
+    }
+
+    #[test]
+    fn test_tips_to_parents_rejects_numeric_arrays() {
+        // The V-20 bug: a node returning raw byte arrays. This MUST be an
+        // error so a client can never accidentally use genesis parents.
+        let tips = serde_json::json!([[32, 219, 13, 5]]);
+        let array = tips.as_array().unwrap();
+        assert!(tips_to_parents(array).is_err());
+    }
+
+    #[test]
+    fn test_tips_to_parents_rejects_malformed_hex() {
+        let tips = serde_json::json!(["not-a-hex-id", encode_id(&[1u8; 32])]);
+        let array = tips.as_array().unwrap();
+        assert!(tips_to_parents(array).is_err());
+    }
+
+    #[test]
+    fn test_tips_to_parents_rejects_non_string() {
+        let tips = serde_json::json!([12345]);
+        let array = tips.as_array().unwrap();
+        assert!(tips_to_parents(array).is_err());
     }
 }

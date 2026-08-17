@@ -16,7 +16,6 @@
 //!
 //! Economic policy: validation → lock → snapshot → mutation → commit → persistence
 
-use crate::consensus::{BlockId, ConsensusState};
 use crate::ledger::Ledger;
 use crate::parent_selection::DAG;
 use crate::rpc::Mempool;
@@ -30,6 +29,10 @@ use tokio::sync::RwLock;
 pub enum ProcessingError {
     /// Validation failed
     ValidationFailed(ValidationError),
+    /// Transaction passed the pure gate (PoW + signature) but its parents are
+    /// not yet in the DAG: the caller may persist it as an orphan and request
+    /// the missing parents over P2P. Carries the missing parent hashes.
+    Orphan(Vec<[u8; 32]>),
     /// Lock acquisition failed
     LockError(String),
     /// Ledger operation failed
@@ -46,6 +49,11 @@ impl std::fmt::Display for ProcessingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProcessingError::ValidationFailed(e) => write!(f, "Validation failed: {}", e),
+            ProcessingError::Orphan(missing) => write!(
+                f,
+                "Transaction has {} missing parent(s) (orphan)",
+                missing.len()
+            ),
             ProcessingError::LockError(e) => write!(f, "Lock error: {}", e),
             ProcessingError::LedgerError(e) => write!(f, "Ledger error: {}", e),
             ProcessingError::DagError(e) => write!(f, "DAG error: {}", e),
@@ -89,22 +97,22 @@ impl TransactionProcessor {
     /// Process a transaction through the secure pipeline
     ///
     /// 🔒 ZERO TRUST PIPELINE:
-    /// 1. validate_full() - All validations before any state access
+    /// 0. Deterministic double-spend resolution (min-id wins, cascade prune + ledger rebuild)
+    /// 1. validate_pure() (PoW + signature gate) then orphan gate (missing
+    ///    parents => ProcessingError::Orphan) then validate_dag() + validate_ledger()
     /// 2. Acquire write locks
     /// 3. Snapshot state for rollback
     /// 4. Apply ledger transfer
     /// 5. Commit nonce atomically
-    /// 6. Add to DAG (validated) - THIS IS THE CONSENSUS CONFIRMATION EVENT
-    /// 7. Apply block reward (with consensus state verification, after DAG confirmation)
-    /// 8. Add to mempool
-    /// 9. Persist state
-    /// 10. Rollback on any error
+    /// 6. Add to DAG (validated) - THE CONSENSUS CONFIRMATION EVENT
+    /// 7. Add to mempool
+    /// 8. Persist state
+    /// 9. Rollback on any error
     ///
-    /// 🔒 CONSENSUS-LINKED REWARD:
-    /// - Block reward uses consensus state (single source of truth for height)
-    /// - No external block_height injection possible
-    /// - Rewards tracked per BlockId (fork-safe, persists across reorgs)
-    /// - Reward only given if block is finalized (has enough confirmations)
+    /// 🪙 MONETARY POLICY: ZERO EMISSION. No rewards are ever minted here.
+    /// The token supply is fixed at genesis and can only decrease via fees
+    /// being burned. There is nothing a caller can supply (no miner address,
+    /// no height, no block id) that would create new tokens.
     ///
     /// This is the ONLY public method that can modify system state
     pub async fn process(
@@ -114,17 +122,100 @@ impl TransactionProcessor {
         ledger: &Arc<RwLock<Ledger>>,
         mempool: &Arc<RwLock<Mempool>>,
         min_fee: u64,
-        miner_address: Option<&[u8; 32]>,
-        consensus_state: &mut ConsensusState,
-        block_id: Option<BlockId>,
     ) -> Result<(), ProcessingError> {
         tracing::info!("🔍 Processing transaction: {}", hex::encode(tx.id));
 
-        // STEP 1: FULL VALIDATION (no state access, no locks)
+        // STEP 0: DETERMINISTIC DOUBLE-SPEND RESOLUTION (NV-09)
+        // If another transaction exists for the same (sender, nonce), the one
+        // with the lexicographically SMALLEST id wins (this is the same rule on
+        // every node, so all nodes converge). If we win, we prune the losing
+        // subtree and rebuild the ledger from the remaining DAG. If we lose,
+        // we reject deterministically. No special-casing for any address.
+        {
+            let dag_read = dag.read().await;
+            if let Some(existing_id) =
+                dag_read.find_sender_nonce_conflict(&tx.sender, tx.account_nonce)
+            {
+                if existing_id <= tx.id {
+                    tracing::warn!(
+                        "⚠️ Sender conflict rejected (existing id {} <= new id {}): {}",
+                        hex::encode(&existing_id[..4]),
+                        hex::encode(&tx.id[..4]),
+                        hex::encode(tx.sender)
+                    );
+                    return Err(ProcessingError::ValidationFailed(
+                        ValidationError::SenderConflict,
+                    ));
+                }
+                drop(dag_read);
+                // V-21 FIX: never destroy a valid transaction for an INVALID
+                // winner. The incoming tx must at least pass pure validation
+                // (PoW, signature, sender-key match) BEFORE we prune anything,
+                // otherwise a malformed tx could knock a valid tx out of the
+                // local DAG and diverge the node from the network.
+                self.validator.validate_pure(&tx)?;
+                tracing::warn!(
+                    "🔄 Resolving sender conflict in favor of {} (pruning {})",
+                    hex::encode(&tx.id[..4]),
+                    hex::encode(&existing_id[..4])
+                );
+                let mut dag_w = match dag.try_write() {
+                    Ok(l) => l,
+                    Err(e) => return Err(ProcessingError::LockError(format!("DAG lock: {}", e))),
+                };
+                let mut ledger_w = match ledger.try_write() {
+                    Ok(l) => l,
+                    Err(e) => {
+                        return Err(ProcessingError::LockError(format!("Ledger lock: {}", e)))
+                    }
+                };
+                let pruned = dag_w.prune_subtree(existing_id);
+                // V-21 FIX: purge the pruned transactions from persistent
+                // storage so they cannot resurrect at the next boot (the boot
+                // rebuild would otherwise become nondeterministic: whichever
+                // of the loser/winner it hits first would win).
+                if let Some(storage) = ledger_w.storage() {
+                    let storage_read = storage.read().await;
+                    for pruned_id in &pruned {
+                        let _ = storage_read.delete_transaction(*pruned_id);
+                    }
+                }
+                ledger_w.rebuild_from_dag(&dag_w);
+            }
+        }
+
+        // STEP 1: PURE VALIDATION — the PoW + signature gate. NO state access,
+        // no locks. This gate MUST pass before anything is parked in the
+        // orphan store (H1): parking unvalidated transactions let anyone fill
+        // disk and memory with garbage and trigger unbounded P2P re-requests.
+        self.validator.validate_pure(&tx)?;
+
+        // STEP 1b: ORPHAN GATE — a transaction whose parents are not yet in
+        // the DAG is not inherently invalid: the parents may simply not have
+        // arrived yet. Return Orphan so the caller (RPC/P2P path) persists it
+        // and re-requests the parents. Only reached after the pure gate above,
+        // so every orphan entry costs the submitter one valid PoW + signature.
+        {
+            let dag_read = dag.read().await;
+            let missing_parents: Vec<[u8; 32]> = tx
+                .parents
+                .iter()
+                .filter(|p| **p != [0u8; 32] && !dag_read.transactions().contains_key(*p))
+                .copied()
+                .collect();
+            if !missing_parents.is_empty() {
+                drop(dag_read);
+                return Err(ProcessingError::Orphan(missing_parents));
+            }
+        }
+
+        // STEP 1c: FULL DAG + LEDGER VALIDATION (read-only, no locks held for
+        // mutation). Same checks as the former validate_full(), minus the
+        // pure checks already performed above.
         let dag_read = dag.read().await;
         let ledger_read = ledger.read().await;
-        self.validator
-            .validate_full(&tx, &*dag_read, &*ledger_read, min_fee)?;
+        self.validator.validate_dag(&tx, &dag_read)?;
+        self.validator.validate_ledger(&tx, &ledger_read, min_fee)?;
         drop(dag_read);
         drop(ledger_read);
 
@@ -152,7 +243,7 @@ impl TransactionProcessor {
         // STEP 3: SNAPSHOT STATE FOR ROLLBACK
         let ledger_snapshot = ledger.clone();
 
-        // STEP 4: APPLY LEDGER TRANSFER
+        // STEP 4: APPLY LEDGER TRANSFER (burns the fee)
         if let Err(e) = ledger.transfer_internal(&tx.sender, &tx.receiver, tx.amount, tx.fee) {
             tracing::error!("❌ Ledger transfer failed: {}", e);
             *ledger = ledger_snapshot;
@@ -165,22 +256,23 @@ impl TransactionProcessor {
             )));
         }
 
-        // STEP 5: COMMIT NONCE ATOMICALLY
-        if let Err(e) = ledger.validate_and_commit_nonce_internal(&tx.sender, tx.account_nonce) {
-            tracing::error!("❌ Nonce commit failed: {}", e);
-            *ledger = ledger_snapshot;
-            drop(ledger);
-            drop(dag);
-            drop(mempool);
-            return Err(ProcessingError::LedgerError(format!(
-                "Nonce commit failed: {}",
-                e
-            )));
+        // STEP 5: COMMIT NONCE (deterministic max, not strict +1)
+        // The strict `last_nonce + 1` rule is arrival-order-dependent: a node
+        // that already processed nonces 4,5,6 would reject a late nonce-3
+        // transaction that another node accepted, permanently diverging the
+        // two DAGs. The ledger nonce is a pure function of the DAG (the boot
+        // rebuild takes the max nonce per sender), so the live ledger must
+        // apply the exact same rule to stay consistent with it.
+        {
+            let current = ledger.get_nonce(&tx.sender);
+            if tx.account_nonce > current {
+                ledger.set_nonce(&tx.sender, tx.account_nonce);
+            }
         }
 
-        // STEP 6: ADD TO DAG (VALIDATED) - THIS IS THE CONSENSUS CONFIRMATION EVENT
-        // 🔒 CRITICAL: Reward is ONLY given after DAG confirmation
-        // 🔒 CRITICAL: This links monetary creation to consensus truth
+        // STEP 6: ADD TO DAG - THE CONSENSUS CONFIRMATION EVENT
+        // The DAG is the single source of truth. Finality is immediate once a
+        // transaction is accepted into the DAG.
         if let Err(e) = dag.add_transaction_validated(tx.clone()) {
             tracing::error!("❌ DAG add failed: {}", e);
             *ledger = ledger_snapshot;
@@ -190,83 +282,14 @@ impl TransactionProcessor {
             return Err(ProcessingError::DagError(format!("DAG add failed: {}", e)));
         }
 
-        // STEP 7: QUEUE BLOCK REWARD IF CONFIGURED (AFTER DAG CONFIRMATION)
-        // 🔒 ECONOMIC POLICY: "No reward without consensus truth"
-        // 🔒 CRITICAL: Reward only given AFTER DAG confirmation (not before)
-        // 🔒 CRITICAL: Uses consensus state (single source of truth for height)
-        // 🔒 CRITICAL: Uses BlockId for fork-safe reward tracking
-        // 🔒 CRITICAL: Rewards are deferred until the block is finalized
-        //   (has enough confirmations) - this is the ONLY way to create new tokens
-        if let Some(validator_addr) = miner_address {
-            // For now, use transaction ID as block ID (in production, this should be the actual block ID)
-            let actual_block_id = block_id.unwrap_or(tx.id);
-
-            // Increment height once per transaction for consensus tracking
-            consensus_state.increment_height();
-            let block_height = consensus_state.get_height();
-
-            // Queue the reward for this block (deferred until finality)
-            let reward = crate::ledger::calculate_reward(block_height);
-            if let Err(e) = consensus_state.queue_pending_reward(
-                actual_block_id,
-                *validator_addr,
-                reward,
-                block_height,
-            ) {
-                tracing::error!(
-                    "❌ Block reward queue failed (after DAG confirmation): {}",
-                    e
-                );
-                return Err(ProcessingError::LedgerError(format!(
-                    "Block reward queue failed after DAG confirmation: {}",
-                    e
-                )));
-            }
-
-            // Settle any previously queued rewards that have now reached finality
-            for (queued_block_id, pending) in consensus_state.finalized_pending_rewards() {
-                match ledger.apply_block_reward(
-                    &pending.validator,
-                    queued_block_id,
-                    pending.block_height,
-                    consensus_state,
-                ) {
-                    Ok(()) => {
-                        consensus_state.mark_block_rewarded(queued_block_id);
-                        consensus_state.settle_pending_reward(&queued_block_id);
-                        tracing::info!(
-                            "💰 Block reward SETTLED after finality: {} units to {} (block {}, height {})",
-                            pending.reward,
-                            hex::encode(pending.validator),
-                            hex::encode(queued_block_id),
-                            pending.block_height
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "❌ Block reward settle failed for block {}: {} (will retry)",
-                            hex::encode(queued_block_id),
-                            e
-                        );
-                    }
-                }
-            }
-            tracing::info!(
-                "💰 Block reward queued AFTER DAG confirmation (block_id: {}, height: {}, reward: {})",
-                hex::encode(actual_block_id),
-                block_height,
-                reward
-            );
-        }
-
-        // STEP 8: ADD TO MEMPOOL
+        // STEP 7: ADD TO MEMPOOL
         match mempool.add_internal(tx.clone()).await {
             Ok(_) => tracing::info!("✅ Transaction added to mempool (fee: {})", tx.fee),
             Err(e) => {
                 tracing::error!("❌ Mempool add failed: {}", e);
                 *ledger = ledger_snapshot;
-                // DAG doesn't support rollback, but transaction was just added
-                // In production, DAG should support rollback or use append-only log
+                // Roll back the DAG entry we just added to keep atomicity.
+                dag.remove_transaction(&tx.id);
                 drop(ledger);
                 drop(dag);
                 drop(mempool);
@@ -277,34 +300,26 @@ impl TransactionProcessor {
             }
         }
 
-        // STEP 9: PERSIST STATE
+        // STEP 8: PERSIST STATE (ledger + transaction in Sled, so the DAG
+        // survives restarts and the boot rebuild is consistent)
         if let Err(e) = ledger.save().await {
             tracing::error!("❌ Persistence failed: {}", e);
-            // State is already modified but not persisted
-            // In production, this should trigger a recovery mechanism
             return Err(ProcessingError::PersistenceError(format!(
                 "Save failed: {}",
                 e
             )));
         }
-
-        // STEP 9b: PERSIST TRANSACTION TO SLED (DAG survives restarts)
-        // 🔧 FIX: The DAG is in-memory only; without this, a hard kill loses the DAG
-        // while the ledger (balances+nonces) survives -> node restarts with an
-        // advanced ledger and an empty DAG, silently rejecting all network txs.
         if let Some(storage) = ledger.storage() {
             let storage_read = storage.read().await;
             if let Err(e) = storage_read.put_transaction(&tx) {
                 tracing::error!("❌ Failed to persist transaction to Sled: {}", e);
-            } else {
-                storage_read.flush().ok();
             }
-            // Persist consensus state (height, rewarded blocks, pending rewards)
-            if let Err(e) = storage_read.put_consensus_state(consensus_state) {
-                tracing::error!("❌ Failed to persist consensus state to Sled: {}", e);
-            } else {
-                storage_read.flush().ok();
-            }
+            // P4: NO per-transaction flush. A synchronous Sled flush (fsync)
+            // per accepted tx cost ~690µs/tx in release (78.6ms vs 9.8ms per
+            // 100 txs). Durability is covered by Sled's internal auto-flush
+            // (~500ms) plus the node's periodic flush (10s) and the shutdown
+            // flush; on a hard kill the boot rebuild reconstructs the ledger
+            // from the DAG (source of truth) in Sled's transactions tree.
         }
 
         tracing::info!(
@@ -324,7 +339,6 @@ impl Default for TransactionProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_processor_valid_transaction() {
@@ -351,20 +365,7 @@ mod tests {
         );
 
         // This should fail signature verification (invalid signature)
-        let mut consensus_state = ConsensusState::new();
-        let block_id = Some([0u8; 32]);
-        let result = processor
-            .process(
-                tx,
-                &dag,
-                &ledger,
-                &mempool,
-                10,
-                None,
-                &mut consensus_state,
-                block_id,
-            )
-            .await;
+        let result = processor.process(tx, &dag, &ledger, &mempool, 10).await;
         assert!(result.is_err());
         // The error should be validation failed (insufficient balance or signature)
         // We just check that it failed, not the specific error type
@@ -394,22 +395,514 @@ mod tests {
             vec![1u8; 64],
         );
 
-        let mut consensus_state = ConsensusState::new();
-        let block_id = Some([0u8; 32]);
-        let result = processor
-            .process(
-                tx,
-                &dag,
-                &ledger,
-                &mempool,
-                10,
-                None,
-                &mut consensus_state,
-                block_id,
-            )
-            .await;
+        let result = processor.process(tx, &dag, &ledger, &mempool, 10).await;
         assert!(result.is_err());
         // The error should be validation failed (insufficient balance or signature)
         // We just check that it failed, not the specific error type
+    }
+
+    /// H1: an orphan requires the pure gate (PoW + signature) BEFORE being
+    /// parked. A garbage transaction with missing parents must be rejected as
+    /// a validation failure, never reported as an orphan — otherwise anyone
+    /// could fill the orphan store (disk + memory) without any work.
+    #[tokio::test]
+    async fn test_orphan_gated_by_pure_validation() {
+        let processor = TransactionProcessor::new();
+        let dag = Arc::new(RwLock::new(DAG::new()));
+        let ledger = Arc::new(RwLock::new(Ledger::new()));
+        let mempool = Arc::new(RwLock::new(Mempool::new(1000, 10)));
+
+        // Missing parents + NO PoW (nonce 0) + NO valid signature.
+        let tx = Transaction::new(
+            [[0xAAu8; 32], [0xBBu8; 32]],
+            [1u8; 32],
+            [2u8; 32],
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+
+        let result = processor.process(tx, &dag, &ledger, &mempool, 10).await;
+        assert!(
+            matches!(result, Err(ProcessingError::ValidationFailed(_))),
+            "garbage orphan must fail pure validation, got {:?}",
+            result
+        );
+        assert!(
+            !matches!(result, Err(ProcessingError::Orphan(_))),
+            "garbage orphan must never be reported as an orphan"
+        );
+    }
+
+    /// H1: a transaction that PASSES the pure gate (valid PoW + signature)
+    /// but references missing parents is returned as Orphan carrying the
+    /// missing parent hashes, so the caller can persist and re-request them.
+    #[tokio::test]
+    async fn test_valid_orphan_returns_missing_parents() {
+        let processor = TransactionProcessor::new();
+        let dag = Arc::new(RwLock::new(DAG::new()));
+        let ledger = Arc::new(RwLock::new(Ledger::new()));
+        let mempool = Arc::new(RwLock::new(Mempool::new(1000, 10)));
+
+        let tx = crate::tests::signed_mined_orphan_tx();
+
+        let result = processor
+            .process(tx.clone(), &dag, &ledger, &mempool, 1000)
+            .await;
+        match result {
+            Err(ProcessingError::Orphan(missing_parents)) => {
+                assert!(
+                    missing_parents.contains(&tx.parents[0]),
+                    "orphan must report the missing parent, got {:?}",
+                    missing_parents
+                );
+            }
+            other => panic!("expected ProcessingError::Orphan, got {:?}", other),
+        }
+    }
+
+    /// S11: double-spend resolution is ORDER-INVARIANT. Two conflicting txs
+    /// (same sender + account_nonce, different receivers), mined + signed,
+    /// processed in EITHER arrival order, must leave the node in the same
+    /// state: the lexicographically smallest id wins, the loser is rejected,
+    /// and the ledger ends identical (prune + rebuild is a pure function of
+    /// the DAG).
+    #[tokio::test]
+    async fn test_double_spend_order_invariance() {
+        use crate::wallet::Wallet;
+        let processor = TransactionProcessor::with_difficulty(1); // trivial PoW
+        let wallet = Wallet::from_secret_key(
+            "6b0d2c3e4f5a60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef",
+        )
+        .expect("fixed test key");
+        let sender = wallet.address();
+        let pk = wallet.public_key_bytes();
+
+        let build_conflict = |receiver: [u8; 32]| {
+            let mut tx = Transaction::new(
+                [[0u8; 32]; 2],
+                sender,
+                receiver,
+                100,
+                10,
+                1234567890,
+                0, // nonce placeholder — mined below
+                1, // same account_nonce for both → double spend
+                vec![0u8; 64],
+                pk.clone(),
+            );
+            tx.nonce = tx.mine_nonce(1);
+            tx.signature = wallet.sign_transaction(&tx).expect("sign");
+            tx.id = tx.compute_hash();
+            assert!(tx.verify_pow(1));
+            assert!(Wallet::verify_transaction(&tx));
+            tx
+        };
+
+        let tx_a = build_conflict([0xAAu8; 32]);
+        let tx_b = build_conflict([0xBBu8; 32]);
+        assert_ne!(tx_a.id, tx_b.id);
+        let (winner, loser) = if tx_a.id <= tx_b.id {
+            (tx_a.clone(), tx_b.clone())
+        } else {
+            (tx_b.clone(), tx_a.clone())
+        };
+
+        // Run the same pair in both arrival orders on fresh state. The sender
+        // is funded THROUGH the DAG (faucet -> sender) so that the prune +
+        // rebuild path (which reseeds strictly from genesis + DAG) keeps the
+        // funding — mirroring production.
+        // Borrow the processor once: the closure + async blocks capture this
+        // shared reference (Copy), keeping the closure Fn for both runs.
+        let processor_ref = &processor;
+        let run = |first: Transaction, second: Transaction, second_is_loser: bool| {
+            let expect_second_ok = !second_is_loser;
+            async move {
+                let dag = Arc::new(RwLock::new(DAG::new()));
+                let ledger = Arc::new(RwLock::new(Ledger::new()));
+                let mempool = Arc::new(RwLock::new(Mempool::new(1000, 10)));
+
+                let faucet = hex::decode(crate::genesis::FAUCET_ADDRESS).unwrap();
+                let faucet: [u8; 32] = faucet.try_into().unwrap();
+                let funding = Transaction::new(
+                    [[0u8; 32]; 2],
+                    faucet,
+                    sender,
+                    1000,
+                    5,
+                    1234567890,
+                    0,
+                    1,
+                    vec![0u8; 64],
+                    vec![1u8; 64],
+                );
+                dag.write()
+                    .await
+                    .add_transaction_validated(funding)
+                    .unwrap();
+                let dag_read = dag.read().await;
+                ledger.write().await.rebuild_from_dag(&dag_read);
+                drop(dag_read);
+                assert_eq!(ledger.read().await.get_balance(&sender), 1000);
+
+                processor_ref
+                    .process(first, &dag, &ledger, &mempool, 10)
+                    .await
+                    .expect("first arrival is accepted");
+                let second_result = processor_ref
+                    .process(second, &dag, &ledger, &mempool, 10)
+                    .await;
+                if expect_second_ok {
+                    assert!(
+                        second_result.is_ok(),
+                        "the winning transaction must be accepted, got {:?}",
+                        second_result
+                    );
+                } else {
+                    assert!(
+                        second_result.is_err(),
+                        "the losing transaction must be rejected, got {:?}",
+                        second_result
+                    );
+                }
+                (dag, ledger)
+            }
+        };
+
+        let (dag_wl, ledger_wl) = run(winner.clone(), loser.clone(), true).await;
+        let (dag_lw, ledger_lw) = run(loser.clone(), winner.clone(), false).await;
+
+        // Identical DAG outcome: funding + exactly the winner, in both orders.
+        {
+            let dag_wl_guard = dag_wl.read().await;
+            let dag_lw_guard = dag_lw.read().await;
+            assert_eq!(
+                dag_wl_guard.transaction_count(),
+                2,
+                "order 1: funding + winner"
+            );
+            assert_eq!(
+                dag_lw_guard.transaction_count(),
+                2,
+                "order 2: funding + winner"
+            );
+            assert!(dag_wl_guard.transactions().contains_key(&winner.id));
+            assert!(dag_lw_guard.transactions().contains_key(&winner.id));
+            assert!(!dag_wl_guard.transactions().contains_key(&loser.id));
+            assert!(!dag_lw_guard.transactions().contains_key(&loser.id));
+            // WEIGHT: identical in both orders too — the DAG maintains it the
+            // same way whichever transaction arrives first. Both roots (winner
+            // and funding have genesis parents) → each subtree = {itself} = 1.
+            assert_eq!(dag_wl_guard.get_transaction(winner.id).unwrap().weight, 1.0);
+            assert_eq!(dag_lw_guard.get_transaction(winner.id).unwrap().weight, 1.0);
+            for (label, guard) in [("order 1", &dag_wl_guard), ("order 2", &dag_lw_guard)] {
+                let funding_weight = guard
+                    .transactions()
+                    .values()
+                    .find(|tx| tx.sender == funding_sender())
+                    .map(|tx| tx.weight)
+                    .unwrap_or(0.0);
+                assert_eq!(funding_weight, 1.0, "{label}: funding weight");
+            }
+        }
+
+        // Identical ledger outcome in both orders.
+        let ledger_wl = ledger_wl.read().await;
+        let ledger_lw = ledger_lw.read().await;
+        assert_eq!(
+            ledger_wl.get_balance(&sender),
+            ledger_lw.get_balance(&sender),
+            "sender balance must be order-invariant"
+        );
+        assert_eq!(
+            ledger_wl.get_balance(&winner.receiver),
+            ledger_lw.get_balance(&winner.receiver),
+            "winner receiver balance must be order-invariant"
+        );
+        assert_eq!(ledger_wl.get_balance(&sender), 1000 - 110);
+        assert_eq!(ledger_wl.get_balance(&winner.receiver), 100);
+        assert_eq!(ledger_wl.get_balance(&loser.receiver), 0);
+    }
+
+    fn funding_sender() -> [u8; 32] {
+        hex::decode(crate::genesis::FAUCET_ADDRESS)
+            .unwrap()
+            .try_into()
+            .unwrap()
+    }
+
+    /// S11 reinforcement (restart/resync dimension): a crash that leaves BOTH
+    /// double-spend candidates — plus a descendant built on the loser — in
+    /// persistent storage must still converge to the same canonical winner at
+    /// boot. The boot path (node.rs) runs `canonical_resolve_conflicts` BEFORE
+    /// the topological rebuild (V-21), then rebuilds the ledger from the
+    /// surviving DAG. This test replays exactly that sequence on a simulated
+    /// crash residue and asserts the outcome is identical to the live
+    /// resolution (winner only, same balances).
+    #[tokio::test]
+    async fn test_boot_rebuild_converges_after_crash_residue() {
+        use crate::parent_selection::canonical_resolve_conflicts;
+        use crate::wallet::Wallet;
+
+        let wallet = Wallet::from_secret_key(
+            "6b0d2c3e4f5a60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef",
+        )
+        .expect("fixed test key");
+        let sender = wallet.address();
+        let pk = wallet.public_key_bytes();
+
+        let build_conflict = |receiver: [u8; 32]| {
+            let mut tx = Transaction::new(
+                [[0u8; 32]; 2],
+                sender,
+                receiver,
+                100,
+                10,
+                1234567890,
+                0,
+                1, // same account_nonce for both = double spend
+                vec![0u8; 64],
+                pk.clone(),
+            );
+            tx.nonce = tx.mine_nonce(1);
+            tx.signature = wallet.sign_transaction(&tx).expect("sign");
+            tx.id = tx.compute_hash();
+            tx
+        };
+
+        let tx_a = build_conflict([0xAAu8; 32]);
+        let tx_b = build_conflict([0xBBu8; 32]);
+        let (winner, loser) = if tx_a.id <= tx_b.id {
+            (tx_a.clone(), tx_b.clone())
+        } else {
+            (tx_b.clone(), tx_a.clone())
+        };
+
+        // Crash residue: a descendant built on the loser before the prune.
+        let mut loser_child = Transaction::new(
+            [loser.id, [0u8; 32]],
+            [0xADu8; 32],
+            [0xACu8; 32],
+            5,
+            5,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 32],
+        );
+        loser_child.nonce = loser_child.mine_nonce(1);
+        loser_child.id = loser_child.compute_hash();
+
+        // Funding tx (faucet -> sender) — present in the residue like S11.
+        let faucet: [u8; 32] = hex::decode(crate::genesis::FAUCET_ADDRESS)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let funding = Transaction::new(
+            [[0u8; 32]; 2],
+            faucet,
+            sender,
+            1000,
+            5,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+
+        let mut residue = vec![
+            funding.clone(),
+            winner.clone(),
+            loser.clone(),
+            loser_child.clone(),
+        ];
+
+        // Boot step 1: canonical resolution (V-21) — pure function of the set.
+        let pruned = canonical_resolve_conflicts(&mut residue);
+        assert!(pruned.contains(&loser.id), "the loser must be pruned");
+        assert!(
+            pruned.contains(&loser_child.id),
+            "the descendant of the loser must be pruned"
+        );
+        assert!(!pruned.contains(&winner.id), "the winner must survive");
+        assert_eq!(residue.len(), 2, "only funding + winner remain");
+
+        // Boot step 2: topological insert + tips rebuild.
+        let mut dag = DAG::new();
+        for tx in &residue {
+            dag.add_transaction_validated(tx.clone()).unwrap();
+        }
+        dag.rebuild_tips();
+
+        // Boot step 3: the ledger is a DERIVED VIEW of the DAG.
+        let mut ledger = Ledger::new();
+        ledger.rebuild_from_dag(&dag);
+
+        assert_eq!(dag.transaction_count(), 2, "funding + winner only");
+        assert!(dag.transactions().contains_key(&winner.id));
+        assert!(!dag.transactions().contains_key(&loser.id));
+        assert!(!dag.transactions().contains_key(&loser_child.id));
+        assert_eq!(
+            ledger.get_balance(&sender),
+            1000 - 110,
+            "same sender balance as the live S11 resolution"
+        );
+        assert_eq!(ledger.get_balance(&winner.receiver), 100);
+        assert_eq!(ledger.get_balance(&loser.receiver), 0);
+        assert_eq!(ledger.get_balance(&loser_child.receiver), 0);
+
+        // WEIGHT: boot rebuild maintains tx.weight exactly like the live path.
+        // The winner and funding are both roots (genesis parents) — each
+        // subtree = {itself} = 1. The pruned loser and its descendant are
+        // gone with their weights — nothing survives the prune.
+        assert_eq!(dag.get_transaction(winner.id).unwrap().weight, 1.0);
+        assert_eq!(dag.get_transaction(funding.id).unwrap().weight, 1.0);
+    }
+
+    /// P4 benchmark harness (run with `cargo test -- --ignored bench_`):
+    /// measures the cost of the STEP 8 persistence path per accepted
+    /// transaction. Before the P4 fix, each accepted tx performed TWO full
+    /// Sled flushes (fsync) plus a full-state ledger rewrite (save writes
+    /// every balance + nonce). The numbers printed are the reference and the
+    /// post-fix regression check.
+    #[ignore]
+    #[tokio::test]
+    async fn bench_sled_persistence_per_transaction() {
+        use crate::storage::Storage;
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(RwLock::new(Storage::open(dir.path().join("sled")).unwrap()));
+        let ledger = Arc::new(RwLock::new(
+            Ledger::new_with_storage(storage.clone()).await.unwrap(),
+        ));
+        let dag = Arc::new(RwLock::new(DAG::new()));
+        // Large mempool: the bench measures the STORAGE path, not the
+        // 1000-entry mempool eviction policy.
+        let mempool = Arc::new(RwLock::new(Mempool::new(100_000, 10)));
+        let processor = TransactionProcessor::with_difficulty(1);
+
+        // Fund one sender through the real DAG -> ledger path.
+        let wallet = crate::wallet::Wallet::from_secret_key(
+            "6b0d2c3e4f5a60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef",
+        )
+        .expect("fixed test key");
+        let sender = wallet.address();
+        let pk = wallet.public_key_bytes();
+        let faucet: [u8; 32] = hex::decode(crate::genesis::FAUCET_ADDRESS)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let funding = Transaction::new(
+            [[0u8; 32]; 2],
+            faucet,
+            sender,
+            100_000_000,
+            5,
+            0,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+        dag.write()
+            .await
+            .add_transaction_validated(funding.clone())
+            .unwrap();
+        let dag_read = dag.read().await;
+        ledger.write().await.rebuild_from_dag(&dag_read);
+        drop(dag_read);
+
+        let build_tx = |account_nonce: u64| {
+            let mut tx = Transaction::new(
+                [[0u8; 32]; 2],
+                sender,
+                [0x77u8; 32],
+                100,
+                10,
+                0,
+                0,
+                account_nonce,
+                vec![0u8; 64],
+                pk.clone(),
+            );
+            tx.nonce = tx.mine_nonce(1);
+            tx.signature = wallet.sign_transaction(&tx).expect("sign");
+            tx.id = tx.compute_hash();
+            tx
+        };
+
+        let mut nonce_counter: u64 = 0;
+        // Isolate phase costs on a fresh state with the first 100 txs.
+        let probe_txs: Vec<Transaction> = (0..100)
+            .map(|_| {
+                nonce_counter += 1;
+                build_tx(nonce_counter)
+            })
+            .collect();
+        let mut t = Instant::now();
+        for tx in &probe_txs {
+            assert!(tx.verify_pow(1));
+        }
+        println!("P4 micro: verify_pow x100 -> {:?}", t.elapsed());
+        t = Instant::now();
+        for tx in &probe_txs {
+            assert!(crate::wallet::Wallet::verify_transaction(tx));
+        }
+        println!("P4 micro: verify_transaction x100 -> {:?}", t.elapsed());
+        t = Instant::now();
+        for tx in &probe_txs {
+            processor.validator.validate_pure(tx).unwrap();
+        }
+        println!("P4 micro: validate_pure x100 -> {:?}", t.elapsed());
+        t = Instant::now();
+        for tx in &probe_txs {
+            let d = dag.read().await;
+            let l = ledger.read().await;
+            processor.validator.validate_dag(tx, &d).unwrap();
+            processor.validator.validate_ledger(tx, &l, 10).unwrap();
+        }
+        println!("P4 micro: validate_dag+ledger x100 -> {:?}", t.elapsed());
+        t = Instant::now();
+        for tx in &probe_txs {
+            if let Err(e) = processor
+                .process(tx.clone(), &dag, &ledger, &mempool, 10)
+                .await
+            {
+                panic!("tx rejected: {}", e);
+            }
+        }
+        println!("P4 micro: full process x100 -> {:?}", t.elapsed());
+        for &n in &[1000usize, 10000] {
+            // Build all txs up front so mining/signing cost is measured apart.
+            let t_build = Instant::now();
+            let txs: Vec<Transaction> = (0..n)
+                .map(|_| {
+                    nonce_counter += 1;
+                    build_tx(nonce_counter)
+                })
+                .collect();
+            let build_elapsed = t_build.elapsed();
+            let t0 = Instant::now();
+            for tx in &txs {
+                if let Err(e) = processor
+                    .process(tx.clone(), &dag, &ledger, &mempool, 10)
+                    .await
+                {
+                    panic!("tx rejected: {}", e);
+                }
+            }
+            let elapsed = t0.elapsed();
+            println!(
+                "P4 bench: {n} txs -> process {elapsed:?} ({:.0} tps), build {build_elapsed:?}",
+                n as f64 / elapsed.as_secs_f64()
+            );
+        }
     }
 }

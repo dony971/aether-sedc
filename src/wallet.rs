@@ -2,10 +2,15 @@
 //!
 //! Provides cryptographic key generation, signing, and verification for transactions.
 //! Uses Ed25519 for digital signatures with BIP39 mnemonic support.
+//!
+//! Wallet files are ALWAYS encrypted at rest with Argon2id (password-based KDF)
+//! and a single AES-256-GCM payload (secret key + mnemonic share one fresh
+//! 96-bit nonce). Plaintext wallet files are never written.
 
 use crate::transaction::{Address, Transaction};
 use aes_gcm::aead::{Aead, NewAead};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
+use argon2::{Algorithm, Argon2, Params, Version};
 use bip39::{Language, Mnemonic};
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::VerifyingKey;
@@ -19,7 +24,7 @@ use std::path::Path;
 use tokio::fs;
 
 /// Convert public key to human-readable address with checksum
-/// Format: AETH<base58_encoded_public_key><checksum>
+/// Format: AETH<hex_encoded_public_key_20_bytes><checksum_4_bytes>
 pub fn public_key_to_address(public_key: &[u8]) -> String {
     // Use first 20 bytes of public key for shorter address
     let key_bytes = &public_key[..20.min(public_key.len())];
@@ -67,19 +72,58 @@ pub fn verify_address_checksum(address: &str) -> bool {
     checksum == expected_checksum
 }
 
-/// Encrypted wallet structure for secure storage
+/// Wallet payload that is encrypted (secret key + mnemonic in ONE payload so
+/// the AES-GCM nonce is never reused across ciphertexts).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WalletPayload {
+    secret_key_hex: String,
+    mnemonic: Option<String>,
+}
+
+/// Encrypted wallet structure for secure storage (v2: Argon2id + single payload)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedWallet {
-    /// Encrypted secret key
-    pub encrypted_secret: String,
-    /// Salt for key derivation
+    /// Format version (2 = Argon2id, single payload)
+    pub version: u32,
+    /// KDF name ("argon2id")
+    pub kdf: String,
+    /// Salt for key derivation (hex)
     pub salt: String,
-    /// Nonce for AES-GCM
+    /// Fresh nonce for AES-GCM (hex, 12 bytes)
     pub nonce: String,
     /// Public key (not encrypted, for address derivation)
     pub public_key_hex: String,
-    /// BIP39 mnemonic (encrypted)
-    pub encrypted_mnemonic: String,
+    /// Single encrypted payload: WalletPayload JSON (hex)
+    pub payload: String,
+}
+
+/// Legacy v1 wallet format (PBKDF2, dual payload). Read-only, for migration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyEncryptedWallet {
+    encrypted_secret: String,
+    salt: String,
+    nonce: String,
+    public_key_hex: String,
+    encrypted_mnemonic: String,
+}
+
+/// Argon2id parameters (OWASP-recommended for 2023+: 64 MiB, t=3, p=1)
+const ARGON2_M_COST: u32 = 65_536;
+const ARGON2_T_COST: u32 = 3;
+const ARGON2_P_COST: u32 = 1;
+const KDF_SALT_LEN: usize = 16;
+const AES_NONCE_LEN: usize = 12;
+
+/// Derive a 256-bit encryption key from a password using Argon2id
+fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
+        .map_err(|e| format!("Argon2 params error: {}", e))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = [0u8; 32];
+    argon2
+        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .map_err(|e| format!("Argon2id key derivation failed: {}", e))?;
+    Ok(key)
 }
 
 /// Wallet structure holding the keypair
@@ -113,11 +157,11 @@ impl Wallet {
         let mut entropy = [0u8; 16]; // 128 bits for 12 words
         rand::rngs::OsRng.fill_bytes(&mut entropy);
 
-        // Generate mnemonic from entropy
-        let mnemonic = Mnemonic::from_entropy(&entropy).unwrap_or_else(|_| {
-            // Fallback: generate a simple mnemonic if entropy fails
-            Mnemonic::from_entropy(&[0u8; 16]).unwrap()
-        });
+        // Generate mnemonic from entropy. H8: 128 bits is always a valid BIP39
+        // length — a failure here is a library bug, never a reason to fall
+        // back to zero entropy (which would mint a PREDICTABLE keypair).
+        let mnemonic = Mnemonic::from_entropy(&entropy)
+            .expect("128-bit entropy is always a valid BIP39 mnemonic");
         let mnemonic_phrase = mnemonic.to_string();
 
         // Derive seed from mnemonic using BIP39
@@ -172,77 +216,104 @@ impl Wallet {
         })
     }
 
-    /// Encrypt wallet with password
+    /// Encrypt wallet with password (Argon2id + AES-256-GCM, single payload)
     pub fn encrypt(&self, password: &str) -> Result<EncryptedWallet, Box<dyn std::error::Error>> {
-        // Generate salt
-        let mut salt = [0u8; 16];
+        if password.is_empty() {
+            return Err("Password must not be empty".into());
+        }
+
+        // Generate fresh salt and derive the encryption key
+        let mut salt = [0u8; KDF_SALT_LEN];
         OsRng.fill_bytes(&mut salt);
+        let key_bytes = derive_key(password, &salt)?;
 
-        // Derive key from password using PBKDF2
-        let mut key_bytes = [0u8; 32];
-        let iterations: u32 = 100_000;
-        pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, iterations, &mut key_bytes);
-
-        // Generate nonce
-        let mut nonce_bytes = [0u8; 12];
+        // Generate a FRESH nonce for this encryption (never reused)
+        let mut nonce_bytes = [0u8; AES_NONCE_LEN];
         OsRng.fill_bytes(&mut nonce_bytes);
 
-        // Encrypt secret key
-        let key = Key::from_slice(&key_bytes);
-        let cipher = Aes256Gcm::new(key);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        // Single payload: secret key + mnemonic encrypted together
+        let payload = WalletPayload {
+            secret_key_hex: self.secret_key_hex.clone(),
+            mnemonic: self.mnemonic.clone(),
+        };
+        let payload_bytes = serde_json::to_vec(&payload)?;
 
-        let secret_bytes = hex::decode(&self.secret_key_hex)?;
-        let encrypted_secret = cipher
-            .encrypt(nonce, secret_bytes.as_ref())
+        let cipher = Aes256Gcm::new(Key::from_slice(&key_bytes));
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let encrypted = cipher
+            .encrypt(nonce, payload_bytes.as_ref())
             .map_err(|e| format!("Encryption failed: {}", e))?;
 
-        // Encrypt mnemonic if present
-        let encrypted_mnemonic = if let Some(ref mnemonic) = self.mnemonic {
-            cipher
-                .encrypt(nonce, mnemonic.as_bytes())
-                .map_err(|e| format!("Mnemonic encryption failed: {}", e))?
-        } else {
-            vec![]
-        };
-
         Ok(EncryptedWallet {
-            encrypted_secret: hex::encode(encrypted_secret),
+            version: 2,
+            kdf: "argon2id".to_string(),
             salt: hex::encode(salt),
             nonce: hex::encode(nonce_bytes),
             public_key_hex: self.public_key_hex.clone(),
-            encrypted_mnemonic: hex::encode(encrypted_mnemonic),
+            payload: hex::encode(encrypted),
         })
     }
 
-    /// Decrypt wallet with password
+    /// Decrypt wallet with password (Argon2id + AES-256-GCM, single payload)
     pub fn decrypt(
         encrypted: &EncryptedWallet,
         password: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Derive key from password
+        if encrypted.version != 2 || encrypted.kdf != "argon2id" {
+            return Err(format!(
+                "Unsupported wallet format (version={}, kdf={})",
+                encrypted.version, encrypted.kdf
+            )
+            .into());
+        }
+
+        let salt = hex::decode(&encrypted.salt)?;
+        let key_bytes = derive_key(password, &salt)?;
+
+        let nonce_bytes = hex::decode(&encrypted.nonce)?;
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let encrypted_payload = hex::decode(&encrypted.payload)?;
+        let cipher = Aes256Gcm::new(Key::from_slice(&key_bytes));
+        let payload_bytes = cipher
+            .decrypt(nonce, encrypted_payload.as_ref())
+            .map_err(|_| "Decryption failed: wrong password or corrupted file")?;
+
+        let payload: WalletPayload = serde_json::from_slice(&payload_bytes)?;
+
+        Ok(Wallet {
+            public_key_hex: encrypted.public_key_hex.clone(),
+            secret_key_hex: payload.secret_key_hex,
+            mnemonic: payload.mnemonic,
+        })
+    }
+
+    /// Decrypt a legacy v1 wallet (PBKDF2, dual payload) — migration support.
+    /// Nonce reuse existed in v1 (same nonce for both payloads); v1 files are
+    /// only accepted for reading so they can be re-encrypted as v2.
+    fn decrypt_legacy(
+        encrypted: &LegacyEncryptedWallet,
+        password: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let salt = hex::decode(&encrypted.salt)?;
         let mut key_bytes = [0u8; 32];
         let iterations: u32 = 100_000;
         pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, iterations, &mut key_bytes);
 
-        // Decrypt secret key
-        let key = Key::from_slice(&key_bytes);
-        let cipher = Aes256Gcm::new(key);
         let nonce_bytes = hex::decode(&encrypted.nonce)?;
         let nonce = Nonce::from_slice(&nonce_bytes);
+        let cipher = Aes256Gcm::new(Key::from_slice(&key_bytes));
 
         let encrypted_secret = hex::decode(&encrypted.encrypted_secret)?;
         let secret_bytes = cipher
             .decrypt(nonce, encrypted_secret.as_ref())
-            .map_err(|e| format!("Decryption failed: {}", e))?;
+            .map_err(|_| "Decryption failed: wrong password or corrupted file")?;
 
-        // Decrypt mnemonic if present
         let mnemonic = if !encrypted.encrypted_mnemonic.is_empty() {
             let encrypted_mnemonic = hex::decode(&encrypted.encrypted_mnemonic)?;
             let mnemonic_bytes = cipher
                 .decrypt(nonce, encrypted_mnemonic.as_ref())
-                .map_err(|e| format!("Mnemonic decryption failed: {}", e))?;
+                .map_err(|_| "Decryption failed: wrong password or corrupted file")?;
             Some(String::from_utf8(mnemonic_bytes)?)
         } else {
             None
@@ -255,41 +326,39 @@ impl Wallet {
         })
     }
 
-    /// Load wallet from a file (encrypted)
+    /// Load wallet from a file (encrypted, v2 or legacy v1)
     pub async fn from_file<P: AsRef<Path>>(
         path: P,
         password: Option<&str>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let content = fs::read_to_string(path).await?;
 
-        // Try to load as encrypted wallet first
         if let Ok(encrypted) = serde_json::from_str::<EncryptedWallet>(&content) {
-            if let Some(pwd) = password {
-                return Self::decrypt(&encrypted, pwd);
-            } else {
-                return Err("Password required for encrypted wallet".into());
-            }
+            let pwd = password.ok_or("Password required for encrypted wallet")?;
+            return Self::decrypt(&encrypted, pwd);
         }
 
-        // Fallback to unencrypted wallet (legacy)
-        let wallet: Wallet = serde_json::from_str(&content)?;
-        Ok(wallet)
+        // Legacy v1 wallet (PBKDF2) — accept for migration, never written.
+        if let Ok(legacy) = serde_json::from_str::<LegacyEncryptedWallet>(&content) {
+            let pwd = password.ok_or("Password required for encrypted wallet")?;
+            return Self::decrypt_legacy(&legacy, pwd);
+        }
+
+        Err("Unsupported or corrupted wallet file".into())
     }
 
-    /// Save wallet to a file (encrypted if password provided)
+    /// Save wallet to a file. A password is REQUIRED: wallets are never
+    /// persisted in plaintext (secret keys stay encrypted at rest).
     pub async fn to_file<P: AsRef<Path>>(
         &self,
         path: P,
         password: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(pwd) = password {
-            let encrypted = self.encrypt(pwd)?;
-            let content = serde_json::to_string_pretty(&encrypted)?;
-            fs::write(path, content).await?;
-        } else {
-            let content = serde_json::to_string_pretty(self)?;
-            fs::write(path, content).await?;
-        }
+        let pwd = password
+            .ok_or("A password is required to save a wallet (plaintext storage is disabled)")?;
+        let encrypted = self.encrypt(pwd)?;
+        let content = serde_json::to_string_pretty(&encrypted)?;
+        fs::write(path, content).await?;
         Ok(())
     }
 
@@ -419,10 +488,10 @@ mod tests {
         let path = "test_wallet.json";
 
         wallet
-            .to_file(path, None)
+            .to_file(path, Some("correct horse battery staple"))
             .await
             .expect("Failed to save wallet");
-        let loaded = Wallet::from_file(path, None)
+        let loaded = Wallet::from_file(path, Some("correct horse battery staple"))
             .await
             .expect("Failed to load wallet");
 
@@ -431,6 +500,52 @@ mod tests {
 
         // Cleanup
         tokio::fs::remove_file(path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_plaintext_save_rejected() {
+        let wallet = Wallet::new();
+        let path = "test_wallet_plaintext_rejected.json";
+
+        // Saving WITHOUT a password must fail: no plaintext storage allowed.
+        let result = wallet.to_file(path, None).await;
+        assert!(result.is_err());
+        assert!(!tokio::fs::try_exists(path).await.unwrap_or(false));
+
+        tokio::fs::remove_file(path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_wrong_password_rejected() {
+        let wallet = Wallet::new();
+        let path = "test_wallet_wrong_pwd.json";
+
+        wallet
+            .to_file(path, Some("good-password-123"))
+            .await
+            .expect("Failed to save wallet");
+
+        let result = Wallet::from_file(path, Some("wrong-password")).await;
+        assert!(result.is_err());
+
+        tokio::fs::remove_file(path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_encrypt_single_payload_and_fresh_nonce() {
+        let wallet = Wallet::new_with_mnemonic();
+
+        // Nonce must be fresh on every encryption (no reuse across saves).
+        let e1 = wallet.encrypt("pwd-1").unwrap();
+        let e2 = wallet.encrypt("pwd-1").unwrap();
+        assert_ne!(e1.nonce, e2.nonce);
+        assert_ne!(e1.salt, e2.salt);
+        assert_ne!(e1.payload, e2.payload);
+
+        // Secret + mnemonic live in ONE payload.
+        let d = Wallet::decrypt(&e1, "pwd-1").unwrap();
+        assert_eq!(d.secret_key_hex, wallet.secret_key_hex);
+        assert_eq!(d.mnemonic, wallet.mnemonic);
     }
 
     #[test]
@@ -482,12 +597,12 @@ mod tests {
 
         // Save wallet
         wallet
-            .to_file(path, None)
+            .to_file(path, Some("pwd-with-persistence"))
             .await
             .expect("Failed to save wallet");
 
         // Load wallet
-        let loaded_wallet = Wallet::from_file(path, None)
+        let loaded_wallet = Wallet::from_file(path, Some("pwd-with-persistence"))
             .await
             .expect("Failed to load wallet");
 
@@ -527,12 +642,12 @@ mod tests {
 
         // Save wallet
         wallet
-            .to_file(path, None)
+            .to_file(path, Some("pwd-loop"))
             .await
             .expect("Failed to save wallet");
 
         // Load wallet
-        let loaded_wallet = Wallet::from_file(path, None)
+        let loaded_wallet = Wallet::from_file(path, Some("pwd-loop"))
             .await
             .expect("Failed to load wallet");
 
