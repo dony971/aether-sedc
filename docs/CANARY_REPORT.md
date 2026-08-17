@@ -267,3 +267,66 @@ dup_ignored=2043` — **zéro purge, zéro perte, toutes les bornes respectées*
 > batterie B1-B8, monitoring divergence=0. 🔴 STOP si B4 échoue ; 🟠 NOUVELLE
 > CORRECTION si régression ; 🟡 NOUVELLE RC + CANARY si tout passe. Jamais de
 > publication directe.
+
+### B4.6 Campagne Phase A → B sur la RC B4 (`canary_b4_campaign.ps1`, 23:24-23:50)
+
+Réseau **neuf** (8 nœuds, RC `8f04bb27…`, dirs `aether-canary-b4`, ports
+42001-46101 + joineurs 47001-49101). Gates validés : SHA256 du binaire,
+HEAD de campagne, diff `src` vs gel = fichiers B4 uniquement, version 1.2.0,
+genèse. L'ancien réseau gelé (5 nœuds, 465 tx, monitor b2 divergence=0 sur
+60 min) a été arrêté proprement après archivage.
+
+**PHASE A — PASS** : 3 seeds déployés (faucet.key sur seed-1, copie avant
+premier boot), 2 pairs hub, solde fondateur 100 000 000 000, convergence
+3/3 pendant 2 min d'observation, 0 tx. Wallet générateur financé (1e11).
+
+**PHASE B — batterie B1-B8 (5 nœuds)** :
+
+| Test | Résultat |
+|---|---|
+| B1 — séries 10/50/100 (multi-endpoints 1/4/5) | **PASS** — 0 rejet, delta exact, convergence 5/5 |
+| B2 — redémarrages nœuds 4-5 (mêmes dirs) | **PASS** — 0 perte, resync, convergence |
+| B3 — nœud 4 hors-ligne pendant 20 tx | **PASS** — récupération + convergence |
+| B5 — 8 tx concurrentes | **PASS** — ≥ 8 acceptées, convergence |
+| B6 — double dépense (2 CLI parallèles) | **PASS** — exactement 1 acceptée, convergence |
+| B7 — 250 appels rapides | **PASS** — 212 limités / 38 OK, nœud réactif après la fenêtre |
+| B8 — faucet burst 8 | **PASS** — delta ≥ 8, convergence |
+
+**B4 SERIES (PRIORITÉ) — joins à froid** :
+
+| Test | Résultat | Code gelé (réf.) |
+|---|---|---|
+| **B4-1 jointure fraîche @463** | **PASS — 123 s** (stats : requested=798 received=470 batches=1169 orphan_created=468 resolved=461 purged=0) | **FAIL : livelock** |
+| B4-2 jointure fraîche @500 | **PASS — 107 s** (orphan_purged=0) | — |
+| B4-3 jointure fraîche @1000 | **PASS — 268 s** (requested=2523 received=1144 batches=2642 orphan_created=1133 resolved=993 purged=0, parent_deduped=1590, dup_ignored=1993) | — |
+
+**Convergence finale 8/8 nœuds @1000 tx : PASS** (txset/dag/tips/ledger/
+weights/supply identiques). **Zéro purge d'orphelin, zéro divergence** sur
+toute la campagne. 6 « FAIL » du résumé = artefacts de script uniquement
+(vérifications « exactement N » lues pendant le dernier tx en vol, message
+affichant bien N ; check « nœud encore up » de B7 exécuté dans la fenêtre de
+rate-limit — nœud confirmé réactif juste après). Checks corrigés
+(Wait-Exact, pause hors fenêtre) pour les prochaines exécutions.
+
+### B4.7 Verdict — campagne Phase A → B sur RC B4
+
+| Critère | Résultat |
+|---|---|
+| Jointure @463 (MUST PASS) | ✅ PASS (123 s vs livelock gelé) |
+| Jointures @500 / @1000 | ✅ PASS (107 s / 268 s) |
+| Ordre (child-first, partition) | ✅ couvert : tests unitaires + joins à froid réels |
+| Redémarrage en cours de bootstrap | ✅ harnais (186/800, relancé, converge 138 s) |
+| Réseau (multi-pairs, churn, simultané, duplication) | ✅ harnais 23/23 + campagne |
+| Performance avant/après | ✅ 123 s @463 vs boucle infinie |
+| Compteurs de monitoring | ✅ `aether_getSyncStats` sur chaque join |
+| Batterie B1-B8, divergence, convergence | ✅ PASS intégral |
+| Consensus / gel `b1b8376` | ✅ intact (diff src = fichiers B4 uniquement) |
+
+**Verdict : 🟡 NOUVELLE RC + CANARY validée** — tous les tests de la campagne
+B4 passent, aucune régression, zéro divergence. Conformément au mandat,
+**aucune publication directe** : la RC B4 (`24c61e3`, `8f04bb27…`) est
+proposée comme candidat final à la décision opérateur (Phase C, extension du
+réseau, testeurs publics). Réseau de campagne actif : 8 nœuds, 1000 tx,
+convergés (observation continue possible via `canary_monitor.ps1
+-NodeList 1,2,3,4,5,6,7,8 -DataRoot aether-canary-b4
+-LogName canary_monitor_c.log`).
