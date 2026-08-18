@@ -330,3 +330,14 @@ réseau, testeurs publics). Réseau de campagne actif : 8 nœuds, 1000 tx,
 convergés (observation continue possible via `canary_monitor.ps1
 -NodeList 1,2,3,4,5,6,7,8 -DataRoot aether-canary-b4
 -LogName canary_monitor_c.log`).
+
+## C.1 — Phase C (testnet contrôlé) — RÉSULTAT : 🔴 STOP (nouvelle RC)
+
+Le rapport complet est dans `docs/PHASE_C_REPORT.md` (12 sections du mandat)
+et le registre des incidents dans `docs/PHASE_C_INCIDENTS.md`. En bref :
+portes release/réseau PASS, testeurs 10 nœuds PASS, tests utilisateurs PASS
+(faucet substitué), charge 100/500/1000 PASS, charges 2500/5000/10000
+INATTEIGNABLES et bootstrap bloqué au-delà de ~1000 tx (plafond du mempool à
+1000, jamais drainé ; join @1100 figé à 1012/1100, 42 min, livelock Orphan
+Solver, purges d'orphelins > 0). 0 divergence, 0 perte, 0 crash. Décision
+opérateur requise.
