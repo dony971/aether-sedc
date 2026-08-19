@@ -15,10 +15,11 @@ use axum::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Semaphore};
 use tower_http::cors::CorsLayer;
 
@@ -41,6 +42,22 @@ const MAX_RPC_TX_SIZE: usize = 1024 * 1024;
 /// stored AFTER the pure validation gate (PoW + signature), but the store
 /// must still be bounded so a determined attacker cannot grow it forever.
 const MAX_ORPHANS: usize = 50_000;
+
+/// PHASE D (mempool correction): a queued transaction that cannot reach a
+/// terminal disposition within this TTL is dropped from the queue. Retries
+/// (requeue after transient failures) are therefore ALWAYS bounded — a stuck
+/// transaction can never live in the queue forever (mandate §5).
+const MEMPOOL_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// PHASE D: bounded LRU of permanently rejected transaction ids. A rejected
+/// tx is never retried in a loop, but a long-forgotten id can be re-submitted
+/// after the cache rotates (no infinite retries, no permanent ban) (mandate §5).
+const MEMPOOL_REJECT_CACHE: usize = 1000;
+
+/// PHASE D: maximum transactions selected per drain cycle. The drainer runs
+/// every ~150 ms, so a full 1000-slot queue empties in ~1.5 s of SELECT time
+/// (each cycle also covers a full drain of the pool under sustained load).
+const MEMPOOL_DRAIN_BATCH: usize = 100;
 
 impl RateLimiter {
     pub fn new(max_requests: u32, window_secs: u64) -> Self {
@@ -368,14 +385,95 @@ pub struct AccountNonceResponse {
     pub next_nonce: u64,
 }
 
+/// PHASE D: mempool lifecycle counters (mandate §5 observability). Every
+/// queue event is counted; the node drainer task logs them every 5 s and
+/// exposes them via aether_getMempoolStats + /metrics, so the drain is
+/// provable: mempool ↑ → selection → inclusion → mempool ↓.
+#[derive(Debug, Default)]
+pub struct MempoolStats {
+    /// Transactions accepted into the pending queue
+    pub added: AtomicU64,
+    /// Transactions removed from the queue (any terminal disposition)
+    pub removed: AtomicU64,
+    /// Transactions included in the DAG (or already there as duplicates)
+    pub included: AtomicU64,
+    /// Transactions permanently rejected (invalid, or capacity backpressure)
+    pub rejected: AtomicU64,
+    /// Transactions dropped by TTL expiry
+    pub expired: AtomicU64,
+    /// Duplicate attempts (already in queue / DAG / reject cache)
+    pub duplicate: AtomicU64,
+    /// Transactions parked as orphans (missing parents at SELECT time)
+    pub orphan_parked: AtomicU64,
+    /// Orphans re-accepted into the queue after their parents arrived
+    pub orphan_resolved: AtomicU64,
+}
+
+/// PHASE D: terminal disposition of a drained transaction. Every selected tx
+/// reaches exactly ONE disposition per cycle; requeue (transient failure) is
+/// bounded by the TTL (mandate §5: retries never grow infinitely).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MempoolDisposition {
+    /// The tx reached the DAG — its final state IS the DAG (a duplicate of an
+    /// already-accepted tx is counted as included, not as a failure)
+    Included,
+    /// Permanently invalid (bad PoW/signature, sender conflict, double spend,
+    /// overflow, insufficient fee, impossible nonce): rejected once, cached
+    Rejected,
+    /// Missing parents at SELECT time: parked out of the queue as an orphan
+    OrphanParked,
+    /// TTL expired before any disposition
+    Expired,
+}
+
+/// PHASE D: snapshot of the mempool queue + lifecycle counters
+/// (aether_getMempoolStats)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MempoolStatsResponse {
+    pub size: u64,
+    pub max_size: u64,
+    pub min_fee: u64,
+    pub added: u64,
+    pub removed: u64,
+    pub included: u64,
+    pub rejected: u64,
+    pub expired: u64,
+    pub duplicate: u64,
+    pub orphan_parked: u64,
+    pub orphan_resolved: u64,
+}
+
 /// Mempool for transaction queuing with economic priority
 /// Economic policy: transactions are prioritized by fee rate (fee per unit of work)
+///
+/// PHASE D (mempool correction): the mempool is a REAL PENDING QUEUE with the
+/// lifecycle ACCEPT → QUEUE → SELECT → PROCESS → INCLUDE → REMOVE. It can
+/// never deadlock the network: a full queue is transient (the drainer empties
+/// it), the DAG add is never rolled back because of the queue (the processor
+/// STEP 7 now removes instead of adding), and every queued transaction reaches
+/// a terminal disposition: DAG-included, rejected once (bounded cache), parked
+/// as orphan, or TTL-expired. `max_size` is a backpressure bound ONLY — the
+/// Phase C dead-end (a never-drained 1000-tx window blocking DAG growth,
+/// bootstrap and the faucet) is gone.
 pub struct Mempool {
     queue: VecDeque<Transaction>,
+    /// PHASE D: ids currently SELECTed (in-flight in the drainer) but not yet
+    /// disposed. SELECT removes the tx from the queue; a terminal disposition
+    /// is counted exactly once per lifecycle (queued OR in-flight), so the
+    /// counters stay exact and `dispose` is idempotent.
+    in_flight: HashSet<TransactionId>,
+    /// Enqueue timestamp per tx id (TTL / expiry). Survives SELECT so a
+    /// requeued tx keeps its ORIGINAL deadline — retries stay bounded.
+    enqueued_at: HashMap<TransactionId, Instant>,
+    /// Bounded LRU of permanently rejected tx ids (no infinite retries)
+    recent_rejects: VecDeque<TransactionId>,
+    recent_rejects_set: HashSet<TransactionId>,
     max_size: usize,
     semaphore: Arc<Semaphore>,
     /// Minimum fee required for a transaction to be accepted
     min_fee: u64,
+    /// PHASE D: lifecycle counters (mandate §5 observability)
+    pub stats: MempoolStats,
 }
 
 impl Mempool {
@@ -383,9 +481,14 @@ impl Mempool {
     pub fn new(max_size: usize, max_concurrent: usize) -> Self {
         Self {
             queue: VecDeque::with_capacity(max_size),
+            in_flight: HashSet::new(),
+            enqueued_at: HashMap::new(),
+            recent_rejects: VecDeque::new(),
+            recent_rejects_set: HashSet::new(),
             max_size,
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             min_fee: 1, // Minimum fee of 1 unit (anti-spam)
+            stats: MempoolStats::default(),
         }
     }
 
@@ -399,40 +502,145 @@ impl Mempool {
         self.min_fee
     }
 
-    /// Add transaction to mempool with economic validation
-    /// Economic policy: transaction must meet minimum fee requirement
-    /// When mempool is full, lower-fee transactions may be evicted to make room for higher-fee ones
-    /// Add transaction to mempool (INTERNAL USE ONLY)
-    /// 🔒 ZERO TRUST: This method is private. Use TransactionProcessor for all mempool operations.
-    pub async fn add_internal(&mut self, tx: Transaction) -> Result<(), RpcError> {
+    /// PHASE D: enqueue a transaction into the pending queue (QUEUE step).
+    /// Gate order: fee (economic) → permanent-reject cache → in-queue dedup
+    /// → capacity (backpressure, TRANSIENT: the drainer empties the queue).
+    /// The pure gate (PoW + signature) and the in-DAG dedup run in the accept
+    /// funnel BEFORE this (they need the DAG read lock). `min_fee` is the
+    /// accept-time oracle gate (spam control); the drainer later processes
+    /// without a fee gate because the fee was already paid at accept.
+    pub fn enqueue(&mut self, tx: Transaction, min_fee: u64) -> Result<(), RpcError> {
         // Economic validation: check minimum fee
-        if tx.fee < self.min_fee {
+        if tx.fee < min_fee {
+            self.stats.rejected.fetch_add(1, Ordering::Relaxed);
             return Err(RpcError(format!(
                 "Insufficient fee: {} < minimum {}",
-                tx.fee, self.min_fee
+                tx.fee, min_fee
             )));
         }
 
-        // If mempool is full, try to evict lower-fee transactions
-        if self.queue.len() >= self.max_size {
-            // Check if this transaction has higher fee than the lowest in mempool
-            let min_fee_in_pool = self.queue.iter().map(|t| t.fee).min().unwrap_or(0);
-
-            if tx.fee > min_fee_in_pool {
-                // Evict the lowest-fee transaction to make room
-                if let Some(pos) = self.queue.iter().position(|t| t.fee == min_fee_in_pool) {
-                    self.queue.remove(pos);
-                    tracing::info!("🔄 Evicted low-fee transaction (fee: {}) to make room for higher-fee (fee: {})", min_fee_in_pool, tx.fee);
-                }
-            } else {
-                return Err(RpcError(
-                    "Mempool full (consider higher fee for priority)".to_string(),
-                ));
-            }
+        // Permanently rejected ids are cached: no infinite retries.
+        if self.recent_rejects_set.contains(&tx.id) {
+            self.stats.duplicate.fetch_add(1, Ordering::Relaxed);
+            return Err(RpcError("Duplicate transaction".to_string()));
         }
 
-        self.queue.push_back(tx);
+        // In-queue dedup.
+        if self.queue.iter().any(|t| t.id == tx.id) {
+            self.stats.duplicate.fetch_add(1, Ordering::Relaxed);
+            return Err(RpcError("Duplicate transaction".to_string()));
+        }
+
+        // PHASE D: capacity is a BACKPRESSURE bound, not a permanent dead-end
+        // (the Phase C root cause was a full window that never drained).
+        if self.queue.len() >= self.max_size {
+            self.stats.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err(RpcError(
+                "Mempool full (consider higher fee for priority)".to_string(),
+            ));
+        }
+
+        self.queue.push_back(tx.clone());
+        self.enqueued_at.insert(tx.id, Instant::now());
+        self.stats.added.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// PHASE D: deterministic SELECT (mandate §3). Returns up to `batch`
+    /// transactions in a canonical order — fee DESC, then tx id ASC — so two
+    /// nodes with the same state always select the same candidates. The
+    /// non-selected remainder stays queued; the enqueue timestamps survive
+    /// SELECT, so a requeued tx keeps its original TTL deadline.
+    pub fn select_batch(&mut self, batch: usize) -> Vec<Transaction> {
+        if self.queue.is_empty() || batch == 0 {
+            return Vec::new();
+        }
+        let mut all: Vec<Transaction> = self.queue.drain(..).collect();
+        all.sort_by(|a, b| b.fee.cmp(&a.fee).then_with(|| a.id.cmp(&b.id)));
+        let split = batch.min(all.len());
+        let selected: Vec<Transaction> = all.drain(..split).collect();
+        self.queue = VecDeque::from(all);
+        for tx in &selected {
+            self.in_flight.insert(tx.id);
+        }
+        selected
+    }
+
+    /// PHASE D: drop queued transactions that exceeded the TTL. Only txs still
+    /// IN the queue are eligible (a tx mid-processing is not expired under
+    /// it). Bounded retries: a stuck tx can never live in the queue forever.
+    pub fn expire_stale(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<TransactionId> = self
+            .queue
+            .iter()
+            .filter_map(|t| {
+                let enqueued_at = self.enqueued_at.get(&t.id)?;
+                if now.duration_since(*enqueued_at) > MEMPOOL_TTL {
+                    Some(t.id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for id in expired {
+            self.dispose(&id, MempoolDisposition::Expired);
+        }
+    }
+
+    /// PHASE D: terminal disposition — remove from the queue + timestamps and
+    /// count the outcome. Counts queued OR in-flight txs (SELECT moves the tx
+    /// out of the queue before the drainer processes it). Idempotent: a tx
+    /// may already have been removed (the processor STEP 7 removes on
+    /// inclusion, the drainer disposes after).
+    pub fn dispose(&mut self, tx_id: &TransactionId, outcome: MempoolDisposition) {
+        let was_queued = {
+            let before = self.queue.len();
+            self.queue.retain(|t| &t.id != tx_id);
+            self.queue.len() != before
+        };
+        let was_in_flight = self.in_flight.remove(tx_id);
+        if was_queued || was_in_flight {
+            self.enqueued_at.remove(tx_id);
+            self.stats.removed.fetch_add(1, Ordering::Relaxed);
+            match outcome {
+                MempoolDisposition::Included => {
+                    self.stats.included.fetch_add(1, Ordering::Relaxed);
+                }
+                MempoolDisposition::Rejected => {
+                    self.stats.rejected.fetch_add(1, Ordering::Relaxed);
+                    self.record_reject(*tx_id);
+                }
+                MempoolDisposition::OrphanParked => {
+                    self.stats.orphan_parked.fetch_add(1, Ordering::Relaxed);
+                }
+                MempoolDisposition::Expired => {
+                    self.stats.expired.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// PHASE D: re-queue a transaction after a transient failure (lock
+    /// contention, insufficient balance, persistence error). The ORIGINAL
+    /// enqueue timestamp is kept: the TTL deadline does NOT reset on retry,
+    /// so retries are always bounded (mandate §5).
+    pub fn requeue(&mut self, tx: Transaction) {
+        self.in_flight.remove(&tx.id);
+        self.enqueued_at.entry(tx.id).or_insert_with(Instant::now);
+        self.queue.push_back(tx);
+    }
+
+    /// Bounded LRU of permanently rejected tx ids (no infinite retries).
+    fn record_reject(&mut self, tx_id: TransactionId) {
+        if self.recent_rejects_set.insert(tx_id) {
+            self.recent_rejects.push_back(tx_id);
+            if self.recent_rejects.len() > MEMPOOL_REJECT_CACHE {
+                if let Some(oldest) = self.recent_rejects.pop_front() {
+                    self.recent_rejects_set.remove(&oldest);
+                }
+            }
+        }
     }
 
     /// Get transaction semaphore for rate limiting
@@ -892,113 +1100,252 @@ impl AetherRpcImpl {
             tx.account_nonce
         );
 
-        // STEP 2: USE TRANSACTION PROCESSOR (ZERO TRUST SINGLE ENTRY POINT)
-        // 🔒 All validation and state mutations go through TransactionProcessor.
-        // 🪙 Monetary policy: ZERO EMISSION - the processor never mints tokens.
-        // H1: orphan handling (missing parents) now lives INSIDE the processor,
-        // AFTER the pure validation gate (PoW + signature). It returns
-        // ProcessingError::Orphan(missing) and we park it below — never
-        // before, so unvalidated garbage cannot fill the orphan store.
+        // STEP 2: PHASE D — ACCEPT PATH (enqueue-based lifecycle).
+        // The mempool is a REAL pending queue: this funnel ACCEPTS (pure
+        // gate + dedup + fee gate) and QUEUEs; the node drainer task SELECTs
+        // and PROCESSes through the full validation pipeline. The processor
+        // can no longer be blocked by a full mempool (a full queue is
+        // transient — the drainer empties it), the DAG add is never rolled
+        // back because of the queue (processor STEP 7 now removes instead of
+        // adding), and the faucet cannot be pinned by a pool full of old txs.
+        // This kills the Phase C dead-end: DAG growth no longer stops at
+        // 1000 txs and bootstrap is never blocked by the pool.
         let processor = TransactionProcessor::new();
-        let mempool = self.mempool.read().await;
-        let mempool_occupancy = mempool.size() as f64 / mempool.max_size() as f64;
+
+        // Pure gate FIRST (PoW + signature): unvalidated junk must never
+        // occupy a queue slot (parity with the H1 orphan rule — parking
+        // costs one valid PoW + signature).
+        if let Err(e) = processor.validate_pure(&tx) {
+            self.mempool
+                .write()
+                .await
+                .stats
+                .rejected
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(RpcError(e.to_string()));
+        }
+
+        // Dedup against the DAG (the consensus source of truth): a tx already
+        // in the DAG is an idempotent duplicate — counted, never re-queued.
+        {
+            let dag_read = self.dag.read().await;
+            if dag_read.transactions().contains_key(&tx.id) {
+                drop(dag_read);
+                self.mempool
+                    .write()
+                    .await
+                    .stats
+                    .duplicate
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(RpcError("Duplicate transaction".to_string()));
+            }
+        }
+
+        // Economic gate at ACCEPT time: the fee oracle adjusts with the queue
+        // occupancy and gates spam. The drainer later processes WITHOUT a fee
+        // gate (min_fee = 0 — the fee was already paid at accept): this
+        // prevents the oracle from self-pinning the network under sustained
+        // load (the Phase C faucet failure) without bypassing fees — a tx
+        // below the oracle minimum is still rejected at accept.
+        let mempool_occupancy = {
+            let mempool = self.mempool.read().await;
+            mempool.size() as f64 / mempool.max_size() as f64
+        };
         let min_fee = {
             let mut oracle = self.fee_oracle.write().await;
             oracle.adjust(mempool_occupancy);
             oracle.current_fee()
         };
-        drop(mempool);
         // Sync fee to mempool (acquire write lock separately to avoid deadlock)
         {
             let mut mempool_write = self.mempool.write().await;
             mempool_write.set_min_fee(min_fee);
         }
 
-        // V-22 FIX: retry transient LOCK CONTENTION instead of dropping the
-        // transaction. The processor uses try_write() so it can fail with
-        // LockError whenever another task (P2P channel, orphan solver, another
-        // RPC send) holds the DAG/ledger/mempool locks. Before this fix the
-        // tx was lost forever: it never entered the DAG, and the peer-side
-        // seen-transactions dedup meant a later resync never re-delivered it.
-        let mut lock_attempts = 0;
-        let result = loop {
-            match processor
-                .process(tx.clone(), &self.dag, &self.ledger, &self.mempool, min_fee)
+        let enqueue_result = self.mempool.write().await.enqueue(tx.clone(), min_fee);
+        if let Err(e) = enqueue_result {
+            tracing::warn!("❌ Mempool enqueue rejected: {}", e);
+            return Err(e);
+        }
+        // 💾 Persist the pending tx (removed on its terminal disposition)
+        if let Ok(storage) = self.storage.try_read() {
+            let _ = storage.put_mempool_tx(&tx);
+        }
+        // 🔄 Broadcast to P2P peers
+        self.p2p_network.broadcast_transaction(tx.clone()).await;
+        if source == "Orphan" {
+            // The orphan solver re-accepted a parked orphan: its parents have
+            // arrived and the tx is once more a queue candidate.
+            self.mempool
+                .write()
                 .await
-            {
-                Ok(_) => break Ok(()),
-                Err(ProcessingError::LockError(_)) if lock_attempts < 20 => {
-                    lock_attempts += 1;
-                    tokio::time::sleep(std::time::Duration::from_millis(25 * lock_attempts as u64))
+                .stats
+                .orphan_resolved
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        tracing::info!("✅ Transaction queued to mempool (fee: {})", tx.fee);
+        Ok(TransactionResponse {
+            tx_id: tx.id,
+            status: "in_mempool".to_string(),
+            message: "Transaction accepted locally (in mempool, not yet in DAG)".to_string(),
+        })
+    }
+
+    /// PHASE D: one drain cycle — the mempool lifecycle in action:
+    ///   SELECT (deterministic, fee DESC / id ASC) → PROCESS (full validation
+    ///   pipeline, min_fee = 0: the fee was already paid at accept) → INCLUDE
+    ///   (DAG) / park (orphan) / reject (permanent, cached) / requeue
+    ///   (transient, TTL-bounded).
+    /// Every selected tx reaches exactly one disposition per cycle, retries
+    /// are bounded (TTL + reject cache + finite queue), and the queue can
+    /// never block DAG growth or bootstrap (Phase C root cause fixed).
+    /// Runs on every node type via the node drainer task (~150 ms tick).
+    pub async fn drain_mempool(&self) {
+        // 1) TTL expiry (bounded retries).
+        {
+            let mut mempool = self.mempool.write().await;
+            mempool.expire_stale();
+        }
+        // 2) Deterministic SELECT (same state → same candidate set).
+        let batch = {
+            let mut mempool = self.mempool.write().await;
+            mempool.select_batch(MEMPOOL_DRAIN_BATCH)
+        };
+        if batch.is_empty() {
+            return;
+        }
+        let processor = TransactionProcessor::new();
+        for tx in batch {
+            // Retry transient lock contention (the processor uses try_write;
+            // a busy lock never drops a tx from the queue).
+            let mut lock_attempts = 0;
+            let result = loop {
+                match processor
+                    .process(tx.clone(), &self.dag, &self.ledger, &self.mempool, 0)
+                    .await
+                {
+                    Ok(_) => break Ok(()),
+                    Err(ProcessingError::LockError(_)) if lock_attempts < 20 => {
+                        lock_attempts += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            25 * lock_attempts as u64,
+                        ))
+                        .await;
+                    }
+                    Err(e) => break Err(e),
+                }
+            };
+            match result {
+                Ok(_) => {
+                    // INCLUDE: the tx reached the DAG and leaves the queue
+                    // (processor STEP 7 also removed it; dispose is idempotent).
+                    self.dispose_mempool_tx(&tx.id, MempoolDisposition::Included)
                         .await;
                 }
-                Err(e) => break Err(e),
+                Err(ProcessingError::Orphan(missing_parents)) => {
+                    // Missing parents at SELECT time: park out of the queue and
+                    // re-request the parents over P2P. The orphan solver
+                    // re-enqueues it once they arrive (mempool_orphan_resolved).
+                    if self.park_orphan(tx.clone(), &missing_parents).await {
+                        self.dispose_mempool_tx(&tx.id, MempoolDisposition::OrphanParked)
+                            .await;
+                    } else {
+                        // Orphan store full: the tx is dropped from the queue
+                        // (bounded — it cannot live in the queue forever).
+                        self.dispose_mempool_tx(&tx.id, MempoolDisposition::Rejected)
+                            .await;
+                    }
+                }
+                Err(ProcessingError::ValidationFailed(ValidationError::MissingParent {
+                    parent_id,
+                    ..
+                })) => {
+                    // Defensive: the orphan gate and validate_dag run under the
+                    // same DAG read lock in process(); keep the behavior.
+                    let missing = vec![parent_id];
+                    if self.park_orphan(tx.clone(), &missing).await {
+                        self.dispose_mempool_tx(&tx.id, MempoolDisposition::OrphanParked)
+                            .await;
+                    } else {
+                        self.dispose_mempool_tx(&tx.id, MempoolDisposition::Rejected)
+                            .await;
+                    }
+                }
+                Err(ProcessingError::ValidationFailed(ValidationError::DuplicateTransaction {
+                    ..
+                })) => {
+                    // Already in the DAG: its final state IS the DAG — count it
+                    // as included (a duplicate of an accepted tx is not a
+                    // failure, and re-inclusion is impossible by definition).
+                    self.dispose_mempool_tx(&tx.id, MempoolDisposition::Included)
+                        .await;
+                }
+                Err(ProcessingError::ValidationFailed(
+                    ValidationError::SenderConflict
+                    | ValidationError::InvalidPoW { .. }
+                    | ValidationError::InvalidSignature
+                    | ValidationError::SenderPublicKeyMismatch
+                    | ValidationError::DoubleSpend
+                    | ValidationError::Overflow
+                    | ValidationError::InsufficientFee { .. }
+                    | ValidationError::InvalidNonce { .. },
+                )) => {
+                    // Permanently invalid: rejected ONCE, then cached (bounded)
+                    // so it can never be retried in a loop (mandate §5).
+                    tracing::warn!(
+                        "🗑️ Mempool tx {} permanently rejected",
+                        hex::encode(&tx.id[..4])
+                    );
+                    self.dispose_mempool_tx(&tx.id, MempoolDisposition::Rejected)
+                        .await;
+                }
+                Err(e) => {
+                    // Transient: insufficient balance, ledger/DAG/persistence
+                    // error, or exhausted lock retries. Requeue; the TTL
+                    // bounds the retries (mandate §5).
+                    tracing::debug!("🔄 Mempool tx requeued after transient failure: {}", e);
+                    self.requeue_mempool_tx(tx).await;
+                }
             }
-        };
-        if lock_attempts > 0 {
-            tracing::info!(
-                "🔁 Lock contention retried {} time(s) for tx {}",
-                lock_attempts,
-                hex::encode(tx.id)
-            );
         }
+        // Resolve newly applicable orphans in the same cycle (fixpoint).
+        self.process_orphans().await;
+    }
 
-        match result {
-            Ok(_) => {
-                tracing::info!("✅ Transaction processed successfully via TransactionProcessor");
-                // 💾 Persist to mempool storage
-                if let Ok(storage) = self.storage.try_read() {
-                    let _ = storage.put_mempool_tx(&tx);
-                }
-                // 🔄 Broadcast to P2P peers
-                self.p2p_network.broadcast_transaction(tx.clone()).await;
-                Ok(TransactionResponse {
-                    tx_id: tx.id,
-                    status: "in_mempool".to_string(),
-                    message: "Transaction accepted locally (in mempool, not yet in DAG)"
-                        .to_string(),
-                })
-            }
-            Err(ProcessingError::Orphan(missing_parents)) => {
-                // H1: the transaction passed the pure gate (PoW + signature)
-                // but its parents are not in the DAG yet. Park it (bounded)
-                // and re-request the parents over P2P.
-                if self.park_orphan(tx, &missing_parents).await {
-                    Err(RpcError(format!(
-                        "Transaction has {} missing parent(s). Stored as orphan and requesting via P2P. Please retry in a few seconds.",
-                        missing_parents.len()
-                    )))
-                } else {
-                    Err(RpcError(format!(
-                        "Orphan limit reached ({}). Transaction rejected.",
-                        MAX_ORPHANS
-                    )))
-                }
-            }
-            Err(ProcessingError::ValidationFailed(ValidationError::MissingParent {
-                parent_id,
-                ..
-            })) => {
-                // Defensive: unreachable in the current flow (the orphan gate
-                // and validate_dag run under the same DAG read lock), but keep
-                // the behavior identical if a future refactor reorders them.
-                let missing = vec![parent_id];
-                if self.park_orphan(tx, &missing).await {
-                    Err(RpcError(format!(
-                        "Transaction has {} missing parent(s). Stored as orphan and requesting via P2P. Please retry in a few seconds.",
-                        missing.len()
-                    )))
-                } else {
-                    Err(RpcError(format!(
-                        "Orphan limit reached ({}). Transaction rejected.",
-                        MAX_ORPHANS
-                    )))
-                }
-            }
-            Err(e) => {
-                tracing::error!("❌ Transaction processing failed: {}", e);
-                Err(RpcError(e.to_string()))
-            }
+    /// PHASE D: remove a drained tx from the queue, persist the removal and
+    /// count the disposition.
+    async fn dispose_mempool_tx(&self, tx_id: &TransactionId, outcome: MempoolDisposition) {
+        {
+            let mut mempool = self.mempool.write().await;
+            mempool.dispose(tx_id, outcome);
+        }
+        if let Ok(storage) = self.storage.try_read() {
+            let _ = storage.remove_mempool_tx(*tx_id);
+        }
+    }
+
+    /// PHASE D: re-queue a tx after a transient failure (the TTL keeps the
+    /// retries bounded).
+    async fn requeue_mempool_tx(&self, tx: Transaction) {
+        self.mempool.write().await.requeue(tx);
+    }
+
+    /// PHASE D: snapshot of the mempool queue + lifecycle counters
+    /// (aether_getMempoolStats).
+    pub async fn mempool_stats(&self) -> MempoolStatsResponse {
+        let mempool = self.mempool.read().await;
+        MempoolStatsResponse {
+            size: mempool.size() as u64,
+            max_size: mempool.max_size() as u64,
+            min_fee: mempool.min_fee(),
+            added: mempool.stats.added.load(Ordering::Relaxed),
+            removed: mempool.stats.removed.load(Ordering::Relaxed),
+            included: mempool.stats.included.load(Ordering::Relaxed),
+            rejected: mempool.stats.rejected.load(Ordering::Relaxed),
+            expired: mempool.stats.expired.load(Ordering::Relaxed),
+            duplicate: mempool.stats.duplicate.load(Ordering::Relaxed),
+            orphan_parked: mempool.stats.orphan_parked.load(Ordering::Relaxed),
+            orphan_resolved: mempool.stats.orphan_resolved.load(Ordering::Relaxed),
         }
     }
 
@@ -1986,6 +2333,12 @@ async fn handle_rpc(
                 Err(e) => Err(e),
             }
         }
+        // PHASE D: mempool lifecycle observability (mandate §13) — queue size
+        // + all 8 counters, so the drain is provable on any node.
+        "aether_getMempoolStats" => {
+            let stats = rpc_impl.mempool_stats().await;
+            serde_json::to_value(stats).map_err(|e| RpcError(e.to_string()))
+        }
         "aether_getTransactionHistory" => {
             let address = payload
                 .get("params")
@@ -2340,6 +2693,14 @@ async fn handle_metrics(State(state): State<Arc<AetherRpcImpl>>) -> String {
     let peer_count = state.p2p_network.peer_count().await;
     let mempool = state.mempool.read().await;
     let mempool_size = mempool.size();
+    let mempool_added = mempool.stats.added.load(Ordering::Relaxed);
+    let mempool_removed = mempool.stats.removed.load(Ordering::Relaxed);
+    let mempool_included = mempool.stats.included.load(Ordering::Relaxed);
+    let mempool_rejected = mempool.stats.rejected.load(Ordering::Relaxed);
+    let mempool_expired = mempool.stats.expired.load(Ordering::Relaxed);
+    let mempool_duplicate = mempool.stats.duplicate.load(Ordering::Relaxed);
+    let mempool_orphan = mempool.stats.orphan_parked.load(Ordering::Relaxed);
+    let mempool_orphan_resolved = mempool.stats.orphan_resolved.load(Ordering::Relaxed);
     drop(mempool);
 
     format!(
@@ -2358,6 +2719,38 @@ async fn handle_metrics(State(state): State<Arc<AetherRpcImpl>>) -> String {
          # HELP aether_mempool_size Current mempool transaction count\n\
          # TYPE aether_mempool_size gauge\n\
          aether_mempool_size {mempool_size}\n\
+         \n\
+         # HELP aether_mempool_added_total Total transactions queued (PHASE D)\n\
+         # TYPE aether_mempool_added_total counter\n\
+         aether_mempool_added_total {mempool_added}\n\
+         \n\
+         # HELP aether_mempool_removed_total Total transactions removed from the queue (PHASE D)\n\
+         # TYPE aether_mempool_removed_total counter\n\
+         aether_mempool_removed_total {mempool_removed}\n\
+         \n\
+         # HELP aether_mempool_included_total Total transactions included in the DAG (PHASE D)\n\
+         # TYPE aether_mempool_included_total counter\n\
+         aether_mempool_included_total {mempool_included}\n\
+         \n\
+         # HELP aether_mempool_rejected_total Total transactions permanently rejected (PHASE D)\n\
+         # TYPE aether_mempool_rejected_total counter\n\
+         aether_mempool_rejected_total {mempool_rejected}\n\
+         \n\
+         # HELP aether_mempool_expired_total Total transactions expired by TTL (PHASE D)\n\
+         # TYPE aether_mempool_expired_total counter\n\
+         aether_mempool_expired_total {mempool_expired}\n\
+         \n\
+         # HELP aether_mempool_duplicate_total Total duplicate attempts (PHASE D)\n\
+         # TYPE aether_mempool_duplicate_total counter\n\
+         aether_mempool_duplicate_total {mempool_duplicate}\n\
+         \n\
+         # HELP aether_mempool_orphan_parked_total Total transactions parked as orphans (PHASE D)\n\
+         # TYPE aether_mempool_orphan_parked_total counter\n\
+         aether_mempool_orphan_parked_total {mempool_orphan}\n\
+         \n\
+         # HELP aether_mempool_orphan_resolved_total Total orphans re-accepted after parent arrival (PHASE D)\n\
+         # TYPE aether_mempool_orphan_resolved_total counter\n\
+         aether_mempool_orphan_resolved_total {mempool_orphan_resolved}\n\
          \n\
          # HELP aether_uptime_seconds Node uptime in seconds\n\
          # TYPE aether_uptime_seconds counter\n\
@@ -2387,6 +2780,7 @@ mod tests {
     use crate::p2p::P2PConfig;
     use crate::parent_selection::DAG;
     use crate::transaction::Transaction;
+    use crate::wallet::Wallet;
     use crate::P2PNetwork;
 
     fn test_rpc_impl(dir: &std::path::Path) -> AetherRpcImpl {
@@ -2421,6 +2815,495 @@ mod tests {
             Arc::new(RwLock::new(HashMap::new())),
             Arc::new(crate::sync_stats::SyncContext::default()),
         )
+    }
+
+    /// PHASE D: build `count` distinct VALID transactions (mined PoW +
+    /// signature), each with its OWN sender (a unique (sender, nonce) pair →
+    /// no STEP 0 sender-conflict, fully parallel mining). Parents = genesis
+    /// (no genesis txs in a fresh test DAG → not orphans).
+    async fn make_valid_tx_batch(count: usize) -> Vec<Transaction> {
+        let mut tasks = Vec::with_capacity(count);
+        for i in 0..count {
+            tasks.push(tokio::spawn(async move {
+                // Derive a unique secret key per tx (unique sender).
+                let mut key = [0u8; 32];
+                key[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                key[8..16].copy_from_slice(&(i as u64).to_be_bytes());
+                let key_hex: String = key.iter().map(|b| format!("{:02x}", b)).collect();
+                let wallet = Wallet::from_secret_key(&key_hex).expect("test key");
+                let sender = wallet.address();
+                let parents = [[0u8; 32]; 2];
+                let ts = 1234567890 + i as u64;
+                let base = Transaction::new(
+                    parents,
+                    sender,
+                    [2u8; 32],
+                    1,
+                    10,
+                    ts,
+                    0,
+                    1,
+                    Vec::new(),
+                    wallet.public_key_bytes(),
+                );
+                let nonce = base.mine_nonce(Transaction::default_difficulty());
+                let unsigned = Transaction::new(
+                    parents,
+                    sender,
+                    [2u8; 32],
+                    1,
+                    10,
+                    ts,
+                    nonce,
+                    1,
+                    Vec::new(),
+                    wallet.public_key_bytes(),
+                );
+                let sig = wallet.sign_transaction(&unsigned).expect("sign");
+                let tx = Transaction::new(
+                    parents,
+                    sender,
+                    [2u8; 32],
+                    1,
+                    10,
+                    ts,
+                    nonce,
+                    1,
+                    sig,
+                    wallet.public_key_bytes(),
+                );
+                debug_assert!(tx.verify_pow(Transaction::default_difficulty()));
+                debug_assert!(Wallet::verify_transaction(&tx));
+                tx
+            }));
+        }
+        let mut out = Vec::with_capacity(count);
+        for task in tasks {
+            out.push(task.await.expect("mining task"));
+        }
+        out
+    }
+
+    /// PHASE D: run drain cycles until the queue is empty (bounded loops —
+    /// a livelock would trip the cycle cap and fail the test).
+    async fn drain_until_empty(rpc: &AetherRpcImpl) -> usize {
+        let mut cycles = 0;
+        while rpc.mempool.read().await.size() > 0 && cycles < 200 {
+            rpc.drain_mempool().await;
+            cycles += 1;
+        }
+        cycles
+    }
+
+    /// PHASE D §3: deterministic selection — two nodes with the same state
+    /// select the same candidates: fee DESC, then tx id ASC.
+    #[test]
+    fn test_mempool_deterministic_selection() {
+        let mut m1 = Mempool::new(1000, 10);
+        let mut m2 = Mempool::new(1000, 10);
+        let mut txs = Vec::new();
+        for (i, fee) in [50u64, 100, 50, 10].iter().enumerate() {
+            let mut sender = [0u8; 32];
+            sender[0] = i as u8;
+            txs.push(Transaction::new(
+                [[0u8; 32]; 2],
+                sender,
+                [2u8; 32],
+                1,
+                *fee,
+                1234567890 + i as u64,
+                0,
+                1,
+                Vec::new(),
+                Vec::new(),
+            ));
+        }
+        for tx in &txs {
+            m1.enqueue(tx.clone(), 1).unwrap();
+            m2.enqueue(tx.clone(), 1).unwrap();
+        }
+        let b1 = m1.select_batch(4);
+        let b2 = m2.select_batch(4);
+        assert_eq!(b1.len(), 4);
+        assert_eq!(b1[0].id, txs[1].id); // fee 100 first
+                                         // fee-50 tie: id ASC (the smaller of the two ids, computed at runtime)
+        let (smaller, larger) = if txs[0].id <= txs[2].id {
+            (&txs[0], &txs[2])
+        } else {
+            (&txs[2], &txs[0])
+        };
+        assert_eq!(b1[1].id, smaller.id);
+        assert_eq!(b1[2].id, larger.id);
+        assert_eq!(b1[3].id, txs[3].id); // fee 10 last
+                                         // Same state → same candidate set (determinism across nodes).
+        assert_eq!(
+            b2.iter().map(|t| t.id).collect::<Vec<_>>(),
+            b1.iter().map(|t| t.id).collect::<Vec<_>>()
+        );
+    }
+
+    /// PHASE D §5: TTL expiry — a tx stuck in the queue past its deadline is
+    /// dropped and counted (retries are bounded).
+    #[test]
+    fn test_mempool_ttl_expiry() {
+        let mut mempool = Mempool::new(1000, 10);
+        let tx = Transaction::new(
+            [[0u8; 32]; 2],
+            [1u8; 32],
+            [2u8; 32],
+            1,
+            10,
+            1234567890,
+            0,
+            1,
+            Vec::new(),
+            Vec::new(),
+        );
+        mempool.enqueue(tx.clone(), 1).unwrap();
+        // Backdate the enqueue time beyond the TTL.
+        *mempool.enqueued_at.get_mut(&tx.id).unwrap() =
+            Instant::now() - MEMPOOL_TTL - Duration::from_secs(1);
+        mempool.expire_stale();
+        assert_eq!(mempool.size(), 0);
+        assert_eq!(mempool.stats.expired.load(Ordering::Relaxed), 1);
+        assert_eq!(mempool.stats.removed.load(Ordering::Relaxed), 1);
+    }
+
+    /// PHASE D §5: the permanent-reject cache is bounded — the oldest entry
+    /// is evicted, so a tx is never retried forever, but a long-forgotten id
+    /// can be re-submitted after the cache rotates.
+    #[test]
+    fn test_mempool_reject_cache_bounded() {
+        // Queue capacity 2000 so the 1100 enqueues below are not capped by
+        // the queue itself — this test isolates the REJECT CACHE bound (1000).
+        let mut mempool = Mempool::new(2000, 10);
+        let mut txs = Vec::new();
+        for i in 0..1100 {
+            let mut sender = [0u8; 32];
+            sender[0] = (i % 256) as u8;
+            sender[1] = (i / 256) as u8;
+            let tx = Transaction::new(
+                [[0u8; 32]; 2],
+                sender,
+                [2u8; 32],
+                1,
+                10,
+                1234567890 + i as u64,
+                0,
+                1,
+                Vec::new(),
+                Vec::new(),
+            );
+            mempool.enqueue(tx.clone(), 1).unwrap();
+            txs.push(tx);
+        }
+        for tx in &txs {
+            mempool.dispose(&tx.id, MempoolDisposition::Rejected);
+        }
+        assert!(mempool.recent_rejects_set.len() <= MEMPOOL_REJECT_CACHE);
+        assert_eq!(mempool.recent_rejects.len(), MEMPOOL_REJECT_CACHE);
+        // The oldest id was evicted: re-enqueueable.
+        mempool
+            .enqueue(txs[0].clone(), 1)
+            .expect("oldest id evicted from cache");
+        // The most recent id is still cached.
+        let err = mempool.enqueue(txs[1099].clone(), 1);
+        assert!(matches!(err, Err(e) if e.0.contains("Duplicate transaction")));
+    }
+
+    /// M1 (mandate §7): mempool < 1000 — the full lifecycle under capacity:
+    /// every queued tx is drained into the DAG, the queue returns to 0, and
+    /// the counters agree (added == included == removed). No livelock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn test_m1_lifecycle_under_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+        let txs = make_valid_tx_batch(200).await;
+        {
+            let mut ledger = rpc.ledger.write().await;
+            for tx in &txs {
+                ledger.set_balance(&tx.sender, 100_000_000_000);
+            }
+        }
+        for tx in &txs {
+            rpc.mempool
+                .write()
+                .await
+                .enqueue(tx.clone(), 1)
+                .expect("enqueue under capacity");
+        }
+        assert_eq!(rpc.mempool.read().await.size(), 200);
+        let cycles = drain_until_empty(&rpc).await;
+        assert!(cycles < 200, "drain livelock: {} cycles", cycles);
+        assert_eq!(rpc.mempool.read().await.size(), 0);
+        let stats = rpc.mempool_stats().await;
+        assert_eq!(stats.added, 200);
+        assert_eq!(stats.included, 200);
+        assert_eq!(stats.removed, 200);
+        assert_eq!(rpc.dag.read().await.transaction_count(), 200);
+    }
+
+    /// M2 (mandate §7): mempool AT capacity — a full queue is a TRANSIENT
+    /// backpressure gate, never a dead-end (the Phase C root cause): the
+    /// 1001st tx is rejected, the drain empties the queue, and fresh txs are
+    /// accepted again. Rejected junk is cached (no infinite retries).
+    #[tokio::test]
+    async fn test_m2_full_queue_transient_backpressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+        // 1000 distinct junk txs (unique ids, no PoW/signature).
+        let junk: Vec<Transaction> = (0..1000)
+            .map(|i| {
+                let mut sender = [0u8; 32];
+                sender[0] = (i % 256) as u8;
+                sender[1] = (i / 256) as u8;
+                Transaction::new(
+                    [[0u8; 32]; 2],
+                    sender,
+                    [2u8; 32],
+                    1,
+                    1000,
+                    1234567890 + i as u64,
+                    0,
+                    1,
+                    Vec::new(),
+                    Vec::new(),
+                )
+            })
+            .collect();
+        {
+            let mut mempool = rpc.mempool.write().await;
+            for tx in &junk {
+                mempool.enqueue(tx.clone(), 1).expect("fill to capacity");
+            }
+            // 1001st: capacity backpressure (transient, not permanent).
+            let mut sender = [9u8; 32];
+            sender[2] = 1;
+            let extra = Transaction::new(
+                [[0u8; 32]; 2],
+                sender,
+                [2u8; 32],
+                1,
+                1000,
+                999_999_999_9,
+                0,
+                1,
+                Vec::new(),
+                Vec::new(),
+            );
+            let err = mempool.enqueue(extra.clone(), 1);
+            assert!(matches!(err, Err(e) if e.0.contains("Mempool full")));
+            // In-queue dedup.
+            let err2 = mempool.enqueue(junk[0].clone(), 1);
+            assert!(matches!(err2, Err(e) if e.0.contains("Duplicate transaction")));
+        }
+        // Drain: all junk is permanently rejected (InvalidPoW) and cached.
+        drain_until_empty(&rpc).await;
+        assert_eq!(rpc.mempool.read().await.size(), 0);
+        let stats = rpc.mempool_stats().await;
+        assert_eq!(stats.added, 1000);
+        assert_eq!(stats.removed, 1000);
+        assert!(stats.rejected >= 1000, "junk must be rejected on drain");
+        assert_eq!(stats.included, 0);
+        // After the drain: fresh txs accepted again (queue not blocked).
+        let mut s2 = [9u8; 32];
+        s2[2] = 2;
+        let fresh = Transaction::new(
+            [[0u8; 32]; 2],
+            s2,
+            [2u8; 32],
+            1,
+            1000,
+            1234567890,
+            0,
+            1,
+            Vec::new(),
+            Vec::new(),
+        );
+        rpc.mempool
+            .write()
+            .await
+            .enqueue(fresh, 1)
+            .expect("accept after drain");
+    }
+
+    /// M3 (mandate §7): the mandatory 1100-tx non-regression (Phase C §6
+    /// critical) — a 1100-tx queue fully drains into the DAG: the exact load
+    /// that stalled Phase C (join@1100 blocked at 1012/1100 for 42 minutes).
+    /// Mining-heavy: run with `cargo test --release -- --ignored` in the
+    /// campaign (debug PoW mining is ~5-10x slower; the campaign always runs
+    /// the release binary anyway).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    #[ignore = "heavy PoW mining (~1 min); run explicitly in release in the campaign"]
+    async fn test_m3_drain_1100_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+        let txs = make_valid_tx_batch(1100).await;
+        {
+            let mut ledger = rpc.ledger.write().await;
+            for tx in &txs {
+                ledger.set_balance(&tx.sender, 100_000_000_000);
+            }
+        }
+        // The network accepts over time while the drainer runs concurrently:
+        // queue up to capacity, drain, repeat (1100 total).
+        let mut enqueued = 0;
+        while enqueued < 1100 {
+            let take = (1100 - enqueued).min(900);
+            for tx in &txs[enqueued..enqueued + take] {
+                rpc.mempool
+                    .write()
+                    .await
+                    .enqueue(tx.clone(), 1)
+                    .expect("enqueue");
+            }
+            enqueued += take;
+            let cycles = drain_until_empty(&rpc).await;
+            assert!(cycles < 200, "drain livelock: {} cycles", cycles);
+            assert_eq!(
+                rpc.mempool.read().await.size(),
+                0,
+                "queue must drain between batches"
+            );
+        }
+        let stats = rpc.mempool_stats().await;
+        assert_eq!(stats.added, 1100);
+        assert_eq!(stats.included, 1100);
+        assert_eq!(stats.removed, 1100);
+        assert_eq!(rpc.dag.read().await.transaction_count(), 1100);
+    }
+
+    /// M4 (mandate §7): 2500-tx sustained drain under a 1000-slot queue —
+    /// no livelock, no infinite growth, full convergence. Mining-heavy:
+    /// run with `cargo test --release -- --ignored` in the campaign.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    #[ignore = "heavy PoW mining (~2 min); run explicitly in release in the campaign"]
+    async fn test_m4_drain_2500_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+        let txs = make_valid_tx_batch(2500).await;
+        {
+            let mut ledger = rpc.ledger.write().await;
+            for tx in &txs {
+                ledger.set_balance(&tx.sender, 100_000_000_000);
+            }
+        }
+        let mut enqueued = 0;
+        while enqueued < 2500 {
+            let take = (2500 - enqueued).min(900);
+            for tx in &txs[enqueued..enqueued + take] {
+                rpc.mempool
+                    .write()
+                    .await
+                    .enqueue(tx.clone(), 1)
+                    .expect("enqueue");
+            }
+            enqueued += take;
+            let cycles = drain_until_empty(&rpc).await;
+            assert!(cycles < 200, "drain livelock: {} cycles", cycles);
+            assert_eq!(rpc.mempool.read().await.size(), 0);
+        }
+        let stats = rpc.mempool_stats().await;
+        assert_eq!(stats.added, 2500);
+        assert_eq!(stats.included, 2500);
+        assert_eq!(stats.removed, 2500);
+        assert_eq!(rpc.dag.read().await.transaction_count(), 2500);
+    }
+
+    /// M5 (mandate §7, ignored by default — run with `cargo test -- --ignored`
+    /// as part of the campaign): 5000-tx sustained drain under a 1000-slot
+    /// queue — the ceiling of the Phase D load envelope.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    #[ignore = "heavy (~1-2 min of PoW mining); run explicitly in the campaign"]
+    async fn test_m5_drain_5000_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+        let txs = make_valid_tx_batch(5000).await;
+        {
+            let mut ledger = rpc.ledger.write().await;
+            for tx in &txs {
+                ledger.set_balance(&tx.sender, 100_000_000_000);
+            }
+        }
+        let mut enqueued = 0;
+        while enqueued < 5000 {
+            let take = (5000 - enqueued).min(900);
+            for tx in &txs[enqueued..enqueued + take] {
+                rpc.mempool
+                    .write()
+                    .await
+                    .enqueue(tx.clone(), 1)
+                    .expect("enqueue");
+            }
+            enqueued += take;
+            let cycles = drain_until_empty(&rpc).await;
+            assert!(cycles < 200, "drain livelock: {} cycles", cycles);
+            assert_eq!(rpc.mempool.read().await.size(), 0);
+        }
+        let stats = rpc.mempool_stats().await;
+        assert_eq!(stats.added, 5000);
+        assert_eq!(stats.included, 5000);
+        assert_eq!(stats.removed, 5000);
+        assert_eq!(rpc.dag.read().await.transaction_count(), 5000);
+    }
+
+    /// PHASE D §6: the faucet must not be permanently pinned by a full pool
+    /// of old txs (Phase C INC-05). While the queue is full the accept gate
+    /// (oracle at max) rejects a low-fee tx — spam control — but once the
+    /// drain empties the queue the oracle relaxes and the SAME low-fee tx is
+    /// accepted again (and reaches the DAG).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_faucet_low_fee_revives_after_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+        // Fill the queue to capacity with high-fee txs (fee 1000).
+        let junk: Vec<Transaction> = (0..1000)
+            .map(|i| {
+                let mut sender = [0u8; 32];
+                sender[0] = (i % 256) as u8;
+                sender[1] = (i / 256) as u8;
+                Transaction::new(
+                    [[0u8; 32]; 2],
+                    sender,
+                    [2u8; 32],
+                    1,
+                    1000,
+                    1234567890 + i as u64,
+                    0,
+                    1,
+                    Vec::new(),
+                    Vec::new(),
+                )
+            })
+            .collect();
+        {
+            let mut mempool = rpc.mempool.write().await;
+            for tx in &junk {
+                mempool.enqueue(tx.clone(), 1).unwrap();
+            }
+        }
+        // A valid faucet-style tx (fee 10, mined + signed once).
+        let faucet_tx = make_valid_tx_batch(1).await.remove(0);
+        {
+            let mut ledger = rpc.ledger.write().await;
+            ledger.set_balance(&faucet_tx.sender, 100_000_000_000);
+        }
+        // While the queue is full, the accept gate (oracle at max) rejects it.
+        let res = rpc.process_transaction(faucet_tx.clone(), "Faucet").await;
+        assert!(
+            res.is_err(),
+            "low-fee tx must be gated while the queue is full"
+        );
+        // Drain: junk is permanently rejected, the queue empties.
+        drain_until_empty(&rpc).await;
+        assert_eq!(rpc.mempool.read().await.size(), 0);
+        // The SAME low-fee tx is now accepted (the oracle relaxed with the
+        // occupancy) — the faucet revives after the drain.
+        let res2 = rpc.process_transaction(faucet_tx.clone(), "Faucet").await;
+        assert!(res2.is_ok(), "faucet tx must be accepted after the drain");
+        // And it drains into the DAG.
+        drain_until_empty(&rpc).await;
+        assert_eq!(rpc.dag.read().await.transaction_count(), 1);
     }
 
     /// V-20: aether_getTips must return canonical hex strings, never raw
@@ -2570,9 +3453,12 @@ mod tests {
         assert_eq!(disk.len(), 0, "no orphan may be persisted without PoW");
     }
 
-    /// H1: a transaction with missing parents that PASSES the pure gate
-    /// (valid PoW + signature) is parked as an orphan (memory + disk) and the
-    /// friendly error is returned to the submitter.
+    /// H1 (PHASE D): a transaction with missing parents that PASSES the pure
+    /// gate (valid PoW + signature) is QUEUED by the funnel (the parents are
+    /// checked at SELECT/PROCESS time, not at accept), then PARKED as an
+    /// orphan (memory + disk) by the drainer — counted orphan_parked. The
+    /// pure gate guarantee is unchanged: garbage still never reaches any
+    /// store (tested above).
     #[tokio::test]
     async fn test_valid_orphan_persisted() {
         let dir = tempfile::tempdir().unwrap();
@@ -2581,12 +3467,14 @@ mod tests {
         let tx = crate::tests::signed_mined_orphan_tx();
 
         let result = rpc.process_transaction(tx.clone(), "RPC-test").await;
-        let err = result.expect_err("missing parents must not be accepted");
         assert!(
-            err.to_string().contains("missing parent"),
-            "expected the friendly orphan error, got: {}",
-            err
+            result.is_ok(),
+            "a pure-valid tx is queued even when its parents are missing"
         );
+
+        // The drainer SELECTs it, process() reports the missing parents and
+        // the tx is parked as an orphan (memory + disk).
+        rpc.drain_mempool().await;
 
         let orphans = rpc.orphans.read().await;
         assert!(
@@ -2601,10 +3489,16 @@ mod tests {
             disk.iter().any(|o| o.id == tx.id),
             "valid orphan must be persisted to disk"
         );
+        drop(storage);
+
+        let stats = rpc.mempool_stats().await;
+        assert_eq!(stats.orphan_parked, 1, "the park must be counted");
+        assert_eq!(stats.removed, 1, "the tx must leave the queue");
     }
 
     /// H1: the orphan store is capped — beyond MAX_ORPHANS entries, new
-    /// orphans are rejected and NOT persisted anywhere.
+    /// orphans are rejected by the drainer (park_orphan returns false) and
+    /// NOT persisted anywhere.
     #[tokio::test]
     async fn test_orphan_cap_rejects_beyond_limit() {
         let dir = tempfile::tempdir().unwrap();
@@ -2638,13 +3532,12 @@ mod tests {
         // A valid orphan (PoW + signature) submitted when the store is full.
         let tx = crate::tests::signed_mined_orphan_tx();
 
+        // PHASE D: the funnel queues it (it cannot see the orphan store);
+        // the drainer's park attempt fails against the cap and the tx is
+        // dropped from the queue (bounded — never parked, never persisted).
         let result = rpc.process_transaction(tx.clone(), "RPC-test").await;
-        let err = result.expect_err("orphan must be rejected when the store is full");
-        assert!(
-            err.to_string().to_lowercase().contains("orphan limit"),
-            "expected an orphan-limit rejection, got: {}",
-            err
-        );
+        assert!(result.is_ok(), "pure-valid tx is queued (funnel)");
+        rpc.drain_mempool().await;
 
         // Nothing new in memory...
         let orphans = rpc.orphans.read().await;
@@ -2662,6 +3555,10 @@ mod tests {
             !disk.iter().any(|o| o.id == tx.id),
             "the overflowing orphan must not be persisted"
         );
+        drop(storage);
+
+        // The queue must not keep it either (no infinite retries).
+        assert_eq!(rpc.mempool.read().await.size(), 0);
     }
 
     /// H3: the per-IP rate limiter isolates clients — one IP exhausting its
@@ -2895,9 +3792,12 @@ mod tests {
         assert!(orphan.verify_pow(20));
         assert!(Wallet::verify_transaction(&orphan));
 
-        // 1) Park: O is rejected as an orphan and persisted (memory + Sled).
+        // 1) PHASE D: the funnel QUEUES O (the pure gate passes; parents are
+        // checked at SELECT/PROCESS time); the drainer parks it as an orphan
+        // and persists it (memory + Sled).
         let result = rpc.process_transaction(orphan.clone(), "Test").await;
-        assert!(result.is_err(), "missing parents must reject the tx");
+        assert!(result.is_ok(), "pure-valid tx is queued (funnel)");
+        rpc.drain_mempool().await;
         {
             let orphans = rpc.orphans.read().await;
             assert!(
@@ -2925,8 +3825,10 @@ mod tests {
             .unwrap();
 
         // 3) Auto-resubmission: process_orphans re-processes O through the
-        // FULL gate and clears it from memory and disk.
+        // FULL gate — the funnel re-queues it (counted orphan_resolved) and
+        // clears it from memory and disk; the drainer then includes it.
         rpc.process_orphans().await;
+        rpc.drain_mempool().await;
 
         assert!(
             rpc.dag.read().await.get_transaction(orphan.id).is_some(),
@@ -2956,9 +3858,10 @@ mod tests {
         let status = rpc.determine_transaction_status(orphan.id).await;
         assert_eq!(
             status.local_status,
-            LocalStatus::InMempool,
-            "an accepted tx is in both mempool and DAG; the status precedence \
-             is orphans -> mempool -> DAG, so InMempool is the honest result"
+            LocalStatus::InLocalDag,
+            "PHASE D: an included tx leaves the queue (the REMOVE step), so \
+             the honest status is the DAG — it can no longer linger in both \
+             stores (that lingering was the Phase C dead-end)"
         );
     }
 

@@ -370,15 +370,29 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     {
         let storage_read = storage.read().await;
         if let Ok(persisted_txs) = storage_read.load_mempool_txs() {
+            let dag_read = dag.read().await;
             let mut mempool_write = mempool.write().await;
+            let mut skipped = 0usize;
             for tx in persisted_txs {
+                // PHASE D: skip txs already in the DAG (legacy persisted copies
+                // of accepted txs — the old build persisted the last-1000
+                // accepted txs into the "Mempool" tree) and drop their stale
+                // copies: only genuinely pending txs re-enter the queue. This
+                // self-heals old data dirs: a fresh boot never starts with a
+                // full queue that blocks everything (the Phase C dead-end).
+                if dag_read.transactions().contains_key(&tx.id) {
+                    let _ = storage_read.remove_mempool_tx(tx.id);
+                    skipped += 1;
+                    continue;
+                }
                 if mempool_write.size() < mempool_write.max_size() {
-                    let _ = mempool_write.add_internal(tx).await;
+                    let _ = mempool_write.enqueue(tx, 0);
                 }
             }
             tracing::info!(
-                "💾 Loaded {} persisted mempool transactions",
-                mempool_write.size()
+                "💾 Loaded {} persisted mempool transactions ({} skipped: already in DAG)",
+                mempool_write.size(),
+                skipped
             );
         }
     }
@@ -506,6 +520,66 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                     tracing::warn!("❌ P2P transaction rejected: {}", e);
                 }
             }
+        }
+    });
+
+    // PHASE D: MEMPOOL DRAINER — the mempool lifecycle loop
+    // (ACCEPT → QUEUE → SELECT → PROCESS → INCLUDE → REMOVE). Spawned
+    // unconditionally so it runs on every node type (miner, validator,
+    // observer): a node that accepts transactions into its queue must also
+    // drain them into its DAG, or the queue becomes the Phase C dead-end
+    // again. Observability (mandate §13): the lifecycle counters + drain
+    // rate are logged every 5 s (aether_getMempoolStats + /metrics expose
+    // them on demand).
+    let dag_for_drain = dag.clone();
+    let mempool_for_drain = mempool.clone();
+    let ledger_for_drain = ledger.clone();
+    let storage_for_drain = storage.clone();
+    let ledger_path_for_drain = ledger_path.clone();
+    let p2p_for_drain = p2p_network.clone();
+    let orphans_for_drain = orphans.clone();
+    let sync_ctx_for_drain = sync_ctx.clone();
+
+    tokio::spawn(async move {
+        tracing::info!("✅ Mempool drainer task spawned");
+        let rpc_impl = AetherRpcImpl::new(
+            dag_for_drain,
+            ledger_for_drain,
+            storage_for_drain,
+            ledger_path_for_drain,
+            mempool_for_drain,
+            p2p_for_drain,
+            Arc::new(RwLock::new(true)),
+            orphans_for_drain,
+            sync_ctx_for_drain,
+        );
+        let mut last_log = std::time::Instant::now();
+        let mut last_removed: u64 = 0;
+        loop {
+            rpc_impl.drain_mempool().await;
+            if last_log.elapsed() >= std::time::Duration::from_secs(5) {
+                let s = rpc_impl.mempool_stats().await;
+                let removed_delta = s.removed.saturating_sub(last_removed);
+                let drain_rate = removed_delta as f64 / 5.0;
+                tracing::info!(
+                    "🔻 Mempool | size={} max={} min_fee={} | added={} removed={} included={} rejected={} expired={} duplicate={} orphan={} resolved={} | drain_rate={:.1}/s",
+                    s.size,
+                    s.max_size,
+                    s.min_fee,
+                    s.added,
+                    s.removed,
+                    s.included,
+                    s.rejected,
+                    s.expired,
+                    s.duplicate,
+                    s.orphan_parked,
+                    s.orphan_resolved,
+                    drain_rate
+                );
+                last_removed = s.removed;
+                last_log = std::time::Instant::now();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         }
     });
 

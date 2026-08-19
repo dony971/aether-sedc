@@ -94,6 +94,13 @@ impl TransactionProcessor {
         }
     }
 
+    /// PHASE D: expose the pure gate (PoW + signature) to the mempool ACCEPT
+    /// path, so unvalidated junk never occupies a queue slot (parity with the
+    /// H1 orphan rule: entering any store costs one valid PoW + signature).
+    pub fn validate_pure(&self, tx: &Transaction) -> Result<(), ValidationError> {
+        self.validator.validate_pure(tx)
+    }
+
     /// Process a transaction through the secure pipeline
     ///
     /// 🔒 ZERO TRUST PIPELINE:
@@ -282,23 +289,16 @@ impl TransactionProcessor {
             return Err(ProcessingError::DagError(format!("DAG add failed: {}", e)));
         }
 
-        // STEP 7: ADD TO MEMPOOL
-        match mempool.add_internal(tx.clone()).await {
-            Ok(_) => tracing::info!("✅ Transaction added to mempool (fee: {})", tx.fee),
-            Err(e) => {
-                tracing::error!("❌ Mempool add failed: {}", e);
-                *ledger = ledger_snapshot;
-                // Roll back the DAG entry we just added to keep atomicity.
-                dag.remove_transaction(&tx.id);
-                drop(ledger);
-                drop(dag);
-                drop(mempool);
-                return Err(ProcessingError::MempoolError(format!(
-                    "Mempool add failed: {}",
-                    e
-                )));
-            }
-        }
+        // STEP 7: REMOVE FROM MEMPOOL (PHASE D — the mempool is a PENDING
+        // queue, not a dead-end window). The drainer SELECTed this tx; once it
+        // reaches the DAG it leaves the queue. Previously this step ADDED the
+        // tx to a never-drained window and ROLLED BACK the DAG add when the
+        // window was full — that is exactly how the network deadlocked at 1000
+        // transactions (Phase C root cause): DAG growth stopped, bootstrap got
+        // blocked, the faucet was pinned. The queue can now never reject a
+        // DAG-valid tx: inclusion is the terminal disposition. Idempotent (the
+        // drainer may already have disposed of it).
+        mempool.remove_transaction(&tx.id);
 
         // STEP 8: PERSIST STATE (ledger + transaction in Sled, so the DAG
         // survives restarts and the boot rebuild is consistent)
