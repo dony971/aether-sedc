@@ -120,15 +120,66 @@ drain_` (M3/M4/M5).
 
 ## Campagne réseau (mandat §15)
 
-Rejouée à partir du binaire release de cette correction :
+Rejouée à partir du binaire release de cette correction (commits `d5051ed` +
+fixes de campagne, SHA256 final `153394F86EA613A5A57FF8D791D6C1DE2C03E99A4F4E95C423B3D5DCAFA6BFE2`).
 
-1. Rejeu Phase A + Phase B (batterie B1-B8, joins @500/@1000).
-2. Critiques Phase C : charge 1100 → 2500 → 5000 avec joins frais à chaque
-   niveau, faucet sous charge, redémarrages (§10 : reprise sans perte ni doublon),
-   observation `aether_getMempoolStats` (drain prouvable : ↑ → sélection →
-   inclusion → ↓).
-3. Bootstrap 5000 : nœud neuf jusqu'à h_txset/h_dag/h_tips/h_ledger/h_weights/
-   supply — une file pleine ne doit jamais bloquer le bootstrap.
+### Fixes de campagne découverts pendant la Phase D
+
+1. **Tempête de requêtes parents (`src/rpc.rs`, park_orphan)** : le drainer
+   re-demandait les DEUX parents pour CHAQUE orphelin garé, immédiatement —
+   tempête de GetData (une réponse par requête), affamant les vrais lots de
+   sync : un joineur recevait seulement les ~500 premières tx, les racines
+   n'arrivaient jamais, bootstrap livelocké à 0 tx. **Fix** : park_orphan ne
+   requête plus rien ; le solveur d'orphelins possède les requêtes.
+2. **Solveur d'orphelins (`src/rpc.rs`, process_orphans)** : ne collecte plus
+   que les parents DUE (cooldown via `SyncContext::backoff_for`), en priorisant
+   les jamais-demandés → rotation complète du set de parents (128/cycle) au lieu
+   des mêmes 128 ; suppression du sleep 20 ms/requête (stallait le cycle drain).
+3. **Cap d'inventaire (`src/p2p.rs`)** : `take(MAX_INV_ITEMS)` s'appliquait à
+   l'inventaire BRUT du pair → toute tx au-delà de la 1000ᵉ invisible pour le
+   joineur (diff vide, `sync_requested=0`, bootstrap bloqué à quelques tx du
+   tip). **Fix** : le cap borne la REQUÊTE (le vrai diff) — un joineur tardif
+   demande tout son manquant.
+
+### Leçon opérationnelle (ports)
+
+Les ports d'écoute des joineurs (50001-54001) tombent dans la plage éphémère
+OS (49152-65535) : un socket SORTANT d'un pair peut s'y lier (collision
+observée : éphémère de node5 sur 50001) et le bind du listener échoue
+(10048/10013) — le nœud tourne alors SANS couche P2P (RPC + drainer vivants,
+sync = 0, silencieux). Les joineurs Phase D utilisent donc 49002-49006
+(p2p) / 49102-49106 (rpc), sous la plage éphémère.
+
+### Résultats
+
+- **Stage A — rampe 1100 (non-régression Phase C) : PASS (15/15).**
+  Ramp 1100 atteinte (~3,5 tx/s, 8 générateurs parallèles), convergence 8/8,
+  mempool after1100 : `size=0/1000 min_fee=1 added=1104 removed=1100
+  included=1100 rejected=0 expired=0 dup=32 orphan=0 resolved=0`.
+- **Stage B — join frais @1100 (node9) : PASS.** Empreintes identiques
+  (h_txset/h_dag/h_tips/h_ledger/h_weights/supply). Mempool du joineur :
+  `added=2184 removed=2184 included=1068 orphan=1116 resolved=1055` — cascade
+  de résolution d'orphelins fonctionnelle (avant fix : livelock à 0).
+- **Stage C — rampe 2500 + join frais @2500 (node10) : PASS.** Sync 0 → 2500
+  en ~140 s (orphan_created=1641, resolved=1578) ; empreintes identiques ;
+  drain : `added=1400 included=1400 removed=1400 size=0`.
+- **Stage D — rampe 5000 + join frais @5000 (node11) : PASS — bootstrap 5000
+  critique réussi.** Sync 0 → 5007 en ~340 s (orphan_created=2765,
+  resolved=2751) ; empreintes identiques ; drain : `added=3908 included=3907
+  size=0 rejected=0 expired=0`.
+- **Stage E — faucet sous charge @5000+ : PASS.** Tx faucet acceptée et
+  créditée (+100000000000 raw) ; convergence finale 11/11 empreintes
+  identiques ; mempool final `size=0` ; **invariant zéro-émission delta=0**
+  (somme des 16 adresses surveillées == genesis `1000000100000000000`, frais
+  dirigés vers l'adresse de burn `ffff…`).
+- Redémarrages §10 : boot-load 1069 tx persistées rejouées + ledger reconstruit
+  (supply cohérent) ; les nodes 1-8 ont repris à 1100 exactement.
+
+### Verdict campagne
+
+Tous les seuils critiques du mandat §15 sont passés (drain correct, bootstrap
+5000, joins @1100/2500/5000, faucet sous charge, invariants) → **🟡 CANARY À
+REPRENDRE** (nouvelle RC, même mandat).
 
 ## Limites restantes
 

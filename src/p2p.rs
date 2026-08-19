@@ -849,10 +849,17 @@ impl P2PNetwork {
                             // being requested), re-requesting it is pure waste.
                             let our_hashes = get_dag_hashes();
                             let our_hash_set: HashSet<Vec<u8>> = our_hashes.into_iter().collect();
+                            // PHASE D live-campaign fix: the MAX_INV_ITEMS cap
+                            // used to apply to the PEER's raw inventory, which
+                            // hid every tx beyond the first 1000 from a joining
+                            // node (the diff came out empty, sync_requested=0,
+                            // bootstrap stuck a few txs short of the tip). The
+                            // cap now bounds the REQUEST (the real diff) so a
+                            // late joiner still asks for the whole missing set.
                             let missing_hashes: Vec<Vec<u8>> = hashes
                                 .into_iter()
-                                .take(MAX_INV_ITEMS)
                                 .filter(|h| !our_hash_set.contains(h) && !is_orphan(h.as_slice()))
+                                .take(MAX_INV_ITEMS)
                                 .collect();
 
                             // Request missing transactions via GetData

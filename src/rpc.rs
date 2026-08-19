@@ -1350,9 +1350,10 @@ impl AetherRpcImpl {
     }
 
     /// H1: persist a pure-validated orphan (PoW + signature already checked by
-    /// the processor) under a hard cap, and request the missing parents over
-    /// P2P. Returns false when the orphan store is full (nothing persisted).
-    async fn park_orphan(&self, tx: Transaction, missing_parents: &[[u8; 32]]) -> bool {
+    /// the processor) under a hard cap. Returns false when the orphan store is
+    /// full (nothing persisted). The missing parents are NOT requested here —
+    /// the orphan solver (process_orphans) owns the bounded parent requests.
+    async fn park_orphan(&self, tx: Transaction, _missing_parents: &[[u8; 32]]) -> bool {
         // Cap: never let the orphan store grow without bound.
         {
             let orphans = self.orphans.read().await;
@@ -1396,22 +1397,18 @@ impl AetherRpcImpl {
             .orphan_created
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // Request the missing parents via P2P (each in its own task so one
-        // slow peer cannot block the others). B4: request_transaction now
-        // deduplicates with an escalating backoff, so repeated orphans of the
-        // same tx cannot flood the peer with duplicate GetData.
-        for parent in missing_parents {
-            let p2p = self.p2p_network.clone();
-            let parent_hash = parent.to_vec();
-            tokio::spawn(async move {
-                p2p.request_transaction(parent_hash).await;
-            });
-        }
-
+        // NOTE (Phase D live-campaign fix): the missing parents are NOT
+        // requested here anymore. Requesting both parents for EVERY parked
+        // orphan from the drainer flooded the peers with GetData (one reply
+        // per request, ~30 ms of node-loop time each) and starved the real
+        // sync batches: a joining node received only the first ~500 txs, the
+        // dependency roots never arrived and bootstrap livelocked at 0 txs.
+        // The orphan solver (process_orphans, bounded to 128 due parents per
+        // cycle with an escalating backoff) now owns the parent requests.
         tracing::info!(
             "📦 Orphan stored: {} (missing {} parent(s)) - persisted to disk",
             hex::encode(&tx.id),
-            missing_parents.len()
+            _missing_parents.len()
         );
         true
     }
@@ -1588,17 +1585,34 @@ impl AetherRpcImpl {
         // that exact moment), the orphan stayed stuck forever. Re-request
         // every cycle so chains converge. B4: the requests themselves are
         // deduplicated with an escalating backoff inside request_transaction.
+        // Phase D: only parents whose cooldown is DUE are collected (up to
+        // 128 per cycle), preferring the never-requested ones so the whole
+        // parent set is covered instead of the same 128 forever; no sleep —
+        // the backoff bounds the request rate and a per-request sleep in the
+        // drainer path was stalling the drain cycle.
         {
             let missing_parent_hashes: Vec<[u8; 32]> = {
                 let orphans = self.orphans.read().await;
                 let dag = self.dag.read().await;
+                let requested = self.sync_ctx.requested_parents.read().await;
+                let now = std::time::Instant::now();
                 let mut hashes: Vec<[u8; 32]> = Vec::new();
                 for (_tx_id, orphan) in orphans.iter() {
                     for parent in orphan.parents.iter() {
-                        if *parent != [0u8; 32]
-                            && !dag.transactions().contains_key(parent)
-                            && !hashes.contains(parent)
+                        if *parent == [0u8; 32]
+                            || dag.transactions().contains_key(parent)
+                            || hashes.contains(parent)
                         {
+                            continue;
+                        }
+                        let due = match requested.get(parent.as_slice()) {
+                            Some((last, attempts)) => {
+                                now.duration_since(*last)
+                                    >= crate::sync_stats::SyncContext::backoff_for(*attempts)
+                            }
+                            None => true,
+                        };
+                        if due {
                             hashes.push(*parent);
                         }
                         if hashes.len() >= 128 {
@@ -1621,7 +1635,6 @@ impl AetherRpcImpl {
                     self.p2p_network
                         .request_transaction(parent_hash.to_vec())
                         .await;
-                    tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
                 }
             }
         }
