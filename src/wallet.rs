@@ -126,6 +126,43 @@ fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; 32], Box<dyn std::erro
     Ok(key)
 }
 
+/// Reconstruct a wallet only after checking that all persisted material belongs
+/// to the same keypair. `public_key_hex` is deliberately stored outside the
+/// encrypted payload so clients can display an address while locked; it must
+/// therefore be authenticated by this verification after decryption.
+fn wallet_from_material(
+    public_key_hex: String,
+    secret_key_hex: String,
+    mnemonic: Option<String>,
+) -> Result<Wallet, Box<dyn std::error::Error>> {
+    let secret_bytes = hex::decode(&secret_key_hex)?;
+    if secret_bytes.len() != 32 {
+        return Err("Invalid decrypted secret key length".into());
+    }
+    let mut secret = [0u8; 32];
+    secret.copy_from_slice(&secret_bytes);
+    let expected_public_key =
+        hex::encode(SigningKey::from_bytes(&secret).verifying_key().to_bytes());
+
+    if public_key_hex != expected_public_key {
+        return Err("Wallet public key does not match decrypted secret key".into());
+    }
+
+    if let Some(phrase) = &mnemonic {
+        let parsed = Mnemonic::parse_in(Language::English, phrase)?;
+        let seed = parsed.to_seed("");
+        if seed[..32] != secret {
+            return Err("Wallet mnemonic does not match decrypted secret key".into());
+        }
+    }
+
+    Ok(Wallet {
+        public_key_hex,
+        secret_key_hex,
+        mnemonic,
+    })
+}
+
 /// Wallet structure holding the keypair
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Wallet {
@@ -222,6 +259,13 @@ impl Wallet {
             return Err("Password must not be empty".into());
         }
 
+        // Never persist internally inconsistent key material.
+        wallet_from_material(
+            self.public_key_hex.clone(),
+            self.secret_key_hex.clone(),
+            self.mnemonic.clone(),
+        )?;
+
         // Generate fresh salt and derive the encryption key
         let mut salt = [0u8; KDF_SALT_LEN];
         OsRng.fill_bytes(&mut salt);
@@ -268,9 +312,15 @@ impl Wallet {
         }
 
         let salt = hex::decode(&encrypted.salt)?;
+        if salt.len() != KDF_SALT_LEN {
+            return Err("Invalid wallet salt length".into());
+        }
         let key_bytes = derive_key(password, &salt)?;
 
         let nonce_bytes = hex::decode(&encrypted.nonce)?;
+        if nonce_bytes.len() != AES_NONCE_LEN {
+            return Err("Invalid wallet nonce length".into());
+        }
         let nonce = Nonce::from_slice(&nonce_bytes);
 
         let encrypted_payload = hex::decode(&encrypted.payload)?;
@@ -281,11 +331,11 @@ impl Wallet {
 
         let payload: WalletPayload = serde_json::from_slice(&payload_bytes)?;
 
-        Ok(Wallet {
-            public_key_hex: encrypted.public_key_hex.clone(),
-            secret_key_hex: payload.secret_key_hex,
-            mnemonic: payload.mnemonic,
-        })
+        wallet_from_material(
+            encrypted.public_key_hex.clone(),
+            payload.secret_key_hex,
+            payload.mnemonic,
+        )
     }
 
     /// Decrypt a legacy v1 wallet (PBKDF2, dual payload) — migration support.
@@ -296,11 +346,17 @@ impl Wallet {
         password: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let salt = hex::decode(&encrypted.salt)?;
+        if salt.len() != KDF_SALT_LEN {
+            return Err("Invalid legacy wallet salt length".into());
+        }
         let mut key_bytes = [0u8; 32];
         let iterations: u32 = 100_000;
         pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, iterations, &mut key_bytes);
 
         let nonce_bytes = hex::decode(&encrypted.nonce)?;
+        if nonce_bytes.len() != AES_NONCE_LEN {
+            return Err("Invalid legacy wallet nonce length".into());
+        }
         let nonce = Nonce::from_slice(&nonce_bytes);
         let cipher = Aes256Gcm::new(Key::from_slice(&key_bytes));
 
@@ -319,11 +375,11 @@ impl Wallet {
             None
         };
 
-        Ok(Wallet {
-            public_key_hex: encrypted.public_key_hex.clone(),
-            secret_key_hex: hex::encode(secret_bytes),
+        wallet_from_material(
+            encrypted.public_key_hex.clone(),
+            hex::encode(secret_bytes),
             mnemonic,
-        })
+        )
     }
 
     /// Load wallet from a file (encrypted, v2 or legacy v1)
@@ -546,6 +602,29 @@ mod tests {
         let d = Wallet::decrypt(&e1, "pwd-1").unwrap();
         assert_eq!(d.secret_key_hex, wallet.secret_key_hex);
         assert_eq!(d.mnemonic, wallet.mnemonic);
+    }
+
+    #[test]
+    fn test_decrypt_rejects_tampered_public_key_metadata() {
+        let wallet = Wallet::new_with_mnemonic();
+        let mut encrypted = wallet.encrypt("wallet-test-password").unwrap();
+
+        // The public key is visible while a wallet is locked, but it must not
+        // be accepted if an attacker swaps it in the serialized metadata.
+        encrypted.public_key_hex = Wallet::new().public_key_hex;
+        assert!(Wallet::decrypt(&encrypted, "wallet-test-password").is_err());
+    }
+
+    #[test]
+    fn test_decrypt_rejects_invalid_kdf_lengths_without_panicking() {
+        let wallet = Wallet::new();
+        let mut encrypted = wallet.encrypt("wallet-test-password").unwrap();
+        encrypted.nonce = hex::encode([0u8; AES_NONCE_LEN - 1]);
+        assert!(Wallet::decrypt(&encrypted, "wallet-test-password").is_err());
+
+        let mut encrypted = wallet.encrypt("wallet-test-password").unwrap();
+        encrypted.salt = hex::encode([0u8; KDF_SALT_LEN - 1]);
+        assert!(Wallet::decrypt(&encrypted, "wallet-test-password").is_err());
     }
 
     #[test]

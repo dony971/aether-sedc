@@ -1310,6 +1310,16 @@ impl AetherRpcImpl {
         }
         // Resolve newly applicable orphans in the same cycle (fixpoint).
         self.process_orphans().await;
+        // INC-01: crash-durability — fsync the Sled log after every drained
+        // batch (incl. orphan resolutions) so a hard kill can never lose more
+        // than the in-flight batch. Bounded by the drain cycle (150ms). The
+        // incident observed ~9658 of 10004 persisted txs lost on a single
+        // unclean kill — the periodic 10s flush alone is NOT enough.
+        if let Ok(storage) = self.storage.try_read() {
+            if let Err(e) = storage.flush() {
+                tracing::error!("❌ INC-01: drain batch flush failed: {}", e);
+            }
+        }
     }
 
     /// PHASE D: remove a drained tx from the queue, persist the removal and
@@ -1521,6 +1531,7 @@ impl AetherRpcImpl {
                     "🔄 Re-processing orphan transaction: {}",
                     hex::encode(&tx_id[..8])
                 );
+                let orphan_parents = orphan.parents.clone();
                 match self.process_transaction(orphan, "Orphan").await {
                     Ok(_) => {
                         any_resolved = true;
@@ -1532,6 +1543,30 @@ impl AetherRpcImpl {
                             "✅ Orphan transaction successfully processed: {}",
                             hex::encode(&tx_id[..8])
                         );
+                        // INC-01: classify the resolution — local if any
+                        // parent came from the local store, remote otherwise
+                        // (P2P GetData / full sync). local + remote == total.
+                        let mut is_local = false;
+                        {
+                            let sourced = self.sync_ctx.store_sourced_parents.read().await;
+                            for parent in orphan_parents.iter() {
+                                if *parent != [0u8; 32] && sourced.contains(parent.as_slice()) {
+                                    is_local = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if is_local {
+                            self.sync_ctx
+                                .stats
+                                .orphan_resolved_local
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            self.sync_ctx
+                                .stats
+                                .orphan_resolved_remote
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         // Remove from orphans on success
                         let mut orphans = self.orphans.write().await;
                         orphans.remove(&tx_id);
@@ -1628,6 +1663,41 @@ impl AetherRpcImpl {
 
             if !missing_parent_hashes.is_empty() {
                 for parent_hash in missing_parent_hashes {
+                    // INC-01 store-first: a parent that exists in the LOCAL
+                    // persisted store must NEVER be re-requested over P2P —
+                    // the node already possesses it ("rebuild from what you
+                    // have locally"). Resolve it directly through the normal
+                    // acceptance funnel; the drainer's recovery insert handles
+                    // txs whose ledger effects are already applied.
+                    let store_tx = {
+                        if let Ok(storage) = self.storage.try_read() {
+                            storage.get_transaction(parent_hash).ok()
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(tx) = store_tx {
+                        self.sync_ctx
+                            .stats
+                            .store_hits
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.sync_ctx
+                            .store_sourced_parents
+                            .write()
+                            .await
+                            .insert(parent_hash.to_vec());
+                        if let Err(e) = self.process_transaction(tx, "SolverStore").await {
+                            tracing::warn!(
+                                "⚠️ Orphan Solver - store parent accepted with error: {}",
+                                e
+                            );
+                        }
+                        continue;
+                    }
+                    self.sync_ctx
+                        .stats
+                        .store_misses
+                        .fetch_add(1, Ordering::Relaxed);
                     tracing::info!(
                         "📡 Orphan Solver - Re-requesting missing parent via P2P: {}",
                         hex::encode(&parent_hash[..8])

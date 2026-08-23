@@ -4,7 +4,7 @@ use crate::{
     json_storage::{ensure_data_dir, load_dag_from_json, save_dag_to_json},
     ledger::Ledger,
     p2p::{P2PConfig, P2PNetwork},
-    parent_selection::{canonical_resolve_conflicts, DAG},
+    parent_selection::{canonical_resolve_conflicts, rebuild_dag_topological, DAG},
     rpc::{start_rpc_server, AetherRpcImpl, Mempool},
     storage::Storage,
     transaction::{Address, Transaction},
@@ -12,7 +12,9 @@ use crate::{
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 
 pub struct NodeHandles {
@@ -108,11 +110,15 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
         }
     }
 
+    // INC-01: shared bootstrap state created BEFORE the boot rebuild so the
+    // rebuild itself is observable (counters, orphan TTL, parent dedup).
+    let sync_ctx = Arc::new(crate::sync_stats::SyncContext::default());
+
     let mut ledger = Ledger::new_with_storage(storage.clone())
         .await
         .map_err(|e| format!("Failed to load ledger from Sled: {}", e))?;
 
-    let (dag, balances, orphans, missing_parent_hashes) = {
+    let (dag, balances, orphans, missing_parent_hashes, rebuild_skipped) = {
         let genesis_config = GenesisConfig::default();
         let (mut dag, _balances, mut orphans_rebuilt, mut missing_parent_hashes) =
             initialize_genesis(genesis_config);
@@ -254,48 +260,49 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             }
         }
 
+        let mut rebuild_skipped = 0u64;
         if !all_txs.is_empty() {
             tracing::info!(
                 "📂 Rebuilding DAG from {} persisted transactions + orphans (Sled/JSON)",
                 all_txs.len()
             );
-            // Topological insert: repeatedly add transactions whose parents
-            // are already in the DAG (Sled iteration order is random).
-            // The ledger (balances+nonces) is already persisted and must NOT
-            // be re-validated here (nonce replay would reject valid txs).
-            let mut remaining: Vec<Transaction> = all_txs;
-            let mut progress = true;
-            while progress && !remaining.is_empty() {
-                progress = false;
-                let mut still_pending = Vec::new();
-                for tx in remaining {
-                    let parent0_ok = tx.parents[0] == [0u8; 32]
-                        || dag.transactions().contains_key(&tx.parents[0]);
-                    let parent1_ok = tx.parents[1] == [0u8; 32]
-                        || dag.transactions().contains_key(&tx.parents[1]);
-                    if !(parent0_ok && parent1_ok) {
-                        still_pending.push(tx);
-                        continue;
-                    }
-                    match dag.add_transaction_validated(tx) {
-                        Ok(_) => {
-                            progress = true;
-                        }
-                        Err(e) => {
-                            tracing::warn!("⚠️ Failed to rebuild transaction: {}", e);
-                            progress = true;
-                        }
-                    }
-                }
-                remaining = still_pending;
-            }
-            for tx in remaining {
+            // INC-01: pure topological insert via rebuild_dag_topological —
+            // every persisted tx lands in exactly one bucket (inserted /
+            // skipped with an explicit reason / orphaned), nothing is ever
+            // dropped silently. NO ledger/balance validation here: the
+            // persisted ledger already contains the effects of historical
+            // txs, re-validating them would wrongly drop valid txs.
+            sync_ctx
+                .stats
+                .rebuild_total
+                .fetch_add(all_txs.len() as u64, Ordering::Relaxed);
+            let rebuild_started = Instant::now();
+            let (rebuild_inserted, rebuild_skipped_count, rebuild_orphans) =
+                rebuild_dag_topological(&mut dag, all_txs);
+            rebuild_skipped = rebuild_skipped_count;
+            for tx in rebuild_orphans {
                 tracing::warn!(
                     "⚠️ Orphan transaction detected during rebuild: tx_id: {}",
                     hex::encode(&tx.id[..8])
                 );
                 orphans_rebuilt.insert(tx.id, tx);
             }
+            sync_ctx
+                .stats
+                .rebuild_inserted
+                .fetch_add(rebuild_inserted, Ordering::Relaxed);
+            sync_ctx
+                .stats
+                .rebuild_skipped
+                .fetch_add(rebuild_skipped, Ordering::Relaxed);
+            sync_ctx
+                .stats
+                .rebuild_orphaned
+                .fetch_add(orphans_rebuilt.len() as u64, Ordering::Relaxed);
+            sync_ctx.stats.rebuild_duration_ms.fetch_add(
+                rebuild_started.elapsed().as_millis() as u64,
+                Ordering::Relaxed,
+            );
             dag.rebuild_tips();
             tracing::info!(
                 "  DAG rebuilt: {} transactions, {} tips",
@@ -317,7 +324,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
         }
         ledger.save().await?;
 
-        for (_tx_id, orphan) in &orphans_rebuilt {
+        for orphan in orphans_rebuilt.values() {
             for parent in orphan.parents.iter() {
                 if *parent != [0u8; 32] && !dag.transactions().contains_key(parent) {
                     missing_parent_hashes.push(parent.to_vec());
@@ -330,6 +337,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             ledger.balances.clone(),
             orphans_rebuilt,
             missing_parent_hashes,
+            rebuild_skipped,
         )
     };
 
@@ -339,20 +347,63 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     let dag: Arc<RwLock<DAG>> = Arc::new(RwLock::new(dag));
     let _balances: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(balances));
 
-    // The DAG is the single source of truth; the ledger is a DERIVED VIEW.
-    // Always rebuild the ledger (balances + nonces + fees burned) from genesis
-    // + a full DAG replay so a node can never boot with stale or inconsistent
-    // state. This is what makes conflict resolution and node restart converge.
+    // INC-01 GUARD: the DAG is the source of truth ONLY when the local store
+    // is complete. A crash can truncate the transaction tree (observed in the
+    // incident: 10004 -> 20 persisted txs). Deriving the ledger from a partial
+    // DAG and SAVING it permanently destroys the persisted ledger (observed:
+    // supply 1000000099999000986 -> 1000000099999999188). Rules:
+    //   - rebuild complete (no orphans, no skips) AND derived supply <=
+    //     persisted supply -> the DAG covers at least all persisted history
+    //     (a truncated tree with no orphans derives a HIGHER supply, because
+    //     fewer fees were burned) -> rebuild ledger from DAG and save.
+    //   - otherwise -> KEEP the persisted ledger untouched, flag a
+    //     crash-recovery event and let the orphan solver + full sync heal the
+    //     DAG; every tx accepted through the runtime path updates the ledger
+    //     (its nonce guard prevents double application).
     {
         let dag_read = dag.read().await;
-        ledger.rebuild_from_dag(&dag_read);
-        drop(dag_read);
-        let _ = ledger.save().await;
-        tracing::info!(
-            "♻️ Ledger rebuilt from DAG on boot: supply {} (bounds: {})",
-            ledger.total_supply(),
-            ledger.supply_within_bounds()
-        );
+        let orphans_read = orphans.read().await;
+        let store_complete = orphans_read.is_empty() && rebuild_skipped == 0;
+        drop(orphans_read);
+        if store_complete {
+            let mut derived = ledger.clone();
+            derived.rebuild_from_dag(&dag_read);
+            let derived_supply = derived.total_supply();
+            let persisted_supply = ledger.total_supply();
+            // Fresh node: persisted ledger is empty (0) because Sled has no
+            // balances yet — derived == genesis supply is the correct state.
+            // The "truncated store looks complete but derives HIGHER supply"
+            // guard only applies when the persisted ledger already holds
+            // genesis funds.
+            let is_fresh = persisted_supply == 0;
+            if is_fresh || derived_supply <= persisted_supply {
+                ledger = derived;
+                drop(dag_read);
+                let _ = ledger.save().await;
+                tracing::info!(
+                    "♻️ Ledger rebuilt from DAG on boot: supply {} (bounds: {})",
+                    ledger.total_supply(),
+                    ledger.supply_within_bounds()
+                );
+            } else {
+                drop(dag_read);
+                tracing::error!(
+                    "⛔ INC-01: store looks complete but derived supply {} > persisted {} — the persisted ledger has MORE applied history (truncated store with no orphans); KEEPING persisted ledger, recovery required",
+                    derived_supply,
+                    persisted_supply
+                );
+                sync_ctx.stats.wal_recovery.fetch_add(1, Ordering::Relaxed);
+            }
+        } else {
+            drop(dag_read);
+            tracing::error!(
+                "⛔ INC-01: local store INCOMPLETE ({} orphans, {} skipped) — KEEPING persisted ledger (supply {}), NOT overwriting; recovery via orphan solver + sync required",
+                orphans.read().await.len(),
+                rebuild_skipped,
+                ledger.total_supply()
+            );
+            sync_ctx.stats.wal_recovery.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     let ledger: Arc<RwLock<Ledger>> = Arc::new(RwLock::new(ledger));
@@ -425,18 +476,44 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     });
 
     let p2p_dag_for_tx = dag.clone();
+    let storage_for_getdata = storage.clone();
+    let sync_ctx_for_getdata = sync_ctx.clone();
     let get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
         Arc::new(move |hash| {
+            let tx_id: [u8; 32] = match hash.try_into() {
+                Ok(id) => id,
+                Err(_) => return None,
+            };
+            // Memory first: the DAG is the live source of truth.
             if let Ok(dag_lock) = p2p_dag_for_tx.try_read() {
-                let tx_id: [u8; 32] = hash.try_into().ok()?;
-                dag_lock.transactions().get(&tx_id).cloned()
-            } else {
-                None
+                if let Some(tx) = dag_lock.transactions().get(&tx_id) {
+                    sync_ctx_for_getdata
+                        .stats
+                        .getdata_remote
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Some(tx.clone());
+                }
             }
+            // INC-01: store-backed fallback — serve persisted transactions
+            // from disk when they are not in memory (after a reboot with a
+            // partial DAG, or historical txs beyond the mempool). Without
+            // this, peers that own a tx on disk but not in memory could
+            // never serve it, and a node with a truncated DAG could never
+            // heal from a peer that only has it persisted.
+            if let Ok(storage_lock) = storage_for_getdata.try_read() {
+                if let Ok(tx) = storage_lock.get_transaction(tx_id) {
+                    sync_ctx_for_getdata
+                        .stats
+                        .getdata_local
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Some(tx);
+                }
+            }
+            None
         });
 
     // B4: shared bootstrap state (counters, parent-request dedup, orphan TTL).
-    let sync_ctx = Arc::new(crate::sync_stats::SyncContext::default());
+    // (created before the boot rebuild — see above)
 
     // B4: sync dedup must also treat already-parked orphans as known (they are
     // retried by the fixpoint resolver; re-delivering them was the request

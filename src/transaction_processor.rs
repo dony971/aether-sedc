@@ -222,6 +222,23 @@ impl TransactionProcessor {
         let dag_read = dag.read().await;
         let ledger_read = ledger.read().await;
         self.validator.validate_dag(&tx, &dag_read)?;
+        // INC-01 crash recovery: the DAG-level checks passed, but the ledger
+        // may already contain this tx's effects — a crash can truncate the
+        // transaction tree (observed: 10004 -> 20 persisted txs) while the
+        // ledger snapshot survives, leaving the ledger AHEAD of the DAG. Such
+        // a tx must heal the DAG WITHOUT a ledger replay: the balance gate
+        // would reject it (already debited) or the transfer would double-apply.
+        // Signal: the sender's account_nonce slot was already committed (the
+        // nonce is committed atomically with the transfer, so a committed slot
+        // means the effects are in the ledger).
+        {
+            let ledger_nonce = ledger_read.get_nonce(&tx.sender);
+            if ledger_nonce > 0 && tx.account_nonce <= ledger_nonce {
+                drop(dag_read);
+                drop(ledger_read);
+                return self.process_recovery_insert(tx, dag, ledger).await;
+            }
+        }
         self.validator.validate_ledger(&tx, &ledger_read, min_fee)?;
         drop(dag_read);
         drop(ledger_read);
@@ -300,8 +317,28 @@ impl TransactionProcessor {
         // drainer may already have disposed of it).
         mempool.remove_transaction(&tx.id);
 
-        // STEP 8: PERSIST STATE (ledger + transaction in Sled, so the DAG
-        // survives restarts and the boot rebuild is consistent)
+        // STEP 8: PERSIST STATE (transaction FIRST, then ledger — INC-01 commit
+        // order). A crash can never leave the ledger snapshot AHEAD of the
+        // transaction tree: if the ledger was saved for tx N, tx N is already
+        // in the Sled transactions tree. The boot guard then knows the
+        // persisted ledger never references history the DAG cannot rebuild.
+        if let Some(storage) = ledger.storage() {
+            let storage_read = storage.read().await;
+            if let Err(e) = storage_read.put_transaction(&tx) {
+                tracing::error!("❌ Failed to persist transaction to Sled: {}", e);
+                return Err(ProcessingError::PersistenceError(format!(
+                    "Transaction persist failed: {}",
+                    e
+                )));
+            }
+            // P4: NO per-transaction flush. A synchronous Sled flush (fsync)
+            // per accepted tx cost ~690µs/tx in release (78.6ms vs 9.8ms per
+            // 100 txs). Durability is covered by Sled's internal auto-flush
+            // (~500ms), the INC-01 per-batch flush in the drainer, the
+            // node's periodic flush (10s) and the shutdown flush; on a hard
+            // kill the boot guard keeps the persisted ledger and the orphan
+            // solver + full sync heal the DAG from peers.
+        }
         if let Err(e) = ledger.save().await {
             tracing::error!("❌ Persistence failed: {}", e);
             return Err(ProcessingError::PersistenceError(format!(
@@ -309,22 +346,48 @@ impl TransactionProcessor {
                 e
             )));
         }
-        if let Some(storage) = ledger.storage() {
-            let storage_read = storage.read().await;
-            if let Err(e) = storage_read.put_transaction(&tx) {
-                tracing::error!("❌ Failed to persist transaction to Sled: {}", e);
-            }
-            // P4: NO per-transaction flush. A synchronous Sled flush (fsync)
-            // per accepted tx cost ~690µs/tx in release (78.6ms vs 9.8ms per
-            // 100 txs). Durability is covered by Sled's internal auto-flush
-            // (~500ms) plus the node's periodic flush (10s) and the shutdown
-            // flush; on a hard kill the boot rebuild reconstructs the ledger
-            // from the DAG (source of truth) in Sled's transactions tree.
-        }
 
         tracing::info!(
             "✅ Transaction processed successfully: {}",
             hex::encode(tx.id)
+        );
+        Ok(())
+    }
+
+    /// INC-01 crash recovery: DAG-only insertion of a transaction whose
+    /// ledger effects are already applied (the ledger is ahead of the DAG
+    /// after a crash truncated the transaction tree). The DAG is the source
+    /// of truth: heal it WITHOUT replaying the ledger — the ledger already
+    /// reflects the tx, a replay would double-apply the transfer or be
+    /// rejected by the balance gate. Idempotent: a tx already in the DAG is
+    /// a no-op.
+    async fn process_recovery_insert(
+        &self,
+        tx: Transaction,
+        dag: &Arc<RwLock<DAG>>,
+        ledger: &Arc<RwLock<Ledger>>,
+    ) -> Result<(), ProcessingError> {
+        {
+            let mut dag = match dag.try_write() {
+                Ok(l) => l,
+                Err(e) => return Err(ProcessingError::LockError(format!("DAG lock: {}", e))),
+            };
+            if dag.transactions().contains_key(&tx.id) {
+                return Ok(());
+            }
+            if let Err(e) = dag.add_transaction_validated(tx.clone()) {
+                return Err(ProcessingError::DagError(format!("DAG add failed: {}", e)));
+            }
+        }
+        if let Some(storage) = ledger.read().await.storage() {
+            let storage_read = storage.read().await;
+            if let Err(e) = storage_read.put_transaction(&tx) {
+                tracing::error!("❌ INC-01: failed to persist recovery tx to Sled: {}", e);
+            }
+        }
+        tracing::info!(
+            "🔁 INC-01 recovery insert (ledger ahead of DAG): {}",
+            hex::encode(&tx.id[..8])
         );
         Ok(())
     }

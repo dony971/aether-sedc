@@ -727,6 +727,58 @@ pub fn canonical_resolve_conflicts(txs: &mut Vec<Transaction>) -> Vec<Transactio
     pruned.into_iter().collect()
 }
 
+/// INC-01: rebuild a DAG from a persisted transaction set using a pure
+/// topological insert — a transaction is inserted only once its parents are
+/// already in the DAG (Sled iteration order is random, so a single pass is
+/// order-dependent). PURE insert: no ledger/balance validation — the
+/// persisted ledger already contains the effects of historical txs and
+/// re-validating them against it would wrongly drop valid txs (the boot
+/// rebuild must never ignore a tx just because its nonce is already
+/// committed). Every persisted tx ends up in EXACTLY ONE bucket:
+///   - inserted: parents were (eventually) present;
+///   - skipped: the DAG rejected it, with an explicit reason logged (never
+///     a silent drop);
+///   - orphans: parents absent from the set (the orphan solver heals them
+///     later from the store or peers).
+/// Deterministic: a pure function of the input set. Returns
+/// (inserted, skipped, orphans).
+pub fn rebuild_dag_topological(
+    dag: &mut DAG,
+    txs: Vec<Transaction>,
+) -> (u64, u64, Vec<Transaction>) {
+    let mut inserted: u64 = 0;
+    let mut skipped: u64 = 0;
+    let mut remaining: Vec<Transaction> = txs;
+    let mut progress = true;
+    while progress && !remaining.is_empty() {
+        progress = false;
+        let mut still_pending = Vec::new();
+        for tx in remaining {
+            let parent0_ok =
+                tx.parents[0] == [0u8; 32] || dag.transactions().contains_key(&tx.parents[0]);
+            let parent1_ok =
+                tx.parents[1] == [0u8; 32] || dag.transactions().contains_key(&tx.parents[1]);
+            if !(parent0_ok && parent1_ok) {
+                still_pending.push(tx);
+                continue;
+            }
+            progress = true;
+            match dag.add_transaction_validated(tx) {
+                Ok(_) => inserted += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        "⚠️ INC-01 rebuild skipped transaction (explicit reason): {}",
+                        e
+                    );
+                    skipped += 1;
+                }
+            }
+        }
+        remaining = still_pending;
+    }
+    (inserted, skipped, remaining)
+}
+
 /// Get current timestamp in milliseconds
 fn current_timestamp_ms() -> u64 {
     SystemTime::now()

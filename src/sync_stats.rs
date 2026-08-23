@@ -19,7 +19,7 @@
 //! finality, parent selection and genesis are untouched.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -76,6 +76,30 @@ pub struct SyncStatsSnapshot {
     pub duplicate_ignored: u64,
     /// Orphan re-processing attempts (retries)
     pub retry_count: u64,
+    /// INC-01: persisted transactions loaded at boot (Sled + JSON)
+    pub rebuild_total: u64,
+    /// INC-01: boot rebuild - transactions inserted into the DAG
+    pub rebuild_inserted: u64,
+    /// INC-01: boot rebuild - transactions skipped (with explicit reason logged)
+    pub rebuild_skipped: u64,
+    /// INC-01: boot rebuild - transactions left orphaned (parents missing from local store)
+    pub rebuild_orphaned: u64,
+    /// INC-01: boot rebuild - elapsed milliseconds
+    pub rebuild_duration_ms: u64,
+    /// INC-01: times the orphan solver found a missing parent in the local store
+    pub store_hits: u64,
+    /// INC-01: times the orphan solver looked for a missing parent in the local store and missed
+    pub store_misses: u64,
+    /// INC-01: GetData responses served from the local store
+    pub getdata_local: u64,
+    /// INC-01: GetData responses served from memory (DAG/mempool)
+    pub getdata_remote: u64,
+    /// INC-01: orphans resolved with parents found in the local store
+    pub orphan_resolved_local: u64,
+    /// INC-01: orphans resolved with parents fetched over P2P
+    pub orphan_resolved_remote: u64,
+    /// INC-01: crash/wal recovery events handled at boot
+    pub wal_recovery: u64,
 }
 
 /// Atomic bootstrap counters.
@@ -92,6 +116,18 @@ pub struct SyncStats {
     pub parent_already_known: AtomicU64,
     pub duplicate_ignored: AtomicU64,
     pub retry_count: AtomicU64,
+    pub rebuild_total: AtomicU64,
+    pub rebuild_inserted: AtomicU64,
+    pub rebuild_skipped: AtomicU64,
+    pub rebuild_orphaned: AtomicU64,
+    pub rebuild_duration_ms: AtomicU64,
+    pub store_hits: AtomicU64,
+    pub store_misses: AtomicU64,
+    pub getdata_local: AtomicU64,
+    pub getdata_remote: AtomicU64,
+    pub orphan_resolved_local: AtomicU64,
+    pub orphan_resolved_remote: AtomicU64,
+    pub wal_recovery: AtomicU64,
 }
 
 impl SyncStats {
@@ -108,6 +144,18 @@ impl SyncStats {
             parent_already_known: self.parent_already_known.load(Ordering::Relaxed),
             duplicate_ignored: self.duplicate_ignored.load(Ordering::Relaxed),
             retry_count: self.retry_count.load(Ordering::Relaxed),
+            rebuild_total: self.rebuild_total.load(Ordering::Relaxed),
+            rebuild_inserted: self.rebuild_inserted.load(Ordering::Relaxed),
+            rebuild_skipped: self.rebuild_skipped.load(Ordering::Relaxed),
+            rebuild_orphaned: self.rebuild_orphaned.load(Ordering::Relaxed),
+            rebuild_duration_ms: self.rebuild_duration_ms.load(Ordering::Relaxed),
+            store_hits: self.store_hits.load(Ordering::Relaxed),
+            store_misses: self.store_misses.load(Ordering::Relaxed),
+            getdata_local: self.getdata_local.load(Ordering::Relaxed),
+            getdata_remote: self.getdata_remote.load(Ordering::Relaxed),
+            orphan_resolved_local: self.orphan_resolved_local.load(Ordering::Relaxed),
+            orphan_resolved_remote: self.orphan_resolved_remote.load(Ordering::Relaxed),
+            wal_recovery: self.wal_recovery.load(Ordering::Relaxed),
         }
     }
 }
@@ -120,6 +168,9 @@ pub struct SyncContext {
     pub requested_parents: Arc<RwLock<HashMap<Vec<u8>, (Instant, u32)>>>,
     /// orphan id -> creation instant (TTL)
     pub orphan_births: Arc<RwLock<HashMap<[u8; 32], Instant>>>,
+    /// INC-01: parent hashes delivered from the local store by the orphan
+    /// solver (classifies orphan resolutions local vs remote).
+    pub store_sourced_parents: Arc<RwLock<HashSet<Vec<u8>>>>,
 }
 
 impl SyncContext {
