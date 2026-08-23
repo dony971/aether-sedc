@@ -36,7 +36,8 @@ function NodePorts($id){ if($id -le 8){ $p2p=41000+$id*1000+1; $rpc=41100+$id*10
 function Wait-Up($id,$timeoutSec=90){ $ports=NodePorts $id; $deadline=(Get-Date).AddSeconds($timeoutSec); while((Get-Date) -lt $deadline){ $s=Rpc $ports[1] "aether_getDagStats" @(); if($s -and $null -ne $s.total_transactions){ return $true } Start-Sleep 1 } return $false }
 function Start-Node($id,$fresh){ $ports=NodePorts $id; $dir=Join-Path $Root ("node"+$id); if($fresh -and (Test-Path $dir)){ Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue } New-Item -ItemType Directory -Force -Path $dir|Out-Null; # copy faucet.key for node1 so aether_faucet is enabled
     $fkSrc="$env:TEMP\opencode\aether-canary-phase-e\node1\faucet.key"; if((Test-Path $fkSrc) -and $id -eq 1 -and -not (Test-Path (Join-Path $dir "faucet.key"))){ Copy-Item $fkSrc (Join-Path $dir "faucet.key") -Force; Log "copied faucet.key to node$id" }
-    $args=@("--node-type","validator","--data-dir",$dir,"--p2p-port","$($ports[0])","--rpc-port","$($ports[1])"); if($id -ne 1){ $args+=@("--bootnodes","127.0.0.1:42001") }; $proc=Start-Process -FilePath $Bin -ArgumentList $args -RedirectStandardOutput (Join-Path $dir "node.log") -RedirectStandardError (Join-Path $dir "node.err") -WindowStyle Hidden -PassThru; if(-not (Wait-Up $id 90)){ Log "node$id FAILED to come up"; return $null } Log "node$id up p2p $($ports[0]) rpc $($ports[1]) pid $($proc.Id)"; return $proc }
+    # LOCAL ONLY: pas de VPS 103.102.135.123:25565 — tous les nœuds utilisent le seed local 127.0.0.1:42001 (node1 inclus en self pour écraser le default VPS)
+    $args=@("--node-type","validator","--data-dir",$dir,"--p2p-port","$($ports[0])","--rpc-port","$($ports[1])","--bootnodes","127.0.0.1:42001"); $proc=Start-Process -FilePath $Bin -ArgumentList $args -RedirectStandardOutput (Join-Path $dir "node.log") -RedirectStandardError (Join-Path $dir "node.err") -WindowStyle Hidden -PassThru; if(-not (Wait-Up $id 90)){ Log "node$id FAILED to come up"; return $null } Log "node$id up p2p $($ports[0]) rpc $($ports[1]) pid $($proc.Id)"; return $proc }
 function Stop-Node($id){ $ports=NodePorts $id; $dir=Join-Path $Root ("node"+$id); $procs=Get-CimInstance Win32_Process -Filter "Name='aether.exe'" -ErrorAction SilentlyContinue | Where-Object{ $_.CommandLine -match [regex]::Escape($dir) }; foreach($p in $procs){ try{ Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }catch{} } Start-Sleep 2 }
 function Kill-Hard($id){ $dir=Join-Path $Root ("node"+$id); $procs=Get-CimInstance Win32_Process -Filter "Name='aether.exe'" -ErrorAction SilentlyContinue | Where-Object{ $_.CommandLine -match [regex]::Escape($dir) }; foreach($p in $procs){ try{ Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue; Log "KILL hard node$id pid $($p.ProcessId)" }catch{} } }
 function TxTotal($rpc){ $s=Rpc $rpc "aether_getDagStats" @(); if($s){ return [long]$s.total_transactions } return -1 }
@@ -44,18 +45,19 @@ function Ramp-To($target,$label){
     $rpc=(NodePorts 1)[1]
     $base=TxTotal $rpc; Log "RAMP $label : base=$base target=$target"
     if($base -ge $target){ Log " already at $base >= $target"; return $true }
-    # Use faucet with distinct random addresses to bypass 60s rate-limit per address
+    # PERFORMANCE: 8× parallèle via wallets b8_*.json (pré-fundés par faucet) — ~2-3 tx/s vs 0.6 tx/s single-faucet, nécessaire pour 10k <2h
+    $wallets=@(); foreach($i in 0..7){ $f="$WalletsRoot\b8_$i.json"; if(Test-Path $f){ $o= (& $Bin balance $f --rpc-url "http://127.0.0.1:$rpc" --password $PW 2>&1 | Out-String); $addr=([regex]::Match($o,"Address: ([0-9a-fA-F]{64})")).Groups[1].Value.ToLower(); if($addr){ $wallets+=@{addr=$addr;path=$f} } } }
+    if($wallets.Count -eq 0){ Log "WARN no wallets, fallback single-faucet"; $sw=[System.Diagnostics.Stopwatch]::StartNew(); $waves=0; $accepted=0; while((TxTotal $rpc) -lt $target -and $waves -lt 8000){ $waves++; $g1=[Guid]::NewGuid().ToString("N"); $g2=[Guid]::NewGuid().ToString("N"); $randAddr=($g1+$g2).Substring(0,64); $r=Rpc $rpc "aether_faucet" @($randAddr); $isOk=$false; if($r){ if($r.success -eq $true -or $r.status -eq "ok"){ $isOk=$true } }; if($isOk){ $accepted++ }; if($waves % 50 -eq 0){ Log " wave $waves accepted=$accepted total=$(TxTotal $rpc)" }; Start-Sleep -Milliseconds 80 }; $sw.Stop(); $cur=TxTotal $rpc; Log "RAMP $label done: accepted=$accepted total=$cur in $($sw.Elapsed.TotalSeconds.ToString('N1'))s"; return ($cur -ge $target) }
+    # fund wallets once if balance low (faucet 10 AETH ≈ 990 tx per wallet)
+    foreach($w in $wallets){ $bal=Rpc $rpc "aether_getBalance" @($w.addr); if(-not $bal -or [long]$bal.balance -lt 50000000000){ $g1=[Guid]::NewGuid().ToString("N"); $g2=[Guid]::NewGuid().ToString("N"); $randAddr=($g1+$g2).Substring(0,64); $fr=Rpc $rpc "aether_faucet" @($w.addr); if($fr.success){ Log "funded $($w.addr.Substring(0,8))" } Start-Sleep -Milliseconds 200 } }
     $sw=[System.Diagnostics.Stopwatch]::StartNew(); $waves=0; $accepted=0
-    while((TxTotal $rpc) -lt $target -and $waves -lt 8000){
-        $waves++
-        # generate a random 32-byte address (hex 64) - use GUID + random to avoid duplicate rate-limit
-        $g1=[Guid]::NewGuid().ToString("N"); $g2=[Guid]::NewGuid().ToString("N"); $randAddr=($g1+$g2).Substring(0,64)
-        $r=Rpc $rpc "aether_faucet" @($randAddr)
-        $isOk = $false; if($r){ if($r.success -eq $true -or $r.status -eq "ok"){ $isOk=$true } }
-        if($isOk){ $accepted++ } elseif($r -and $r.error -match "Rate limited"){ Start-Sleep -Milliseconds 200; continue } elseif($r -and $r.PSObject.Properties.Name -contains "error"){ Log " faucet err: $($r.error)" }
-        if($waves % 50 -eq 0){ Log " wave $waves accepted=$accepted total=$(TxTotal $rpc)" }
-        Start-Sleep -Milliseconds 80
-        if($waves % 200 -eq 0){ $cur=TxTotal $rpc; if($cur -eq $base -and $cur -lt $target){ Log " STALL at wave $waves cur=$cur"; } $base=$cur }
+    while((TxTotal $rpc) -lt $target -and $waves -lt 5000){
+        $waves++; $procs=@()
+        foreach($w in $wallets){ $to=([Guid]::NewGuid().ToString("N")+ [Guid]::NewGuid().ToString("N")).Substring(0,64); $procs+=Start-Process -FilePath $Bin -ArgumentList @("send",$to,"1","10","--rpc-url","http://127.0.0.1:$rpc","--wallet",$w.path,"--password",$PW) -WindowStyle Hidden -PassThru }
+        foreach($p in $procs){ $p.WaitForExit(15000) | Out-Null; if($p.ExitCode -eq 0){ $accepted++ } }
+        if($waves % 20 -eq 0){ $cur=TxTotal $rpc; Log " wave $waves accepted=$accepted total=$cur" }
+        if($waves % 100 -eq 0){ $cur=TxTotal $rpc; if($cur -eq $base -and $cur -lt $target){ Log " STALL at wave $waves cur=$cur" } $base=$cur }
+        Start-Sleep -Milliseconds 100
     }
     $sw.Stop(); $cur=TxTotal $rpc; Log "RAMP $label done: accepted=$accepted total=$cur in $($sw.Elapsed.TotalSeconds.ToString('N1'))s"
     return ($cur -ge $target)

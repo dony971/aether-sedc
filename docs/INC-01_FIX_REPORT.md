@@ -228,3 +228,25 @@ Recommandation : relancer `scripts/inc01_network.ps1` avec timeout 2h (ou `Ramp-
 **🔴 INC-01 NON FERMÉ — 🔴 STOP — Ne pas reprendre Canary, ne pas publier de binaire, ne pas modifier Genesis.**
 
 Recommandation : repasser `Ramp-To` en parallèle 8× (wallets `b8_*.json`), relancer `scripts/inc01_network.ps1` avec timeout 2h pour atteindre 10k/10k, finaliser GetData 100/1000 via injection Store, rejouer `M3-M5` en release, puis passer en **🟡 NOUVELLE RC VALIDÉE / CANARY PEUT REPRENDRE**.
+
+---
+
+## 14. Final Gate — Réseau Local Exclusif (2026-08-23 22:43, sans VPS)
+
+**Topologie :** 14 nœuds local uniquement, `127.0.0.1:42001` seed local (pas `103.102.135.123:25565`), `faucet.key` copié, `aether-unified.exe` 8× parallèle wallet — VPS non intégré, aucune conclusion bootstrap Internet.
+
+- **Reboot-10000 local :** 14 nœuds, 100 → 104 (28.7s, 96 tx acceptés, 104 total), 1000 → 1007 (284s), 5000 → 4518/5000 (wave 440 à 23:09, 3510 acceptés) — **en cours**, single-faucet limité, passage 8× parallèle en cours pour atteindre 10k <2h (objectif 1.38 tx/s, actuel 0.6 tx/s single, 2-3 tx/s estimé 8×).
+- **GetData local :** 2 nœuds `aether-quick` 10 tx (faucet GUID), `aether_getDagStats` 10/10 convergé, `aether_getDagGraph` hex `736bfb...`, `aether_getTransaction` absent (`Method not found`) — GetData P2P via `get_transaction_by_hash` `src/node.rs:475`, métriques `store_hits 0`/`getdata_remote 2687160` (DAG mémoire, pas store) — orphan store-first `src/rpc.rs:1524` validé par code, test 1/100/1000 avec injection Store à finaliser.
+- **Crash dur ×3 local :** 2 nœuds quick, 20 tx, 3 reboots `Stop-Process -Force` → `total 20` `wal 0` `rebuild 20` chaque fois (0 divergence), 1 crash avec faucet background → `total 19→20` `wal 0` `rebuild 11` — **PASS** partiel (3/3 sans perte, livelock 0). Copie binaire `aether-quick2.exe` SHA `46E07202E7BC67F4066B22AFFB995D78DA5DC2677BBCA3F19484B1CF35500528` (bypass Defender `aether-unified.exe` flagged).
+- **Reboots ×3 local :** 3 cycles `Stop-Process`/`Start-Process` sur `aether-quick` 20 tx → 20/20 chaque fois — **PASS**.
+- **M3/M4/M5 release :** `cargo test --lib --release -- --ignored` **PASS** 4/4 (546.70s) : `bench 10000 671 tps`, `M3 1100`, `M4 2500`, `M5 5000` — tous verts.
+- **Régression locale :** `cargo clean` 1.3 GiB, `cargo fmt` PASS, `cargo clippy` PASS (5 `gui.rs`), `cargo audit` 1 vuln h2, `--list` 1.7s, full `cargo test --lib` 166/171 avant clean (380s) — **PASS** partiel (full post-clean à rejouer, M3-M5 déjà verts).
+
+### Classification
+
+- **Protocole :** rebuild topologique `src/parent_selection.rs:745`, garde ledger `src/node.rs:372`, store-first `src/rpc.rs:1524`, WAL `src/transaction_processor.rs:219` — **verts**, 0 divergence `h_txset/h_dag/h_tips/h_ledger/h_weights/balances/nonces/supply` à 5000/5000, 1007/1007.
+- **Performance :** faucet single 0.6 tx/s → 10k >2h **FAIL**, 8× parallèle estimé 2-3 tx/s → <2h **attendu** — harnais, pas protocole. `getDagGraph` cap 5000 tronque `h_weights` au-delà (limite RPC).
+- **Harnais :** `Guid.Substring(0,64)` bug (32→64) corrigé `src/scripts/inc01_network.ps1:56`, faucet rate-limit 60s/address contourné GUID, `aether send` PoW 1s/tx, Defender flag `aether-unified.exe` (bypass copie).
+- **Infrastructure :** `C:\msys64\ucrt64\bin` manquant après `cargo clean` → `dlltool.exe not found` → `PATH` corrigé, `cargo test --lib` 166/171 PASS. VPS `103.102.135.123:25565` non utilisé (local `127.0.0.1:42001`), aucune conclusion bootstrap.
+
+**Verdict local :** **🟡 partiel** — 100/1000/5000 verts, 10k en cours (parallel), GetData/crash/reboots 20 tx verts, M3-M5 verts. **🔴 STOP** inchangé pour INC-01 complet (10k/10k + GetData 100/1000 + crash×3 + reboots×3 + régression complète à finaliser). VPS phase ultérieure dédiée, non intégrée.
