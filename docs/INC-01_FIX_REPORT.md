@@ -1,7 +1,7 @@
 # INC-01 Fix Report — Rebuild / Ledger Guard / Store-First / WAL
 
 **Branche :** `inc-01-fix` **Base gelée :** `b3e11df`  
-**Commit RC :** `ff1ae2ee3dae640dd261beb788ed0211efc779ae` (distinct de `b3e11df`, section 8)  
+**Commit RC :** `77f01ee31cde8a0a900d75934fc8af8afa6efc97` (HEAD actuel `inc-01-fix`, distinct de `b3e11df` — vérifiable via `git rev-parse HEAD` et `git log --oneline -1`)  
 **Binaire testé :** `target/release/aether-unified.exe` SHA256 `1E452605358B94C4AC2E1AEDBCBD9EAB45B4A54538C0AD6B2D9ED9AFF5E0155B` (release) / `7B0F43A141C746723A96A639424814659864D8ABBB1F761320349730BE8390B8` (debug) — rebuild 2026-08-23 08:00 UTC, 28s  
 **Date :** 2026-08-23  
 **Auteur :** Muse Spark (opencode)
@@ -162,3 +162,69 @@ Recommandation : relancer `scripts/inc01_network.ps1` avec timeout 2h (ou `Ramp-
 ---
 
 *Preuves : logs `~\.local\share\opencode\inc01_network_run3.log`, `cargo-test-lib.log`, outputs `tool_0214e4a74001KYpN9ZDTdV9krH`.*
+
+---
+
+## 12. Final Gate (2026-08-23)
+
+### Reboot-10000 — 2h timeout
+
+- **Infra :** même `scripts/inc01_network.ps1`, 14 nœuds, faucet GUID, `copied faucet.key`, `guard fresh-node` corrigé.
+- **Résultat 1h (précédent) :** 5651/10000, 0 divergence pré, timeout → **PARTIEL**
+- **Résultat 2h (23/08 17:28-19:28) :** 7788/10000 (wave 5150, total 7788) — progression 2137 tx supplémentaires en 1h supplémentaire (0.59 tx/s après 5000, dégradation due à `getDagGraph` cap et sync). **FAIL** selon critère « >2h = FAIL » (spec §1). Unit test local `test_inc01_rebuild_10000_restores_exact_state` reste **PASS** (317s, 10000/10000, `h_txset` `h_weights` identiques), prouvant que le rebuild est correct ; le dépassement est dû au débit faucet single-thread, pas à la correction.
+- **Métriques 7788 :** `pre-reboot reboot-5000` 14/14 `37ff9d181bd9eea0` (5000), `reboot-10000` interrompu à 7788, `rebuild` non testé à 10k réseau. Optimisation requise : faucet parallèle 8× (comme `phase_d_ramp.ps1`) pour atteindre 1.38 tx/s moyen (10k/7200s) — actuel single-faucet plafonne à ~0.6 tx/s après 5k.
+- **Action :** repasser à `Ramp-To` parallèle wallet (8 `aether send` via `aether-unified.exe`, wallets `b8_*.json` pré-fundés) ou batch `aether_faucet` parallèle, et relancer avec timeout 2h.
+
+### GetData store-first — complet
+
+- **Code :** `src/node.rs:475` `get_transaction_by_hash` mémoire → `storage.get_transaction` → `getdata_local` vs `getdata_remote`, `src/rpc.rs:store_hits/misses`.
+- **Test réseau 2 nœuds (7545 tx, post-crash) :** `aether_getDagGraph(100)` → 5 tx ids, `aether_getTransaction` sur chaque id présent → `store_hits 0`, `getdata_local 0`, `getdata_remote 2687160` (servi depuis DAG mémoire, pas store — normal car DAG complet). Pour forcer le chemin store, il faut un tx présent sur disque mais absent du DAG mémoire (orphan non résolu) — ce chemin est couvert par le solveur store-first `src/rpc.rs:1524` (`store_hits` incrémenté quand `storage.get_transaction(parent)` réussit avant P2P). Test négatif `deadbeef...` → `store_misses 64` inchangé (pas de requête P2P inutile pour tx déjà présent : le test 5× n’a pas incrémenté `getdata_local`, prouvant l’absence de requête inutile).
+- **Validation :** chemin store-first présent et métriques exposées ; test 1/100/1000 avec IDs réels **partiellement** validé (servi depuis mémoire, pas depuis store, car DAG complet). Le test complet 100/1000 avec orphan artificiel (tx injecté dans store sans DAG) reste à finaliser via helper Rust (injection `Storage::put_transaction`).
+
+### Crash dur
+
+- **Kill :** `Stop-Process -Force` (TerminateProcess) pendant `faucet` loop (écritures Sled + mempool).
+- **Mesures 23/08 19:28 :** `wal_recovery 1`, `rebuild_total 7590`, `rebuild_inserted 7548`, `rebuild_orphaned 42`, `rebuild_skipped 0`, `total_transactions 7548`, `tip_count 88`, `connected_peers 8`, rebuildTime ~0.03-0.05s. `Get-State` node1 vs node2 : `7548/7548` converge après rebuild, `h_txset` `h_weights` identiques (fingerprint `37ff9d...` avant crash). Aucune divergence `h_ledger`/`supply` (ledger gardé, `persisted==0` fresh-node corrigé).
+- **Verdict crash :** **PASS** partiel (1 crash, recovery OK), à compléter par 3 crashes + mesures `missing tx`, `duplicate tx`, `orphan count` comparées à peer sain.
+
+### Reboots ×3
+
+- Script `Test-Reboot` prêt pour 3 cycles `10000 tx → reboot → convergence`. Exécuté pour 100/1000/5000 (1 reboot chacun) : **PASS**. Cycle 3× 10k non atteint due au timeout 10k, mais le mécanisme `Start-Node $victim $false` + `rebuild_tips` est validé (0.027-0.054s). À finaliser avec `reboot ×3` explicite (seed 42001 vs non-seed 43001, pendant sync vs après sync).
+
+### Store / Ledger incohérence
+
+- Scénario simulé par `test_inc01_recovery_insert_ledger_ahead` : ledger en avance (`nonce 1` commité) vs DAG tronqué (tx absente) → `process_recovery_insert` DAG-only sans replay → **PASS**, pas de double-débit. Réseau : `wal_recovery` + guard `persisted==0 || derived<=persisted` couvre le cas frais vs tronqué.
+
+### Audit h2 — RUSTSEC-2026-0258
+
+- **Crate :** `h2 v0.3.27`, **ID :** `RUSTSEC-2026-0258`, Date 2026-08-17, Titre `h2 unbounded empty DATA frames`, URL `https://rustsec.org/advisories/RUSTSEC-2026-0258`, Solution `>=0.4.16`.
+- **Chemin :** `h2 0.3.27 → hyper 0.14.32 (client,h2,http1,http2) → hyper-tls 0.5.0 → reqwest 0.11.27 → aether-unified v1.2.0`. Transitive, pas directe.
+- **Composant :** HTTP/2 `DATA` frames vides non bornés → DoS mémoire/CPU.
+- **Exploitabilité Aether :** P2P utilise TCP custom (`p2p.rs`), pas HTTP/2 ; RPC utilise `hyper 0.14` en HTTP/1.1 JSON-RPC (`aether_getDagStats` etc) ; client `reqwest` n’utilise HTTP/2 que vers des peers HTTP/2 (nos nœuds n’exposent pas H2). Risque **faible**, DoS seulement si un attaquant force une connexion H2 vers le RPC (non exposé en H2 par défaut). Aucun PoC réseau Aether.
+- **Correctif disponible :** `h2 >=0.4.16` nécessite `hyper >=1.0` et `reqwest >=0.12`/`tonic >=0.12` — bump majeur breaking (API `hyper::Client` → `hyper-util`, `tonic` 0.11→0.12). Non sans risque pour un hotfix INC-01.
+- **Décision :** **ne pas mettre à jour dans cette RC** (git `77f01ee`), documenter, planifier upgrade `hyper 1.x` en phase suivante avec tests `cargo test --lib` + `S1-S11 W1-W12 B4`. `cargo audit` reste avec 1 vulnérabilité + 7 `unmaintained` (bincode, derivative, fxhash, instant, paste, rustls-pemfile, ttf-parser) préexistants.
+
+### Régression finale
+
+- `cargo clean` → 1.3 GiB, `cargo fmt --check` **PASS**, `cargo clippy` **PASS** (5 warnings `gui.rs`), `cargo audit` **1 vulnérabilité h2** (voir ci-dessus).
+- `cargo test --lib` : avant clean **166 passed, 4 ignored, 0 failed** (380s, inc01 4/4) ; après clean, `--list` **PASS** (1.7s), full run interrompu à 600s à `test_inc01_rebuild_10000` (60s+), mais précédente run complète reste référence. `S1-S11 W1-W12 B4-1 B4-2 B4-3 M3 M4 M5` : **non rejoués après clean** (M3-M5 `ignored` en debug, à rejouer en release comme en phase D) — à finaliser après `h2` upgrade.
+
+### RC Integrity
+
+- Aucune modification de code depuis `77f01ee31cde8a0a900d75934fc8af8afa6efc97` (seulement ce rapport). Si `h2` upgrade, **nouvelle RC** requise, rebuild propre, SHA256 du binaire testé uniquement, rapport mis à jour avec `commit`, `SHA256`, `rustc --version`, `Cargo.lock` hash.
+
+---
+
+## 13. Verdict Final Gate
+
+- **Reboot-10000 :** 🔴 **FAIL** (>2h, 7788/10000) — débit faucet insuffisant, pas de perte (0 divergence avant), unit test 10k PASS.
+- **GetData :** 🟡 **PARTIEL** (chemin store-first présent, métriques OK, test 1/100/1000 avec orphan store à finaliser)
+- **Crash dur :** 🟡 **PARTIEL** (1 crash PASS, 3× + mesures complètes à finaliser)
+- **Reboots ×3 :** 🟡 **PARTIEL** (1× 100/1000/5000 PASS, 3× 10k à finaliser)
+- **Store/Ledger incohérence :** 🟢 **PASS** (unit + guard)
+- **Audit h2 :** 🟡 **DOCUMENTÉ** (pas de maj dans cette RC)
+- **Régression :** 🟡 **PARTIEL** (166/171 avant clean, à rejouer complet après h2)
+
+**🔴 INC-01 NON FERMÉ — 🔴 STOP — Ne pas reprendre Canary, ne pas publier de binaire, ne pas modifier Genesis.**
+
+Recommandation : repasser `Ramp-To` en parallèle 8× (wallets `b8_*.json`), relancer `scripts/inc01_network.ps1` avec timeout 2h pour atteindre 10k/10k, finaliser GetData 100/1000 via injection Store, rejouer `M3-M5` en release, puis passer en **🟡 NOUVELLE RC VALIDÉE / CANARY PEUT REPRENDRE**.
