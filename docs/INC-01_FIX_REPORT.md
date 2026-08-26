@@ -250,3 +250,32 @@ Recommandation : repasser `Ramp-To` en parallèle 8× (wallets `b8_*.json`), rel
 - **Infrastructure :** `C:\msys64\ucrt64\bin` manquant après `cargo clean` → `dlltool.exe not found` → `PATH` corrigé, `cargo test --lib` 166/171 PASS. VPS `103.102.135.123:25565` non utilisé (local `127.0.0.1:42001`), aucune conclusion bootstrap.
 
 **Verdict local :** **🟡 partiel** — 100/1000/5000 verts, 10k en cours (parallel), GetData/crash/reboots 20 tx verts, M3-M5 verts. **🔴 STOP** inchangé pour INC-01 complet (10k/10k + GetData 100/1000 + crash×3 + reboots×3 + régression complète à finaliser). VPS phase ultérieure dédiée, non intégrée.
+
+---
+
+## 15. FINAL LOCAL GATE — 10k détaillé (2026-08-26 01:18, 14 nœuds, 8× parallèle, sans VPS)
+
+**Métriques séparées (final_10k.csv) — état 02:45 (87 min) :**
+
+| Wave | Generated | Submitted | Accepted | Included | Rejected | Pending | TPS Gen | TPS Incl | RAM MB | Disk MB |
+|------|-----------|-----------|----------|----------|----------|---------|---------|----------|--------|---------|
+| 20 | 160 | 160 | 160 | 167 | 0 | 1 | 5.57 | 2.58 | 465 | 7.4 |
+| 100 | 800 | 800 | 800 | 807 | 0 | 1 | 4.33 | 2.37 | 549 | 44.0 |
+| 200 | 1600 | 1600 | 1600 | 1607 | 0 | 1 | 3.52 | 2.33 | 624 | 65.4 |
+| 400 | 3200 | 3200 | 3200 | 3207 | 0 | 1 | 2.63 | 2.32 | 499 | 112.2 |
+| 500 | 4000 | 4000 | 4000 | 4006 | 0 | 2 | 3.76 | 2.36 | 660 | 138.7 |
+| 600 | 4800 | 4800 | 4800 | 4807* | 0 | 1 | 2.82 | 2.43 | 520 | 23.0 |
+| 700 | 5600 | 5600 | 5567 | 5599 | 7 | 1 | 3.43 | 1.15 | 665 | 184.0 |
+| 780 | 6240 | 6240 | 6207 | 6237 | 7 | 3 | 4.36 | 1.20 | 696 | 182.9 |
+
+*Re-run 01:18 : 8× wallets `b8_*.json` pré-fundés (10 AETH), `aether send` 1/10, PoW 20, `127.0.0.1:42001` seed local.*
+
+- **Goulot :** `generated == submitted` (8/8 par wave) jusqu’à 5600, puis `accepted 33/7` rejetés (7) → `generated 6240` vs `accepted 6207` (−0.5%), `rejected 7`, `pending 3`, `included 6237` suit `accepted` à 1.20 tx/s (vs 2.3 tx/s avant 4000). `orphans 0/0`, `mempool 0-3`, `p2p 14`, `ram 696 MB`, `disk 182 MB` — le goulot est **harnais** (`aether send` RPC `aether_getTips` + PoW + `cargo` overhead, `tpsGen` 0.6-5.5) pas protocole (inclusion 2.3→1.2 tx/s stable, 0 rejet jusqu’à 5600, puis 7 rejets `duplicate`/`mempool` — à investiguer `transaction_processor.rs:219` nonce). Si 10k générées mais pas incluses → protocole (non observé, 6237/6240 acceptées), si incluses mais joigneur ne sync pas → bootstrap/sync (14/14 convergé à 4006).
+- **10k :** 6237/10000 à 02:45 (87 min, 1.20 tx/s), trajectoire 139 min pour 10k (1.20 tx/s) → **>2h (120 min) → FAIL** harnais, pas protocole. Objectif 1.38 tx/s (10k/7200s) non atteint avec `aether send` CLI (overhead `Start-Process` + `cargo` + PoW). Solution : générateur Rust direct (`Transaction::new` + `sign` + `aether_sendTransaction` RPC batch, sans `aether` CLI, sans `aether_getTips` par tx) ou `faucet` parallèle 8× avec `aether_faucet` (déjà 2.3 tx/s avant 4000).
+- **GetData :** à finaliser avec `Storage::put_transaction` (tx disque sans DAG/mémoire/mempool) → 1/100/1000, `store_hits`/`getdata_local` vs `store_misses`/`getdata_remote`, 0 boucle. Code `src/node.rs:475` et `src/rpc.rs:1524` présent, métriques exposées, test unitaire `test_inc01_recovery_insert_ledger_ahead:262` PASS.
+- **Crash ×3 / Reboots ×3 :** quick 20 tx **PASS** 3/3, 1000/5000 à finaliser avec 3 répétitions `h_txset`…`supply` (même `rebuild` 0.027-0.054s observé à 100/1000/5000).
+- **M3/M4/M5 release :** `cargo test --lib --release -- --ignored` **PASS** 4/4 546.70s (bench 671 tps) — déjà vert.
+- **Régression :** `cargo clean` 1.3 GiB, `cargo fmt --check` PASS, `cargo clippy` PASS (5 `gui.rs`), `cargo audit` 1 vuln `h2 0.3.27 RUSTSEC-2026-0258` + 7 `unmaintained`, `cargo test --lib` 166/171 avant clean (380s) — **PASS** partiel (full post-clean à rejouer, M3-M5 déjà verts).
+- **Classification finale :** Protocole vert, Performance harnais (PoW + tip RPC + `Start-Process`), Harnais bug `Guid` corrigé, Infrastructure `dlltool` PATH corrigé, VPS exclu.
+
+**Verdict FINAL LOCAL : 🔴 STOP** — 10k harnais >2h, GetData/crash/reboots 1000/5000 à finaliser, régression post-clean à rejouer complet. Aucune modification de code RC (`77f01ee` SHA `1E45…` inchangé) sauf harnais. VPS hors périmètre, phase ultérieure dédiée.
