@@ -171,6 +171,13 @@ pub struct SyncContext {
     /// INC-01: parent hashes delivered from the local store by the orphan
     /// solver (classifies orphan resolutions local vs remote).
     pub store_sourced_parents: Arc<RwLock<HashSet<Vec<u8>>>>,
+    /// C2-004: cached topological serving order, keyed by DAG length.
+    /// Recomputing Kahn's sort over the whole DAG for EVERY GetData
+    /// collapsed serving nodes at ~10k txs (measured +34M hash lookups
+    /// in 60 s). The order is a SERVING HINT ONLY, never consensus: a
+    /// stale entry (e.g. same length after a prune+add) merely batches
+    /// less optimally, never wrong data.
+    pub topo_cache: Arc<RwLock<Option<(u64, Vec<Vec<u8>>)>>>,
 }
 
 impl SyncContext {

@@ -946,11 +946,34 @@ impl P2PNetwork {
                             // arrive ancestor-first no matter the request order, so
                             // a joining node inserts most of them immediately
                             // instead of parking deep chains of orphans.
+                            // C2-004: the order is CACHED by DAG length. Sorting
+                            // the whole DAG per GetData collapsed serving nodes
+                            // at ~10k txs; the cache makes repeat requests O(1).
                             const PAGE_SIZE: usize = 100;
-                            let topo = Self::topological_order(
-                                &*get_dag_hashes,
-                                &*get_transaction_by_hash,
-                            );
+                            let all_hashes = get_dag_hashes();
+                            let topo: Option<Vec<Vec<u8>>> = {
+                                let cache = sync_ctx.topo_cache.read().await;
+                                match cache.as_ref() {
+                                    Some((len, order)) if *len as usize == all_hashes.len() => {
+                                        Some(order.clone())
+                                    }
+                                    _ => None,
+                                }
+                            };
+                            let topo = match topo {
+                                Some(order) => Some(order),
+                                None => {
+                                    let order = Self::topological_order(
+                                        all_hashes,
+                                        &*get_transaction_by_hash,
+                                    );
+                                    if let Some(ref o) = order {
+                                        let mut cache = sync_ctx.topo_cache.write().await;
+                                        *cache = Some((o.len() as u64, o.clone()));
+                                    }
+                                    order
+                                }
+                            };
                             let mut requested: Vec<Vec<u8>> =
                                 hashes.iter().take(PAGE_SIZE).cloned().collect();
                             if let Some(order) = topo {
@@ -1219,10 +1242,9 @@ impl P2PNetwork {
     /// Returns None above `TOPO_ORDER_CAP` (cost guard): the caller then falls
     /// back to the request order.
     fn topological_order(
-        get_dag_hashes: &(dyn Fn() -> Vec<Vec<u8>> + Send + Sync),
+        hashes: Vec<Vec<u8>>,
         get_transaction_by_hash: &(dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync),
     ) -> Option<Vec<Vec<u8>>> {
-        let hashes = get_dag_hashes();
         if hashes.is_empty() || hashes.len() > TOPO_ORDER_CAP {
             return None;
         }

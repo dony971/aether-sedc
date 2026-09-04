@@ -790,6 +790,11 @@ pub struct AetherRpcImpl {
     /// Faucet signing key, loaded from a SERVER-ONLY file (`data_dir/faucet.key`)
     /// at startup. `None` means the faucet is disabled (no secret in the source).
     faucet_key: Option<SigningKey>,
+    /// C2-002: serializes faucet distributions. The account nonce is read as
+    /// `ledger_nonce + 1`; concurrent calls raced and minted several txs with
+    /// the SAME nonce (only the smallest id wins, the rest are pruned —
+    /// observed as missing faucet receives on catching-up nodes).
+    faucet_serial: Arc<tokio::sync::Mutex<()>>,
     rate_limiter: RateLimiter,
     /// H3: per-client-IP budget so a single attacker cannot exhaust the shared
     /// per-method budget (which would DoS every other client).
@@ -860,6 +865,7 @@ impl AetherRpcImpl {
             faucet_cooldowns: Arc::new(RwLock::new(std::collections::HashMap::new())),
             fee_oracle: Arc::new(RwLock::new(FeeOracle::new())),
             faucet_key,
+            faucet_serial: Arc::new(tokio::sync::Mutex::new(())),
             rate_limiter: RateLimiter::new(200, 10), // 200 requests per 10s window
             rate_limiter_per_ip: RateLimiter::new(40, 10), // 40 requests per 10s per client IP
             start_time: std::time::Instant::now(),
@@ -2091,6 +2097,9 @@ impl AetherRpcImpl {
 
     /// Faucet - give test funds via a real DAG transaction
     pub async fn faucet(&self, address: Address) -> Result<FaucetResponse, RpcError> {
+        // C2-002: serialize whole distributions (nonce read + mine + submit)
+        // so concurrent calls cannot mint duplicate-nonce siblings.
+        let _serial = self.faucet_serial.lock().await;
         // The faucet secret key lives in a server-only file. Without it the
         // faucet is disabled: no operator has handed us the key, so we must
         // not issue funds (fixes V-01: key removed from source).
