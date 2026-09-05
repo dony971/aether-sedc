@@ -1267,7 +1267,14 @@ impl P2PNetwork {
                         continue;
                     }
                     if indeg.contains_key(parent.as_slice()) {
-                        *indeg.get_mut(parent.as_slice()).unwrap() += 1;
+                        // C2-004 FIX: indeg[h] counts h's UNMET PARENT
+                        // dependencies (Kahn). The previous code incremented
+                        // the PARENT's counter (i.e. counted children), which
+                        // emitted tips-first: joining nodes parked every batch
+                        // as orphans and the re-request storm collapsed serving
+                        // nodes at ~10k txs. Parents-first lets joiners insert
+                        // immediately.
+                        *indeg.get_mut(h).unwrap() += 1;
                     }
                     children.entry(parent.to_vec()).or_default().push(h.clone());
                 }
@@ -1849,5 +1856,49 @@ mod tests {
             snap.parent_already_known, 2,
             "repeats within the cooldown are deduplicated"
         );
+    }
+
+    /// C2-004: topological_order must emit parents before children.
+    /// The previous implementation incremented the PARENT's counter
+    /// (counting children), serving tips-first: joining nodes parked
+    /// every batch as orphans and the re-request storm collapsed serving
+    /// nodes at ~10k txs.
+    #[test]
+    fn test_topological_order_parents_first() {
+        let mk = |id: u8, parents: [[u8; 32]; 2]| -> Transaction {
+            Transaction::new(
+                parents,
+                [id; 32],
+                [id + 1; 32],
+                100,
+                10,
+                1234567890 + id as u64,
+                0,
+                1,
+                vec![0u8; 64],
+                vec![0u8; 32],
+            )
+        };
+        let genesis = [0u8; 32];
+        let a = mk(1, [genesis, genesis]);
+        let b = mk(2, [a.id, genesis]);
+        let c = mk(3, [a.id, genesis]);
+        let d = mk(4, [b.id, c.id]);
+        let by_id: std::collections::HashMap<Vec<u8>, Transaction> = [&a, &b, &c, &d]
+            .into_iter()
+            .map(|t| (t.id.to_vec(), t.clone()))
+            .collect();
+        let lookup = |h: &[u8]| -> Option<Transaction> { by_id.get(h).cloned() };
+
+        // Feed child-first: the order must still come out parents-first.
+        let hashes = vec![d.id.to_vec(), c.id.to_vec(), b.id.to_vec(), a.id.to_vec()];
+        let order =
+            P2PNetwork::topological_order(hashes, &lookup).expect("chain+diamond must sort");
+        assert_eq!(order.len(), 4);
+        let pos = |id: &[u8; 32]| order.iter().position(|h| h.as_slice() == id).unwrap();
+        assert!(pos(&a.id) < pos(&b.id), "A before B");
+        assert!(pos(&a.id) < pos(&c.id), "A before C");
+        assert!(pos(&b.id) < pos(&d.id), "B before D");
+        assert!(pos(&c.id) < pos(&d.id), "C before D");
     }
 }
