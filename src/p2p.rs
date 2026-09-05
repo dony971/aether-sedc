@@ -955,9 +955,19 @@ impl P2PNetwork {
                                 let cache = sync_ctx.topo_cache.read().await;
                                 match cache.as_ref() {
                                     Some((len, order)) if *len as usize == all_hashes.len() => {
+                                        sync_ctx
+                                            .stats
+                                            .topo_cache_hits
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         Some(order.clone())
                                     }
-                                    _ => None,
+                                    _ => {
+                                        sync_ctx
+                                            .stats
+                                            .topo_cache_miss
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        None
+                                    }
                                 }
                             };
                             let topo = match topo {

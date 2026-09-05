@@ -100,6 +100,10 @@ pub struct SyncStatsSnapshot {
     pub orphan_resolved_remote: u64,
     /// INC-01: crash/wal recovery events handled at boot
     pub wal_recovery: u64,
+    /// C2-004: GetData serving order taken from the topo cache (no re-sort)
+    pub topo_cache_hits: u64,
+    /// C2-004: GetData serving order recomputed (cache empty/stale/capped)
+    pub topo_cache_miss: u64,
 }
 
 /// Atomic bootstrap counters.
@@ -128,6 +132,8 @@ pub struct SyncStats {
     pub orphan_resolved_local: AtomicU64,
     pub orphan_resolved_remote: AtomicU64,
     pub wal_recovery: AtomicU64,
+    pub topo_cache_hits: AtomicU64,
+    pub topo_cache_miss: AtomicU64,
 }
 
 impl SyncStats {
@@ -156,6 +162,8 @@ impl SyncStats {
             orphan_resolved_local: self.orphan_resolved_local.load(Ordering::Relaxed),
             orphan_resolved_remote: self.orphan_resolved_remote.load(Ordering::Relaxed),
             wal_recovery: self.wal_recovery.load(Ordering::Relaxed),
+            topo_cache_hits: self.topo_cache_hits.load(Ordering::Relaxed),
+            topo_cache_miss: self.topo_cache_miss.load(Ordering::Relaxed),
         }
     }
 }
