@@ -320,3 +320,35 @@ long-offline return like node10) triggers the storm.
 Fix direction (protocol-review, NOT canary): cache the topological
 order / serve GetData without per-message full sort; bound or batch
 parent re-requests; cap inventory-driven storms. No RC change here.
+
+## C3 validation of C2-004 fix (2026-09-05, branch canary-c2-fixes)
+
+**Result: SYNC COLLAPSE FIXED, LEDGER DIVERGENCE PERSISTS (refined).**
+
+- Fresh node11 @10k DAG: 0 -> 10043/10053 in ~20 min. Orphan resolution
+  works (3510 resolved). Serving is O(1): seed **28784 topo hits / 1 miss**
+  (was 1147 miss / 0 hits pre-fix). No request storm.
+- BUT node11 ledger diverges durably (restart does NOT heal):
+  faucet nonce **28 vs 25** on the majority; faucet balance reflects ~16
+  sends vs 24; wallets +/- hundreds of billions.
+- Totals: 10043 vs 10053 (-10); the gap never backfills.
+
+### Refined mechanism (supplements INC-C2-003)
+
+node11 holds faucet conflict-LOSERS (nonces 26-28) the 9-node majority
+pruned, while missing ~13 winners. Coherent story:
+1. C2 faucet bursts (pre-serialization) minted same-nonce siblings;
+   smallest-id-wins pruned losers on nodes that saw both.
+2. Store-backed GetData can serve a loser still present in some peer s
+   sled (prune/purge lag), so a syncing node ingests losers.
+3. The corresponding winners never arrive (same -10 tail pattern as
+   node10: suspected is_orphan/seen interaction), so node11 never
+   re-resolves; nonce slots advance past phantom transfers.
+4. Restart cannot heal: DAG lacks winners, ledger trusts nonce slots.
+
+### Next-branch work (NOT this canary)
+
+1. Synchronous purge-on-prune: store must never serve pruned losers.
+2. Diagnose why fetched-missing winners stall (is_orphan dedup vs
+   requested_parents vs seen-cache on the -10 tail).
+3. STEP-1c redesign: applied-tx tracking instead of nonce-only guard.

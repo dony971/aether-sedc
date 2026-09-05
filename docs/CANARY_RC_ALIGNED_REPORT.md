@@ -102,3 +102,34 @@ réseau sain à 9 nœuds et 10k tx (0 divergence majorité, 0 rejet), mais
 
 **Rappels :** pas d'audit externe crypto ; W11/T1 reste SÉVÈRE ;
 VPS hors périmètre ; aucun binaire publié sans décision opérateur.
+
+---
+
+## 7. C3 — validation des fixes (branche `canary-c2-fixes`, 2026-09-05)
+
+Commits : `2fd46e9` (cache topo + faucet serial), `064b788` (compteurs),
+`07f7d46` (parents-first + test). SHA binaire : `8ADA9726…`.
+
+| Fix | Résultat |
+|---|---|
+| Cache ordre topo (serve O(1)) | ✅ 28784 hits / 1 miss (était 1147 miss / 0 hit) |
+| Ordre parents-first (root cause : indeg comptait les enfants) | ✅ + test `test_topological_order_parents_first` |
+| Join frais à 10k DAG | ✅ 0 → 10043/10053 en ~20 min, 3510 orphans résolus, pas de tempête |
+| Faucet sérialisé | ✅ en place (effet : plus de siblings même-nonce) |
+| Tests Rust | ✅ 167/167 + 14/14 p2p (nouveau test inclus) |
+
+**MAIS — divergence ledger persistante (classe C2-003, mécanisme affiné) :**
+node11 DAG quasi complet mais ledger divergent (faucet nonce 28 vs 25 :
+losers de conflits smallest-id-wins ingérés depuis les stores pairs,
+winners correspondants jamais récupérés, queue -10 figée, restart
+ingérissable). Voir `CANARY_INCIDENTS.md` (section C3).
+
+### Verdict confirmé
+
+```
+🔴 STOP (inchangé)
+```
+
+Le collapse sync est réparé, mais un nœud en rattrapage peut toujours
+atterrir sur un état ledger durablement divergent. Prochaine branche :
+purge-on-prune synchrone, diagnostic winners manquants, redesign STEP-1c.
