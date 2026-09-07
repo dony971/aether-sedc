@@ -155,8 +155,31 @@ impl Storage {
     }
 
     /// Delete a transaction
+    ///
+    /// C2 (purge-on-prune): the delete MUST also remove the AddressIndex
+    /// entries (sender+id and receiver+id). `put_transaction` and
+    /// `batch_write` index every tx by both addresses; leaving stale index
+    /// entries behind lets pruned conflict-losers linger in address scans
+    /// and -- worse -- resurrect through any future reader that trusts the
+    /// index. The tx is looked up first so both index keys are known; a
+    /// missing tx still removes the main entry (idempotent).
     pub fn delete_transaction(&self, id: TransactionId) -> Result<(), StorageError> {
         let tree = self.tree(TreeName::Transactions);
+        let index_tree = self.tree(TreeName::AddressIndex);
+        if let Ok(value) = tree.get(id) {
+            if let Some(value) = value {
+                if let Ok(tx) = bincode::deserialize::<Transaction>(&value) {
+                    let mut sender_key = Vec::with_capacity(64);
+                    sender_key.extend_from_slice(&tx.sender);
+                    sender_key.extend_from_slice(&tx.id);
+                    index_tree.remove(sender_key)?;
+                    let mut receiver_key = Vec::with_capacity(64);
+                    receiver_key.extend_from_slice(&tx.receiver);
+                    receiver_key.extend_from_slice(&tx.id);
+                    index_tree.remove(receiver_key)?;
+                }
+            }
+        }
         tree.remove(id)?;
         Ok(())
     }
@@ -300,8 +323,21 @@ impl Storage {
                     tx_tree.insert(key.as_ref(), value.as_slice())?;
                 }
 
-                // Transaction deletes
+                // Transaction deletes (C2 purge-on-prune: also drop both
+                // AddressIndex keys so pruned losers leave no trace).
                 for id in &tx_deletes {
+                    if let Ok(Some(value)) = tx_tree.get(id.as_ref()) {
+                        if let Ok(tx) = bincode::deserialize::<Transaction>(&value) {
+                            let mut sender_key = Vec::with_capacity(64);
+                            sender_key.extend_from_slice(&tx.sender);
+                            sender_key.extend_from_slice(&tx.id);
+                            index_tree.remove(sender_key.as_slice())?;
+                            let mut receiver_key = Vec::with_capacity(64);
+                            receiver_key.extend_from_slice(&tx.receiver);
+                            receiver_key.extend_from_slice(&tx.id);
+                            index_tree.remove(receiver_key.as_slice())?;
+                        }
+                    }
                     tx_tree.remove(id.as_ref())?;
                 }
 
@@ -746,6 +782,117 @@ mod tests {
 
         storage.delete_transaction(tx.id).unwrap();
         assert!(!storage.transaction_exists(tx.id).unwrap());
+    }
+
+    /// C2 (purge-on-prune): deleting a tx must remove its AddressIndex
+    /// entries (sender AND receiver) so a pruned conflict-loser can never
+    /// be served or resurrected through address scans.
+    #[test]
+    fn test_delete_purges_address_index() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+
+        let tx = Transaction::new(
+            [[0u8; 32]; 2],
+            [1u8; 32],
+            [2u8; 32],
+            100,
+            10,
+            0,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 32],
+        );
+
+        storage.put_transaction(&tx).unwrap();
+        assert_eq!(
+            storage
+                .get_transactions_by_address(&[1u8; 32])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            storage
+                .get_transactions_by_address(&[2u8; 32])
+                .unwrap()
+                .len(),
+            1
+        );
+
+        storage.delete_transaction(tx.id).unwrap();
+        assert!(!storage.transaction_exists(tx.id).unwrap());
+        assert!(storage
+            .get_transactions_by_address(&[1u8; 32])
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .get_transactions_by_address(&[2u8; 32])
+            .unwrap()
+            .is_empty());
+        // Direct index proof (get_transactions_by_address skips dangling
+        // entries, so only a raw prefix scan discriminates the old leak).
+        let index = storage.tree(TreeName::AddressIndex);
+        assert_eq!(index.scan_prefix([1u8; 32]).count(), 0);
+        assert_eq!(index.scan_prefix([2u8; 32]).count(), 0);
+
+        // Idempotent: deleting twice is not an error.
+        storage.delete_transaction(tx.id).unwrap();
+    }
+
+    /// C2 (purge-on-prune): same guarantee through the atomic batch path.
+    #[test]
+    fn test_batch_delete_purges_address_index() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+
+        let tx = Transaction::new(
+            [[0u8; 32]; 2],
+            [3u8; 32],
+            [4u8; 32],
+            100,
+            10,
+            0,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 32],
+        );
+
+        storage
+            .batch_write(vec![BatchOperation::PutTransaction(tx.clone())])
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_transactions_by_address(&[3u8; 32])
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            storage
+                .get_transactions_by_address(&[4u8; 32])
+                .unwrap()
+                .len(),
+            1
+        );
+
+        storage
+            .batch_write(vec![BatchOperation::DeleteTransaction(tx.id)])
+            .unwrap();
+        assert!(!storage.transaction_exists(tx.id).unwrap());
+        assert!(storage
+            .get_transactions_by_address(&[3u8; 32])
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .get_transactions_by_address(&[4u8; 32])
+            .unwrap()
+            .is_empty());
+        let index = storage.tree(TreeName::AddressIndex);
+        assert_eq!(index.scan_prefix([3u8; 32]).count(), 0);
+        assert_eq!(index.scan_prefix([4u8; 32]).count(), 0);
     }
 
     #[test]
