@@ -856,11 +856,30 @@ impl P2PNetwork {
                             // bootstrap stuck a few txs short of the tip). The
                             // cap now bounds the REQUEST (the real diff) so a
                             // late joiner still asks for the whole missing set.
+                            // C2 diagnostics: advertised total + orphan-dedup skips.
+                            sync_ctx.stats.inventory_advertised.fetch_add(
+                                hashes.len() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            let mut skipped_orphan = 0u64;
                             let missing_hashes: Vec<Vec<u8>> = hashes
                                 .into_iter()
-                                .filter(|h| !our_hash_set.contains(h) && !is_orphan(h.as_slice()))
+                                .filter(|h| {
+                                    if our_hash_set.contains(h) {
+                                        return false;
+                                    }
+                                    if is_orphan(h.as_slice()) {
+                                        skipped_orphan += 1;
+                                        return false;
+                                    }
+                                    true
+                                })
                                 .take(MAX_INV_ITEMS)
                                 .collect();
+                            sync_ctx
+                                .stats
+                                .inventory_skipped_orphan
+                                .fetch_add(skipped_orphan, std::sync::atomic::Ordering::Relaxed);
 
                             // Request missing transactions via GetData
                             if !missing_hashes.is_empty() {
@@ -1045,6 +1064,12 @@ impl P2PNetwork {
                             //    they are parked as orphans and their parents are
                             //    requested (bounded by the parent-request dedup).
                             let mut pending: Vec<(Vec<u8>, Transaction)> = Vec::new();
+                            // C2 diagnostics: raw items before the DAG/orphan
+                            // dedup below (peers re-sending tracked items?).
+                            sync_ctx.stats.sync_response_items.fetch_add(
+                                tx_bytes_list.len() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                             for tx_bytes in tx_bytes_list.into_iter().take(MAX_INV_ITEMS) {
                                 if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
                                     if get_transaction_by_hash(&tx.id).is_some()

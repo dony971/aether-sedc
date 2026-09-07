@@ -76,6 +76,18 @@ pub struct SyncStatsSnapshot {
     pub duplicate_ignored: u64,
     /// Orphan re-processing attempts (retries)
     pub retry_count: u64,
+    /// C2 (missing-winner diagnostics): total tx hashes ever advertised
+    /// by peer Inventory messages. If a tx we lack is never advertised,
+    /// the gap is on the SERVING side.
+    pub inventory_advertised: u64,
+    /// C2: advertised hashes skipped because already parked as orphans
+    /// (is_orphan dedup). A stuck high count with zero resolutions means
+    /// parents never arrive for the parked set: request-side stall.
+    pub inventory_skipped_orphan: u64,
+    /// C2: raw tx items inside received SyncResponse batches, BEFORE the
+    /// DAG/orphan dedup. sync_received <= this number; a wide gap means
+    /// peers keep re-sending what we already track (serving blind spot).
+    pub sync_response_items: u64,
     /// INC-01: persisted transactions loaded at boot (Sled + JSON)
     pub rebuild_total: u64,
     /// INC-01: boot rebuild - transactions inserted into the DAG
@@ -120,6 +132,9 @@ pub struct SyncStats {
     pub parent_already_known: AtomicU64,
     pub duplicate_ignored: AtomicU64,
     pub retry_count: AtomicU64,
+    pub inventory_advertised: AtomicU64,
+    pub inventory_skipped_orphan: AtomicU64,
+    pub sync_response_items: AtomicU64,
     pub rebuild_total: AtomicU64,
     pub rebuild_inserted: AtomicU64,
     pub rebuild_skipped: AtomicU64,
@@ -150,6 +165,9 @@ impl SyncStats {
             parent_already_known: self.parent_already_known.load(Ordering::Relaxed),
             duplicate_ignored: self.duplicate_ignored.load(Ordering::Relaxed),
             retry_count: self.retry_count.load(Ordering::Relaxed),
+            inventory_advertised: self.inventory_advertised.load(Ordering::Relaxed),
+            inventory_skipped_orphan: self.inventory_skipped_orphan.load(Ordering::Relaxed),
+            sync_response_items: self.sync_response_items.load(Ordering::Relaxed),
             rebuild_total: self.rebuild_total.load(Ordering::Relaxed),
             rebuild_inserted: self.rebuild_inserted.load(Ordering::Relaxed),
             rebuild_skipped: self.rebuild_skipped.load(Ordering::Relaxed),
@@ -210,6 +228,27 @@ mod tests {
         assert_eq!(snap.sync_progress, 0);
         assert_eq!(snap.orphan_created, 0);
         assert_eq!(snap.parent_already_known, 0);
+    }
+
+    /// C2 (missing-winner diagnostics): the new counters exist, default
+    /// to zero, and round-trip through the snapshot (they are exposed via
+    /// `aether_getSyncStats` for the next canary).
+    #[test]
+    fn test_p2_diagnostic_counters() {
+        let stats = SyncStats::default();
+        stats.inventory_advertised.fetch_add(10, Ordering::Relaxed);
+        stats
+            .inventory_skipped_orphan
+            .fetch_add(3, Ordering::Relaxed);
+        stats.sync_response_items.fetch_add(7, Ordering::Relaxed);
+        stats.topo_cache_hits.fetch_add(5, Ordering::Relaxed);
+        stats.topo_cache_miss.fetch_add(1, Ordering::Relaxed);
+        let snap = stats.snapshot();
+        assert_eq!(snap.inventory_advertised, 10);
+        assert_eq!(snap.inventory_skipped_orphan, 3);
+        assert_eq!(snap.sync_response_items, 7);
+        assert_eq!(snap.topo_cache_hits, 5);
+        assert_eq!(snap.topo_cache_miss, 1);
     }
 
     #[test]
