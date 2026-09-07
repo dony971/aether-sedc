@@ -408,6 +408,37 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
 
     let ledger: Arc<RwLock<Ledger>> = Arc::new(RwLock::new(ledger));
 
+    // C2 P3: applied-set cross-check (observability for the next canary).
+    // dag_not_applied > 0 after a complete-store rebuild means transfers
+    // were skipped live and only healed at boot; applied_not_in_dag > 0
+    // means marks survived their tx (should only happen transiently
+    // around prunes — save() rewrites authoritatively).
+    {
+        let dag_read = dag.read().await;
+        let ledger_read = ledger.read().await;
+        let mut dag_not_applied = 0u64;
+        for key in dag_read.transactions().keys() {
+            if let Ok(id) = <[u8; 32]>::try_from(key.as_slice()) {
+                if !ledger_read.is_applied(&id) {
+                    dag_not_applied += 1;
+                }
+            }
+        }
+        let mut applied_not_in_dag = 0u64;
+        for id in ledger_read.applied.iter() {
+            if !dag_read.transactions().contains_key(id.as_slice()) {
+                applied_not_in_dag += 1;
+            }
+        }
+        if dag_not_applied > 0 || applied_not_in_dag > 0 {
+            tracing::warn!(
+                "🔍 C2 P3 applied cross-check: {} DAG txs without applied mark, {} applied marks without DAG tx",
+                dag_not_applied,
+                applied_not_in_dag
+            );
+        }
+    }
+
     tracing::info!("💾 DAG loaded from JSON");
     tracing::info!("🔄 Rebuilding tips...");
     {
