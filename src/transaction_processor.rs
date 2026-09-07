@@ -222,21 +222,48 @@ impl TransactionProcessor {
         let dag_read = dag.read().await;
         let ledger_read = ledger.read().await;
         self.validator.validate_dag(&tx, &dag_read)?;
-        // INC-01 crash recovery: the DAG-level checks passed, but the ledger
-        // may already contain this tx's effects — a crash can truncate the
-        // transaction tree (observed: 10004 -> 20 persisted txs) while the
-        // ledger snapshot survives, leaving the ledger AHEAD of the DAG. Such
-        // a tx must heal the DAG WITHOUT a ledger replay: the balance gate
-        // would reject it (already debited) or the transfer would double-apply.
-        // Signal: the sender's account_nonce slot was already committed (the
-        // nonce is committed atomically with the transfer, so a committed slot
-        // means the effects are in the ledger).
+        // INC-01 crash recovery, made PRECISE by C2 P3 applied-tracking:
+        // the DAG-level checks passed, but the ledger may already contain
+        // this tx's effects — a crash can truncate the transaction tree
+        // while the ledger snapshot survives, leaving the ledger AHEAD of
+        // the DAG. Such a tx must heal the DAG WITHOUT a ledger replay:
+        // the balance gate would reject it (already debited) or the
+        // transfer would double-apply.
+        //
+        // C2 P3: route on POSITIVE evidence, never on the nonce slot
+        // alone. A committed slot does NOT prove this transfer ran:
+        // the max-rule nonce can commit via a HIGHER-nonce tx while a
+        // lower-nonce transfer never applied (out-of-order arrival on
+        // catch-up nodes fossilized whole ledgers durably, INC-C2-003).
+        //   1. account_nonce above the committed max ⟹ never applied
+        //      (application would have committed >= it): normal path,
+        //      no store I/O (fast path).
+        //   2. id ∈ applied set ⟹ effects present ⟹ DAG-only heal.
+        //   3. id persisted in store ⟹ was accepted (transfer ran;
+        //      covers pre-tracking upgrades with empty applied sets,
+        //      no backfill needed) ⟹ DAG-only heal.
+        //   4. otherwise ⟹ transfer never ran here ⟹ NORMAL processing
+        //      (the balance gate + DAG-duplicate reject + snapshot
+        //      rollback bound every corner: DAG-present dups were already
+        //      rejected by validate_dag above; conflicts by STEP 0;
+        //      unfundable by validate_ledger with zero mutation; a DAG-add
+        //      failure after transfer rolls everything back).
         {
             let ledger_nonce = ledger_read.get_nonce(&tx.sender);
-            if ledger_nonce > 0 && tx.account_nonce <= ledger_nonce {
-                drop(dag_read);
-                drop(ledger_read);
-                return self.process_recovery_insert(tx, dag, ledger).await;
+            if tx.account_nonce <= ledger_nonce {
+                let mut effects_present = ledger_read.is_applied(&tx.id);
+                if !effects_present {
+                    if let Some(storage) = ledger_read.storage() {
+                        if let Ok(in_store) = storage.read().await.transaction_exists(tx.id) {
+                            effects_present = in_store;
+                        }
+                    }
+                }
+                if effects_present {
+                    drop(dag_read);
+                    drop(ledger_read);
+                    return self.process_recovery_insert(tx, dag, ledger).await;
+                }
             }
         }
         self.validator.validate_ledger(&tx, &ledger_read, min_fee)?;
@@ -279,6 +306,11 @@ impl TransactionProcessor {
                 e
             )));
         }
+        // C2 P3: effects applied — record positive evidence BEFORE the
+        // nonce commit. Any later failure rolls back to the snapshot
+        // (which excludes this mark), so the mark can never outlive the
+        // transfer it attests.
+        ledger.mark_applied(&tx.id);
 
         // STEP 5: COMMIT NONCE (deterministic max, not strict +1)
         // The strict `last_nonce + 1` rule is arrival-order-dependent: a node
@@ -967,5 +999,115 @@ mod tests {
                 n as f64 / elapsed.as_secs_f64()
             );
         }
+    }
+
+    /// C2 P3 (INC-C2-003): a committed nonce slot is NOT proof the transfer
+    /// ran. Simulate out-of-order arrival on a catch-up node: the slot is
+    /// committed to 10 with NO transfer, then a nonce-3 tx arrives. The old
+    /// nonce-only rule sent it to recovery-insert (DAG-only, transfer
+    /// fossilized); the precise rule must FULLY apply it.
+    #[tokio::test]
+    async fn test_phantom_nonce_heals_transfer() {
+        use crate::wallet::Wallet;
+        let processor = TransactionProcessor::with_difficulty(1);
+        let wallet = Wallet::from_secret_key(
+            "6b0d2c3e4f5a60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef",
+        )
+        .expect("fixed test key");
+        let sender = wallet.address();
+        let pk = wallet.public_key_bytes();
+        let receiver = [9u8; 32];
+
+        let dag = Arc::new(RwLock::new(DAG::new()));
+        let ledger = Arc::new(RwLock::new(Ledger::new()));
+        let mempool = Arc::new(RwLock::new(Mempool::new(1000, 10)));
+
+        ledger.write().await.set_balance(&sender, 10000);
+        // Phantom commit: slot to 10 with zero transfers.
+        ledger.write().await.set_nonce(&sender, 10);
+
+        let mut tx = Transaction::new(
+            [[0u8; 32]; 2],
+            sender,
+            receiver,
+            100,
+            10,
+            1234567890,
+            0,
+            3,
+            vec![0u8; 64],
+            pk,
+        );
+        tx.nonce = tx.mine_nonce(1);
+        tx.signature = wallet.sign_transaction(&tx).expect("sign");
+        tx.id = tx.compute_hash();
+
+        processor
+            .process(tx.clone(), &dag, &ledger, &mempool, 10)
+            .await
+            .expect("phantom nonce must heal with full apply");
+        // Transfer applied (not skipped): sender debited amount+fee.
+        assert_eq!(ledger.read().await.get_balance(&sender), 10000 - 110);
+        assert_eq!(ledger.read().await.get_balance(&receiver), 100);
+        assert!(ledger.read().await.is_applied(&tx.id));
+        // Max-rule nonce keeps the higher committed slot.
+        assert_eq!(ledger.read().await.get_nonce(&sender), 10);
+        assert!(dag.read().await.transactions().contains_key(&tx.id));
+    }
+
+    /// C2 P3: a tx whose effects ARE present (applied mark set, balances
+    /// reflect the transfer — crash-ahead shape) heals the DAG WITHOUT
+    /// replaying: no double debit, DAG gains the tx.
+    #[tokio::test]
+    async fn test_applied_true_duplicate_skips_replay() {
+        use crate::wallet::Wallet;
+        let processor = TransactionProcessor::with_difficulty(1);
+        let wallet = Wallet::from_secret_key(
+            "6b0d2c3e4f5a60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef",
+        )
+        .expect("fixed test key");
+        let sender = wallet.address();
+        let pk = wallet.public_key_bytes();
+        let receiver = [9u8; 32];
+
+        let dag = Arc::new(RwLock::new(DAG::new()));
+        let ledger = Arc::new(RwLock::new(Ledger::new()));
+        let mempool = Arc::new(RwLock::new(Mempool::new(1000, 10)));
+
+        ledger.write().await.set_balance(&sender, 10000);
+
+        let mut tx = Transaction::new(
+            [[0u8; 32]; 2],
+            sender,
+            receiver,
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            pk,
+        );
+        tx.nonce = tx.mine_nonce(1);
+        tx.signature = wallet.sign_transaction(&tx).expect("sign");
+        tx.id = tx.compute_hash();
+
+        // Simulate crash-ahead: effects present, DAG lacks the tx.
+        {
+            let mut l = ledger.write().await;
+            l.transfer_internal(&sender, &receiver, 100, 10).unwrap();
+            l.set_nonce(&sender, 1);
+            l.mark_applied(&tx.id);
+        }
+        assert_eq!(ledger.read().await.get_balance(&sender), 10000 - 110);
+
+        processor
+            .process(tx.clone(), &dag, &ledger, &mempool, 10)
+            .await
+            .expect("recovery must heal the DAG");
+        // No double debit, DAG healed.
+        assert_eq!(ledger.read().await.get_balance(&sender), 10000 - 110);
+        assert_eq!(ledger.read().await.get_balance(&receiver), 100);
+        assert!(dag.read().await.transactions().contains_key(&tx.id));
     }
 }

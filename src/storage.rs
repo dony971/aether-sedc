@@ -49,6 +49,7 @@ pub enum TreeName {
     Nonces,       // Account nonces for replay protection
     Orphans,      // Orphan transactions waiting for parents
     Mempool,      // Persistent mempool queue
+    AppliedTx,    // C2 P3: ids of transactions whose ledger effects were applied
 }
 
 impl TreeName {
@@ -61,6 +62,7 @@ impl TreeName {
             TreeName::Nonces => "nonces",
             TreeName::Orphans => "orphans",
             TreeName::Mempool => "mempool",
+            TreeName::AppliedTx => "applied_tx",
         }
     }
 }
@@ -76,6 +78,7 @@ pub struct Storage {
     nonces: Tree,
     orphans: Tree,
     mempool: Tree,
+    applied_tx: Tree,
 }
 
 impl Storage {
@@ -91,6 +94,7 @@ impl Storage {
         let nonces = db.open_tree(TreeName::Nonces.name())?;
         let orphans = db.open_tree(TreeName::Orphans.name())?;
         let mempool = db.open_tree(TreeName::Mempool.name())?;
+        let applied_tx = db.open_tree(TreeName::AppliedTx.name())?;
 
         Ok(Self {
             db,
@@ -101,6 +105,7 @@ impl Storage {
             nonces,
             orphans,
             mempool,
+            applied_tx,
         })
     }
 
@@ -114,7 +119,44 @@ impl Storage {
             TreeName::Nonces => &self.nonces,
             TreeName::Orphans => &self.orphans,
             TreeName::Mempool => &self.mempool,
+            TreeName::AppliedTx => &self.applied_tx,
         }
+    }
+
+    /// C2 P3: record a transaction id whose ledger effects were applied.
+    /// Together with `is_applied` this replaces the nonce-only STEP-1c
+    /// heuristic with positive evidence (see transaction_processor).
+    pub fn mark_applied(&self, id: TransactionId) -> Result<(), StorageError> {
+        self.tree(TreeName::AppliedTx).insert(id, &[])?;
+        Ok(())
+    }
+
+    /// C2 P3: drop an applied mark (used when a tx is pruned; the
+    /// prune path rebuilds the applied set from the surviving DAG, this
+    /// covers direct deletes).
+    pub fn unmark_applied(&self, id: TransactionId) -> Result<(), StorageError> {
+        self.tree(TreeName::AppliedTx).remove(id)?;
+        Ok(())
+    }
+
+    /// C2 P3: true when this tx's ledger effects were applied.
+    pub fn is_applied(&self, id: TransactionId) -> Result<bool, StorageError> {
+        Ok(self.tree(TreeName::AppliedTx).get(id)?.is_some())
+    }
+
+    /// C2 P3: all applied ids (boot load + cross-checks).
+    pub fn get_all_applied(
+        &self,
+    ) -> Result<std::collections::HashSet<TransactionId>, StorageError> {
+        let mut set = std::collections::HashSet::new();
+        for item in self.tree(TreeName::AppliedTx).iter() {
+            let (key, _) = item.map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            let id: TransactionId = key.as_ref().try_into().map_err(|_| {
+                StorageError::DatabaseError("Invalid applied id length".to_string())
+            })?;
+            set.insert(id);
+        }
+        Ok(set)
     }
 
     /// Store a transaction
@@ -181,10 +223,13 @@ impl Storage {
             }
         }
         tree.remove(id)?;
+        // C2 P3: a deleted tx is no longer applied. Without this, a later
+        // re-arrival of the same id would take the recovery-insert path and
+        // skip its transfer (fossilization). Prune callers additionally
+        // rebuild the whole applied set from the surviving DAG.
+        self.tree(TreeName::AppliedTx).remove(id)?;
         Ok(())
     }
-
-    /// Get all transactions
     pub fn get_all_transactions(&self) -> Result<Vec<Transaction>, StorageError> {
         let tree = self.tree(TreeName::Transactions);
         let mut transactions = Vec::new();
@@ -315,16 +360,18 @@ impl Storage {
         let tx_tree = self.transactions.clone();
         let balance_tree = self.balances.clone();
         let index_tree = self.address_index.clone();
+        let applied_tree = self.applied_tx.clone();
 
-        (&tx_tree, &balance_tree, &index_tree)
-            .transaction(|(tx_tree, balance_tree, index_tree)| {
+        (&tx_tree, &balance_tree, &index_tree, &applied_tree)
+            .transaction(|(tx_tree, balance_tree, index_tree, applied_tree)| {
                 // Transaction inserts
                 for (key, value) in &tx_inserts {
                     tx_tree.insert(key.as_ref(), value.as_slice())?;
                 }
 
                 // Transaction deletes (C2 purge-on-prune: also drop both
-                // AddressIndex keys so pruned losers leave no trace).
+                // AddressIndex keys so pruned losers leave no trace, plus
+                // the C2 P3 applied mark so a re-arrival re-applies).
                 for id in &tx_deletes {
                     if let Ok(Some(value)) = tx_tree.get(id.as_ref()) {
                         if let Ok(tx) = bincode::deserialize::<Transaction>(&value) {
@@ -339,6 +386,7 @@ impl Storage {
                         }
                     }
                     tx_tree.remove(id.as_ref())?;
+                    applied_tree.remove(id.as_ref())?;
                 }
 
                 // Balance updates

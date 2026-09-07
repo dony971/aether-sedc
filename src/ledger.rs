@@ -6,7 +6,7 @@ use crate::parent_selection::DAG;
 use crate::storage::Storage;
 use crate::transaction::{Address, Transaction, TransactionId};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -22,6 +22,13 @@ pub struct Ledger {
     storage: Option<Arc<RwLock<Storage>>>,
     /// Total fees burned (economic policy: fees are burned, not given to miners)
     pub total_fees_burned: u64,
+    /// C2 P3: ids of transactions whose ledger effects (transfer) were
+    /// applied. Positive evidence replacing the nonce-only STEP-1c
+    /// heuristic: a committed nonce slot does NOT prove the transfer ran
+    /// (out-of-order arrival + max-rule nonce can commit the slot while a
+    /// lower-nonce transfer never applied — observed durably on catch-up
+    /// nodes, INC-C2-003). Persisted in the `applied_tx` Sled tree.
+    pub applied: HashSet<TransactionId>,
 }
 
 /// Fee burn address (all fees are sent here and effectively burned)
@@ -42,6 +49,7 @@ impl Ledger {
             nonces: HashMap::new(),
             storage: None,
             total_fees_burned: 0,
+            applied: HashSet::new(),
         }
     }
 
@@ -55,6 +63,7 @@ impl Ledger {
             nonces: HashMap::new(),
             storage: Some(storage.clone()),
             total_fees_burned: 0,
+            applied: HashSet::new(),
         };
 
         // Load balances from Sled
@@ -70,6 +79,10 @@ impl Ledger {
             let addr_hex = hex::encode(addr);
             ledger.nonces.insert(addr_hex, nonce);
         }
+
+        // C2 P3: load the applied-tx set (empty on pre-tracking upgrades;
+        // the STEP-1c rule treats store-membership as backstop precision).
+        ledger.applied = storage_read.get_all_applied().unwrap_or_default();
 
         drop(storage_read);
 
@@ -108,6 +121,16 @@ impl Ledger {
                     .try_into()
                     .map_err(|e| format!("Invalid address length: {}", e))?;
                 storage_read.put_nonce(address, *nonce)?;
+            }
+            // C2 P3: persist the applied-tx set AUTHORITATIVELY (stale ids
+            // removed first so pruned losers drop out even if a delete path
+            // missed them; mirrors the balances/nonces full rewrite).
+            let stored = storage_read.get_all_applied().unwrap_or_default();
+            for id in stored.difference(&self.applied) {
+                storage_read.unmark_applied(*id)?;
+            }
+            for id in &self.applied {
+                storage_read.mark_applied(*id)?;
             }
             // P4: no flush here — save() runs on EVERY accepted transaction
             // (STEP 8); a synchronous flush (fsync) per save cost ~690µs/tx
@@ -310,6 +333,23 @@ impl Ledger {
         self.set_nonce(address, account_nonce);
     }
 
+    /// C2 P3: record that a tx's transfer effects were applied.
+    pub fn mark_applied(&mut self, id: &TransactionId) {
+        self.applied.insert(*id);
+    }
+
+    /// C2 P3: true when this tx's transfer effects were applied.
+    /// Positive evidence — unlike the nonce slot, which can be committed
+    /// by a HIGHER-nonce tx while this tx's transfer never ran.
+    pub fn is_applied(&self, id: &TransactionId) -> bool {
+        self.applied.contains(id)
+    }
+
+    /// C2 P3: drop an applied mark (prune parity).
+    pub fn unmark_applied(&mut self, id: &TransactionId) {
+        self.applied.remove(id);
+    }
+
     /// Get all balances
     pub fn get_all_balances(&self) -> &HashMap<String, u64> {
         &self.balances
@@ -362,6 +402,9 @@ impl Ledger {
         self.balances.clear();
         self.nonces.clear();
         self.total_fees_burned = 0;
+        // C2 P3: the applied set is re-derived purely, like everything
+        // else (pruned losers drop out; no stale marks survive).
+        self.applied.clear();
 
         // Apply genesis distribution (fixed supply).
         for (addr_hex, balance) in crate::genesis::GENESIS_LEDGER {
@@ -437,6 +480,8 @@ impl Ledger {
                     next_pending.push(tx);
                     continue;
                 }
+                // C2 P3: effects applied — record positive evidence.
+                self.applied.insert(tx.id);
                 let last = self.get_nonce(&tx.sender);
                 if tx.account_nonce > last {
                     self.set_nonce(&tx.sender, tx.account_nonce);
@@ -647,6 +692,35 @@ mod tests {
         // Load new ledger from storage
         let ledger2 = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
         assert_eq!(ledger2.get_nonce(&addr), 5); // Nonce persisted
+    }
+
+    /// C2 P3: the applied-tx set persists across save/load (temp sled).
+    #[tokio::test]
+    async fn test_applied_persistence_roundtrip() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let storage_arc = Arc::new(RwLock::new(storage));
+
+        let mut ledger = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        let id_a = [0xAAu8; 32];
+        let id_b = [0xBBu8; 32];
+        assert!(!ledger.is_applied(&id_a));
+        ledger.mark_applied(&id_a);
+        ledger.mark_applied(&id_b);
+        assert!(ledger.is_applied(&id_a));
+        ledger.save().await.unwrap();
+
+        let ledger2 = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        assert!(ledger2.is_applied(&id_a));
+        assert!(ledger2.is_applied(&id_b));
+
+        // Unmark + save drops the id (prune parity).
+        let mut ledger3 = ledger2;
+        ledger3.unmark_applied(&id_a);
+        ledger3.save().await.unwrap();
+        let ledger4 = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        assert!(!ledger4.is_applied(&id_a));
+        assert!(ledger4.is_applied(&id_b));
     }
 
     #[test]

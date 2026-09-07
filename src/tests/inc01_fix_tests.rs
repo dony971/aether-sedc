@@ -303,12 +303,19 @@ async fn test_inc01_recovery_insert_ledger_ahead() {
     // The helper tx: valid PoW + signature, account_nonce 1, parents above.
     let tx = crate::tests::signed_mined_orphan_tx();
     let sender = tx.sender;
-    // The ledger is AHEAD: the effects are already applied (nonce 1
-    // committed, sender debited).
+    // The ledger is AHEAD: the effects are TRULY applied (sender debited
+    // to 8900, nonce 1 committed, applied mark set — exactly what the
+    // production STEP 4 + mark sites persist). A bare nonce commit with
+    // an undebited balance would be the PHANTOM shape (never applied),
+    // which the precise C2 P3 rule must fully apply instead of skip
+    // (see test_phantom_nonce_heals_transfer).
     {
         let mut l = ledger.write().await;
         l.set_balance(&sender, 10_000);
+        l.transfer_internal(&sender, &tx.receiver, tx.amount, tx.fee)
+            .expect("setup transfer");
         l.commit_nonce(&sender, 1);
+        l.mark_applied(&tx.id);
     }
 
     let result = processor
@@ -320,8 +327,13 @@ async fn test_inc01_recovery_insert_ledger_ahead() {
     assert!(dag.read().await.transactions().contains_key(&tx.id));
     // ...but the ledger was NOT replayed: no double-debit, nonce unchanged.
     let l = ledger.read().await;
-    assert_eq!(l.get_balance(&sender), 10_000, "no double-debit");
+    assert_eq!(
+        l.get_balance(&sender),
+        10_000 - (tx.amount + tx.fee),
+        "no double-debit"
+    );
     assert_eq!(l.get_nonce(&sender), 1, "nonce unchanged");
+    assert!(l.is_applied(&tx.id), "applied mark kept");
     drop(l);
 
     // Idempotence: a second delivery is a no-op (duplicate in DAG).
@@ -330,4 +342,71 @@ async fn test_inc01_recovery_insert_ledger_ahead() {
         .await;
     assert!(again.is_err(), "duplicate must be rejected");
     assert_eq!(dag.read().await.transaction_count(), 3);
+}
+
+/// GetData store-only: proves that a transaction persisted to Storage (disk)
+/// can be retrieved WITHOUT any in-memory references (DAG/mempool).
+///
+/// Procedure:
+/// 1. Storage::put_transaction(tx) — tx on disk only
+/// 2. Verify presence on disk (transaction_exists + get_transaction)
+/// 3. Verify NOT in DAG/mempool (empty DAG)
+/// 4. Retrieve from store again — same data, no P2P needed
+#[tokio::test]
+async fn test_inc01_getdata_store_only() {
+    let tmp = PathBuf::from("/tmp/inc01_getdata_store_only");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let storage = Arc::new(Storage::open(&tmp).expect("storage"));
+
+    // Create 100 transactions (valid PoW + signature)
+    let mut txs = Vec::new();
+    for i in 0..100u64 {
+        let mut tx = crate::tests::signed_mined_orphan_tx();
+        // Unique sender to avoid conflicts
+        tx.sender = [((i % 256) as u8); 32];
+        tx.nonce = i;
+        tx.timestamp = 1_700_000_000_000 + i;
+        tx.id = tx.compute_hash();
+        txs.push(tx);
+    }
+
+    // Step 1: Put all txs in storage (disk only, no DAG/mempool)
+    for tx in &txs {
+        storage.put_transaction(tx).expect("put_transaction");
+    }
+    storage.flush().expect("flush");
+
+    // Step 2: Verify presence on disk
+    for tx in &txs {
+        assert!(
+            storage.transaction_exists(tx.id).unwrap(),
+            "tx {} must exist on disk",
+            hex::encode(tx.id)
+        );
+        let retrieved = storage.get_transaction(tx.id).unwrap();
+        assert_eq!(retrieved.id, tx.id, "retrieved tx id mismatch");
+        assert_eq!(retrieved.sender, tx.sender, "retrieved sender mismatch");
+        assert_eq!(retrieved.nonce, tx.nonce, "retrieved nonce mismatch");
+    }
+
+    // Step 3: Verify NOT in DAG/mempool (fresh DAG, no txs added)
+    let dag = Arc::new(RwLock::new(DAG::new()));
+    assert_eq!(dag.read().await.transaction_count(), 0, "DAG must be empty");
+
+    // Step 4: Retrieve from store again — same data
+    let mut store_hits = 0u64;
+    for tx in &txs {
+        if storage.transaction_exists(tx.id).unwrap() {
+            let retrieved = storage.get_transaction(tx.id).unwrap();
+            assert_eq!(retrieved.id, tx.id);
+            store_hits += 1;
+        }
+    }
+    assert_eq!(store_hits, 100, "all 100 txs must be served from store");
+    println!(
+        "GetData store-only: 100 txs served from disk, store_hits={}",
+        store_hits
+    );
 }
