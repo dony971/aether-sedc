@@ -133,3 +133,24 @@ ingérissable). Voir `CANARY_INCIDENTS.md` (section C3).
 Le collapse sync est réparé, mais un nœud en rattrapage peut toujours
 atterrir sur un état ledger durablement divergent. Prochaine branche :
 purge-on-prune synchrone, diagnostic winners manquants, redesign STEP-1c.
+
+---
+
+## 8. Branche `canary-c2-fixes` — correctifs P1→P3 (au-delà de `f8a435f`)
+
+Protocole `77f01ee` intouché ; tout le travail est sur `canary-c2-fixes`.
+Aucune règle consensus/DAG/ledger/économique modifiée (que de la
+précision d'application, du serving et de l'observabilité).
+
+| Priorité | Contenu | Commit | Tests |
+|---|---|---|---|
+| P1 purge-on-prune | `delete_transaction` + `batch_write` effacent aussi les clés `AddressIndex` (sender+receiver) et le mark applied ; un loser élagué ne laisse aucune trace servable | `4ff6446` | `test_delete_purges_address_index`, `test_batch_delete_purges_address_index` (contrôle négatif : échouent sur l'ancien code) |
+| P2 diagnostic winners | compteurs `inventory_advertised`, `inventory_skipped_orphan`, `sync_response_items` exposés via `aether_getSyncStats` | `bab1b80` | `test_p2_diagnostic_counters` |
+| P3 applied-tracking | arbre Sled `AppliedTx` + set `Ledger.applied` persisté ; STEP-1c routé sur preuve positive (appliqué/store) au lieu du seul nonce ; cross-check boot loggé | `99c06f5` | `test_applied_persistence_roundtrip`, `test_phantom_nonce_heals_transfer`, `test_applied_true_duplicate_skips_replay` ; setup du test INC-01 `recovery_insert_ledger_ahead` rendu fidèle (transfert réellement appliqué — l'ancien setup testait le cas fantôme) |
+| P4 régression | suite complète | — | **174/174 PASS**, fmt, clippy, 0 erreur |
+
+Mécanisme C2-003 affiné par cette analyse : l'out-of-order massif du
+rattrapage + nonce max-rule + garde nonce-only = transferts sautés
+fossilisés (aucun crash requis). P3 corrige exactement ce cas : un
+winner tardif s'applique (au lieu d'être sauté), un vrai dupliqué ne
+rejoue pas (rollback snapshot + rejet dupliqué DAG en garde-fous).
