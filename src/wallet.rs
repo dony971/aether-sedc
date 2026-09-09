@@ -414,7 +414,29 @@ impl Wallet {
             .ok_or("A password is required to save a wallet (plaintext storage is disabled)")?;
         let encrypted = self.encrypt(pwd)?;
         let content = serde_json::to_string_pretty(&encrypted)?;
-        fs::write(path, content).await?;
+        // WALLET HARDENING (atomic persistence): temp file in the same
+        // directory + flush + sync + atomic rename. A crash leaves either
+        // the previous complete file or the new one — never a truncation.
+        // File IO only: no consensus/DAG/ledger impact.
+        let path = path.as_ref();
+        // PID-unique temp name: two concurrent writers must never share
+        // a temp file (interleaved writes would publish a torn wallet).
+        let tmp_name = format!(
+            "{}.tmp-{}",
+            path.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "wallet".to_string()),
+            std::process::id()
+        );
+        let tmp_path = path.with_file_name(tmp_name);
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut f = fs::File::create(&tmp_path).await?;
+            f.write_all(content.as_bytes()).await?;
+            f.flush().await?;
+            f.sync_all().await?;
+        }
+        fs::rename(&tmp_path, path).await?;
         Ok(())
     }
 
