@@ -1,0 +1,28 @@
+{
+  "_comment": "Watchdog config: canary C2 nodes. Roles: SEED/FULL expect peers after grace; BOOTSTRAP tolerates 0 peers while syncing; ISOLATED always tolerates 0.",
+  "binary": "C:\\Users\\Shadow\\Documents\\aether-fix\\aether-main\\target\\release\\aether-unified.exe",
+  "thresholds": {
+    "rpcTimeoutSec": 8,
+    "graceSec": 120,
+    "stallWindowSec": 300,
+    "ramWarnMB": 500,
+    "ramCritMB": 1500,
+    "maxRestartsPerHour": 3,
+    "restartCooldownSec": 120,
+    "diskWarnPct": 80,
+    "diskCritPct": 95,
+    "mempoolWarn": 500,
+    "orphanWarn": 200
+  },
+  "nodes": [
+    {"name": "node1", "dataDir": "C:\\Users\\Shadow\\AppData\\Local\\Temp\\opencode\\aether-canary-c2\\node1", "p2p": 42001, "rpc": 42101, "role": "SEED", "nodeType": "validator", "bootnodes": ["127.0.0.1:42001"]},
+    {"name": "node2", "dataDir": "C:\\Users\\Shadow\\AppData\\Local\\Temp\\opencode\\aether-canary-c2\\node2", "p2p": 43001, "rpc": 43101, "role": "FULL", "nodeType": "validator", "bootnodes": ["127.0.0.1:42001"]},
+    {"name": "node3", "dataDir": "C:\\Users\\Shadow\\AppData\\Local\\Temp\\opencode\\aether-canary-c2\\node3", "p2p": 44001, "rpc": 44101, "role": "FULL", "nodeType": "validator", "bootnodes": ["127.0.0.1:42001"]},
+    {"name": "node4", "dataDir": "C:\\Users\\Shadow\\AppData\\Local\\Temp\\opencode\\aether-canary-c2\\node4", "p2p": 45001, "rpc": 45101, "role": "FULL", "nodeType": "validator", "bootnodes": ["127.0.0.1:42001"]},
+    {"name": "node5", "dataDir": "C:\\Users\\Shadow\\AppData\\Local\\Temp\\opencode\\aether-canary-c2\\node5", "p2p": 46001, "rpc": 46101, "role": "FULL", "nodeType": "validator", "bootnodes": ["127.0.0.1:42001"]},
+    {"name": "node6", "dataDir": "C:\\Users\\Shadow\\AppData\\Local\\Temp\\opencode\\aether-canary-c2\\node6", "p2p": 47001, "rpc": 47101, "role": "FULL", "nodeType": "validator", "bootnodes": ["127.0.0.1:42001"]},
+    {"name": "node7", "dataDir": "C:\\Users\\Shadow\\AppData\\Local\\Temp\\opencode\\aether-canary-c2\\node7", "p2p": 48001, "rpc": 48101, "role": "FULL", "nodeType": "validator", "bootnodes": ["127.0.0.1:42001"]},
+    {"name": "node8", "dataDir": "C:\\Users\\Shadow\\AppData\\Local\\Temp\\opencode\\aether-canary-c2\\node8", "p2p": 49001, "rpc": 49101, "role": "FULL", "nodeType": "validator", "bootnodes": ["127.0.0.1:42001"]},
+    {"name": "node9", "dataDir": "C:\\Users\\Shadow\\AppData\\Local\\Temp\\opencode\\aether-canary-c2\\node9", "p2p": 49009, "rpc": 49109, "role": "FULL", "nodeType": "validator", "bootnodes": ["127.0.0.1:42001"]}
+  ]
+}
