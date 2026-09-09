@@ -68,7 +68,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // old and new networks. Deployment MUST rotate the genesis (ceremony) so the
 // new network starts from a clean state.
 /// Wire format version of the P2P handshake.
-const P2P_PROTOCOL_VERSION: u8 = 3;
+// OBSERVABILITY-ONLY visibility: `pub` so the boot banner can log it.
+pub const P2P_PROTOCOL_VERSION: u8 = 3;
 /// Handshake frame: magic(4) | version(1) | genesis hash(32) | ephemeral key(32)
 const HANDSHAKE_FRAME_LEN: usize = 4 + 1 + 32 + 32;
 

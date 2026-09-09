@@ -137,11 +137,16 @@ fn prompt_password() -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
-
     let cli = Cli::parse_from(env::args_os());
+
+    // OBSERVABILITY-ONLY (n°4): CLI subcommands keep stdout-only logging
+    // (unchanged behavior); the node path installs the file sink below,
+    // once the data dir is resolved.
+    if cli.command.is_some() {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .init();
+    }
 
     // Handle subcommands (non-node commands)
     match &cli.command {
@@ -306,6 +311,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if cli.repair_ledger {
         cfg.repair_ledger = true;
+    }
+
+    // OBSERVABILITY-ONLY (n°4): node file logging. Tag = data-dir name
+    // (node1, node2, …) so every line attributes its node.
+    // NOTE: the previous-shutdown check runs BEFORE init (before this
+    // boot writes a single line), otherwise our own banner would make
+    // every boot look UNCLEAN.
+    {
+        use aether_unified::node_logging as nl;
+        let tag = cfg
+            .data_dir
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "node".to_string());
+        let prev_clean = nl::previous_shutdown_clean(&cfg.data_dir);
+        // Keep the guard alive for the whole process (file sink).
+        let _log_guard = nl::init_node_logging(&cfg.data_dir, &tag)
+            .map_err(|e| format!("Failed to initialize node file logging: {}", e))?;
+        // Re-emit what the pre-init config resolution decided (those
+        // tracing! calls above were no-ops without a subscriber).
+        tracing::info!(
+            "📋 config: data_dir={:?} node_type={} p2p={} rpc={} bootnodes={:?}",
+            cfg.data_dir,
+            cfg.node_type,
+            cfg.p2p_port,
+            cfg.rpc_port,
+            cfg.bootnodes,
+        );
+        // Boot banner: everything needed to attribute a later incident.
+        tracing::info!(
+            "🚀 BOOT aether v{} commit={} genesis_hash={} p2p_v{} max_supply={} pid={} data_dir={:?}",
+            nl::BUILD_VERSION,
+            nl::BUILD_COMMIT,
+            hex::encode(aether_unified::genesis::GENESIS_HASH),
+            aether_unified::p2p::P2P_PROTOCOL_VERSION,
+            aether_unified::genesis::MAX_SUPPLY,
+            std::process::id(),
+            cfg.data_dir,
+        );
+        match prev_clean {
+            Some(true) => tracing::info!("🧹 previous shutdown was CLEAN (marker found)"),
+            Some(false) => tracing::warn!(
+                "⚠️ previous shutdown UNCLEAN (no shutdown marker) — possible crash/kill; see prior boot section"
+            ),
+            None => tracing::info!("🆕 first boot (no prior log)"),
+        }
+        // Hold the guard: leak it so the sink outlives this block.
+        std::mem::forget(_log_guard);
     }
 
     let handles = aether_unified::node::run_node(cfg).await?;

@@ -12,6 +12,7 @@ pub mod genesis;
 pub mod json_storage;
 pub mod ledger;
 pub mod node;
+pub mod node_logging;
 pub mod p2p;
 pub mod parent_selection;
 pub mod rpc;
