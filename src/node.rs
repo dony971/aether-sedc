@@ -63,6 +63,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     let data_dir = cfg.data_dir;
     let p2p_port = cfg.p2p_port;
     let rpc_port = cfg.rpc_port;
+    let rpc_bind = cfg.rpc_bind;
 
     let mut bootnodes: Vec<SocketAddr> = Vec::new();
     for addr_str in &cfg.bootnodes {
@@ -75,6 +76,19 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     tracing::info!("Data Directory: {:?}", data_dir);
     tracing::info!("P2P Port: {}", p2p_port);
     tracing::info!("RPC Port: {}", rpc_port);
+    // INFRASTRUCTURE (n°7): loud warning on any non-loopback RPC bind.
+    // Loopback covers 127.0.0.1, ::1 and localhost spellings.
+    {
+        let b = rpc_bind.trim().to_lowercase();
+        let loopback = b == "127.0.0.1" || b == "::1" || b == "localhost";
+        tracing::info!("RPC Bind: {}", rpc_bind);
+        if !loopback {
+            tracing::warn!(
+                "⚠️ WARNING RPC exposed on non-loopback address {} — anyone who can reach it can query balances, request faucet funds (if enabled) and submit transactions. Bind 127.0.0.1 unless you operate a firewall.",
+                rpc_bind
+            );
+        }
+    }
     tracing::info!("Bootnodes: {:?}", bootnodes);
     if !cfg.dns_seeds.is_empty() {
         tracing::info!("DNS Seeds: {:?}", cfg.dns_seeds);
@@ -801,7 +815,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
 
     tracing::info!("📡 About to start RPC server...");
 
-    let rpc_addr: SocketAddr = format!("0.0.0.0:{}", rpc_port).parse()?;
+    let rpc_addr: SocketAddr = format!("{}:{}", rpc_bind, rpc_port).parse()?;
     let rpc_dag = dag.clone();
     let rpc_ledger = ledger.clone();
     let rpc_ledger_path = ledger_path.clone();

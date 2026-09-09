@@ -41,6 +41,11 @@ struct Cli {
     #[arg(long, default_value_t = 9933)]
     rpc_port: u16,
 
+    /// RPC bind address (default loopback). Set explicitly (e.g. 0.0.0.0)
+    /// to expose RPC beyond localhost; the node logs a WARNING then.
+    #[arg(long, default_value = "127.0.0.1")]
+    rpc_bind: String,
+
     /// Bootnode addresses (comma-separated IP:PORT or domain:PORT)
     #[arg(long)]
     bootnodes: Option<String>,
@@ -289,6 +294,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.rpc_port != 9933 {
         cfg.rpc_port = cli.rpc_port;
     }
+    // INFRASTRUCTURE (n°7): explicit opt-in, never a silent 0.0.0.0.
+    // clap default is loopback, so any other value is a deliberate choice.
+    if cli.rpc_bind != "127.0.0.1" {
+        cfg.rpc_bind = cli.rpc_bind.clone();
+    }
     if let Some(ref bn) = cli.bootnodes {
         cfg.bootnodes = bn
             .split(',')
@@ -332,11 +342,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Re-emit what the pre-init config resolution decided (those
         // tracing! calls above were no-ops without a subscriber).
         tracing::info!(
-            "📋 config: data_dir={:?} node_type={} p2p={} rpc={} bootnodes={:?}",
+            "📋 config: data_dir={:?} node_type={} p2p={} rpc={} rpc_bind={} bootnodes={:?}",
             cfg.data_dir,
             cfg.node_type,
             cfg.p2p_port,
             cfg.rpc_port,
+            cfg.rpc_bind,
             cfg.bootnodes,
         );
         // Boot banner: everything needed to attribute a later incident.
