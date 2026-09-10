@@ -13,7 +13,7 @@ function Check($name, $cond, $detail="") {
 
 # 1. CLI SHA == pinned build (canary-c2-fixes branch; updated per release)
 $sha = (Get-FileHash $Bin -Algorithm SHA256).Hash
-$PinnedSHA = "AA9F74445186BDE5FA011A547EA333CA5AE72D02A70D4C5F384FD9DA2EBE5B90"
+$PinnedSHA = "CB8B93E7D1979AED44013D7D6540E25E0EA542A93120B6F4B833323ED27EC8AF"
 Check "CLI SHA" ($sha -eq $PinnedSHA) "(got $sha)"
 
 # 2. CLI surface: no --daemon, no keygen --import-file, has wallet/send/balance
@@ -23,14 +23,15 @@ Check "has wallet/send/balance" (($top -match "wallet") -and ($top -match "send"
 $kg = & $Bin keygen --help 2>&1 | Out-String
 Check "no keygen --import-file" ($kg -notmatch "import-file")
 
-# 3. Wallet backend == RC + no dead RPC calls
-$w = & python -c "from core.rc import verify_binary; verify_binary('C:/Users/Shadow/Documents/aether-wallet/aether.exe'); print('RC OK')" 2>&1 | Out-String
+# 3. Wallet backend == RC + no dead RPC calls (run from the wallet dir:
+# the `core` package is only importable there, not from this repo).
+$w = & python -c "import os; os.chdir('C:/Users/Shadow/Documents/aether-wallet'); from core.rc import verify_binary; verify_binary('C:/Users/Shadow/Documents/aether-wallet/aether.exe'); print('RC OK')" 2>&1 | Out-String
 Check "wallet backend RC" ($w -match "RC OK") "($w)"
 $dead = Select-String -Path "C:\Users\Shadow\Documents\aether-wallet\core\rpc_client.py" -Pattern 'self\._call\("aether_(startMining|stopMining|getNetworkHashrate|stakeTokens|unstakeTokens|getStakingInfo)"' -EA SilentlyContinue
 Check "no dead RPC calls" ($null -eq $dead)
 
-# 4. Config: local seed only
-$cfg = & python -c "from core.config import config; print(config.validated_bootnodes())" 2>&1 | Out-String
+# 4. Config: local seed only (same cwd requirement as above)
+$cfg = & python -c "import os; os.chdir('C:/Users/Shadow/Documents/aether-wallet'); from core.config import config; print(config.validated_bootnodes())" 2>&1 | Out-String
 Check "local bootnode" ($cfg -match "127.0.0.1:42001") "($cfg)"
 Check "CANARY_MODE" ($env:CANARY_MODE -eq $null -or $env:CANARY_MODE -eq "LOCAL")
 

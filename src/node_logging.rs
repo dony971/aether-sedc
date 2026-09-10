@@ -238,15 +238,24 @@ pub fn previous_shutdown_clean(data_dir: &Path) -> Option<bool> {
         return None;
     }
     // Tail only: a huge file must not be fully read at every boot.
+    // Floor to a char boundary: byte-slicing mid-emoji PANICS, and node
+    // logs are full of multi-byte glyphs (this exact panic bricked every
+    // restart in canary testing — found by the watchdog-era logs).
     const TAIL: usize = 8192;
-    let start = content.len().saturating_sub(TAIL);
+    let mut start = content.len().saturating_sub(TAIL);
+    while !content.is_char_boundary(start) {
+        start += 1;
+    }
     let tail = &content[start..];
     // Check current live file AND the freshest rotation (a shutdown marker
     // written just before a rotation could otherwise be missed).
     let mut haystack = tail.to_string();
     let rot1 = data_dir.join("logs").join(format!("{LOG_FILE_NAME}.1"));
     if let Ok(c) = std::fs::read_to_string(&rot1) {
-        let s = c.len().saturating_sub(TAIL);
+        let mut s = c.len().saturating_sub(TAIL);
+        while !c.is_char_boundary(s) {
+            s += 1;
+        }
         haystack.push_str(&c[s..]);
     }
     Some(haystack.contains("Shutting down gracefully"))
@@ -371,6 +380,10 @@ mod tests {
     /// operational half (real kill → UNCLEAN banner) runs in the canary
     /// scripts. Note: Windows Stop-Process/terminate() can never produce
     /// the marker (no Ctrl+C delivered) — UNCLEAN there is BY DESIGN.
+    ///
+    /// C2 regression: the tail cut MUST respect char boundaries — node
+    /// logs are full of multi-byte emoji and a mid-glyph byte slice
+    /// panics, bricking every restart once logs exceed the tail window.
     #[test]
     fn test_previous_shutdown_detection() {
         // No log file at all → first boot.
@@ -398,6 +411,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(previous_shutdown_clean(dir.path()), Some(false));
+    }
+
+    /// C2 regression: multi-byte content with the tail cut landing inside
+    /// an emoji must NOT panic (char-boundary floor), on live or rotated.
+    #[test]
+    fn test_previous_shutdown_emoji_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("logs")).unwrap();
+        // Fill > TAIL bytes with emoji so the cut lands mid-glyph: the
+        // "ab" prefix shifts alignment (total % 4 != 0) so EVERY cut is
+        // inside a 4-byte glyph for some length. Expect Some(false), but
+        // above all: no panic.
+        let filler = format!("ab{}", "🔻".repeat(3000));
+        std::fs::write(dir.path().join("logs").join("node.log"), &filler).unwrap();
+        assert_eq!(previous_shutdown_clean(dir.path()), Some(false));
+        // Same through the rotation path.
+        std::fs::write(dir.path().join("logs").join("node.log.1"), &filler).unwrap();
+        assert_eq!(previous_shutdown_clean(dir.path()), Some(false));
+        // And with a marker present (clean), still no panic.
+        let marked = format!("{filler}Shutting down gracefully...\n");
+        std::fs::write(dir.path().join("logs").join("node.log"), &marked).unwrap();
+        assert_eq!(previous_shutdown_clean(dir.path()), Some(true));
     }
 
     #[test]

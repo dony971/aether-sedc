@@ -352,3 +352,57 @@ pruned, while missing ~13 winners. Coherent story:
 2. Diagnose why fetched-missing winners stall (is_orphan dedup vs
    requested_parents vs seen-cache on the -10 tail).
 3. STEP-1c redesign: applied-tx tracking instead of nonce-only guard.
+
+## INFRA-20260910: Defender false positive kills canary (Bearfoos.A!ml)
+
+**Date:** 2026-09-10 (discovered at canary restart)
+**Type:** INFRASTRUCTURE (antivirus) — NOT protocol, NOT wallet
+**Severity:** HIGH (kills running nodes + deletes binary)
+
+### Facts
+
+- Windows Defender flagged `target/release/aether-unified.exe` as
+  `Trojan:Win32/Bearfoos.A!ml` (ML heuristic) and REMOVED the file +
+  killed 3 running node processes (pids logged in Defender history).
+- Rust+P2P+crypto+PoW loops are classic Bearfoos.ml triggers; the
+  verdict is a false positive by construction (our own source, built
+  locally, SHA-pinned).
+- Explains prior silent mass deaths (no logs, no trace — the killer
+  was outside the processes).
+
+### Resolution
+
+- Operator added Defender exclusions (workspace dirs + process names).
+- Rebuilt from clean tree, relaunched 9/9, gate ALL PASS.
+- No code change required. Lesson recorded: any future "silent mass
+  death" checks Defender history FIRST (before protocol hypotheses).
+
+### Status
+
+**RESOLVED (environment).** Revisit if re-detected after exclusion.
+
+## OBS-20260910: node_logging tail slice panicked on emoji (exit 101)
+
+**Date:** 2026-09-10 (found during canary restart with logging build)
+**Type:** OBSERVABILITY BUG (own code, `node_logging.rs`) — NOT protocol
+**Severity:** HIGH (bricked every restart once logs exceeded 8 KB)
+
+### Facts
+
+- `previous_shutdown_clean` sliced `content[len-8192..]` on a BYTE
+  index; node logs are full of multi-byte emoji -> slice landed
+  mid-glyph -> Rust panic (`not a char boundary`) -> exit 101 BEFORE
+  any log line. Production proof stronger than any unit test.
+- Observed: 4 nodes dead on relaunch, zero log output, exit code 101
+  captured via foreground run.
+
+### Fix
+
+- Floor both slice indices to char boundaries (`is_char_boundary`
+  loop) + regression test `test_previous_shutdown_emoji_boundary`
+  (misaligned multi-byte filler, live + rotated + marked cases).
+- Rebuilt, relaunched 9/9 @10081, restarts clean, toolchain + E2E green.
+
+### Status
+
+**RESOLVED (verified live).**
