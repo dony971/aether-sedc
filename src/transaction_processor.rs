@@ -130,7 +130,10 @@ impl TransactionProcessor {
         mempool: &Arc<RwLock<Mempool>>,
         min_fee: u64,
     ) -> Result<(), ProcessingError> {
-        tracing::info!("🔍 Processing transaction: {}", hex::encode(tx.id));
+        // LOG NOISE (soak): per-tx line on the hot path (thousands/hour
+        // during sync/load) — DEBUG only. Rejections/failures keep their
+        // own WARN/ERROR lines at their sites.
+        tracing::debug!("🔍 Processing transaction: {}", hex::encode(tx.id));
 
         // STEP 0: DETERMINISTIC DOUBLE-SPEND RESOLUTION (NV-09)
         // If another transaction exists for the same (sender, nonce), the one

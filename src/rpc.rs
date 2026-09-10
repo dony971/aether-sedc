@@ -952,7 +952,9 @@ impl AetherRpcImpl {
             );
             return None;
         }
-        tracing::info!("🔑 Faucet key loaded from {:?}", key_file);
+        // LOG NOISE (soak): load_faucet_key runs on every RPC-impl
+        // construction — success is routine, failures already warn_once.
+        tracing::debug!("🔑 Faucet key loaded from {:?}", key_file);
         Some(key)
     }
 
@@ -1448,7 +1450,13 @@ impl AetherRpcImpl {
         // the data-dir root.
         if let Ok(storage_guard) = self.storage.try_read() {
             if let Ok(disk_orphans) = storage_guard.get_all_orphans() {
-                tracing::info!("📦 Loaded {} orphans from disk", disk_orphans.len());
+                // LOG NOISE (soak): this runs every maintenance cycle —
+                // only worth an INFO line when something was actually found.
+                if disk_orphans.is_empty() {
+                    tracing::debug!("📦 Loaded 0 orphans from disk");
+                } else {
+                    tracing::info!("📦 Loaded {} orphans from disk", disk_orphans.len());
+                }
                 for orphan in disk_orphans {
                     let mut orphans = self.orphans.write().await;
                     if !orphans.contains_key(&orphan.id) {

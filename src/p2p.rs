@@ -826,7 +826,13 @@ impl P2PNetwork {
                                 // Mark as seen with timestamp and source (Network) before sending to channel
                                 insert_seen(&seen_transactions, tx_bytes.clone()).await;
 
-                                info!("Received transaction from {}: {}", addr, hex::encode(tx.id));
+                                // LOG NOISE (soak): per-tx line on the hot
+                                // path — DEBUG only (failures keep WARN).
+                                tracing::debug!(
+                                    "Received transaction from {}: {}",
+                                    addr,
+                                    hex::encode(tx.id)
+                                );
                                 let _ = tx_channel.send(tx);
 
                                 // Forward transaction to all other connected peers (relay)
@@ -1036,9 +1042,12 @@ impl P2PNetwork {
                             }
                         }
                         P2PMessage::SyncRequest => {
-                            // Respond with full inventory
+                            // Respond with full inventory. LOG NOISE (soak):
+                            // periodic full-inventory announcements (10k hashes
+                            // each on a big DAG) — DEBUG only. Sync progress
+                            // stays visible via the maintenance summary line.
                             let our_hashes = get_dag_hashes();
-                            info!(
+                            tracing::debug!(
                                 "[Sync] Sending inventory with {} hashes to {}",
                                 our_hashes.len(),
                                 addr

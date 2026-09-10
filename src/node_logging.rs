@@ -169,14 +169,24 @@ impl std::io::Write for RollingGuard<'_> {
         // Locking per write() call is correct but chatty; the fmt layer
         // issues one write per event part, so worst case a few syscalls
         // per line. Acceptable for a 2-tps canary node; documented.
-        if let Ok(mut st) = self.inner.lock() {
-            st.append(buf)?;
+        // Poison-tolerant: a panic elsewhere must NEVER silence logging
+        // forever (recovered guard or explicit stderr note instead).
+        let mut st = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                eprintln!("node_logging: lock poisoned, recovering guard");
+                poisoned.into_inner()
+            }
+        };
+        if let Err(e) = st.append(buf) {
+            // Rotation/open failures must be VISIBLE (stderr survives
+            // even when the file sink is broken).
+            eprintln!("node_logging: append failed ({e}); log data lost");
         }
         Ok(buf.len())
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
-        // Already flushed per append; nothing buffered here.
+    fn flush(&mut self) -> std::io::Result<()> {        // Already flushed per append; nothing buffered here.
         Ok(())
     }
 }
@@ -411,6 +421,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(previous_shutdown_clean(dir.path()), Some(false));
+    }
+
+    /// A poisoned mutex (panic elsewhere while logging) must NOT silence
+    /// all future logging: the guard recovers and writes continue.
+    #[test]
+    fn test_poisoned_lock_still_writes() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let w = RollingFileWriter::new(dir.path(), "node.log").unwrap();
+        // Poison deliberately.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = w.inner.lock().unwrap();
+            panic!("simulated logger-adjacent panic");
+        }));
+        // Writes still land afterwards.
+        {
+            let mut g = RollingGuard {
+                _phantom: std::marker::PhantomData,
+                inner: Arc::clone(&w.inner),
+            };
+            g.write_all(b"after poison\n").unwrap();
+        }
+        let content = std::fs::read_to_string(dir.path().join("node.log")).unwrap();
+        assert!(content.contains("after poison"));
     }
 
     /// C2 regression: multi-byte content with the tail cut landing inside

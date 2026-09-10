@@ -538,7 +538,9 @@ impl Wallet {
         // Verify the signature against the signing hash
         match verifying_key.verify(&tx_hash, &signature) {
             Ok(_) => {
-                tracing::info!("✅ Signature verified successfully");
+                // LOG NOISE (soak): success is the hot path (thousands/hour
+                // during sync) — DEBUG only. Failures stay WARN.
+                tracing::debug!("✅ Signature verified successfully");
                 true
             }
             Err(e) => {

@@ -13,7 +13,7 @@ function Check($name, $cond, $detail="") {
 
 # 1. CLI SHA == pinned build (canary-c2-fixes branch; updated per release)
 $sha = (Get-FileHash $Bin -Algorithm SHA256).Hash
-$PinnedSHA = "CB8B93E7D1979AED44013D7D6540E25E0EA542A93120B6F4B833323ED27EC8AF"
+$PinnedSHA = "71363C82F43546ECAF5C5334B476B35201EB9988E6BF8A5ED36FB6DDF89D5D8B"
 Check "CLI SHA" ($sha -eq $PinnedSHA) "(got $sha)"
 
 # 2. CLI surface: no --daemon, no keygen --import-file, has wallet/send/balance
