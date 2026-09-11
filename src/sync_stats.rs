@@ -88,6 +88,17 @@ pub struct SyncStatsSnapshot {
     /// DAG/orphan dedup. sync_received <= this number; a wide gap means
     /// peers keep re-sending what we already track (serving blind spot).
     pub sync_response_items: u64,
+    /// VPS-2 §5: advertised hashes we actually lack (inventory diff size).
+    /// Persistently high with flat sync_received = peers advertise but
+    /// deliveries never arrive (serving/requesting stall, not emptiness).
+    pub inventory_missing: u64,
+    /// VPS-2 §5: missing-parent sets collected per orphan-solver cycle
+    /// (before backoff dedup). Compares against parent_requested (sent).
+    pub parent_missing: u64,
+    /// VPS-2 §6: monotone sync frontier = max DAG total observed on the
+    /// P2P path. progress(t+1) >= progress(t) BY CONSTRUCTION (max-update);
+    /// a flat frontier with pending orphans/requests = stall evidence.
+    pub sync_frontier: u64,
     /// INC-01: persisted transactions loaded at boot (Sled + JSON)
     pub rebuild_total: u64,
     /// INC-01: boot rebuild - transactions inserted into the DAG
@@ -135,6 +146,9 @@ pub struct SyncStats {
     pub inventory_advertised: AtomicU64,
     pub inventory_skipped_orphan: AtomicU64,
     pub sync_response_items: AtomicU64,
+    pub inventory_missing: AtomicU64,
+    pub parent_missing: AtomicU64,
+    pub sync_frontier: AtomicU64,
     pub rebuild_total: AtomicU64,
     pub rebuild_inserted: AtomicU64,
     pub rebuild_skipped: AtomicU64,
@@ -168,6 +182,9 @@ impl SyncStats {
             inventory_advertised: self.inventory_advertised.load(Ordering::Relaxed),
             inventory_skipped_orphan: self.inventory_skipped_orphan.load(Ordering::Relaxed),
             sync_response_items: self.sync_response_items.load(Ordering::Relaxed),
+            inventory_missing: self.inventory_missing.load(Ordering::Relaxed),
+            parent_missing: self.parent_missing.load(Ordering::Relaxed),
+            sync_frontier: self.sync_frontier.load(Ordering::Relaxed),
             rebuild_total: self.rebuild_total.load(Ordering::Relaxed),
             rebuild_inserted: self.rebuild_inserted.load(Ordering::Relaxed),
             rebuild_skipped: self.rebuild_skipped.load(Ordering::Relaxed),

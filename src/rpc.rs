@@ -1676,6 +1676,12 @@ impl AetherRpcImpl {
             };
 
             if !missing_parent_hashes.is_empty() {
+                // VPS-2 §5: demand signal before sending (compare with
+                // parent_requested actually emitted below).
+                self.sync_ctx.stats.parent_missing.fetch_add(
+                    missing_parent_hashes.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 for parent_hash in missing_parent_hashes {
                     // INC-01 store-first: a parent that exists in the LOCAL
                     // persisted store must NEVER be re-requested over P2P —

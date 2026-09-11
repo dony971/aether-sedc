@@ -887,6 +887,12 @@ impl P2PNetwork {
                                 .stats
                                 .inventory_skipped_orphan
                                 .fetch_add(skipped_orphan, std::sync::atomic::Ordering::Relaxed);
+                            // VPS-2 §5: the diff size itself (how much the
+                            // peer has that we lack), independent of caps.
+                            sync_ctx.stats.inventory_missing.fetch_add(
+                                missing_hashes.len() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
 
                             // Request missing transactions via GetData
                             if !missing_hashes.is_empty() {
@@ -976,51 +982,45 @@ impl P2PNetwork {
                             // the whole DAG per GetData collapsed serving nodes
                             // at ~10k txs; the cache makes repeat requests O(1).
                             const PAGE_SIZE: usize = 100;
-                            let all_hashes = get_dag_hashes();
-                            let topo: Option<Vec<Vec<u8>>> = {
-                                let cache = sync_ctx.topo_cache.read().await;
-                                match cache.as_ref() {
-                                    Some((len, order)) if *len as usize == all_hashes.len() => {
-                                        sync_ctx
-                                            .stats
-                                            .topo_cache_hits
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        Some(order.clone())
-                                    }
-                                    _ => {
-                                        sync_ctx
-                                            .stats
-                                            .topo_cache_miss
-                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        None
-                                    }
-                                }
-                            };
-                            let topo = match topo {
-                                Some(order) => Some(order),
-                                None => {
-                                    let order = Self::topological_order(
-                                        all_hashes,
-                                        &*get_transaction_by_hash,
-                                    );
-                                    if let Some(ref o) = order {
-                                        let mut cache = sync_ctx.topo_cache.write().await;
-                                        *cache = Some((o.len() as u64, o.clone()));
-                                    }
-                                    order
+                            let topo = Self::cached_topo_order(
+                                &sync_ctx,
+                                get_dag_hashes(),
+                                &*get_transaction_by_hash,
+                            )
+                            .await;
+                            let sort_topo = |v: &mut Vec<Vec<u8>>, order: &Option<Vec<Vec<u8>>>| {
+                                if let Some(order) = order {
+                                    let pos: HashMap<&Vec<u8>, usize> =
+                                        order.iter().enumerate().map(|(i, h)| (h, i)).collect();
+                                    v.sort_by_key(|h| pos.get(h).copied().unwrap_or(usize::MAX));
                                 }
                             };
                             let mut requested: Vec<Vec<u8>> =
                                 hashes.iter().take(PAGE_SIZE).cloned().collect();
-                            if let Some(order) = topo {
-                                let pos: HashMap<&Vec<u8>, usize> =
-                                    order.iter().enumerate().map(|(i, h)| (h, i)).collect();
-                                requested
-                                    .sort_by_key(|h| pos.get(h).copied().unwrap_or(usize::MAX));
-                            }
+                            sort_topo(&mut requested, &topo);
+                            // VPS-2 ANCESTOR-CLOSED PAGES: extend the requested
+                            // set with missing ancestors (bounded budget) so
+                            // every served page is self-sufficient — the
+                            // receiver inserts bottom-up instead of parking
+                            // orphans whose parents live outside the page
+                            // (measured: 8 txs/40 min without this on deep
+                            // history). Bounds preserved (no blind full-chain
+                            // download): PAGE_SIZE requested + ANCESTOR_BUDGET
+                            // extra, defensive step cap, DAG-resident only.
+                            // No message/validation/consensus change: the
+                            // receiver funnels everything through the normal
+                            // accept path as before.
+                            let mut page = P2PNetwork::ancestor_closed_page(
+                                requested,
+                                &*get_transaction_by_hash,
+                            );
+                            // Re-sort parents-first (ancestors appended
+                            // out of order above); fall back to request
+                            // order without a topo map.
+                            sort_topo(&mut page, &topo);
                             let mut tx_bytes_list = Vec::new();
 
-                            for hash in requested {
+                            for hash in page {
                                 if let Some(tx) = get_transaction_by_hash(&hash) {
                                     if let Ok(bytes) = bincode::serialize(&tx) {
                                         tx_bytes_list.push(bytes);
@@ -1029,7 +1029,9 @@ impl P2PNetwork {
                             }
 
                             if !tx_bytes_list.is_empty() {
-                                info!(
+                                // LOG NOISE: per-response line (was per-100;
+                                // pages are bigger now but far fewer).
+                                tracing::debug!(
                                     "[Sync] Sending {} transactions to {}",
                                     tx_bytes_list.len(),
                                     addr
@@ -1280,6 +1282,102 @@ impl P2PNetwork {
         let peers = self.peers.read().await;
         let peers: &std::collections::HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>> = &*peers;
         peers.keys().copied().collect()
+    }
+
+    /// C2-004: cached topological serving order, keyed by DAG length.
+    /// Sorting the whole DAG per GetData collapsed serving nodes at ~10k
+    /// txs; repeat requests are O(1). The order is a SERVING HINT ONLY,
+    /// never consensus (a stale entry merely batches less optimally).
+    async fn cached_topo_order(
+        sync_ctx: &Arc<SyncContext>,
+        all_hashes: Vec<Vec<u8>>,
+        get_transaction_by_hash: &(dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync),
+    ) -> Option<Vec<Vec<u8>>> {
+        {
+            let cache = sync_ctx.topo_cache.read().await;
+            if let Some((len, order)) = cache.as_ref() {
+                if *len as usize == all_hashes.len() {
+                    sync_ctx
+                        .stats
+                        .topo_cache_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Some(order.clone());
+                }
+            }
+            sync_ctx
+                .stats
+                .topo_cache_miss
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let order = Self::topological_order(all_hashes, get_transaction_by_hash);
+        if let Some(ref o) = order {
+            let mut cache = sync_ctx.topo_cache.write().await;
+            *cache = Some((o.len() as u64, o.clone()));
+        }
+        order
+    }
+
+    /// VPS-2: extend a requested hash set with its DAG-resident ancestors
+    /// (bounded), so the served page is self-sufficient for bottom-up
+    /// insertion. Pure function of (requested set, DAG contents):
+    /// deterministic, no network, no consensus impact.
+    ///
+    /// Guarantees: every returned hash is DAG-resident (requested unknowns
+    /// are dropped — the serving layer skips them anyway); requested ones
+    /// come with their ancestor closure up to the budget; at most
+    /// ANCESTOR_BUDGET extras; genesis (`[0; 32]`) parents terminate;
+    /// no duplicates; terminates (visited set + step cap double-guard
+    /// against any cycle).
+    pub(crate) fn ancestor_closed_page(
+        requested: Vec<Vec<u8>>,
+        get_transaction_by_hash: &(dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync),
+    ) -> Vec<Vec<u8>> {
+        const ANCESTOR_BUDGET: usize = 400;
+        const ANCESTOR_STEPS: usize = 20_000;
+        let mut page: Vec<Vec<u8>> =
+            Vec::with_capacity(requested.len().saturating_add(ANCESTOR_BUDGET));
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for h in requested.into_iter() {
+            // Requested-but-unknown hashes are dropped here (the serving
+            // layer would skip them anyway); only servable txs enter.
+            if get_transaction_by_hash(&h).is_none() {
+                continue;
+            }
+            if seen.insert(h.clone()) {
+                page.push(h);
+            }
+        }
+        let mut budget = ANCESTOR_BUDGET;
+        let mut steps = 0usize;
+        let mut idx = 0usize;
+        while idx < page.len() && budget > 0 && steps < ANCESTOR_STEPS {
+            steps += 1;
+            let h = page[idx].clone();
+            idx += 1;
+            let parents: [[u8; 32]; 2] = match get_transaction_by_hash(&h) {
+                Some(tx) => tx.parents,
+                None => continue,
+            };
+            for parent in parents.iter() {
+                if *parent == [0u8; 32] {
+                    continue;
+                }
+                let key = parent.to_vec();
+                if seen.contains(&key) {
+                    continue;
+                }
+                if get_transaction_by_hash(&key).is_none() {
+                    continue;
+                }
+                seen.insert(key.clone());
+                page.push(key);
+                budget -= 1;
+                if budget == 0 {
+                    break;
+                }
+            }
+        }
+        page
     }
 
     /// B4: deterministic dependency order of the local DAG (parents before
@@ -1893,12 +1991,96 @@ mod tests {
         );
     }
 
+    /// VPS-2 helper: build a linear chain root -> ... -> tip on top of
+    /// genesis parents. Returns txs oldest-first.
+    #[cfg(test)]
+    fn test_chain(n: usize, start: u8) -> Vec<Transaction> {
+        use crate::Transaction;
+        let genesis = [0u8; 32];
+        let mut chain = Vec::new();
+        let mut parent = genesis;
+        for i in 0..n {
+            let tx = Transaction::new(
+                [parent, genesis],
+                [start.wrapping_add(i as u8); 32],
+                [200u8; 32],
+                100,
+                10,
+                1234567890 + i as u64,
+                0,
+                i as u64,
+                vec![0u8; 64],
+                vec![0u8; 32],
+            );
+            parent = tx.id;
+            chain.push(tx);
+        }
+        chain
+    }
+
+    /// VPS-2: requesting only the tip of a chain returns the whole
+    /// ancestor-closed set (chain length < budget).
+    #[test]
+    fn test_ancestor_closed_page_closes_chain() {
+        let chain = test_chain(10, 50);
+        let by_id: std::collections::HashMap<Vec<u8>, Transaction> =
+            chain.iter().map(|t| (t.id.to_vec(), t.clone())).collect();
+        let lookup = |h: &[u8]| -> Option<Transaction> { by_id.get(h).cloned() };
+        let tip = chain.last().unwrap().id.to_vec();
+        let page = P2PNetwork::ancestor_closed_page(vec![tip.clone()], &lookup);
+        assert_eq!(page.len(), 10, "full chain must be included");
+        assert!(page.contains(&tip));
+        assert!(page.contains(&chain[0].id.to_vec()));
+        // Deterministic: same input twice, same output.
+        let again = P2PNetwork::ancestor_closed_page(vec![tip], &lookup);
+        assert_eq!(page, again);
+    }
+
+    /// VPS-2 §12 anti-loop/bound: a 600-deep chain with budget 400 returns
+    /// exactly tip + 400 nearest ancestors (401), terminates, no dupes.
+    #[test]
+    fn test_ancestor_closed_page_budget_bound() {
+        let chain = test_chain(600, 10);
+        let by_id: std::collections::HashMap<Vec<u8>, Transaction> =
+            chain.iter().map(|t| (t.id.to_vec(), t.clone())).collect();
+        let lookup = |h: &[u8]| -> Option<Transaction> { by_id.get(h).cloned() };
+        let tip = chain.last().unwrap().id.to_vec();
+        let page = P2PNetwork::ancestor_closed_page(vec![tip], &lookup);
+        assert_eq!(page.len(), 401, "tip + exactly 400 ancestors");
+        // Nearest 400 present (indices 199..=598), the next one excluded.
+        assert!(page.contains(&chain[599].id.to_vec()));
+        assert!(page.contains(&chain[200].id.to_vec()));
+        assert!(page.contains(&chain[199].id.to_vec()));
+        assert!(!page.contains(&chain[198].id.to_vec()));
+        let mut sorted = page.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), page.len(), "no duplicates in page");
+    }
+
+    /// VPS-2 §12: unknown hashes are skipped (never invented), duplicate
+    /// requests deduped, genesis terminates.
+    #[test]
+    fn test_ancestor_closed_page_skips_unknown_and_dupes() {
+        let chain = test_chain(5, 80);
+        let by_id: std::collections::HashMap<Vec<u8>, Transaction> =
+            chain.iter().map(|t| (t.id.to_vec(), t.clone())).collect();
+        let lookup = |h: &[u8]| -> Option<Transaction> { by_id.get(h).cloned() };
+        let tip = chain.last().unwrap().id.to_vec();
+        let ghost = vec![0xFFu8; 32];
+        let page = P2PNetwork::ancestor_closed_page(
+            vec![tip.clone(), ghost.clone(), tip.clone()],
+            &lookup,
+        );
+        assert_eq!(page.len(), 5, "chain once, ghost skipped, dupe dropped");
+        assert!(!page.contains(&ghost));
+    }
+
     /// C2-004: topological_order must emit parents before children.
     /// The previous implementation incremented the PARENT's counter
     /// (counting children), serving tips-first: joining nodes parked
     /// every batch as orphans and the re-request storm collapsed serving
-    /// nodes at ~10k txs.
-    #[test]
+    /// nodes at ~10k txs.    #[test]
     fn test_topological_order_parents_first() {
         let mk = |id: u8, parents: [[u8; 32]; 2]| -> Transaction {
             Transaction::new(

@@ -636,6 +636,21 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                         .stats
                         .sync_progress
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // VPS-2 §6: monotone frontier = max DAG total observed
+                    // on P2P success. progress(t+1) >= progress(t) BY
+                    // CONSTRUCTION (max-update); a flat frontier alongside
+                    // pending orphans/requests is stall evidence.
+                    let total_now = dag_for_p2p.read().await.transaction_count() as u64;
+                    let prev = sync_ctx_for_p2p
+                        .stats
+                        .sync_frontier
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if total_now > prev {
+                        sync_ctx_for_p2p
+                            .stats
+                            .sync_frontier
+                            .fetch_max(total_now, std::sync::atomic::Ordering::Relaxed);
+                    }
                     rpc_impl.process_orphans().await;
                 }
                 Err(e) => {
