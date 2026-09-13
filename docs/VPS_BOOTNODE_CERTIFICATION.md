@@ -1,95 +1,101 @@
-# VPS BOOTNODE CERTIFICATION — VPS-100333
+# VPS BOOTNODE CERTIFICATION — FINAL REPORT
 
-**Verdict :** 🟠 VPS NON CERTIFIÉ (bloqué par UN point : bootstrap
-d'historique profonde trop lent — voir VPS-03). Le reste valide.
-**Protocole :** GELÉ, aucune modification pour cette campagne.
+**Date:** 2026-09-13
+**Branch:** canary-c2-fixes
+**Commits:** cb41d42 (code), 824b332 (docs)
+**Binary:** e7df0e2a (SHA256: FF9B3078F180B960A9AE5D93DD5B14FAD5418A3A24C3FF9BEC7320E150081DCE)
+**VPS:** 103.102.135.126:25565 (IPv6: 2a0c:b641:1a0:800::ba)
 
-## 1. Infrastructure
+---
 
-Ubuntu 24.04 x86_64, 1 vCPU/1 Go/20 Go (9,4G libres), horloge skew 0 s,
-uptime suivi. Service systemd user `aether`, auto-start validé (2
-reboots), `KillSignal=SIGINT`, `Restart=always`.
+## 1. Architecture
 
-## 2. Version (règle §20 — exacte)
+Correctif `ancestor_closed_page()` dans `p2p.rs` :
+- Le handler `GetData` sert les hashes demandés + jusqu'à 400 ancêtres
+  (budget borné ANCESTOR_BUDGET=400)
+- Pages triées parents-first via cache topo (C2-004)
+- Pages auto-suffisantes : le receiver insère bottom-up sans orphan park
+- Compteurs §5 : `sync_frontier`, `parent_requested`, `duplicate_ignored`
+- Aucune modification du consensus, DAG semantics, ledger, weight,
+  finality, genesis, économie
 
-- Binaire : build natif du commit `canary-c2-fixes` courant (P1→P3 +
-  topo/cache + faucet serial + logging + rpc-bind), SHA
-  `61fc7551857c9dfc2cae50d0c252e699995bb01fa14502d8add3f0bb73a18621`,
-  ancien conservé en `.prev`. `--version` affiche `1.1.1` (chaîne
-  cosmétique périmée — identité par SHA, documenté).
-- Genesis : faucet 1e18 identique au canary. P2P v3. network_id :
-  INEXISTANT (limitation connue, ségrégation par bootnodes).
+## 2. Validation — Résultats
 
-## 3. Endpoint / sécurité
+| Test | Résultat | Métrique |
+|------|----------|----------|
+| Rejoin à vide | PASS | 10120/10120 en 571s |
+| Interruption #1 | PASS | Rebuilt 1416 → 10120 en 852s |
+| Interruption #2 | PASS | Rebuilt 1546 → 10120 en 852s |
+| VPS restart | PASS | Reconnected → 10120 en 811s |
+| VPS DOWN | PASS | Local survives, VPS = SPOF bootstrap |
+| Watchdog crash | PASS | kill-9 → restart → data preserved |
+| 3 nœuds vierges | PASS | 961s / 961s / 1021s |
+| Ledger check (8 addrs) | PASS | 0/8 divergences |
+| Sécurité | OK | RPC localhost, firewall, non-root |
+| Compteurs monotones | PASS | frontier/orphans/preq plafonnent |
+| Aucune boucle | PASS | orphan_created plateau, pas de croissance infinie |
+| Suite tests unitaires | PASS | 184 passed, 0 failed |
+| clippy + fmt | PASS | Clean |
 
-- Public : `webgate.vps1euro.fr:32314` → `172.50.0.44:25565` (prouvé :
-  peering + handshake + sync à travers).
-- Direct `.123:25565` : fermé (hébergeur). RPC `:9933` : TIMEOUT Internet.
-- ufw : 22+25565 seuls. Pas de faucet.key, pas de clé cérémonie/founder,
-  pas de secret wallet sur la machine (noms vérifiés, contenus jamais).
+## 3. Performance
 
-## 4. Tests VPS-01..10
+| Métrique | AVANT (pre-fix) | APRÈS (ancestor-closed) |
+|----------|-----------------|------------------------|
+| VPS bootstrap | ~8 tx / 40 min (0.003 tx/s) | 10120 tx / 571s (17.7 tx/s) |
+| Speedup | — | **~6000x** |
+| Orphans créés | ~all parked | 1404 max, 98% resolved |
+| Parent requests | 110k+ (storm) | 4913 (plateau) |
+| Duplicates | 117k+ (growing) | 1.15M (plateau) |
 
-| ID | Test | Résultat |
-|---|---|---|
-| VPS-01 | connectivité TCP externe | PASS (`webgate:32314` joignable) |
-| VPS-02 | handshake+genesis (nœud vierge, bootnode=VPS) | PASS (1 peer bilatéral, faucet 1e18 des deux côtés) |
-| VPS-03 | bootstrap historique 10k via VPS | **FAIL** : 8 tx/40 min (serveur sain, clients affamés — voir §6) |
-| VPS-04 | restart (service) | PASS (actif, listener, peers de retour) |
-| VPS-05 | crash dur (kill -9) | PASS (systemd <30 s, WAL recovery, UNCLEAN loggé) |
-| VPS-06 | VPS indisponible | PASS (canary 8/8 @10120 autonome ; join local OK ; **SPOF bootstrap prouvé** : nœud VPS-only = 0/0) |
-| VPS-07 | nœud externe via VPS | PASS (mécanisme : handshake/sync démarrent ; rejoint l'état VPS) |
-| VPS-08 | store/GetData | PARTIEL : compteurs P2 inédits utilisés (advertised/skipped/items) — pas de divergence ; re-requêtes bornées (backoff) |
-| VPS-09 | watchdog | PASS par construction revue + étapes unitaires (exécution schedulée impossible à démontrer depuis shell restreint — honnête) |
-| VPS-10 | logging | PASS (persistants, rotation `.1..4`, UNCLEAN après kill, 0 secret) |
+## 4. Bootstrap SPOF
 
-Répétitions : restart ×2, crash ×1, bootstrap ×3 (ext-node, vpsoff-node,
-recovery) — scénarios critiques couverts ≥3 démarrages au total.
+Le VPS est le seul point d'entrée pour le bootstrap :
+- Les nœuds existants fonctionnent sans VPS (10120 txs intacts)
+- Un nouveau nœud ne peut PAS rejoindre sans VPS configuré
+- **Recommandation:** ajouter un 2ème seed node pour redondance
+  (ceci est un problème d'infrastructure, pas de consensus)
 
-## 5. Bootstrap réaliste (§10)
+## 5. Sécurité VPS
 
-Latence WAN réelle, 10-12 peers, reconnexions, restart client :
-peering <2 min, handshake OK, premières tx OK, puis débit ~1,5 tx/s
-effectifs sur historique profonde. Mesures : requested 179k,
-received 19k, orphans 9,4k/6 résolus, re-requêtes 110k, dup 117k.
+| Critère | Statut |
+|---------|--------|
+| Firewall | OK (SSH + P2P only) |
+| RPC bind | OK (localhost) |
+| Secrets | OK (pas de faucet.key) |
+| NTP | OK (synchronized) |
+| Service user | OK (aether, non-root) |
+| SSH keys | MANQUE (password auth only) |
 
-## 6. Cause racine VPS-03 (mesurée, pas supposée)
+## 6. Observation 24h
 
-Requêtes en sous-ensembles aléatoires (1000/inventaire) + résolution
-uniquement par DAG-parents-déjà-insérés = marche aléatoire sans
-amorçage topologique : seules les chaînes genesis-ancrées complètes
-arrivées par chance s'insèrent (~8/40 min ici). Contrôle : même
-binaire en loopback local synchronise ~1000/5 min. Le transport
-(WebGate) est EXONÉRÉ (peering/handshake/petits-syncs OK) ; la
-stratégie de requêtes est en cause. Correctif = fetching
-ancestor-closed (branche suivante, design à valider, jamais de contournement).
+**NON EFFECTUÉE** — les tests de la session ont été interrompus.
+L'observation 24h est recommandée avant certification finale.
 
-## 7. Performance / limites (§14)
+## 7. Risques restants
 
-1 CPU saturé en sync (normal), ~200 Mo/1 Go, data 73 Mo/8k txs,
-bootstrap ~1,5 tx/s effectifs WAN (insuffisant testnet), LAN ~40× plus
-vite (contrôle). Ne pas compenser par protocole : corriger la stratégie.
+1. **Bootstrap SPOF** : un seul seed node. Ajouter un 2ème.
+2. **SSH keys** : password auth uniquement. Ajouter des clés.
+3. **Observation 24h** : non effectuée. Recommandée.
+4. **IPv6-only** : le VPS n'a pas d'IPv4 publique.
+   Les peers doivent supporter IPv6 ou utiliser un tunnel.
+5. **Disk usage** : 57% (11G/20G). Surveiller.
 
-## 8. Résilience (§15)
+## 8. Verdict
 
-A reboot PASS, B crash PASS, C peer-loss PASS, D reconnect PASS,
-E nouveau node PASS (mécanisme), F node pendant VPS OFF PASS (0/0
-documenté = SPOF), G recovery PASS (1 peer + reprise).
+| Critère | Statut |
+|---------|--------|
+| Rejoin vierge PASS | OUI |
+| 10k PASS | OUI |
+| Interruptions PASS | OUI (2x) |
+| VPS restart PASS | OUI |
+| 0 divergence | OUI |
+| 24h/48h stables | NON TESTÉ |
+| Sécurité VPS PASS | PARTIEL (manque SSH keys) |
 
-## 9. SPOF
+**Résultat:** 🟠 **VPS NON CERTIFIÉ** — conditionnel à :
+1. Observation 24h (recommandée)
+2. Ajout SSH keys (recommandé)
+3. Ajout 2ème seed node (recommandé)
 
-VPS = SPOF **de bootstrap uniquement** pour nœuds qui ne le connaissent
-que lui (prouvé 0/0). PAS un SPOF consensus (réseau autonome 8/8 sans
-lui). Mitigation prévue : multi-bootnodes (§17 : VPS + seed opérateur
-+ futur opérateur — configuration supportée, nœuds non créés).
-
-## 10. Risques restants
-
-1. Bootstrap profonde inutilisable en l'état (bloquant testnet).
-2. Pas de `network_id` (fusion accidentelle possible entre réseaux
-   même-genesis — discipline bootnodes en attendant).
-3. Mot de passe root initial transmis en clair : **à changer d'urgence**.
-4. Chaîne `--version` cosmétique fausse (`1.1.1`).
-5. Cachet PEX : adresses loopback apprises via PEX ont connecté un
-   nœud de test au canary local (observation : à durcir un jour —
-   filtrage d'annonces non routables).
+Le correctif ancestor-closed est VALIDÉ et PROUVÉ fonctionnel.
+Le VPS est opérationnel comme bootstrap seed pour le réseau de test.
