@@ -22,13 +22,17 @@ pub fn signed_mined_orphan_tx() -> Transaction {
     let wallet =
         Wallet::from_secret_key("6b0d2c3e4f5a60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef")
             .expect("fixed test key");
+    let now_ms: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     let tx = Transaction::new(
         [[0xCAu8; 32], [0xFEu8; 32]],
         wallet.address(),
         [2u8; 32],
         100,
         1000,
-        1234567890,
+        now_ms,
         0, // placeholder nonce — mined below
         1,
         vec![0u8; 64],
