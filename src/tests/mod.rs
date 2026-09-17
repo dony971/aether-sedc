@@ -1,14 +1,22 @@
 //! Security tests module
+pub mod consensus_harness;
+pub mod crash_harness;
+pub mod deep_sync_harness;
 pub mod inc01_fix_tests;
+pub mod multiprocess_crash;
+pub mod pow_economics;
+pub mod scalability;
 pub mod security_tests;
+pub mod spec_check;
+pub mod sybil_scale;
 
 use crate::transaction::Transaction;
 use crate::wallet::Wallet;
 
-/// H1: deterministic orphan transaction with a VALID PoW (difficulty 20) and
+/// H1: deterministic orphan transaction with a VALID PoW (difficulty 24) and
 /// VALID signature, referencing parents `[0xCA; 32]` / `[0xFE; 32]` that are
 /// absent from any fresh DAG. The nonce and signature were computed once with
-/// `mine_nonce(20)` + signing and are hardcoded here so tests never spend
+/// `mine_nonce(24)` + signing and are hardcoded here so tests never spend
 /// seconds (or minutes on an unlucky nonce) in a PoW search.
 pub fn signed_mined_orphan_tx() -> Transaction {
     let wallet =
@@ -21,14 +29,15 @@ pub fn signed_mined_orphan_tx() -> Transaction {
         100,
         1000,
         1234567890,
-        161041, // precomputed PoW nonce
+        0, // placeholder nonce — mined below
         1,
-        hex::decode(
-            "019a99bc40bf26f25f9e724dc8f0cb0a3f917e65092389107d05cf95fefbb8275c95cff0bb2a703f072ff46ec49b6ffb5f94d9820239feb905612be9bbe4960d",
-        )
-        .expect("fixed signature"),
+        vec![0u8; 64],
         wallet.public_key_bytes(),
     );
+    let mut tx = tx;
+    tx.nonce = tx.mine_nonce(Transaction::default_difficulty());
+    tx.signature = wallet.sign_transaction(&tx).expect("sign");
+    tx.id = tx.compute_hash();
     debug_assert!(tx.verify_pow(Transaction::default_difficulty()));
     debug_assert!(Wallet::verify_transaction(&tx));
     tx

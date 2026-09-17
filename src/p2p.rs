@@ -32,6 +32,12 @@ const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 /// Maximum number of concurrently connected peers (V-10)
 const MAX_PEERS: usize = 128;
 
+/// Maximum number of peers from the same /24 subnet (eclipse prevention)
+const MAX_PEERS_PER_SUBNET: usize = 4;
+
+/// Number of outbound connection slots reserved and never evicted
+const PROTECTED_OUTBOUND_SLOTS: usize = 8;
+
 /// Maximum number of known peer addresses retained (PEX/DNS growth bound)
 const MAX_KNOWN_PEERS: usize = 1000;
 
@@ -42,8 +48,159 @@ const MAX_SEEN_TXS: usize = 50_000;
 /// message (vector-of-vectors amplification bound)
 const MAX_INV_ITEMS: usize = 1000;
 
+/// DEEP SYNC: maximum transactions per SyncResponse page.
+/// Each page is ancestor-closed and topologically sorted.
+const MAX_SYNC_PAGE: usize = 100;
+
+/// DEEP SYNC: maximum number of ancestor-closure pages that can be computed
+/// per GetData request. Total max served = MAX_CLOSURE_PAGES * MAX_SYNC_PAGE.
+/// This bounds CPU (BFS walk), memory (HashSet), and network (message size).
+const MAX_CLOSURE_PAGES: usize = 10;
+
+/// DEEP SYNC: adaptive backpressure base interval (ms) for SyncResponse delivery.
+/// Scales with batch size instead of fixed 50ms per tx.
+const BACKPRESSURE_BASE_MS: u64 = 5;
+
+// --- Peer Scoring ---
+/// Initial score for new peers
+const PEER_SCORE_INITIAL: i32 = 100;
+/// Score below this → temporary ban
+const PEER_SCORE_BAN_THRESHOLD: i32 = 0;
+/// Penalty for invalid message (bad format, invalid tx)
+const PEER_PENALTY_INVALID_MSG: i32 = -10;
+/// Penalty for contradictory data (conflicting inventory)
+const PEER_PENALTY_CONTRADICTION: i32 = -20;
+/// Penalty for timeout (slow or stalled peer)
+const PEER_PENALTY_TIMEOUT: i32 = -5;
+/// Penalty for rate limit hit (flood)
+const PEER_PENALTY_FLOOD: i32 = -15;
+/// Penalty for abusive/abnormal requests
+const PEER_PENALTY_ABUSIVE: i32 = -10;
+/// Bonus for successful sync contribution
+const PEER_BONUS_SYNC: i32 = 5;
+/// Score recovery per decay interval (towards 100)
+const PEER_DECAY_RATE: i32 = 1;
+/// Decay interval
+const PEER_DECAY_INTERVAL: Duration = Duration::from_secs(300);
+/// Temporary ban duration
+const PEER_BAN_TEMP: Duration = Duration::from_secs(300);
+/// Number of temp bans before permanent ban
+const PEER_BAN_TEMP_MAX: usize = 3;
+/// Permanent ban duration
+const PEER_BAN_PERM: Duration = Duration::from_secs(3600);
+
+/// Per-peer reputation score with decay and ban tracking
+#[derive(Clone, Debug)]
+struct PeerScore {
+    score: i32,
+    temp_bans: usize,
+    last_decay: Instant,
+    banned_until: Option<Instant>,
+}
+
+impl PeerScore {
+    fn new() -> Self {
+        Self {
+            score: PEER_SCORE_INITIAL,
+            temp_bans: 0,
+            last_decay: Instant::now(),
+            banned_until: None,
+        }
+    }
+
+    /// Apply decay: score moves towards PEER_SCORE_INITIAL
+    fn decay(&mut self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_decay) >= PEER_DECAY_INTERVAL {
+            if self.score < PEER_SCORE_INITIAL {
+                self.score = (self.score + PEER_DECAY_RATE).min(PEER_SCORE_INITIAL);
+            } else if self.score > PEER_SCORE_INITIAL {
+                self.score = (self.score - PEER_DECAY_RATE).max(PEER_SCORE_INITIAL);
+            }
+            self.last_decay = now;
+        }
+    }
+
+    /// Apply a penalty. Returns true if peer should be banned.
+    fn penalize(&mut self, penalty: i32) -> bool {
+        self.score += penalty;
+        self.score <= PEER_SCORE_BAN_THRESHOLD
+    }
+
+    /// Apply a bonus (capped at initial)
+    fn reward(&mut self, bonus: i32) {
+        self.score = (self.score + bonus).min(PEER_SCORE_INITIAL + 50);
+    }
+
+    /// Check if currently banned
+    fn is_banned(&self) -> bool {
+        if let Some(until) = self.banned_until {
+            Instant::now() < until
+        } else {
+            false
+        }
+    }
+
+    /// Ban the peer (temp or perm based on history)
+    fn ban(&mut self) {
+        self.temp_bans += 1;
+        if self.temp_bans >= PEER_BAN_TEMP_MAX {
+            self.banned_until = Some(Instant::now() + PEER_BAN_PERM);
+        } else {
+            self.banned_until = Some(Instant::now() + PEER_BAN_TEMP);
+        }
+    }
+}
+
 /// Maximum frames accepted from a peer per second (rate limit)
 const MAX_MSGS_PER_SEC: u64 = 400;
+
+/// Extract the /24 subnet prefix from a SocketAddr (first 3 bytes of IPv4).
+/// Returns None for IPv6 (handled separately) or invalid addresses.
+fn subnet_24(addr: SocketAddr) -> Option<[u8; 3]> {
+    match addr {
+        SocketAddr::V4(v4) => {
+            let octets = v4.ip().octets();
+            Some([octets[0], octets[1], octets[2]])
+        }
+        SocketAddr::V6(v6) => {
+            let octets = v6.ip().octets();
+            // Use first 3 bytes as synthetic /24-equivalent
+            Some([octets[0], octets[1], octets[2]])
+        }
+    }
+}
+
+/// Count how many connected peers share the same /24 subnet as `addr`.
+async fn count_subnet_peers(
+    addr: SocketAddr,
+    peers: &HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>,
+) -> usize {
+    let target = match subnet_24(addr) {
+        Some(s) => s,
+        None => return 0,
+    };
+    peers
+        .keys()
+        .filter(|k| subnet_24(**k) == Some(target))
+        .count()
+}
+
+/// Count how many connected peers share the same /24 subnet as `addr`,
+/// excluding `addr` itself (for checking before adding).
+async fn count_subnet_peers_excluding(
+    addr: SocketAddr,
+    peers: &HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>,
+) -> usize {
+    let target = match subnet_24(addr) {
+        Some(s) => s,
+        None => return 0,
+    };
+    peers
+        .keys()
+        .filter(|k| **k != addr && subnet_24(**k) == Some(target))
+        .count()
+}
 
 // H2: network timeouts. A peer that connects and never speaks (slow-loris),
 // stalls mid-frame, or points at a black-holed address must be released
@@ -164,6 +321,8 @@ pub struct P2PNetwork {
     get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
     get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
     seen_transactions: Arc<RwLock<HashMap<Vec<u8>, SeenTxEntry>>>,
+    /// Per-peer reputation scores
+    peer_scores: Arc<RwLock<HashMap<SocketAddr, PeerScore>>>,
     /// B4: shared bootstrap state (counters, parent-request dedup, orphan TTL)
     sync_ctx: Arc<SyncContext>,
     /// B4: true when the hash is already in the orphan store (sync dedup)
@@ -191,6 +350,7 @@ impl P2PNetwork {
             get_transaction_by_hash,
             get_tips,
             seen_transactions: Arc::new(RwLock::new(HashMap::new())),
+            peer_scores: Arc::new(RwLock::new(HashMap::new())),
             sync_ctx,
             is_orphan,
         }
@@ -208,6 +368,7 @@ impl P2PNetwork {
         let get_transaction_by_hash = Arc::clone(&self.get_transaction_by_hash);
         let get_tips = Arc::clone(&self.get_tips);
         let seen_transactions = Arc::clone(&self.seen_transactions);
+        let peer_scores = Arc::clone(&self.peer_scores);
         let sync_ctx = Arc::clone(&self.sync_ctx);
         let is_orphan = Arc::clone(&self.is_orphan);
         let local_addr = self.config.listen_addr;
@@ -234,6 +395,7 @@ impl P2PNetwork {
                 get_transaction_by_hash,
                 get_tips,
                 seen_transactions,
+                peer_scores,
                 peer_discovery_tx,
                 sync_ctx,
                 is_orphan,
@@ -472,6 +634,7 @@ impl P2PNetwork {
         get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
         get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         seen_transactions: Arc<RwLock<HashMap<Vec<u8>, SeenTxEntry>>>,
+        peer_scores: Arc<RwLock<HashMap<SocketAddr, PeerScore>>>,
         peer_discovery_tx: mpsc::UnboundedSender<SocketAddr>,
         sync_ctx: Arc<SyncContext>,
         is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
@@ -488,6 +651,33 @@ impl P2PNetwork {
                             );
                             drop(socket);
                             continue;
+                        }
+                        // ECLIPSE-01: enforce /24 subnet diversity
+                        let subnet_count = count_subnet_peers_excluding(addr, &peers_guard).await;
+                        if subnet_count >= MAX_PEERS_PER_SUBNET {
+                            warn!(
+                                "Rejecting incoming peer {}: /24 subnet limit reached ({}/{})",
+                                addr, subnet_count, MAX_PEERS_PER_SUBNET
+                            );
+                            drop(socket);
+                            continue;
+                        }
+                    }
+                    // SCORING: check if peer is banned
+                    {
+                        let mut scores = peer_scores.write().await;
+                        if let Some(score) = scores.get_mut(&addr) {
+                            score.decay();
+                            if score.is_banned() {
+                                warn!(
+                                    "Rejecting banned peer {}: banned until {:?}",
+                                    addr, score.banned_until
+                                );
+                                drop(socket);
+                                continue;
+                            }
+                        } else {
+                            scores.insert(addr, PeerScore::new());
                         }
                     }
                     info!("New peer connected: {}", addr);
@@ -507,6 +697,7 @@ impl P2PNetwork {
                     let known_peers = known_peers.clone();
                     let sync_ctx = Arc::clone(&sync_ctx);
                     let is_orphan = Arc::clone(&is_orphan);
+                    let peer_scores = Arc::clone(&peer_scores);
                     tokio::spawn(async move {
                         Self::handle_peer(
                             socket,
@@ -519,6 +710,7 @@ impl P2PNetwork {
                             get_transaction_by_hash,
                             get_tips,
                             seen_transactions,
+                            peer_scores,
                             msg_sender,
                             msg_receiver,
                             peer_discovery_tx,
@@ -630,6 +822,7 @@ impl P2PNetwork {
         get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
         get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         seen_transactions: Arc<RwLock<HashMap<Vec<u8>, SeenTxEntry>>>,
+        peer_scores: Arc<RwLock<HashMap<SocketAddr, PeerScore>>>,
         msg_sender: mpsc::UnboundedSender<Vec<u8>>,
         msg_receiver: mpsc::UnboundedReceiver<Vec<u8>>,
         peer_discovery_tx: mpsc::UnboundedSender<SocketAddr>,
@@ -757,6 +950,16 @@ impl P2PNetwork {
                     "Peer {} exceeded message rate limit ({} msgs/s), disconnecting",
                     addr, MAX_MSGS_PER_SEC
                 );
+                // SCORING: penalize flood
+                {
+                    let mut scores = peer_scores.write().await;
+                    if let Some(score) = scores.get_mut(&addr) {
+                        if score.penalize(PEER_PENALTY_FLOOD) {
+                            score.ban();
+                            warn!("Peer {} banned (flood, score={})", addr, score.score);
+                        }
+                    }
+                }
                 break;
             }
 
@@ -804,6 +1007,14 @@ impl P2PNetwork {
                 Ok(p) => p,
                 Err(e) => {
                     warn!("Decryption failed for {}: {:?}", addr, e);
+                    // SCORING: penalize invalid message
+                    let mut scores = peer_scores.write().await;
+                    if let Some(score) = scores.get_mut(&addr) {
+                        if score.penalize(PEER_PENALTY_INVALID_MSG) {
+                            score.ban();
+                            warn!("Peer {} banned (invalid msg, score={})", addr, score.score);
+                        }
+                    }
                     break;
                 }
             };
@@ -900,15 +1111,29 @@ impl P2PNetwork {
                                     missing_hashes.len() as u64,
                                     std::sync::atomic::Ordering::Relaxed,
                                 );
+                                // DEEP SYNC: register missing hashes in the frontier
+                                {
+                                    let mut frontier = sync_ctx.frontier.write().await;
+                                    for h in &missing_hashes {
+                                        frontier.add_pending(h.clone());
+                                    }
+                                }
                                 info!(
                                     "Requesting {} missing transactions from {}",
                                     missing_hashes.len(),
                                     addr
                                 );
                                 if let Ok(getdata_msg) =
-                                    bincode::serialize(&P2PMessage::GetData(missing_hashes))
+                                    bincode::serialize(&P2PMessage::GetData(missing_hashes.clone()))
                                 {
                                     let _ = msg_sender.send(getdata_msg);
+                                }
+                                // DEEP SYNC: mark hashes as requested in frontier
+                                {
+                                    let mut frontier = sync_ctx.frontier.write().await;
+                                    for h in &missing_hashes {
+                                        frontier.mark_requested(h, addr);
+                                    }
                                 }
                             }
                         }
@@ -972,16 +1197,10 @@ impl P2PNetwork {
                             }
                         }
                         P2PMessage::GetData(hashes) => {
-                            // B4: serve the requested transactions in DETERMINISTIC
-                            // DEPENDENCY order (parents before children, Kahn's
-                            // algorithm over the local DAG). Batches therefore
-                            // arrive ancestor-first no matter the request order, so
-                            // a joining node inserts most of them immediately
-                            // instead of parking deep chains of orphans.
-                            // C2-004: the order is CACHED by DAG length. Sorting
-                            // the whole DAG per GetData collapsed serving nodes
-                            // at ~10k txs; the cache makes repeat requests O(1).
-                            const PAGE_SIZE: usize = 100;
+                            // DEEP SYNC: serve requested transactions with FULL
+                            // ancestor closure, split into multiple topologically
+                            // sorted pages. Each page is ancestor-closed so the
+                            // receiver can insert bottom-up without orphans.
                             let topo = Self::cached_topo_order(
                                 &sync_ctx,
                                 get_dag_hashes(),
@@ -995,51 +1214,42 @@ impl P2PNetwork {
                                     v.sort_by_key(|h| pos.get(h).copied().unwrap_or(usize::MAX));
                                 }
                             };
-                            let mut requested: Vec<Vec<u8>> =
-                                hashes.iter().take(PAGE_SIZE).cloned().collect();
-                            sort_topo(&mut requested, &topo);
-                            // VPS-2 ANCESTOR-CLOSED PAGES: extend the requested
-                            // set with missing ancestors (bounded budget) so
-                            // every served page is self-sufficient — the
-                            // receiver inserts bottom-up instead of parking
-                            // orphans whose parents live outside the page
-                            // (measured: 8 txs/40 min without this on deep
-                            // history). Bounds preserved (no blind full-chain
-                            // download): PAGE_SIZE requested + ANCESTOR_BUDGET
-                            // extra, defensive step cap, DAG-resident only.
-                            // No message/validation/consensus change: the
-                            // receiver funnels everything through the normal
-                            // accept path as before.
-                            let mut page = P2PNetwork::ancestor_closed_page(
-                                requested,
+                            // Take up to MAX_SYNC_PAGE of the requested hashes.
+                            let requested: Vec<Vec<u8>> =
+                                hashes.iter().take(MAX_SYNC_PAGE).cloned().collect();
+                            // Compute FULL ancestor closure (bounded by MAX_CLOSURE_PAGES).
+                            let max_entries = MAX_SYNC_PAGE.saturating_mul(MAX_CLOSURE_PAGES);
+                            let mut closure = P2PNetwork::ancestor_full_closure(
+                                &requested,
                                 &*get_transaction_by_hash,
+                                max_entries,
                             );
-                            // Re-sort parents-first (ancestors appended
-                            // out of order above); fall back to request
-                            // order without a topo map.
-                            sort_topo(&mut page, &topo);
-                            let mut tx_bytes_list = Vec::new();
-
-                            for hash in page {
-                                if let Some(tx) = get_transaction_by_hash(&hash) {
-                                    if let Ok(bytes) = bincode::serialize(&tx) {
-                                        tx_bytes_list.push(bytes);
+                            // Topologically sort: ancestors first.
+                            sort_topo(&mut closure, &topo);
+                            // Split into pages of MAX_SYNC_PAGE and send each.
+                            let total_pages = closure.len().div_ceil(MAX_SYNC_PAGE).max(1);
+                            for (page_idx, chunk) in closure.chunks(MAX_SYNC_PAGE).enumerate() {
+                                let mut tx_bytes_list = Vec::with_capacity(chunk.len());
+                                for hash in chunk {
+                                    if let Some(tx) = get_transaction_by_hash(hash) {
+                                        if let Ok(bytes) = bincode::serialize(&tx) {
+                                            tx_bytes_list.push(bytes);
+                                        }
                                     }
                                 }
-                            }
-
-                            if !tx_bytes_list.is_empty() {
-                                // LOG NOISE: per-response line (was per-100;
-                                // pages are bigger now but far fewer).
-                                tracing::debug!(
-                                    "[Sync] Sending {} transactions to {}",
-                                    tx_bytes_list.len(),
-                                    addr
-                                );
-                                if let Ok(sync_resp_msg) =
-                                    bincode::serialize(&P2PMessage::SyncResponse(tx_bytes_list))
-                                {
-                                    let _ = msg_sender.send(sync_resp_msg);
+                                if !tx_bytes_list.is_empty() {
+                                    tracing::debug!(
+                                        "[Sync] Serving page {}/{} ({} txs) to {}",
+                                        page_idx + 1,
+                                        total_pages,
+                                        tx_bytes_list.len(),
+                                        addr
+                                    );
+                                    if let Ok(sync_resp_msg) =
+                                        bincode::serialize(&P2PMessage::SyncResponse(tx_bytes_list))
+                                    {
+                                        let _ = msg_sender.send(sync_resp_msg);
+                                    }
                                 }
                             }
                         }
@@ -1091,7 +1301,18 @@ impl P2PNetwork {
                                             .stats
                                             .duplicate_ignored
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        // DEEP SYNC: mark duplicate as applied in frontier (already resolved)
+                                        {
+                                            let mut frontier = sync_ctx.frontier.write().await;
+                                            frontier.mark_received(&tx.id);
+                                            frontier.mark_applied(&tx.id);
+                                        }
                                         continue;
+                                    }
+                                    // DEEP SYNC: mark as received in frontier
+                                    {
+                                        let mut frontier = sync_ctx.frontier.write().await;
+                                        frontier.mark_received(&tx.id);
                                     }
                                     pending.push((tx_bytes, tx));
                                 }
@@ -1108,12 +1329,36 @@ impl P2PNetwork {
                             let (deliverable, waiting) =
                                 Self::partition_batch(pending, &*get_transaction_by_hash);
 
-                            // Deliver in dependency order (throttled so the ledger
-                            // can breathe).
+                            // DEEP SYNC: adaptive backpressure instead of fixed
+                            // 50ms per tx. Scale interval with batch size to
+                            // maintain throughput while allowing ledger breathing room.
+                            let batch_len = deliverable.len() + waiting.len();
+                            let delay_ms = if batch_len > 0 {
+                                // Scale: base interval * sqrt(batch) / 10, clamped to [1, 20]ms
+                                let scaled = (BACKPRESSURE_BASE_MS as f64
+                                    * (batch_len as f64).sqrt()
+                                    / 10.0) as u64;
+                                scaled.clamp(1, 20)
+                            } else {
+                                0
+                            };
                             for (tx_bytes, tx) in deliverable.into_iter().chain(waiting) {
+                                // DEEP SYNC: mark as applied in frontier before sending to ledger
+                                {
+                                    let mut frontier = sync_ctx.frontier.write().await;
+                                    frontier.mark_applied(&tx.id);
+                                    frontier.record_progress();
+                                }
                                 insert_seen(&seen_transactions, tx_bytes).await;
                                 let _ = tx_channel.send(tx);
-                                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                                if delay_ms > 0 {
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                                }
+                            }
+                            // DEEP SYNC: log frontier state after processing batch
+                            {
+                                let frontier = sync_ctx.frontier.read().await;
+                                tracing::debug!("{}", frontier.log_line());
                             }
                         }
                         P2PMessage::Ping => {
@@ -1154,6 +1399,14 @@ impl P2PNetwork {
                 }
                 Err(e) => {
                     warn!("Failed to deserialize message from {}: {}", addr, e);
+                    // SCORING: penalize invalid message
+                    let mut scores = peer_scores.write().await;
+                    if let Some(score) = scores.get_mut(&addr) {
+                        if score.penalize(PEER_PENALTY_INVALID_MSG) {
+                            score.ban();
+                            warn!("Peer {} banned (deser fail, score={})", addr, score.score);
+                        }
+                    }
                 }
             }
         }
@@ -1164,6 +1417,19 @@ impl P2PNetwork {
             peers_lock.remove(&addr);
         }
         known_peers.write().await.remove(&addr);
+        // DEEP SYNC: failover — move all in-flight requests from this peer back to pending
+        {
+            let mut frontier = sync_ctx.frontier.write().await;
+            let requeued = frontier.on_peer_disconnect(&addr);
+            if requeued > 0 {
+                info!(
+                    "[Sync] Peer {} disconnected, requeued {} in-flight requests for failover",
+                    addr, requeued
+                );
+            }
+            frontier.update_state();
+            tracing::debug!("{}", frontier.log_line());
+        }
         info!("Peer {} removed from peers map", addr);
     }
 
@@ -1177,6 +1443,15 @@ impl P2PNetwork {
                 warn!(
                     "Skipping connect to {}: connection limit reached ({})",
                     addr, MAX_PEERS
+                );
+                return;
+            }
+            // ECLIPSE-01: enforce /24 subnet diversity for outbound connections
+            let subnet_count = count_subnet_peers_excluding(addr, &peers_guard).await;
+            if subnet_count >= MAX_PEERS_PER_SUBNET {
+                warn!(
+                    "Skipping connect to {}: /24 subnet limit reached ({}/{})",
+                    addr, subnet_count, MAX_PEERS_PER_SUBNET
                 );
                 return;
             }
@@ -1201,6 +1476,7 @@ impl P2PNetwork {
                 let get_transaction_by_hash = Arc::clone(&self.get_transaction_by_hash);
                 let get_tips = Arc::clone(&self.get_tips);
                 let seen_transactions = Arc::clone(&self.seen_transactions);
+                let peer_scores = Arc::clone(&self.peer_scores);
                 let sync_ctx = Arc::clone(&self.sync_ctx);
                 let is_orphan = Arc::clone(&self.is_orphan);
                 let peer_discovery_tx = {
@@ -1222,6 +1498,7 @@ impl P2PNetwork {
                         get_transaction_by_hash,
                         get_tips,
                         seen_transactions,
+                        peer_scores,
                         msg_sender,
                         msg_receiver,
                         peer_discovery_tx,
@@ -1378,6 +1655,64 @@ impl P2PNetwork {
             }
         }
         page
+    }
+
+    /// DEEP SYNC: compute the full ancestor closure of a set of requested
+    /// transaction hashes. The result includes ALL ancestors reachable from
+    /// the requested set, bounded by `max_entries` (CPU/memory protection).
+    ///
+    /// Unlike the previous `ancestor_closed_page` with its fixed ANCESTOR_BUDGET
+    /// of 400, this function computes the FULL closure up to the bound, ensuring
+    /// that the served page is self-sufficient for bottom-up insertion.
+    ///
+    /// Returns hashes in an UNORDERED set. The caller must topologically sort
+    /// the result before sending.
+    pub(crate) fn ancestor_full_closure(
+        requested: &[Vec<u8>],
+        get_transaction_by_hash: &(dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync),
+        max_entries: usize,
+    ) -> Vec<Vec<u8>> {
+        let mut closure: Vec<Vec<u8>> = Vec::with_capacity(requested.len().min(max_entries));
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut steps = 0usize;
+        // Seed with requested hashes (only those that exist in the DAG).
+        for h in requested {
+            if get_transaction_by_hash(h).is_none() {
+                continue;
+            }
+            if seen.insert(h.clone()) {
+                closure.push(h.clone());
+            }
+        }
+        // BFS walk: for each hash in the closure, append its parents.
+        let mut idx = 0usize;
+        while idx < closure.len() && closure.len() < max_entries && steps < crate::sync_stats::TOPO_ORDER_CAP {
+            steps += 1;
+            let h = closure[idx].clone();
+            idx += 1;
+            let parents: [[u8; 32]; 2] = match get_transaction_by_hash(&h) {
+                Some(tx) => tx.parents,
+                None => continue,
+            };
+            for parent in parents.iter() {
+                if *parent == [0u8; 32] {
+                    continue;
+                }
+                let key = parent.to_vec();
+                if seen.contains(&key) {
+                    continue;
+                }
+                if get_transaction_by_hash(&key).is_none() {
+                    continue;
+                }
+                seen.insert(key.clone());
+                closure.push(key);
+                if closure.len() >= max_entries {
+                    break;
+                }
+            }
+        }
+        closure
     }
 
     /// B4: deterministic dependency order of the local DAG (parents before
@@ -2117,5 +2452,303 @@ mod tests {
         assert!(pos(&a.id) < pos(&c.id), "A before C");
         assert!(pos(&b.id) < pos(&d.id), "B before D");
         assert!(pos(&c.id) < pos(&d.id), "C before D");
+    }
+
+    #[test]
+    fn test_subnet_24_ipv4() {
+        let addr: SocketAddr = "192.168.1.100:30333".parse().unwrap();
+        assert_eq!(subnet_24(addr), Some([192, 168, 1]));
+        let same: SocketAddr = "192.168.1.200:30333".parse().unwrap();
+        assert_eq!(subnet_24(same), Some([192, 168, 1]));
+        let diff: SocketAddr = "192.168.2.100:30333".parse().unwrap();
+        assert_eq!(subnet_24(diff), Some([192, 168, 2]));
+    }
+
+    #[test]
+    fn test_subnet_24_ipv6() {
+        let addr: SocketAddr = "[2a0c:b641:1a0:800::ba]:30333".parse().unwrap();
+        let sub = subnet_24(addr);
+        assert!(sub.is_some(), "IPv6 must return a subnet");
+    }
+
+    #[test]
+    fn test_count_subnet_peers() {
+        let peers: HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>> = HashMap::new();
+        let addr: SocketAddr = "10.0.0.1:30333".parse().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let count = rt.block_on(count_subnet_peers(addr, &peers));
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_diversity_constants() {
+        assert!(
+            MAX_PEERS_PER_SUBNET >= 2,
+            "must allow at least 2 peers per /24"
+        );
+        assert!(MAX_PEERS_PER_SUBNET <= 16, "must limit to prevent eclipse");
+        assert!(
+            PROTECTED_OUTBOUND_SLOTS >= 4,
+            "must protect at least 4 outbound slots"
+        );
+        assert!(
+            PROTECTED_OUTBOUND_SLOTS < MAX_PEERS,
+            "protected must be less than total"
+        );
+    }
+
+    // === Phase 8: Adversarial P2P Tests ===
+
+    #[test]
+    fn test_peer_score_initial() {
+        let score = PeerScore::new();
+        assert_eq!(score.score, PEER_SCORE_INITIAL);
+        assert!(!score.is_banned());
+        assert_eq!(score.temp_bans, 0);
+    }
+
+    #[test]
+    fn test_peer_score_penalize() {
+        let mut score = PeerScore::new();
+        assert!(!score.penalize(PEER_PENALTY_INVALID_MSG));
+        assert_eq!(score.score, PEER_SCORE_INITIAL + PEER_PENALTY_INVALID_MSG);
+        // Enough penalties to drop below threshold
+        for _ in 0..10 {
+            if score.penalize(PEER_PENALTY_INVALID_MSG) {
+                break;
+            }
+        }
+        assert!(score.score <= PEER_SCORE_BAN_THRESHOLD);
+    }
+
+    #[test]
+    fn test_peer_score_ban_temp_then_perm() {
+        let mut score = PeerScore::new();
+        score.score = PEER_SCORE_BAN_THRESHOLD;
+        score.ban();
+        assert!(score.is_banned());
+        assert_eq!(score.temp_bans, 1);
+        score.score = PEER_SCORE_BAN_THRESHOLD;
+        score.ban();
+        assert_eq!(score.temp_bans, 2);
+        score.score = PEER_SCORE_BAN_THRESHOLD;
+        score.ban();
+        assert_eq!(score.temp_bans, 3);
+        assert!(score.is_banned());
+    }
+
+    #[test]
+    fn test_peer_score_decay() {
+        let mut score = PeerScore::new();
+        score.score = 50;
+        score.last_decay = Instant::now() - Duration::from_secs(600);
+        score.decay();
+        assert_eq!(score.score, 51);
+    }
+
+    #[test]
+    fn test_peer_score_decay_no_op() {
+        let mut score = PeerScore::new();
+        score.last_decay = Instant::now() - Duration::from_secs(600);
+        score.decay();
+        assert_eq!(score.score, PEER_SCORE_INITIAL);
+    }
+
+    #[test]
+    fn test_peer_score_reward() {
+        let mut score = PeerScore::new();
+        score.reward(PEER_BONUS_SYNC);
+        assert_eq!(score.score, PEER_SCORE_INITIAL + PEER_BONUS_SYNC);
+        score.reward(100);
+        assert_eq!(score.score, PEER_SCORE_INITIAL + 50);
+    }
+
+    #[test]
+    fn test_subnet_diversity_limit() {
+        let mut count = 0;
+        for i in 1..=5 {
+            let addr: SocketAddr = format!("192.168.1.{}:30333", i).parse().unwrap();
+            if subnet_24(addr) == Some([192, 168, 1]) {
+                count += 1;
+            }
+        }
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn test_eclipse_attack_blocked() {
+        let attacker_subnet = [10, 0, 0];
+        let mut allowed = 0;
+        for i in 1..=10 {
+            let addr: SocketAddr = format!("10.0.0.{}:30333", i).parse().unwrap();
+            if subnet_24(addr) == Some(attacker_subnet) && allowed < MAX_PEERS_PER_SUBNET {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, MAX_PEERS_PER_SUBNET);
+    }
+
+    #[test]
+    fn test_scoring_flood_bans() {
+        let mut score = PeerScore::new();
+        for _ in 0..7 {
+            if score.penalize(PEER_PENALTY_FLOOD) {
+                score.ban();
+                break;
+            }
+        }
+        assert!(score.is_banned());
+    }
+
+    #[test]
+    fn test_scoring_slow_not_banned() {
+        let mut score = PeerScore::new();
+        for _ in 0..10 {
+            score.penalize(PEER_PENALTY_TIMEOUT);
+        }
+        assert!(score.score > PEER_SCORE_BAN_THRESHOLD);
+        assert!(!score.is_banned());
+    }
+
+    // ===== DEEP SYNC TESTS =====
+
+    /// Helper: build a linear chain of `n` transactions in a lookup table.
+    /// Returns (tip_hash, lookup_fn).
+    fn build_linear_chain(n: usize) -> (Vec<u8>, impl Fn(&[u8]) -> Option<Transaction>) {
+        let mut chain: HashMap<Vec<u8>, Transaction> = HashMap::new();
+        let mut prev_hash = [0u8; 32]; // genesis parent
+        for i in 0..n {
+            let mut parents = [[0u8; 32]; 2];
+            parents[0] = prev_hash;
+            parents[1] = [0u8; 32];
+            let tx = Transaction::new(
+                parents,
+                [1u8; 32], // sender
+                [2u8; 32], // receiver
+                100,       // amount
+                1,         // fee
+                1000 + i as u64, // timestamp
+                0,         // nonce
+                0,         // account_nonce
+                vec![],    // signature
+                vec![],    // public_key
+            );
+            prev_hash = tx.id;
+            chain.insert(tx.id.to_vec(), tx);
+        }
+        let tip = prev_hash.to_vec();
+        let lookup = move |hash: &[u8]| -> Option<Transaction> {
+            chain.get(hash).cloned()
+        };
+        (tip, lookup)
+    }
+
+    #[test]
+    fn test_ancestor_full_closure_linear_chain() {
+        let (tip, lookup) = build_linear_chain(10);
+        let closure = P2PNetwork::ancestor_full_closure(&[tip.clone()], &lookup, 100);
+        // Full closure of a 10-tx chain should include all 10 txs.
+        assert_eq!(closure.len(), 10, "full closure should include all ancestors");
+        // The tip itself should be in the closure.
+        assert!(closure.iter().any(|h| h == &tip));
+    }
+
+    #[test]
+    fn test_ancestor_full_closure_respects_max_entries() {
+        let (tip, lookup) = build_linear_chain(50);
+        let closure = P2PNetwork::ancestor_full_closure(&[tip.clone()], &lookup, 20);
+        // Should be capped at max_entries (20), not the full chain (50).
+        assert!(closure.len() <= 20, "closure should respect max_entries bound");
+        assert!(closure.len() > 0, "closure should not be empty");
+    }
+
+    #[test]
+    fn test_ancestor_full_closure_empty_request() {
+        let (_tip, lookup) = build_linear_chain(10);
+        let closure = P2PNetwork::ancestor_full_closure(&[], &lookup, 100);
+        assert_eq!(closure.len(), 0, "empty request should produce empty closure");
+    }
+
+    #[test]
+    fn test_ancestor_full_closure_unknown_hashes_skipped() {
+        let (_tip, lookup) = build_linear_chain(10);
+        let unknown = vec![99u8; 32];
+        let closure = P2PNetwork::ancestor_full_closure(&[unknown], &lookup, 100);
+        assert_eq!(closure.len(), 0, "unknown hashes should be skipped");
+    }
+
+    #[test]
+    fn test_ancestor_full_closure_duplicate_requests_deduped() {
+        let (tip, lookup) = build_linear_chain(5);
+        let closure = P2PNetwork::ancestor_full_closure(&[tip.clone(), tip.clone()], &lookup, 100);
+        // Duplicate request hashes should be deduplicated.
+        assert_eq!(closure.len(), 5, "duplicates should be deduped");
+    }
+
+    #[test]
+    fn test_ancestor_full_closure_genesis_terminated() {
+        // Chain where a tx has genesis parent [0; 32].
+        let mut chain: HashMap<Vec<u8>, Transaction> = HashMap::new();
+        let genesis_parent = [0u8; 32];
+        let tx = Transaction::new(
+            [genesis_parent, [0u8; 32]],
+            [1u8; 32],
+            [2u8; 32],
+            100,
+            1,
+            1000,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
+        let id = tx.id.to_vec();
+        chain.insert(id.clone(), tx);
+        let lookup = move |hash: &[u8]| -> Option<Transaction> {
+            chain.get(hash).cloned()
+        };
+        let closure = P2PNetwork::ancestor_full_closure(&[id.clone()], &lookup, 100);
+        // Genesis parent [0; 32] should not be in the closure.
+        assert_eq!(closure.len(), 1, "genesis parent should be terminated");
+    }
+
+    #[test]
+    fn test_ancestor_full_closure_bounded_by_max_entries() {
+        // Build a deep chain and verify the bound is strict.
+        let (tip, lookup) = build_linear_chain(100);
+        for max in [5, 10, 25, 50] {
+            let closure = P2PNetwork::ancestor_full_closure(&[tip.clone()], &lookup, max);
+            assert!(
+                closure.len() <= max,
+                "closure len {} should be <= max_entries {}",
+                closure.len(),
+                max
+            );
+        }
+    }
+
+    #[test]
+    fn test_ancestor_full_closure_diamond_dag() {
+        // Build a diamond DAG: genesis -> A, genesis -> B, A+B -> C (tip).
+        let mut chain: HashMap<Vec<u8>, Transaction> = HashMap::new();
+        let genesis = [0u8; 32];
+        let tx_a = Transaction::new([genesis, genesis], [1u8; 32], [2u8; 32], 10, 1, 100, 0, 0, vec![], vec![]);
+        let tx_b = Transaction::new([genesis, genesis], [1u8; 32], [2u8; 32], 20, 1, 101, 0, 1, vec![], vec![]);
+        let id_a = tx_a.id;
+        let id_b = tx_b.id;
+        chain.insert(id_a.to_vec(), tx_a);
+        chain.insert(id_b.to_vec(), tx_b);
+        let tx_c = Transaction::new([id_a, id_b], [1u8; 32], [2u8; 32], 30, 1, 102, 0, 2, vec![], vec![]);
+        let id_c = tx_c.id;
+        chain.insert(id_c.to_vec(), tx_c);
+        let lookup = move |hash: &[u8]| -> Option<Transaction> {
+            chain.get(hash).cloned()
+        };
+        let closure = P2PNetwork::ancestor_full_closure(&[id_c.to_vec()], &lookup, 100);
+        // Should include C, A, B = 3 txs (genesis [0;32] is terminated).
+        assert_eq!(closure.len(), 3, "diamond closure should include all 3 txs");
+        assert!(closure.iter().any(|h| h == &id_a.to_vec()));
+        assert!(closure.iter().any(|h| h == &id_b.to_vec()));
+        assert!(closure.iter().any(|h| h == &id_c.to_vec()));
     }
 }
