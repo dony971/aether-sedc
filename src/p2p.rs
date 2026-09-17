@@ -1329,10 +1329,18 @@ impl P2PNetwork {
                             let (deliverable, waiting) =
                                 Self::partition_batch(pending, &*get_transaction_by_hash);
 
+                            if !waiting.is_empty() {
+                                tracing::info!(
+                                    "📥 SyncResponse: {} deliverable, {} waiting (parents missing, will retry next cycle)",
+                                    deliverable.len(),
+                                    waiting.len()
+                                );
+                            }
+
                             // DEEP SYNC: adaptive backpressure instead of fixed
                             // 50ms per tx. Scale interval with batch size to
                             // maintain throughput while allowing ledger breathing room.
-                            let batch_len = deliverable.len() + waiting.len();
+                            let batch_len = deliverable.len();
                             let delay_ms = if batch_len > 0 {
                                 // Scale: base interval * sqrt(batch) / 10, clamped to [1, 20]ms
                                 let scaled = (BACKPRESSURE_BASE_MS as f64
@@ -1342,7 +1350,13 @@ impl P2PNetwork {
                             } else {
                                 0
                             };
-                            for (tx_bytes, tx) in deliverable.into_iter().chain(waiting) {
+                            // CRITICAL FIX: only send deliverable txs to the mempool.
+                            // waiting txs have parents not yet in the DAG. Sending them
+                            // would create orphans whose parents are also in the mempool,
+                            // causing an unresolvable cascade (resolved=0).
+                            // waiting txs will be re-requested by process_orphans() on
+                            // subsequent cycles when their parents arrive.
+                            for (tx_bytes, tx) in deliverable.into_iter() {
                                 // DEEP SYNC: mark as applied in frontier before sending to ledger
                                 {
                                     let mut frontier = sync_ctx.frontier.write().await;
@@ -1352,7 +1366,10 @@ impl P2PNetwork {
                                 insert_seen(&seen_transactions, tx_bytes).await;
                                 let _ = tx_channel.send(tx);
                                 if delay_ms > 0 {
-                                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                                        delay_ms,
+                                    ))
+                                    .await;
                                 }
                             }
                             // DEEP SYNC: log frontier state after processing batch
@@ -1686,7 +1703,10 @@ impl P2PNetwork {
         }
         // BFS walk: for each hash in the closure, append its parents.
         let mut idx = 0usize;
-        while idx < closure.len() && closure.len() < max_entries && steps < crate::sync_stats::TOPO_ORDER_CAP {
+        while idx < closure.len()
+            && closure.len() < max_entries
+            && steps < crate::sync_stats::TOPO_ORDER_CAP
+        {
             steps += 1;
             let h = closure[idx].clone();
             idx += 1;
@@ -2623,23 +2643,21 @@ mod tests {
             parents[1] = [0u8; 32];
             let tx = Transaction::new(
                 parents,
-                [1u8; 32], // sender
-                [2u8; 32], // receiver
-                100,       // amount
-                1,         // fee
+                [1u8; 32],       // sender
+                [2u8; 32],       // receiver
+                100,             // amount
+                1,               // fee
                 1000 + i as u64, // timestamp
-                0,         // nonce
-                0,         // account_nonce
-                vec![],    // signature
-                vec![],    // public_key
+                0,               // nonce
+                0,               // account_nonce
+                vec![],          // signature
+                vec![],          // public_key
             );
             prev_hash = tx.id;
             chain.insert(tx.id.to_vec(), tx);
         }
         let tip = prev_hash.to_vec();
-        let lookup = move |hash: &[u8]| -> Option<Transaction> {
-            chain.get(hash).cloned()
-        };
+        let lookup = move |hash: &[u8]| -> Option<Transaction> { chain.get(hash).cloned() };
         (tip, lookup)
     }
 
@@ -2648,7 +2666,11 @@ mod tests {
         let (tip, lookup) = build_linear_chain(10);
         let closure = P2PNetwork::ancestor_full_closure(&[tip.clone()], &lookup, 100);
         // Full closure of a 10-tx chain should include all 10 txs.
-        assert_eq!(closure.len(), 10, "full closure should include all ancestors");
+        assert_eq!(
+            closure.len(),
+            10,
+            "full closure should include all ancestors"
+        );
         // The tip itself should be in the closure.
         assert!(closure.iter().any(|h| h == &tip));
     }
@@ -2658,7 +2680,10 @@ mod tests {
         let (tip, lookup) = build_linear_chain(50);
         let closure = P2PNetwork::ancestor_full_closure(&[tip.clone()], &lookup, 20);
         // Should be capped at max_entries (20), not the full chain (50).
-        assert!(closure.len() <= 20, "closure should respect max_entries bound");
+        assert!(
+            closure.len() <= 20,
+            "closure should respect max_entries bound"
+        );
         assert!(closure.len() > 0, "closure should not be empty");
     }
 
@@ -2666,7 +2691,11 @@ mod tests {
     fn test_ancestor_full_closure_empty_request() {
         let (_tip, lookup) = build_linear_chain(10);
         let closure = P2PNetwork::ancestor_full_closure(&[], &lookup, 100);
-        assert_eq!(closure.len(), 0, "empty request should produce empty closure");
+        assert_eq!(
+            closure.len(),
+            0,
+            "empty request should produce empty closure"
+        );
     }
 
     #[test]
@@ -2704,9 +2733,7 @@ mod tests {
         );
         let id = tx.id.to_vec();
         chain.insert(id.clone(), tx);
-        let lookup = move |hash: &[u8]| -> Option<Transaction> {
-            chain.get(hash).cloned()
-        };
+        let lookup = move |hash: &[u8]| -> Option<Transaction> { chain.get(hash).cloned() };
         let closure = P2PNetwork::ancestor_full_closure(&[id.clone()], &lookup, 100);
         // Genesis parent [0; 32] should not be in the closure.
         assert_eq!(closure.len(), 1, "genesis parent should be terminated");
@@ -2732,18 +2759,49 @@ mod tests {
         // Build a diamond DAG: genesis -> A, genesis -> B, A+B -> C (tip).
         let mut chain: HashMap<Vec<u8>, Transaction> = HashMap::new();
         let genesis = [0u8; 32];
-        let tx_a = Transaction::new([genesis, genesis], [1u8; 32], [2u8; 32], 10, 1, 100, 0, 0, vec![], vec![]);
-        let tx_b = Transaction::new([genesis, genesis], [1u8; 32], [2u8; 32], 20, 1, 101, 0, 1, vec![], vec![]);
+        let tx_a = Transaction::new(
+            [genesis, genesis],
+            [1u8; 32],
+            [2u8; 32],
+            10,
+            1,
+            100,
+            0,
+            0,
+            vec![],
+            vec![],
+        );
+        let tx_b = Transaction::new(
+            [genesis, genesis],
+            [1u8; 32],
+            [2u8; 32],
+            20,
+            1,
+            101,
+            0,
+            1,
+            vec![],
+            vec![],
+        );
         let id_a = tx_a.id;
         let id_b = tx_b.id;
         chain.insert(id_a.to_vec(), tx_a);
         chain.insert(id_b.to_vec(), tx_b);
-        let tx_c = Transaction::new([id_a, id_b], [1u8; 32], [2u8; 32], 30, 1, 102, 0, 2, vec![], vec![]);
+        let tx_c = Transaction::new(
+            [id_a, id_b],
+            [1u8; 32],
+            [2u8; 32],
+            30,
+            1,
+            102,
+            0,
+            2,
+            vec![],
+            vec![],
+        );
         let id_c = tx_c.id;
         chain.insert(id_c.to_vec(), tx_c);
-        let lookup = move |hash: &[u8]| -> Option<Transaction> {
-            chain.get(hash).cloned()
-        };
+        let lookup = move |hash: &[u8]| -> Option<Transaction> { chain.get(hash).cloned() };
         let closure = P2PNetwork::ancestor_full_closure(&[id_c.to_vec()], &lookup, 100);
         // Should include C, A, B = 3 txs (genesis [0;32] is terminated).
         assert_eq!(closure.len(), 3, "diamond closure should include all 3 txs");
