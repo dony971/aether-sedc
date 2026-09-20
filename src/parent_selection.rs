@@ -1612,4 +1612,50 @@ mod tests {
         assert_eq!(dag2.get_transaction(star.id).unwrap().weight, 1001.0);
         assert_eq!(dag2.transaction_count(), 1001);
     }
+
+    #[test]
+    fn test_w11_cost_measurement() {
+        use std::time::Instant;
+        let difficulty = Transaction::default_difficulty();
+        let min_fee: u64 = 100;
+        let chain_lengths = [5, 10, 50];
+        println!("\n=== W11 COST MEASUREMENT (difficulty={}) ===", difficulty);
+        println!(
+            "{:<8} {:>10} {:>15} {:>15} {:>10} {:>10}",
+            "LEN", "TIME_MS", "POW_TOTAL", "FEE_TOTAL", "WEIGHT", "STABLE?"
+        );
+        println!("{}", "-".repeat(75));
+        for &len in &chain_lengths {
+            let attacker = [0x9Au8; 32];
+            let mut dag = DAG::new();
+            let start = Instant::now();
+            let mut prev = w_tx([TransactionId::default(); 2], attacker, 1, 1);
+            dag.add_transaction_validated(prev.clone()).unwrap();
+            for i in 2..=len {
+                let mut tx = w_tx([prev.id, TransactionId::default()], attacker, 1, i);
+                tx.nonce = tx.mine_nonce(difficulty);
+                dag.add_transaction_validated(tx.clone()).unwrap();
+                prev = tx;
+            }
+            let elapsed = start.elapsed().as_millis();
+            let root = dag
+                .transactions()
+                .values()
+                .find(|t| t.account_nonce == 1)
+                .unwrap();
+            let stable = root.weight >= crate::rpc::GlobalStatus::STABILITY_THRESHOLD;
+            let pow_total: u64 = dag.transactions().values().map(|t| t.nonce).sum();
+            let fee_total: u64 = len as u64 * min_fee;
+            println!(
+                "{:<8} {:>10} {:>15} {:>15} {:>10.1} {:>10}",
+                len,
+                elapsed,
+                pow_total,
+                fee_total,
+                root.weight,
+                if stable { "YES" } else { "NO" }
+            );
+        }
+        println!("=== END W11 COST ===\n");
+    }
 }

@@ -3,6 +3,7 @@ pub mod consensus_harness;
 pub mod crash_harness;
 pub mod deep_sync_harness;
 pub mod inc01_fix_tests;
+pub mod migration_multinode;
 pub mod multiprocess_crash;
 pub mod pow_economics;
 pub mod scalability;

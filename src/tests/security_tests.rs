@@ -15,7 +15,7 @@ use crate::rpc::Mempool;
 use crate::storage::Storage;
 use crate::transaction::Transaction;
 use crate::transaction_processor::TransactionProcessor;
-use crate::validation::TransactionValidator;
+use crate::validation::{TransactionValidator, ValidationMode};
 use crate::wallet::Wallet;
 use ed25519_dalek::{Signature, Signer, SigningKey};
 use std::sync::Arc;
@@ -410,7 +410,9 @@ mod atomic_execution_tests {
             vec![1u8; 64],
         );
 
-        let result = processor.process(tx, &dag, &ledger, &mempool, 10).await;
+        let result = processor
+            .process(tx, &dag, &ledger, &mempool, 10, ValidationMode::Fresh)
+            .await;
         assert!(result.is_err());
 
         let balance_after = ledger.read().await.get_balance(&sender);
@@ -444,7 +446,9 @@ mod atomic_execution_tests {
             vec![1u8; 64],
         );
 
-        let _ = processor.process(tx, &dag, &ledger, &mempool, 10).await;
+        let _ = processor
+            .process(tx, &dag, &ledger, &mempool, 10, ValidationMode::Fresh)
+            .await;
 
         let nonce_after = ledger.read().await.get_nonce(&sender);
         assert_eq!(nonce_before, nonce_after);
@@ -605,7 +609,9 @@ mod zero_emission_tests {
             vec![1u8; 64],
         );
         // This fails validation (placeholder signature), so nothing changes.
-        let _ = processor.process(tx, &dag, &ledger, &mempool, 10).await;
+        let _ = processor
+            .process(tx, &dag, &ledger, &mempool, 10, ValidationMode::Fresh)
+            .await;
         let supply_after = ledger.read().await.total_supply();
         assert!(supply_after <= supply_before);
     }

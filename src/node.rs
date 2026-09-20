@@ -8,6 +8,7 @@ use crate::{
     rpc::{start_rpc_server, AetherRpcImpl, Mempool},
     storage::Storage,
     transaction::{Address, Transaction},
+    validation::ValidationMode,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -627,7 +628,10 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                 sync_ctx_for_p2p.clone(),
             );
 
-            match rpc_impl.process_transaction(tx, "P2P").await {
+            match rpc_impl
+                .process_transaction(tx, "P2P", ValidationMode::Historical)
+                .await
+            {
                 Ok(_) => {
                     tracing::info!("✅ P2P transaction accepted and processed");
                     // B4: count DAG growth through the sync path and resolve

@@ -20,7 +20,7 @@ use crate::ledger::Ledger;
 use crate::parent_selection::DAG;
 use crate::rpc::Mempool;
 use crate::transaction::Transaction;
-use crate::validation::{TransactionValidator, ValidationError};
+use crate::validation::{TransactionValidator, ValidationError, ValidationMode};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -97,8 +97,12 @@ impl TransactionProcessor {
     /// PHASE D: expose the pure gate (PoW + signature) to the mempool ACCEPT
     /// path, so unvalidated junk never occupies a queue slot (parity with the
     /// H1 orphan rule: entering any store costs one valid PoW + signature).
-    pub fn validate_pure(&self, tx: &Transaction) -> Result<(), ValidationError> {
-        self.validator.validate_pure(tx)
+    pub fn validate_pure(
+        &self,
+        tx: &Transaction,
+        mode: ValidationMode,
+    ) -> Result<(), ValidationError> {
+        self.validator.validate_pure(tx, mode)
     }
 
     /// Process a transaction through the secure pipeline
@@ -129,6 +133,7 @@ impl TransactionProcessor {
         ledger: &Arc<RwLock<Ledger>>,
         mempool: &Arc<RwLock<Mempool>>,
         min_fee: u64,
+        mode: ValidationMode,
     ) -> Result<(), ProcessingError> {
         // LOG NOISE (soak): per-tx line on the hot path (thousands/hour
         // during sync/load) — DEBUG only. Rejections/failures keep their
@@ -163,7 +168,7 @@ impl TransactionProcessor {
                 // (PoW, signature, sender-key match) BEFORE we prune anything,
                 // otherwise a malformed tx could knock a valid tx out of the
                 // local DAG and diverge the node from the network.
-                self.validator.validate_pure(&tx)?;
+                self.validator.validate_pure(&tx, ValidationMode::Fresh)?;
                 tracing::warn!(
                     "🔄 Resolving sender conflict in favor of {} (pruning {})",
                     hex::encode(&tx.id[..4]),
@@ -198,7 +203,7 @@ impl TransactionProcessor {
         // no locks. This gate MUST pass before anything is parked in the
         // orphan store (H1): parking unvalidated transactions let anyone fill
         // disk and memory with garbage and trigger unbounded P2P re-requests.
-        self.validator.validate_pure(&tx)?;
+        self.validator.validate_pure(&tx, mode)?;
 
         // STEP 1b: ORPHAN GATE — a transaction whose parents are not yet in
         // the DAG is not inherently invalid: the parents may simply not have
@@ -463,7 +468,9 @@ mod tests {
         );
 
         // This should fail signature verification (invalid signature)
-        let result = processor.process(tx, &dag, &ledger, &mempool, 10).await;
+        let result = processor
+            .process(tx, &dag, &ledger, &mempool, 10, ValidationMode::Fresh)
+            .await;
         assert!(result.is_err());
         // The error should be validation failed (insufficient balance or signature)
         // We just check that it failed, not the specific error type
@@ -493,7 +500,9 @@ mod tests {
             vec![1u8; 64],
         );
 
-        let result = processor.process(tx, &dag, &ledger, &mempool, 10).await;
+        let result = processor
+            .process(tx, &dag, &ledger, &mempool, 10, ValidationMode::Fresh)
+            .await;
         assert!(result.is_err());
         // The error should be validation failed (insufficient balance or signature)
         // We just check that it failed, not the specific error type
@@ -524,7 +533,9 @@ mod tests {
             vec![1u8; 64],
         );
 
-        let result = processor.process(tx, &dag, &ledger, &mempool, 10).await;
+        let result = processor
+            .process(tx, &dag, &ledger, &mempool, 10, ValidationMode::Fresh)
+            .await;
         assert!(
             matches!(result, Err(ProcessingError::ValidationFailed(_))),
             "garbage orphan must fail pure validation, got {:?}",
@@ -549,7 +560,14 @@ mod tests {
         let tx = crate::tests::signed_mined_orphan_tx();
 
         let result = processor
-            .process(tx.clone(), &dag, &ledger, &mempool, 1000)
+            .process(
+                tx.clone(),
+                &dag,
+                &ledger,
+                &mempool,
+                1000,
+                ValidationMode::Fresh,
+            )
             .await;
         match result {
             Err(ProcessingError::Orphan(missing_parents)) => {
@@ -648,11 +666,11 @@ mod tests {
                 assert_eq!(ledger.read().await.get_balance(&sender), 1000);
 
                 processor_ref
-                    .process(first, &dag, &ledger, &mempool, 10)
+                    .process(first, &dag, &ledger, &mempool, 10, ValidationMode::Fresh)
                     .await
                     .expect("first arrival is accepted");
                 let second_result = processor_ref
-                    .process(second, &dag, &ledger, &mempool, 10)
+                    .process(second, &dag, &ledger, &mempool, 10, ValidationMode::Fresh)
                     .await;
                 if expect_second_ok {
                     assert!(
@@ -956,7 +974,10 @@ mod tests {
         println!("P4 micro: verify_transaction x100 -> {:?}", t.elapsed());
         t = Instant::now();
         for tx in &probe_txs {
-            processor.validator.validate_pure(tx).unwrap();
+            processor
+                .validator
+                .validate_pure(tx, ValidationMode::Fresh)
+                .unwrap();
         }
         println!("P4 micro: validate_pure x100 -> {:?}", t.elapsed());
         t = Instant::now();
@@ -970,7 +991,14 @@ mod tests {
         t = Instant::now();
         for tx in &probe_txs {
             if let Err(e) = processor
-                .process(tx.clone(), &dag, &ledger, &mempool, 10)
+                .process(
+                    tx.clone(),
+                    &dag,
+                    &ledger,
+                    &mempool,
+                    10,
+                    ValidationMode::Fresh,
+                )
                 .await
             {
                 panic!("tx rejected: {}", e);
@@ -990,7 +1018,14 @@ mod tests {
             let t0 = Instant::now();
             for tx in &txs {
                 if let Err(e) = processor
-                    .process(tx.clone(), &dag, &ledger, &mempool, 10)
+                    .process(
+                        tx.clone(),
+                        &dag,
+                        &ledger,
+                        &mempool,
+                        10,
+                        ValidationMode::Fresh,
+                    )
                     .await
                 {
                     panic!("tx rejected: {}", e);
@@ -1046,7 +1081,14 @@ mod tests {
         tx.id = tx.compute_hash();
 
         processor
-            .process(tx.clone(), &dag, &ledger, &mempool, 10)
+            .process(
+                tx.clone(),
+                &dag,
+                &ledger,
+                &mempool,
+                10,
+                ValidationMode::Fresh,
+            )
             .await
             .expect("phantom nonce must heal with full apply");
         // Transfer applied (not skipped): sender debited amount+fee.
@@ -1105,7 +1147,14 @@ mod tests {
         assert_eq!(ledger.read().await.get_balance(&sender), 10000 - 110);
 
         processor
-            .process(tx.clone(), &dag, &ledger, &mempool, 10)
+            .process(
+                tx.clone(),
+                &dag,
+                &ledger,
+                &mempool,
+                10,
+                ValidationMode::Fresh,
+            )
             .await
             .expect("recovery must heal the DAG");
         // No double debit, DAG healed.

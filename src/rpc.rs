@@ -6,7 +6,7 @@ use crate::ledger::Ledger;
 use crate::parent_selection::DAG;
 use crate::transaction::{Address, Transaction, TransactionId};
 use crate::transaction_processor::{ProcessingError, TransactionProcessor};
-use crate::validation::ValidationError;
+use crate::validation::{ValidationError, ValidationMode};
 use axum::{
     extract::{ConnectInfo, State},
     response::Html,
@@ -1056,7 +1056,8 @@ impl AetherRpcImpl {
         };
 
         // Use common validation and processing logic
-        self.process_transaction(tx, "RPC").await
+        self.process_transaction(tx, "RPC", ValidationMode::Fresh)
+            .await
     }
 
     /// Common transaction validation and processing logic (used by both RPC and P2P)
@@ -1066,6 +1067,7 @@ impl AetherRpcImpl {
         &self,
         tx: Transaction,
         source: &str,
+        mode: ValidationMode,
     ) -> Result<TransactionResponse, RpcError> {
         // CONSENSUS ACCEPTANCE RULES:
         // - VALID BUT NOT ACCEPTABLE: Transaction passes basic checks (PoW, signature) but has missing parents -> orphaned
@@ -1123,7 +1125,7 @@ impl AetherRpcImpl {
         // Pure gate FIRST (PoW + signature): unvalidated junk must never
         // occupy a queue slot (parity with the H1 orphan rule — parking
         // costs one valid PoW + signature).
-        if let Err(e) = processor.validate_pure(&tx) {
+        if let Err(e) = processor.validate_pure(&tx, mode) {
             self.mempool
                 .write()
                 .await
@@ -1229,7 +1231,14 @@ impl AetherRpcImpl {
             let mut lock_attempts = 0;
             let result = loop {
                 match processor
-                    .process(tx.clone(), &self.dag, &self.ledger, &self.mempool, 0)
+                    .process(
+                        tx.clone(),
+                        &self.dag,
+                        &self.ledger,
+                        &self.mempool,
+                        0,
+                        ValidationMode::Historical,
+                    )
                     .await
                 {
                     Ok(_) => break Ok(()),
@@ -1546,7 +1555,10 @@ impl AetherRpcImpl {
                     hex::encode(&tx_id[..8])
                 );
                 let orphan_parents = orphan.parents.clone();
-                match self.process_transaction(orphan, "Orphan").await {
+                match self
+                    .process_transaction(orphan, "Orphan", ValidationMode::Historical)
+                    .await
+                {
                     Ok(_) => {
                         any_resolved = true;
                         self.sync_ctx
@@ -1706,7 +1718,10 @@ impl AetherRpcImpl {
                             .write()
                             .await
                             .insert(parent_hash.to_vec());
-                        if let Err(e) = self.process_transaction(tx, "SolverStore").await {
+                        if let Err(e) = self
+                            .process_transaction(tx, "SolverStore", ValidationMode::Historical)
+                            .await
+                        {
                             tracing::warn!(
                                 "⚠️ Orphan Solver - store parent accepted with error: {}",
                                 e
@@ -2210,7 +2225,9 @@ impl AetherRpcImpl {
         tx.id = tx.compute_hash();
 
         // Submit via process_transaction (validates, adds to mempool, broadcasts via P2P)
-        let _response = self.process_transaction(tx.clone(), "Faucet").await?;
+        let _response = self
+            .process_transaction(tx.clone(), "Faucet", ValidationMode::Fresh)
+            .await?;
 
         tracing::info!(
             "💰 Faucet: Sent {} to {} via real DAG tx {}",
@@ -2308,11 +2325,42 @@ pub async fn start_rpc_server(
         .with_state(rpc_impl.clone());
 
     // 4. Merge routes without conflict
+    // CORS: restrict to localhost by default, permissive only for 0.0.0.0
+    let cors = if addr.ip().is_loopback() {
+        // Localhost only: safe for development and local wallet use
+        tower_http::cors::CorsLayer::new()
+            .allow_origin([
+                "http://localhost".parse().unwrap(),
+                "http://127.0.0.1".parse().unwrap(),
+                "http://localhost:30334".parse().unwrap(),
+                "http://127.0.0.1:30334".parse().unwrap(),
+            ])
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::OPTIONS,
+            ])
+            .allow_headers(vec![axum::http::header::CONTENT_TYPE])
+    } else {
+        // Non-loopback: restrictive CORS for security
+        tracing::warn!(
+            "RPC bound to non-loopback address {} — CORS restricted",
+            addr
+        );
+        tower_http::cors::CorsLayer::new()
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::OPTIONS,
+            ])
+            .allow_headers(vec![axum::http::header::CONTENT_TYPE])
+    };
+
     let app = Router::new()
         .merge(rpc_route)
         .merge(metrics_route)
         .merge(ui_route)
-        .layer(CorsLayer::permissive());
+        .layer(cors);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("✅ RPC + Explorer server listening on http://{}", addr);
@@ -2939,7 +2987,10 @@ mod tests {
                 let wallet = Wallet::from_secret_key(&key_hex).expect("test key");
                 let sender = wallet.address();
                 let parents = [[0u8; 32]; 2];
-                let ts = 1234567890 + i as u64;
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64;
                 let base = Transaction::new(
                     parents,
                     sender,
@@ -3395,7 +3446,9 @@ mod tests {
             ledger.set_balance(&faucet_tx.sender, 100_000_000_000);
         }
         // While the queue is full, the accept gate (oracle at max) rejects it.
-        let res = rpc.process_transaction(faucet_tx.clone(), "Faucet").await;
+        let res = rpc
+            .process_transaction(faucet_tx.clone(), "Faucet", ValidationMode::Fresh)
+            .await;
         assert!(
             res.is_err(),
             "low-fee tx must be gated while the queue is full"
@@ -3405,7 +3458,9 @@ mod tests {
         assert_eq!(rpc.mempool.read().await.size(), 0);
         // The SAME low-fee tx is now accepted (the oracle relaxed with the
         // occupancy) — the faucet revives after the drain.
-        let res2 = rpc.process_transaction(faucet_tx.clone(), "Faucet").await;
+        let res2 = rpc
+            .process_transaction(faucet_tx.clone(), "Faucet", ValidationMode::Fresh)
+            .await;
         assert!(res2.is_ok(), "faucet tx must be accepted after the drain");
         // And it drains into the DAG.
         drain_until_empty(&rpc).await;
@@ -3541,7 +3596,9 @@ mod tests {
             vec![1u8; 64],
         );
 
-        let result = rpc.process_transaction(tx, "RPC-test").await;
+        let result = rpc
+            .process_transaction(tx, "RPC-test", ValidationMode::Fresh)
+            .await;
         assert!(result.is_err());
         assert!(
             !result.err().unwrap().to_string().contains("orphan"),
@@ -3572,7 +3629,9 @@ mod tests {
 
         let tx = crate::tests::signed_mined_orphan_tx();
 
-        let result = rpc.process_transaction(tx.clone(), "RPC-test").await;
+        let result = rpc
+            .process_transaction(tx.clone(), "RPC-test", ValidationMode::Fresh)
+            .await;
         assert!(
             result.is_ok(),
             "a pure-valid tx is queued even when its parents are missing"
@@ -3641,7 +3700,9 @@ mod tests {
         // PHASE D: the funnel queues it (it cannot see the orphan store);
         // the drainer's park attempt fails against the cap and the tx is
         // dropped from the queue (bounded — never parked, never persisted).
-        let result = rpc.process_transaction(tx.clone(), "RPC-test").await;
+        let result = rpc
+            .process_transaction(tx.clone(), "RPC-test", ValidationMode::Fresh)
+            .await;
         assert!(result.is_ok(), "pure-valid tx is queued (funnel)");
         rpc.drain_mempool().await;
 
@@ -3892,16 +3953,18 @@ mod tests {
             vec![0u8; 64],
             pk,
         );
-        orphan.nonce = orphan.mine_nonce(20);
+        orphan.nonce = orphan.mine_nonce(24);
         orphan.signature = wallet.sign_transaction(&orphan).expect("sign");
         orphan.id = orphan.compute_hash();
-        assert!(orphan.verify_pow(20));
+        assert!(orphan.verify_pow(24));
         assert!(Wallet::verify_transaction(&orphan));
 
         // 1) PHASE D: the funnel QUEUES O (the pure gate passes; parents are
         // checked at SELECT/PROCESS time); the drainer parks it as an orphan
         // and persists it (memory + Sled).
-        let result = rpc.process_transaction(orphan.clone(), "Test").await;
+        let result = rpc
+            .process_transaction(orphan.clone(), "Test", ValidationMode::Historical)
+            .await;
         assert!(result.is_ok(), "pure-valid tx is queued (funnel)");
         rpc.drain_mempool().await;
         {

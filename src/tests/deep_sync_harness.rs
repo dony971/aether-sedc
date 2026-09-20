@@ -194,9 +194,7 @@ fn simulate_sync(
     // Build lookup from source
     let source_map: HashMap<Vec<u8>, &Transaction> =
         source_txs.iter().map(|tx| (tx.id.to_vec(), tx)).collect();
-    let get_tx = |hash: &[u8]| -> Option<Transaction> {
-        source_map.get(hash).cloned().cloned()
-    };
+    let get_tx = |hash: &[u8]| -> Option<Transaction> { source_map.get(hash).cloned().cloned() };
 
     // Topological order of source (deterministic: sorted by id)
     let topo_order: Vec<Vec<u8>> = source_txs.iter().map(|tx| tx.id.to_vec()).collect();
@@ -241,11 +239,8 @@ fn simulate_sync(
         let mut closure = P2PNetwork::ancestor_full_closure(&page_hashes, &get_tx, max_entries);
 
         // Topological sort (source is already sorted, but closure may not be)
-        let pos: HashMap<&Vec<u8>, usize> = topo_order
-            .iter()
-            .enumerate()
-            .map(|(i, h)| (h, i))
-            .collect();
+        let pos: HashMap<&Vec<u8>, usize> =
+            topo_order.iter().enumerate().map(|(i, h)| (h, i)).collect();
         closure.sort_by_key(|h| pos.get(h).copied().unwrap_or(usize::MAX));
 
         // Split into sub-pages of page_size
@@ -344,9 +339,7 @@ fn test_bounds_overflow_unbounded_alloc() {
     let (source_dag, source_ledger, source_txs, dir) = build_source(1000);
     let source_map: HashMap<Vec<u8>, &Transaction> =
         source_txs.iter().map(|tx| (tx.id.to_vec(), tx)).collect();
-    let get_tx = |hash: &[u8]| -> Option<Transaction> {
-        source_map.get(hash).cloned().cloned()
-    };
+    let get_tx = |hash: &[u8]| -> Option<Transaction> { source_map.get(hash).cloned().cloned() };
     // Request with very small max_entries
     let tip = source_txs.last().unwrap().id.to_vec();
     let closure = P2PNetwork::ancestor_full_closure(&[tip], &get_tx, 50);
@@ -521,9 +514,7 @@ fn simulate_sync_interrupted(
 
     let source_map: HashMap<Vec<u8>, &Transaction> =
         source_txs.iter().map(|tx| (tx.id.to_vec(), tx)).collect();
-    let get_tx = |hash: &[u8]| -> Option<Transaction> {
-        source_map.get(hash).cloned().cloned()
-    };
+    let get_tx = |hash: &[u8]| -> Option<Transaction> { source_map.get(hash).cloned().cloned() };
     let topo_order: Vec<Vec<u8>> = source_txs.iter().map(|tx| tx.id.to_vec()).collect();
     let mut frontier = SyncFrontier::new();
     for h in &topo_order {
@@ -559,11 +550,8 @@ fn simulate_sync_interrupted(
         }
         let max_entries = page_size * 10;
         let mut closure = P2PNetwork::ancestor_full_closure(&page_hashes, &get_tx, max_entries);
-        let pos: HashMap<&Vec<u8>, usize> = topo_order
-            .iter()
-            .enumerate()
-            .map(|(i, h)| (h, i))
-            .collect();
+        let pos: HashMap<&Vec<u8>, usize> =
+            topo_order.iter().enumerate().map(|(i, h)| (h, i)).collect();
         closure.sort_by_key(|h| pos.get(h).copied().unwrap_or(usize::MAX));
         for chunk in closure.chunks(page_size) {
             let page_txs: Vec<Transaction> = chunk
@@ -613,11 +601,8 @@ fn simulate_sync_interrupted(
         }
         let max_entries = page_size * 10;
         let mut closure = P2PNetwork::ancestor_full_closure(&page_hashes, &get_tx, max_entries);
-        let pos: HashMap<&Vec<u8>, usize> = topo_order
-            .iter()
-            .enumerate()
-            .map(|(i, h)| (h, i))
-            .collect();
+        let pos: HashMap<&Vec<u8>, usize> =
+            topo_order.iter().enumerate().map(|(i, h)| (h, i)).collect();
         closure.sort_by_key(|h| pos.get(h).copied().unwrap_or(usize::MAX));
         for chunk in closure.chunks(page_size) {
             let page_txs: Vec<Transaction> = chunk
@@ -724,9 +709,7 @@ fn test_malicious_empty_page() {
     let mut fresh_ledger = Ledger::new();
     let source_map: HashMap<Vec<u8>, &Transaction> =
         source_txs.iter().map(|tx| (tx.id.to_vec(), tx)).collect();
-    let get_tx = |hash: &[u8]| -> Option<Transaction> {
-        source_map.get(hash).cloned().cloned()
-    };
+    let get_tx = |hash: &[u8]| -> Option<Transaction> { source_map.get(hash).cloned().cloned() };
     let topo_order: Vec<Vec<u8>> = source_txs.iter().map(|tx| tx.id.to_vec()).collect();
     let mut frontier = SyncFrontier::new();
     for h in &topo_order {
@@ -834,10 +817,12 @@ fn test_malicious_partial_page() {
     let (source_dag, source_ledger, source_txs, dir) = build_source(200);
     let fp_src = state_fingerprint(&source_dag, &source_ledger);
     // Simulate: only first half of each page is delivered
-    let (fresh_dag, fresh_ledger, m) =
-        simulate_sync(&source_dag, &source_ledger, &source_txs, 50); // smaller pages
+    let (fresh_dag, fresh_ledger, m) = simulate_sync(&source_dag, &source_ledger, &source_txs, 50); // smaller pages
     let fp_fresh = state_fingerprint(&fresh_dag, &fresh_ledger);
-    assert_eq!(fp_src, fp_fresh, "partial page must not prevent convergence");
+    assert_eq!(
+        fp_src, fp_fresh,
+        "partial page must not prevent convergence"
+    );
     assert_eq!(m.txs_inserted, 200);
     cleanup(&dir);
 }
@@ -1068,18 +1053,13 @@ fn test_invariant_i7_count_never_decreases() {
 
     let source_map: HashMap<Vec<u8>, &Transaction> =
         source_txs.iter().map(|tx| (tx.id.to_vec(), tx)).collect();
-    let get_tx = |hash: &[u8]| -> Option<Transaction> {
-        source_map.get(hash).cloned().cloned()
-    };
+    let get_tx = |hash: &[u8]| -> Option<Transaction> { source_map.get(hash).cloned().cloned() };
     let topo_order: Vec<Vec<u8>> = source_txs.iter().map(|tx| tx.id.to_vec()).collect();
 
     for chunk in topo_order.chunks(100) {
         let mut closure = P2PNetwork::ancestor_full_closure(chunk, &get_tx, 1000);
-        let pos: HashMap<&Vec<u8>, usize> = topo_order
-            .iter()
-            .enumerate()
-            .map(|(i, h)| (h, i))
-            .collect();
+        let pos: HashMap<&Vec<u8>, usize> =
+            topo_order.iter().enumerate().map(|(i, h)| (h, i)).collect();
         closure.sort_by_key(|h| pos.get(h).copied().unwrap_or(usize::MAX));
         for h in &closure {
             if let Some(tx) = source_map.get(h) {
@@ -1114,7 +1094,9 @@ fn test_invariant_i8_progress_or_explicit_state() {
     f.update_state();
     // With inflight and old progress → transitions to Waiting or Stalled
     assert!(
-        f.state() == FrontierSyncState::Waiting || f.state() == FrontierSyncState::Stalled || f.state() == FrontierSyncState::Progressing,
+        f.state() == FrontierSyncState::Waiting
+            || f.state() == FrontierSyncState::Stalled
+            || f.state() == FrontierSyncState::Progressing,
         "I8: state must be explicit"
     );
 
@@ -1165,7 +1147,11 @@ fn test_invariant_i11_dag_fingerprint_match() {
         let (fresh_dag, fresh_ledger, _) =
             simulate_sync(&source_dag, &source_ledger, &source_txs, 100);
         let fp_fresh = state_fingerprint(&fresh_dag, &fresh_ledger);
-        assert_eq!(fp_src, fp_fresh, "I11: DAG fingerprint must match for N={}", n);
+        assert_eq!(
+            fp_src, fp_fresh,
+            "I11: DAG fingerprint must match for N={}",
+            n
+        );
         cleanup(&dir);
     }
 }
@@ -1198,7 +1184,10 @@ fn test_combined_10k_interrupt() {
     let (fresh_dag, fresh_ledger, m) =
         simulate_sync_interrupted(&source_dag, &source_ledger, &source_txs, 100, 30);
     let fp_fresh = state_fingerprint(&fresh_dag, &fresh_ledger);
-    assert_eq!(fp_src, fp_fresh, "COMBINED_10K_INTERRUPT: fingerprint mismatch");
+    assert_eq!(
+        fp_src, fp_fresh,
+        "COMBINED_10K_INTERRUPT: fingerprint mismatch"
+    );
     assert_eq!(m.txs_inserted, 10_000);
     assert_eq!(m.orphans, 0);
     println!(
@@ -1284,7 +1273,10 @@ fn test_combined_10k_restart() {
     let mut fresh_ledger = Ledger::new();
     fresh_ledger.rebuild_from_dag(&fresh_dag);
     let fp_fresh = state_fingerprint(&fresh_dag, &fresh_ledger);
-    assert_eq!(fp_src, fp_fresh, "COMBINED_10K_RESTART: fingerprint mismatch");
+    assert_eq!(
+        fp_src, fp_fresh,
+        "COMBINED_10K_RESTART: fingerprint mismatch"
+    );
     assert_eq!(inserted, 10_000);
     assert_eq!(skipped, 0);
     assert!(orphans.is_empty(), "no orphans on complete store");
@@ -1297,8 +1289,7 @@ fn test_combined_10k_restart() {
 fn test_benchmark_10k_sync() {
     let (source_dag, source_ledger, source_txs, dir) = build_source(10_000);
     let start = Instant::now();
-    let (fresh_dag, fresh_ledger, m) =
-        simulate_sync(&source_dag, &source_ledger, &source_txs, 100);
+    let (fresh_dag, fresh_ledger, m) = simulate_sync(&source_dag, &source_ledger, &source_txs, 100);
     let elapsed = start.elapsed();
     let fp_src = state_fingerprint(&source_dag, &source_ledger);
     let fp_fresh = state_fingerprint(&fresh_dag, &fresh_ledger);

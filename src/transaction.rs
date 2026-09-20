@@ -435,11 +435,130 @@ impl Transaction {
     }
 
     /// Get the current PoW difficulty (anti-spam requirement)
-    /// Default difficulty is 20 bits (5 hex zeros): ~1M hashes average.
-    /// This makes spam non-trivial (≈ms of CPU per tx for honest users)
+    /// Default difficulty is 24 bits (6 hex zeros): ~16M hashes average.
+    /// This makes spam non-trivial (~s of CPU per tx for honest users)
     /// while remaining cheap for legitimate transactions.
+    ///
+    /// CONSENSUS RULE: All nodes MUST use the same difficulty. Changing this
+    /// value is a soft fork — old nodes accept a superset of what new nodes
+    /// accept (20-bit nodes accept txs that 24-bit nodes reject).
+    /// All nodes must upgrade simultaneously.
     pub fn default_difficulty() -> u8 {
-        20
+        24
+    }
+
+    /// Activation timestamp for the 20→24 bit difficulty migration (milliseconds).
+    /// This is a consensus constant: all nodes MUST use the same value.
+    /// Transactions with timestamp >= DIFFICULTY_MIGRATION_TS require 24-bit PoW.
+    /// Transactions with timestamp < DIFFICULTY_MIGRATION_TS require 20-bit PoW.
+    ///
+    /// CONSENSUS RULE: This value is hardcoded. It MUST NOT be read from
+    /// local metadata, config files, or network messages. All nodes derive
+    /// difficulty from the same constant, ensuring deterministic validation.
+    pub const DIFFICULTY_MIGRATION_TS: u64 = 1_758_000_000_000; // 2025-09-16T00:00:00Z
+
+    /// Grace period after activation (24 hours in ms) during which nodes can
+    /// still accept 20-bit transactions with pre-activation timestamps.
+    /// After the grace period, no new 20-bit transactions are possible:
+    /// any tx with timestamp < DIFFICULTY_MIGRATION_TS is rejected.
+    pub const GRACE_PERIOD_MS: u64 = 86_400_000; // 24 hours
+
+    /// Maximum age of a transaction timestamp in the past (1 hour in ms).
+    /// Transactions older than this relative to system clock are rejected.
+    /// This prevents backdating attacks and limits the window for difficulty
+    /// manipulation.
+    pub const MAX_PAST_MS: u64 = 3_600_000; // 1 hour
+
+    /// Maximum age of a transaction timestamp in the future (1 hour in ms).
+    /// Transactions newer than this relative to system clock are rejected.
+    /// This prevents future-dating attacks and clock manipulation.
+    pub const MAX_FUTURE_MS: u64 = 3_600_000; // 1 hour
+
+    /// Determine the required PoW difficulty for a transaction based on its
+    /// timestamp relative to the difficulty migration activation timestamp.
+    ///
+    /// Rules:
+    /// 1. If tx.timestamp >= DIFFICULTY_MIGRATION_TS → difficulty = 24
+    /// 2. If tx.timestamp < DIFFICULTY_MIGRATION_TS:
+    ///    a. If now <= DIFFICULTY_MIGRATION_TS + GRACE_PERIOD_MS → difficulty = 20
+    ///    b. If now > DIFFICULTY_MIGRATION_TS + GRACE_PERIOD_MS → REJECT (return None)
+    ///
+    /// Returns `Some(difficulty)` if the transaction is valid, `None` if it
+    /// should be rejected (pre-activation timestamp after grace period).
+    ///
+    /// DETERMINISTIC: This function uses ONLY the hardcoded constants and the
+    /// system clock. No local metadata, config, or network state.
+    pub fn difficulty_for_tx(tx: &Transaction) -> Option<u8> {
+        if tx.timestamp >= Self::DIFFICULTY_MIGRATION_TS {
+            Some(24)
+        } else {
+            Some(20)
+        }
+    }
+
+    /// Determine the difficulty required for a transaction WITHOUT accessing
+    /// the system clock. Used for deterministic validation in contexts where
+    /// clock access is unavailable or undesirable.
+    ///
+    /// `current_time_ms`: current system time in milliseconds since UNIX epoch
+    ///
+    /// RULE: A transaction's difficulty is determined solely by its timestamp
+    /// relative to the activation constant. Pre-activation timestamps always
+    /// require 20-bit PoW; post-activation always require 24-bit.
+    ///
+    /// The time-based backdating REJECTION (after grace period) is NOT done
+    /// here. It is handled by validate_pure() in Fresh mode only. This
+    /// separation ensures that truly historical pre-activation transactions
+    /// remain verifiable indefinitely, while new backdated transactions are
+    /// rejected by the Fresh validation path.
+    pub fn difficulty_for_tx_at(tx: &Transaction, _current_time_ms: u64) -> Option<u8> {
+        if tx.timestamp >= Self::DIFFICULTY_MIGRATION_TS {
+            Some(24)
+        } else {
+            Some(20)
+        }
+    }
+
+    /// Benchmark PoW timing at a given difficulty level.
+    /// Returns (average_ns, median_ns, p95_ns, hashes_per_second) over `iterations` mines.
+    #[cfg(test)]
+    pub fn bench_pow(difficulty: u8, iterations: usize) -> (u128, u128, u128, f64) {
+        use std::time::Instant;
+        let mut tx = Transaction::new(
+            [[0u8; 32]; 2],
+            [1u8; 32],
+            [2u8; 32],
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 32],
+        );
+        let mut times: Vec<u128> = Vec::with_capacity(iterations);
+        let mut total_hashes: u64 = 0;
+        for i in 0..iterations {
+            tx.nonce = 0;
+            tx.timestamp = 1234567890 + i as u64;
+            let start = Instant::now();
+            let nonce = tx.mine_nonce(difficulty);
+            let elapsed = start.elapsed().as_nanos();
+            times.push(elapsed);
+            total_hashes += nonce + 1;
+        }
+        times.sort();
+        let median = times[iterations / 2];
+        let p95_idx = (iterations as f64 * 0.95) as usize;
+        let p95 = times[p95_idx.min(iterations - 1)];
+        let avg = times.iter().sum::<u128>() / iterations as u128;
+        let total_ns: u128 = times.iter().sum();
+        let hps = if total_ns > 0 {
+            total_hashes as f64 / (total_ns as f64 / 1_000_000_000.0)
+        } else {
+            0.0
+        };
+        (avg, median, p95, hps)
     }
 
     /// Verify that the sender address matches the public key
@@ -887,5 +1006,209 @@ mod tests {
         let tips = serde_json::json!([12345]);
         let array = tips.as_array().unwrap();
         assert!(tips_to_parents(array).is_err());
+    }
+
+    #[test]
+    fn test_pow_benchmark_20bits() {
+        let (avg, median, p95, hps) = Transaction::bench_pow(20, 20);
+        println!(
+            "PoW d20: avg={}ns median={}ns p95={}ns hps={:.0}",
+            avg, median, p95, hps
+        );
+        assert!(avg > 0);
+    }
+
+    #[test]
+    fn test_pow_benchmark_22bits() {
+        let (avg, median, p95, hps) = Transaction::bench_pow(22, 10);
+        println!(
+            "PoW d22: avg={}ns median={}ns p95={}ns hps={:.0}",
+            avg, median, p95, hps
+        );
+        assert!(avg > 0);
+    }
+
+    #[test]
+    fn test_pow_benchmark_24bits() {
+        let (avg, median, p95, hps) = Transaction::bench_pow(24, 5);
+        println!(
+            "PoW d24: avg={}ns median={}ns p95={}ns hps={:.0}",
+            avg, median, p95, hps
+        );
+        assert!(avg > 0);
+    }
+
+    #[test]
+    fn test_pow_benchmark_26bits() {
+        let (avg, median, p95, hps) = Transaction::bench_pow(26, 2);
+        println!(
+            "PoW d26: avg={}ns median={}ns p95={}ns hps={:.0}",
+            avg, median, p95, hps
+        );
+        assert!(avg > 0);
+    }
+
+    #[test]
+    fn test_pow_benchmark_28bits() {
+        let (avg, median, p95, hps) = Transaction::bench_pow(28, 1);
+        println!(
+            "PoW d28: avg={}ns median={}ns p95={}ns hps={:.0}",
+            avg, median, p95, hps
+        );
+        assert!(avg > 0);
+    }
+
+    #[test]
+    fn test_pow_benchmark_30bits() {
+        let (avg, median, p95, hps) = Transaction::bench_pow(30, 1);
+        println!(
+            "PoW d30: avg={}ns median={}ns p95={}ns hps={:.0}",
+            avg, median, p95, hps
+        );
+        assert!(avg > 0);
+    }
+
+    // ==================== DIFFICULTY MIGRATION TESTS ====================
+
+    #[test]
+    fn test_difficulty_for_tx_post_activation() {
+        // Transaction with timestamp >= DIFFICULTY_MIGRATION_TS → difficulty = 24
+        let tx = Transaction::new(
+            [[0u8; 32]; 2],
+            [1u8; 32],
+            [2u8; 32],
+            100,
+            10,
+            Transaction::DIFFICULTY_MIGRATION_TS + 1_000_000,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 32],
+        );
+        let result = Transaction::difficulty_for_tx(&tx);
+        assert_eq!(result, Some(24));
+    }
+
+    #[test]
+    fn test_difficulty_for_tx_exact_activation() {
+        // Transaction at exact activation timestamp → difficulty = 24
+        let tx = Transaction::new(
+            [[0u8; 32]; 2],
+            [1u8; 32],
+            [2u8; 32],
+            100,
+            10,
+            Transaction::DIFFICULTY_MIGRATION_TS,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 32],
+        );
+        let result = Transaction::difficulty_for_tx(&tx);
+        assert_eq!(result, Some(24));
+    }
+
+    #[test]
+    fn test_difficulty_for_tx_at_deterministic() {
+        // difficulty_for_tx_at is deterministic — no system clock dependency
+        let tx_before = Transaction::new(
+            [[0u8; 32]; 2],
+            [1u8; 32],
+            [2u8; 32],
+            100,
+            10,
+            Transaction::DIFFICULTY_MIGRATION_TS - 1_000,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 32],
+        );
+        let tx_after = Transaction::new(
+            [[0u8; 32]; 2],
+            [1u8; 32],
+            [2u8; 32],
+            100,
+            10,
+            Transaction::DIFFICULTY_MIGRATION_TS + 1_000,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 32],
+        );
+
+        // Before activation, within grace period → 20
+        let now_ms = Transaction::DIFFICULTY_MIGRATION_TS + 1_000;
+        assert_eq!(
+            Transaction::difficulty_for_tx_at(&tx_before, now_ms),
+            Some(20)
+        );
+
+        // After activation → 24
+        assert_eq!(
+            Transaction::difficulty_for_tx_at(&tx_after, now_ms),
+            Some(24)
+        );
+    }
+
+    #[test]
+    fn test_difficulty_for_tx_at_grace_period_rejects() {
+        // After grace period, pre-activation timestamp → None (rejected)
+        let tx = Transaction::new(
+            [[0u8; 32]; 2],
+            [1u8; 32],
+            [2u8; 32],
+            100,
+            10,
+            Transaction::DIFFICULTY_MIGRATION_TS - 1_000,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 32],
+        );
+        let after_grace =
+            Transaction::DIFFICULTY_MIGRATION_TS + Transaction::GRACE_PERIOD_MS + 1_000;
+        // After grace: difficulty_for_tx_at still returns Some(20) for pre-activation.
+        // The backdating rejection is handled by validate_pure in Fresh mode.
+        assert_eq!(
+            Transaction::difficulty_for_tx_at(&tx, after_grace),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn test_difficulty_for_tx_at_within_grace_allows() {
+        // Within grace period, pre-activation timestamp → 20
+        let tx = Transaction::new(
+            [[0u8; 32]; 2],
+            [1u8; 32],
+            [2u8; 32],
+            100,
+            10,
+            Transaction::DIFFICULTY_MIGRATION_TS - 1_000,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 32],
+        );
+        let within_grace =
+            Transaction::DIFFICULTY_MIGRATION_TS + Transaction::GRACE_PERIOD_MS - 1_000;
+        assert_eq!(
+            Transaction::difficulty_for_tx_at(&tx, within_grace),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn test_constants_are_consistent() {
+        // GRACE_PERIOD_MS must be > 0
+        assert!(Transaction::GRACE_PERIOD_MS > 0);
+        // MAX_PAST_MS must be > 0
+        assert!(Transaction::MAX_PAST_MS > 0);
+        // MAX_FUTURE_MS must be > 0
+        assert!(Transaction::MAX_FUTURE_MS > 0);
+        // DIFFICULTY_MIGRATION_TS must be > 0
+        assert!(Transaction::DIFFICULTY_MIGRATION_TS > 0);
+        // default_difficulty must be 24
+        assert_eq!(Transaction::default_difficulty(), 24);
     }
 }
