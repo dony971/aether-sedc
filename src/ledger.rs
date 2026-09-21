@@ -599,6 +599,15 @@ impl Ledger {
             );
         }
 
+        // P4-incremental: rebuild_from_dag overwrites ALL state (balances,
+        // nonces, applied) without going through individual mutation methods,
+        // so dirty tracking is bypassed.  Mark every entry dirty so that
+        // save_dirty() after rebuild persists the full reconstructed state.
+        self.dirty_balances = self.balances.keys().cloned().collect();
+        self.dirty_nonces = self.nonces.keys().cloned().collect();
+        self.dirty_applied_added = self.applied.clone();
+        self.dirty_applied_removed.clear();
+
         tracing::info!(
             "♻️ Ledger rebuilt from DAG: {} txs, supply {} (<= MAX {}): {}",
             applied.len(),
