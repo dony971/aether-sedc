@@ -29,6 +29,19 @@ pub struct Ledger {
     /// lower-nonce transfer never applied — observed durably on catch-up
     /// nodes, INC-C2-003). Persisted in the `applied_tx` Sled tree.
     pub applied: HashSet<TransactionId>,
+    /// P4-incremental: accounts whose balances were modified since last save.
+    /// O(K) persistence replaces O(N) full sweep.
+    #[serde(skip)]
+    dirty_balances: HashSet<String>,
+    /// P4-incremental: accounts whose nonces were modified since last save.
+    #[serde(skip)]
+    dirty_nonces: HashSet<String>,
+    /// P4-incremental: tx ids newly applied since last save.
+    #[serde(skip)]
+    dirty_applied_added: HashSet<TransactionId>,
+    /// P4-incremental: tx ids removed from applied since last save.
+    #[serde(skip)]
+    dirty_applied_removed: HashSet<TransactionId>,
 }
 
 /// Fee burn address (all fees are sent here and effectively burned)
@@ -50,6 +63,10 @@ impl Ledger {
             storage: None,
             total_fees_burned: 0,
             applied: HashSet::new(),
+            dirty_balances: HashSet::new(),
+            dirty_nonces: HashSet::new(),
+            dirty_applied_added: HashSet::new(),
+            dirty_applied_removed: HashSet::new(),
         }
     }
 
@@ -64,6 +81,10 @@ impl Ledger {
             storage: Some(storage.clone()),
             total_fees_burned: 0,
             applied: HashSet::new(),
+            dirty_balances: HashSet::new(),
+            dirty_nonces: HashSet::new(),
+            dirty_applied_added: HashSet::new(),
+            dirty_applied_removed: HashSet::new(),
         };
 
         // Load balances from Sled
@@ -142,6 +163,62 @@ impl Ledger {
         Ok(())
     }
 
+    /// Save only dirty (modified) accounts to Sled — O(K) instead of O(N).
+    ///
+    /// Called after each accepted transaction (STEP 8 in the processor).
+    /// The dirty sets are populated automatically by `set_balance`,
+    /// `transfer_internal`, `set_nonce`, `mark_applied`, etc.
+    /// After persisting the delta the sets are cleared so the next
+    /// call is minimal.
+    pub async fn save_dirty(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(storage) = &self.storage {
+            let storage_read = storage.read().await;
+
+            // --- Balances: write only dirty entries (O(K)) ---
+            let dirty_bal = std::mem::take(&mut self.dirty_balances);
+            for addr_hex in &dirty_bal {
+                let addr_bytes = hex::decode(addr_hex)?;
+                let address: Address = addr_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|e| format!("Invalid address length: {}", e))?;
+                let balance = *self.balances.get(addr_hex).unwrap_or(&0);
+                storage_read.put_balance(address, balance)?;
+            }
+
+            // --- Nonces: write only dirty entries (O(K)) ---
+            let dirty_non = std::mem::take(&mut self.dirty_nonces);
+            for addr_hex in &dirty_non {
+                let addr_bytes = hex::decode(addr_hex)?;
+                let address: Address = addr_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|e| format!("Invalid address length: {}", e))?;
+                let nonce = *self.nonces.get(addr_hex).unwrap_or(&0);
+                storage_read.put_nonce(address, nonce)?;
+            }
+
+            // --- Applied set: incremental (O(delta)) ---
+            let added = std::mem::take(&mut self.dirty_applied_added);
+            let removed = std::mem::take(&mut self.dirty_applied_removed);
+            for id in &removed {
+                storage_read.unmark_applied(*id)?;
+            }
+            for id in &added {
+                storage_read.mark_applied(*id)?;
+            }
+
+            tracing::debug!(
+                "💾 Ledger delta saved ({} bal, {} non, {} app+ {} app-)",
+                dirty_bal.len(),
+                dirty_non.len(),
+                added.len(),
+                removed.len()
+            );
+        }
+        Ok(())
+    }
+
     /// Get balance for an address
     pub fn get_balance(&self, address: &Address) -> u64 {
         let addr_hex = hex::encode(address);
@@ -176,11 +253,13 @@ impl Ledger {
     /// Set balance for an address
     pub fn set_balance(&mut self, address: &Address, balance: u64) {
         let addr_hex = hex::encode(address);
+        self.dirty_balances.insert(addr_hex.clone());
         self.balances.insert(addr_hex, balance);
     }
 
     /// Set balance for an address by hex string
     pub fn set_balance_hex(&mut self, address_hex: String, balance: u64) {
+        self.dirty_balances.insert(address_hex.clone());
         self.balances.insert(address_hex, balance);
     }
 
@@ -191,6 +270,7 @@ impl Ledger {
         let new_balance = current
             .checked_add(amount)
             .ok_or_else(|| format!("Balance overflow: {} + {}", current, amount))?;
+        self.dirty_balances.insert(addr_hex.clone());
         self.balances.insert(addr_hex, new_balance);
         Ok(())
     }
@@ -202,6 +282,7 @@ impl Ledger {
         if current < amount {
             return Err(format!("Insufficient balance: {} < {}", current, amount));
         }
+        self.dirty_balances.insert(addr_hex.clone());
         self.balances.insert(addr_hex, current - amount);
         Ok(())
     }
@@ -257,6 +338,8 @@ impl Ledger {
             } else {
                 (burn_balance, self.total_fees_burned)
             };
+            self.dirty_balances.insert(from_hex.clone());
+            self.dirty_balances.insert(burn_hex.clone());
             self.balances.insert(from_hex, from_balance - fee);
             self.balances.insert(burn_hex, new_burn_balance);
             self.total_fees_burned = new_total_fees_burned;
@@ -282,6 +365,9 @@ impl Ledger {
         };
 
         // Phase 3: Apply all mutations atomically (all or nothing)
+        self.dirty_balances.insert(from_hex.clone());
+        self.dirty_balances.insert(to_hex.clone());
+        self.dirty_balances.insert(burn_hex.clone());
         self.balances.insert(from_hex, new_from_balance);
         self.balances.insert(to_hex, new_to_balance);
         self.balances.insert(burn_hex, new_burn_balance);
@@ -299,6 +385,7 @@ impl Ledger {
     /// Set nonce for an address
     pub fn set_nonce(&mut self, address: &Address, nonce: u64) {
         let addr_hex = hex::encode(address);
+        self.dirty_nonces.insert(addr_hex.clone());
         self.nonces.insert(addr_hex, nonce);
     }
 
@@ -335,7 +422,10 @@ impl Ledger {
 
     /// C2 P3: record that a tx's transfer effects were applied.
     pub fn mark_applied(&mut self, id: &TransactionId) {
-        self.applied.insert(*id);
+        if self.applied.insert(*id) {
+            self.dirty_applied_added.insert(*id);
+            self.dirty_applied_removed.remove(id);
+        }
     }
 
     /// C2 P3: true when this tx's transfer effects were applied.
@@ -347,7 +437,10 @@ impl Ledger {
 
     /// C2 P3: drop an applied mark (prune parity).
     pub fn unmark_applied(&mut self, id: &TransactionId) {
-        self.applied.remove(id);
+        if self.applied.remove(id) {
+            self.dirty_applied_removed.insert(*id);
+            self.dirty_applied_added.remove(id);
+        }
     }
 
     /// Get all balances
@@ -1304,5 +1397,264 @@ mod tests {
         assert_eq!(ledger.fee_burn_balance(), 6); // 5 (fund) + 1 (winner)
         assert_eq!(ledger.get_nonce(&[0x11u8; 32]), 1);
         assert_eq!(ledger.total_supply(), 1_000_000_100_000_000_000_u64 - 6);
+    }
+
+    // ============================================================================
+    // P4 INCREMENTAL SAVE TESTS
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_save_dirty_one_account() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let storage_arc = Arc::new(RwLock::new(storage));
+
+        let mut ledger = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        let addr = [1u8; 32];
+        ledger.set_balance(&addr, 42);
+        ledger.save_dirty().await.unwrap();
+
+        let ledger2 = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        assert_eq!(ledger2.get_balance(&addr), 42);
+    }
+
+    #[tokio::test]
+    async fn test_save_dirty_two_accounts() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let storage_arc = Arc::new(RwLock::new(storage));
+
+        let mut ledger = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        ledger.set_balance(&a, 100);
+        ledger.set_balance(&b, 200);
+        ledger.save_dirty().await.unwrap();
+
+        let ledger2 = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        assert_eq!(ledger2.get_balance(&a), 100);
+        assert_eq!(ledger2.get_balance(&b), 200);
+    }
+
+    #[tokio::test]
+    async fn test_save_dirty_transfer_with_fee() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let storage_arc = Arc::new(RwLock::new(storage));
+
+        let mut ledger = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        let sender = [1u8; 32];
+        let receiver = [2u8; 32];
+
+        // Seed sender with funds via set_balance (dirty tracked)
+        ledger.set_balance(&sender, 1000);
+        ledger.save_dirty().await.unwrap();
+
+        // Reload: sender should have 1000
+        let mut ledger2 = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        assert_eq!(ledger2.get_balance(&sender), 1000);
+        assert_eq!(ledger2.get_balance(&receiver), 0);
+
+        // Transfer: 500 amount + 10 fee
+        ledger2.transfer_internal(&sender, &receiver, 500, 10).unwrap();
+        assert_eq!(ledger2.get_balance(&sender), 490);
+        assert_eq!(ledger2.get_balance(&receiver), 500);
+        assert_eq!(ledger2.fee_burn_balance(), 10);
+        ledger2.save_dirty().await.unwrap();
+
+        // Reload and verify
+        let ledger3 = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        assert_eq!(ledger3.get_balance(&sender), 490);
+        assert_eq!(ledger3.get_balance(&receiver), 500);
+        assert_eq!(ledger3.fee_burn_balance(), 10);
+        // Total supply = sender + receiver = 490 + 500 = 990 (fee burned)
+        assert_eq!(ledger3.total_supply(), 990);
+    }
+
+    #[tokio::test]
+    async fn test_save_dirty_account_creation() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let storage_arc = Arc::new(RwLock::new(storage));
+
+        let mut ledger = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+
+        // No accounts initially
+        assert_eq!(ledger.account_count(), 0);
+        let ledger_empty = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        assert_eq!(ledger_empty.account_count(), 0);
+
+        // Create a new account (balance 0 -> non-zero)
+        let addr = [0xABu8; 32];
+        ledger.set_balance(&addr, 500);
+        ledger.save_dirty().await.unwrap();
+
+        let ledger2 = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        assert_eq!(ledger2.get_balance(&addr), 500);
+        assert_eq!(ledger2.account_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_save_dirty_successive_transactions() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let storage_arc = Arc::new(RwLock::new(storage));
+
+        let mut ledger = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let c = [3u8; 32];
+
+        // TX 1: A -> B (100 + fee 5)
+        ledger.set_balance(&a, 1000);
+        ledger.save_dirty().await.unwrap();
+        let mut ledger = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        ledger.transfer_internal(&a, &b, 100, 5).unwrap();
+        ledger.save_dirty().await.unwrap();
+
+        // TX 2: B -> C (50 + fee 3)
+        let mut ledger = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        ledger.transfer_internal(&b, &c, 50, 3).unwrap();
+        ledger.save_dirty().await.unwrap();
+
+        // Verify final state
+        let ledger = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        assert_eq!(ledger.get_balance(&a), 895);  // 1000 - 100 - 5
+        assert_eq!(ledger.get_balance(&b), 47);   // 100 - 50 - 3
+        assert_eq!(ledger.get_balance(&c), 50);   // 0 + 50
+        assert_eq!(ledger.fee_burn_balance(), 8);  // 5 + 3
+    }
+
+    #[tokio::test]
+    async fn test_save_dirty_nonce_persistence() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let storage_arc = Arc::new(RwLock::new(storage));
+
+        let mut ledger = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        let addr = [1u8; 32];
+
+        ledger.commit_nonce(&addr, 7);
+        ledger.save_dirty().await.unwrap();
+
+        let ledger2 = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        assert_eq!(ledger2.get_nonce(&addr), 7);
+    }
+
+    #[tokio::test]
+    async fn test_save_dirty_applied_persistence() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let storage_arc = Arc::new(RwLock::new(storage));
+
+        let mut ledger = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        let id = [0xAAu8; 32];
+
+        assert!(!ledger.is_applied(&id));
+        ledger.mark_applied(&id);
+        ledger.save_dirty().await.unwrap();
+
+        let ledger2 = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        assert!(ledger2.is_applied(&id));
+    }
+
+    #[tokio::test]
+    async fn test_save_dirty_unmark_applied_persistence() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let storage_arc = Arc::new(RwLock::new(storage));
+
+        let mut ledger = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        let id = [0xBBu8; 32];
+
+        ledger.mark_applied(&id);
+        ledger.save_dirty().await.unwrap();
+
+        let mut ledger2 = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        assert!(ledger2.is_applied(&id));
+        ledger2.unmark_applied(&id);
+        ledger2.save_dirty().await.unwrap();
+
+        let ledger3 = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        assert!(!ledger3.is_applied(&id));
+    }
+
+    #[tokio::test]
+    async fn test_save_dirty_full_save_equivalence() {
+        // Verify that save_dirty() produces the same result as save()
+        // for the same mutations.
+        let dir1 = tempdir().unwrap();
+        let dir2 = tempdir().unwrap();
+        let storage1 = Storage::open(dir1.path()).unwrap();
+        let storage2 = Storage::open(dir2.path()).unwrap();
+        let arc1 = Arc::new(RwLock::new(storage1));
+        let arc2 = Arc::new(RwLock::new(storage2));
+
+        // Path A: incremental save
+        let mut ledger_a = Ledger::new_with_storage(arc1.clone()).await.unwrap();
+        let sender = [1u8; 32];
+        let receiver = [2u8; 32];
+        ledger_a.set_balance(&sender, 1000);
+        ledger_a.save_dirty().await.unwrap();
+        let mut ledger_a = Ledger::new_with_storage(arc1.clone()).await.unwrap();
+        ledger_a.transfer_internal(&sender, &receiver, 100, 5).unwrap();
+        ledger_a.mark_applied(&[0xCCu8; 32]);
+        ledger_a.commit_nonce(&sender, 1);
+        ledger_a.save_dirty().await.unwrap();
+
+        // Path B: full save
+        let mut ledger_b = Ledger::new_with_storage(arc2.clone()).await.unwrap();
+        ledger_b.set_balance(&sender, 1000);
+        ledger_b.save().await.unwrap();
+        let mut ledger_b = Ledger::new_with_storage(arc2.clone()).await.unwrap();
+        ledger_b.transfer_internal(&sender, &receiver, 100, 5).unwrap();
+        ledger_b.mark_applied(&[0xCCu8; 32]);
+        ledger_b.commit_nonce(&sender, 1);
+        ledger_b.save().await.unwrap();
+
+        // Reload both and compare
+        let final_a = Ledger::new_with_storage(arc1.clone()).await.unwrap();
+        let final_b = Ledger::new_with_storage(arc2.clone()).await.unwrap();
+
+        assert_eq!(final_a.get_balance(&sender), final_b.get_balance(&sender));
+        assert_eq!(final_a.get_balance(&receiver), final_b.get_balance(&receiver));
+        assert_eq!(final_a.fee_burn_balance(), final_b.fee_burn_balance());
+        assert_eq!(final_a.get_nonce(&sender), final_b.get_nonce(&sender));
+        assert_eq!(final_a.is_applied(&[0xCCu8; 32]), final_b.is_applied(&[0xCCu8; 32]));
+        assert_eq!(final_a.total_supply(), final_b.total_supply());
+    }
+
+    #[tokio::test]
+    async fn test_save_dirty_crash_recovery_simulation() {
+        // Simulate crash: mutate in memory, save_dirty, verify persistence
+        let dir = tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let storage_arc = Arc::new(RwLock::new(storage));
+
+        let mut ledger = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        let faucet = hex::decode(crate::genesis::FAUCET_ADDRESS).unwrap();
+        let faucet: [u8; 32] = faucet.try_into().unwrap();
+        let user = [0x55u8; 32];
+
+        // Simulate: genesis + 1 transfer
+        for (addr_hex, balance) in crate::genesis::GENESIS_LEDGER {
+            ledger.set_balance_hex(addr_hex.to_string(), balance);
+        }
+        ledger.transfer_internal(&faucet, &user, 1000, 10).unwrap();
+        ledger.mark_applied(&[0xDDu8; 32]);
+        ledger.commit_nonce(&faucet, 1);
+        ledger.save_dirty().await.unwrap();
+
+        // "Crash" — reload from Sled
+        let ledger2 = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
+        assert_eq!(ledger2.get_balance(&user), 1000);
+        assert_eq!(
+            ledger2.get_balance(&faucet),
+            1_000_000_000_000_000_000_u64 - 1000 - 10
+        );
+        assert_eq!(ledger2.fee_burn_balance(), 10);
+        assert!(ledger2.is_applied(&[0xDDu8; 32]));
+        assert_eq!(ledger2.get_nonce(&faucet), 1);
+        assert!(ledger2.supply_within_bounds());
     }
 }

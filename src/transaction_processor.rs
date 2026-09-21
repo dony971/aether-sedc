@@ -379,7 +379,9 @@ impl TransactionProcessor {
             // kill the boot guard keeps the persisted ledger and the orphan
             // solver + full sync heal the DAG from peers.
         }
-        if let Err(e) = ledger.save().await {
+        // P4-incremental: persist only the accounts modified by this tx
+        // (sender + receiver + burn address = O(3) writes vs O(N) full sweep).
+        if let Err(e) = ledger.save_dirty().await {
             tracing::error!("❌ Persistence failed: {}", e);
             return Err(ProcessingError::PersistenceError(format!(
                 "Save failed: {}",
