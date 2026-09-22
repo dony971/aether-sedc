@@ -141,4 +141,28 @@ Pre-existing failures (documented, NOT P4-related):
 
 ---
 
+## WARNING #1: Fresh Node Sync Stall (FIX IN PROGRESS)
+
+**Status**: Investigating fix on `fix/sync-frontier-delivery` branch
+**Affected**: Fresh node P2P sync when DAG > 1000 txs
+**Severity**: HIGH — prevents scalable node onboarding
+
+### Root Cause
+In `src/p2p.rs:1314`, `SyncResponse` handler called `frontier.mark_received()` for ALL incoming txs BEFORE `partition_batch` split them into deliverable/waiting. Waiting txs (parents missing) were dropped but already marked `received` in frontier. The next inventory diff excluded them permanently → sync stall.
+
+**Deterministic trigger**: DAG > `MAX_SYNC_PAGE * MAX_CLOSURE_PAGES = 1000` txs.
+
+### Fix (commit `cb47977`)
+- Moved `mark_received` + `mark_applied` AFTER `partition_batch`, only for deliverable txs
+- Waiting txs remain "unreceived" → next inventory diff re-requests them automatically
+- Verified: `test_deep_sync_1600` PASS, all invariants PASS, all orphan tests PASS
+
+### Deployment
+- Branch: `fix/sync-frontier-delivery`
+- Cross-compile for Linux x86_64 required
+- Deploy to VPS as alternative binary (DO NOT replace frozen release)
+- Validate: `FRESH_NODE_PERIODIC = PASS`
+
+---
+
 *This is a TESTNET release. Do NOT deploy to mainnet.*
