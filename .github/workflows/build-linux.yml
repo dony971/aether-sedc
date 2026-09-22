@@ -1,0 +1,66 @@
+name: Build Linux Binary
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'Commit to build'
+        required: true
+        default: 'cb47977'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.commit }}
+
+      - name: Install Rust 1.98.1
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          target: x86_64-unknown-linux-gnu
+          override: true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Build release
+        run: |
+          cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Verify ELF
+        run: |
+          file target/x86_64-unknown-linux-gnu/release/aether-unified
+          test $(file target/x86_64-unknown-linux-gnu/release/aether-unified | grep -c "ELF 64-bit LSB executable") -eq 1
+
+      - name: Calculate SHA256
+        run: |
+          sha256sum target/x86_64-unknown-linux-gnu/release/aether-unified > linux_sha256.txt
+          cat linux_sha256.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aether-unified-linux
+          path: |
+            target/x86_64-unknown-linux-gnu/release/aether-unified
+            linux_sha256.txt
+
+      - name: Print build info
+        run: |
+          echo "=== BUILD INFO ==="
+          echo "Commit: ${{ github.event.inputs.commit }}"
+          echo "Rustc: $(rustc --version)"
+          echo "Cargo: $(cargo --version)"
+          echo "Target: x86_64-unknown-linux-gnu"
+          echo "Build command: cargo build --release --target x86_64-unknown-linux-gnu"
+          echo "Binary size: $(stat -c%s target/x86_64-unknown-linux-gnu/release/aether-unified) bytes"
+          echo "SHA256: $(cat linux_sha256.txt)"
