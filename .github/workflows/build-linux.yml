@@ -39,7 +39,7 @@ jobs:
       - name: Verify ELF
         run: |
           file target/x86_64-unknown-linux-gnu/release/aether-unified
-          test $(file target/x86_64-unknown-linux-gnu/release/aether-unified | grep -c "ELF 64-bit LSB executable") -eq 1
+          file target/x86_64-unknown-linux-gnu/release/aether-unified | grep -E "ELF 64-bit LSB (pie )?executable"
 
       - name: Calculate SHA256
         run: |
