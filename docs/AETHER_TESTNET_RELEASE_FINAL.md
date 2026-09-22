@@ -165,4 +165,20 @@ In `src/p2p.rs:1314`, `SyncResponse` handler called `frontier.mark_received()` f
 
 ---
 
+## Incident: Sled Lock Stale After Reboot (2026-09-22)
+
+**Event**: After VPS reboot, `aether.service` failed to start due to stale Sled database lock on `/opt/aether/data/sled_db/db`.
+
+**Root Cause**: Previous session's `pkill` commands killed the aether process without clean shutdown. The Sled database lock file was not released, preventing the new process from acquiring the lock.
+
+**Recovery**: systemd auto-restart detected the failure and retried. After `kill` of the stale process and `systemctl restart`, the service recovered successfully.
+
+**Result**: `REBOOT_RECOVERY = PASS`
+
+**Classification**: Not a consensus bug. A lifecycle/event issue related to unclean shutdown + stale lock.
+
+**Prevention**: Future `pkill` commands should be followed by `systemctl restart aether.service` to ensure clean recovery.
+
+---
+
 *This is a TESTNET release. Do NOT deploy to mainnet.*
