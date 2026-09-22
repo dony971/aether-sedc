@@ -1309,11 +1309,10 @@ impl P2PNetwork {
                                         }
                                         continue;
                                     }
-                                    // DEEP SYNC: mark as received in frontier
-                                    {
-                                        let mut frontier = sync_ctx.frontier.write().await;
-                                        frontier.mark_received(&tx.id);
-                                    }
+                                    // FIX: do NOT mark_received here yet — only mark
+                                    // AFTER partition_batch confirms the tx is deliverable.
+                                    // Waiting txs (parents missing) must remain "unreceived"
+                                    // so the next inventory diff re-requests them.
                                     pending.push((tx_bytes, tx));
                                 }
                             }
@@ -1357,9 +1356,13 @@ impl P2PNetwork {
                             // waiting txs will be re-requested by process_orphans() on
                             // subsequent cycles when their parents arrive.
                             for (tx_bytes, tx) in deliverable.into_iter() {
-                                // DEEP SYNC: mark as applied in frontier before sending to ledger
+                                // DEEP SYNC: mark as received + applied in frontier AFTER
+                                // partition_batch confirmed this tx is deliverable.
+                                // Waiting txs (parents missing) are NOT marked, so the
+                                // next inventory diff re-requests them.
                                 {
                                     let mut frontier = sync_ctx.frontier.write().await;
+                                    frontier.mark_received(&tx.id);
                                     frontier.mark_applied(&tx.id);
                                     frontier.record_progress();
                                 }
@@ -1762,7 +1765,7 @@ impl P2PNetwork {
                         // as orphans and the re-request storm collapsed serving
                         // nodes at ~10k txs. Parents-first lets joiners insert
                         // immediately.
-                        *indeg.get_mut(h).unwrap() += 1;
+                        *indeg.get_mut(h).expect("topological_order: h must be in indeg") += 1;
                     }
                     children.entry(parent.to_vec()).or_default().push(h.clone());
                 }
@@ -1779,7 +1782,7 @@ impl P2PNetwork {
             order.push(h.clone());
             if let Some(kids) = children.get(&h) {
                 for kid in kids {
-                    let d = indeg.get_mut(kid).unwrap();
+                    let d = indeg.get_mut(kid).expect("topological_order: kid must be in indeg");
                     *d -= 1;
                     if *d == 0 {
                         queue.push(kid.clone());
