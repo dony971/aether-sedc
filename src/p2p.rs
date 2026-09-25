@@ -373,8 +373,7 @@ fn is_private_or_reserved(addr: SocketAddr) -> bool {
 /// on the dial decision (receive side), and suppressing private addresses on
 /// the send side would break relay inside a LAN testnet (R4).
 fn pex_sample(
-    known: &HashSet<SocketAddr>,
-    meta: &HashMap<SocketAddr, PeerMeta>,
+    entries: &HashMap<SocketAddr, AddressEntry>,
     scores: &HashMap<SocketAddr, PeerScore>,
     origins: &HashMap<SocketAddr, SocketAddr>,
     local: SocketAddr,
@@ -382,26 +381,28 @@ fn pex_sample(
     now_unix: u64,
     limit: usize,
 ) -> Vec<SocketAddr> {
-    let mut picked: Vec<(i32, SocketAddr)> = P2PNetwork::pex_broadcast_list(known, scores, local)
-        .into_iter()
-        .filter(|a| *a != recipient)
-        // Never echo an address straight back to the peer that taught us it.
-        .filter(|a| origins.get(a).copied() != Some(recipient))
-        // PEX aging: hints held longer than PEX_SHARE_MAX_AGE_SECS stay in the
-        // table for our own redial but are no longer gossiped.
-        .filter(|a| {
-            meta.get(a)
-                .map(|m| now_unix.saturating_sub(m.first_seen) <= PEX_SHARE_MAX_AGE_SECS)
-                .unwrap_or(true)
-        })
-        .map(|a| {
-            let q = meta
-                .get(&a)
-                .map(|m| m.quality)
-                .unwrap_or_else(default_peer_quality);
-            (q, a)
-        })
-        .collect();
+    let mut picked: Vec<(i32, SocketAddr)> =
+        P2PNetwork::pex_broadcast_list(entries, scores, local)
+            .into_iter()
+            .filter(|a| *a != recipient)
+            // Never echo an address straight back to the peer that taught us it.
+            .filter(|a| origins.get(a).copied() != Some(recipient))
+            // PEX aging: hints held longer than PEX_SHARE_MAX_AGE_SECS stay in
+            // the table for our own redial but are no longer gossiped.
+            .filter(|a| {
+                entries
+                    .get(a)
+                    .map(|e| now_unix.saturating_sub(e.first_seen) <= PEX_SHARE_MAX_AGE_SECS)
+                    .unwrap_or(true)
+            })
+            .map(|a| {
+                let q = entries
+                    .get(&a)
+                    .map(|e| e.quality)
+                    .unwrap_or_else(default_peer_quality);
+                (q, a)
+            })
+            .collect();
     // Deterministic: best quality first, address as tiebreak. Pseudo-random
     // outbound selection is 2C (D10), not this stage.
     picked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
@@ -418,33 +419,27 @@ fn pex_sample(
 /// filled the table and then froze it permanently. Connected peers and anchors
 /// are never victims; banned entries are always the preferred victim.
 fn admit_peer(
-    known: &HashSet<SocketAddr>,
-    meta: &HashMap<SocketAddr, PeerMeta>,
+    entries: &HashMap<SocketAddr, AddressEntry>,
     scores: &HashMap<SocketAddr, PeerScore>,
     connected: &HashSet<SocketAddr>,
     incoming: SocketAddr,
     incoming_quality: i32,
 ) -> Option<SocketAddr> {
-    if known.contains(&incoming) || known.len() < MAX_KNOWN_PEERS {
+    if entries.contains_key(&incoming) || entries.len() < MAX_KNOWN_PEERS {
         return None;
     }
     let mut best: Option<(i32, i32, u64, SocketAddr)> = None;
-    for a in known {
+    for (a, e) in entries {
         if connected.contains(a) {
             continue;
         }
-        if meta.get(a).map(|m| m.anchor).unwrap_or(false) {
+        if e.anchor {
             continue;
         }
         let banned = scores.get(a).map(|s| s.is_banned()).unwrap_or(false);
-        let quality = meta
-            .get(a)
-            .map(|m| m.quality)
-            .unwrap_or_else(default_peer_quality);
-        let first_seen = meta.get(a).map(|m| m.first_seen).unwrap_or(0);
         // Lower tuple wins as a victim: banned first, then lowest quality,
         // then oldest, then address (determinism).
-        let key = (if banned { 0 } else { 1 }, quality, first_seen, *a);
+        let key = (if banned { 0 } else { 1 }, e.quality, e.first_seen, *a);
         if best.map(|b| key < b).unwrap_or(true) {
             best = Some(key);
         }
@@ -498,11 +493,7 @@ fn expire_anchors(anchors: &[(SocketAddr, u64)], now_unix: u64) -> Vec<SocketAdd
 /// TTL clock, and applies quality-aware admission (D8) when the table is
 /// already full. Returns true when the address ended up known.
 async fn ingress_address(
-    known: &Arc<RwLock<HashSet<SocketAddr>>>,
-    meta: &Arc<RwLock<HashMap<SocketAddr, PeerMeta>>>,
-    seen: &Arc<RwLock<HashMap<SocketAddr, Instant>>>,
-    origins: &Arc<RwLock<HashMap<SocketAddr, SocketAddr>>>,
-    scores: &Arc<RwLock<HashMap<SocketAddr, PeerScore>>>,
+    addresses: &Arc<RwLock<AddressManager>>,
     sessions: &Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
     local: SocketAddr,
     addr: SocketAddr,
@@ -512,49 +503,24 @@ async fn ingress_address(
         return false;
     }
     let now = unix_now();
+    let at = Instant::now();
 
-    // At capacity: evict a weaker entry rather than simply refusing. The old
-    // rule ("table full, drop it") let a hostile PEX burst fill the table with
-    // junk and then freeze it permanently (D8).
-    if let Some(victim) = {
-        let guard = known.read().await;
-        if guard.contains(&addr) || guard.len() < MAX_KNOWN_PEERS {
-            None
-        } else {
-            let connected: HashSet<SocketAddr> =
-                sessions.read().await.keys().copied().collect();
-            let s = scores.read().await;
-            let m = meta.read().await;
-            admit_peer(&guard, &m, &s, &connected, addr, default_peer_quality())
-        }
-    } {
-        known.write().await.remove(&victim);
-        meta.write().await.remove(&victim);
-        seen.write().await.remove(&victim);
-        origins.write().await.remove(&victim);
-    }
+    // Snapshot the session table and release it *before* taking the address
+    // manager. The old code held `known` while reading `sessions`, `scores`,
+    // `meta` and `seen` in several different orders; nesting is now impossible
+    // because only one of the two guards is ever held.
+    let connected: HashSet<SocketAddr> = sessions.read().await.keys().copied().collect();
 
-    let accepted = {
-        let mut guard = known.write().await;
-        if guard.contains(&addr) {
-            true
-        } else if guard.len() >= MAX_KNOWN_PEERS {
-            false
-        } else {
-            guard.insert(addr);
+    let mut mgr = addresses.write().await;
+    match mgr.admit(addr, source, default_peer_quality(), now, at, &connected) {
+        // Already present: just refresh the TTL clock.
+        Admission::AlreadyKnown => {
+            mgr.touch(addr, at);
             true
         }
-    };
-    if !accepted {
-        return false;
+        Admission::Inserted { .. } => true,
+        Admission::Refused => false,
     }
-
-    seen.write().await.insert(addr, Instant::now());
-    meta.write()
-        .await
-        .entry(addr)
-        .or_insert_with(|| PeerMeta::new(source, now));
-    true
 }
 
 // H2: network timeouts. A peer that connects and never speaks (slow-loris),
@@ -688,37 +654,44 @@ fn default_peer_quality() -> i32 {
     PEER_SCORE_INITIAL
 }
 
-/// Per-address metadata persisted with the versioned peer store (D8).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct PeerMeta {
+/// Everything the node records about one address: where it came from, when it
+/// was last useful, how well it has behaved, and whether it has been promoted
+/// to an anchor. `last_seen` is the Phase-1 TTL clock.
+///
+/// Supersedes the former `PeerMeta` + `known_peers` + `peer_last_seen` triple.
+/// Those three were always written together (`ingress_address`,
+/// `load_known_peers`) and always removed together (the TTL sweep), so keeping
+/// them in three tables only created a chance for them to disagree.
+///
+/// Deliberately *not* `Serialize`: persistence goes through `PeerStoreEntry`,
+/// whose schema is the on-disk contract (`Instant` is not portable anyway).
+#[derive(Debug, Clone)]
+struct AddressEntry {
     /// How the address was learned.
-    #[serde(default)]
     source: PeerSource,
     /// Unix seconds when this address was first learned.
-    #[serde(default)]
     first_seen: u64,
+    /// Monotonic clock of the last time we heard from or about this address.
+    /// Drives `PEER_TTL` expiry; refreshed for every live session.
+    last_seen: Instant,
     /// Unix seconds of the last successful handshake, if any.
-    #[serde(default)]
     last_success: Option<u64>,
     /// Total outbound dial attempts.
-    #[serde(default)]
     attempts: u32,
     /// Attempts that never reached a handshake.
-    #[serde(default)]
     failures: u32,
     /// Quality in `0..=PEER_QUALITY_MAX`; drives admission and eviction (D8).
-    #[serde(default = "default_peer_quality")]
     quality: i32,
     /// True while promoted as an anchor (D9).
-    #[serde(default)]
     anchor: bool,
 }
 
-impl PeerMeta {
-    fn new(source: PeerSource, now: u64) -> Self {
+impl AddressEntry {
+    fn new(source: PeerSource, now: u64, at: Instant) -> Self {
         Self {
             source,
             first_seen: now,
+            last_seen: at,
             last_success: None,
             attempts: 0,
             failures: 0,
@@ -737,6 +710,399 @@ impl PeerMeta {
         self.attempts = self.attempts.saturating_add(1);
         self.failures = self.failures.saturating_add(1);
         self.quality = (self.quality - 5).max(0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AddressManager
+// ---------------------------------------------------------------------------
+
+/// Single owner of everything the node knows about addresses.
+///
+/// Replaces the five previously-scattered tables — `known_peers`,
+/// `peer_meta`, `peer_last_seen`, `pex_origins` and `peer_scores` — so that
+/// address state sits behind exactly one lock. That removes the lock-order
+/// inversions the four separate guards made possible (read `known` then write
+/// `seen` in one task, the reverse in another) and makes it impossible for
+/// membership, metadata and the TTL clock to drift apart.
+///
+/// `scores` stays a *separate* map rather than folding into `entries` on
+/// purpose: an address evicted by the TTL sweep must keep its ban, otherwise
+/// expiring a peer would silently un-ban it.
+/// Outcome of a capacity-aware admission attempt (D8).
+///
+/// `ingress_address` needs to distinguish "already known" (true, just refresh
+/// the clock) from "refused" (false) — a bare `Option<SocketAddr>` conflated
+/// both with "made room", which is exactly the ambiguity that made the old
+/// caller's `accepted` flag easy to get wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    /// Already present; nothing was inserted.
+    AlreadyKnown,
+    /// Newly adopted. `evicted` is the address displaced to make room.
+    Inserted { evicted: Option<SocketAddr> },
+    /// Table full and nothing worth displacing; not adopted.
+    Refused,
+}
+
+struct AddressManager {
+    /// membership + metadata + TTL clock, in one map
+    entries: HashMap<SocketAddr, AddressEntry>,
+    /// which peer told us about each address (PEX echo suppression, D5)
+    origins: HashMap<SocketAddr, SocketAddr>,
+    /// reputation / ban state (per-message hot path)
+    scores: HashMap<SocketAddr, PeerScore>,
+}
+
+impl AddressManager {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            origins: HashMap::new(),
+            scores: HashMap::new(),
+        }
+    }
+
+    // --- membership ------------------------------------------------------
+
+    fn contains(&self, addr: SocketAddr) -> bool {
+        self.entries.contains_key(&addr)
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn addresses(&self) -> Vec<SocketAddr> {
+        self.entries.keys().copied().collect()
+    }
+
+    /// Remove an address and everything keyed off it.
+    fn remove(&mut self, addr: &SocketAddr) -> bool {
+        self.origins.remove(addr);
+        self.entries.remove(addr).is_some()
+    }
+
+    // --- observation / lifecycle ----------------------------------------
+
+    /// Adopt an address, refreshing the TTL clock of one we already hold.
+    ///
+    /// The source is only recorded when the address is *new*: the first
+    /// observer names it, so a later PEX hint cannot relabel an address we
+    /// originally learned from a seed.
+    fn observe(&mut self, addr: SocketAddr, source: PeerSource, now: u64, at: Instant) {
+        self.touch(addr, at);
+        self.entries
+            .entry(addr)
+            .or_insert_with(|| AddressEntry::new(source, now, at));
+    }
+
+    /// Stamp the TTL clock for an address we already hold.
+    fn touch(&mut self, addr: SocketAddr, at: Instant) {
+        if let Some(e) = self.entries.get_mut(&addr) {
+            e.last_seen = at;
+        }
+    }
+
+    fn record_success(&mut self, addr: SocketAddr, now: u64) {
+        if let Some(e) = self.entries.get_mut(&addr) {
+            e.record_success(now);
+        }
+    }
+
+    fn record_failure(&mut self, addr: SocketAddr) {
+        if let Some(e) = self.entries.get_mut(&addr) {
+            e.record_failure();
+        }
+    }
+
+    // --- admission -------------------------------------------------------
+
+    /// Capacity-aware admission (D8). Returns `AlreadyKnown` when the address
+    /// is present, `Inserted` when it was adopted (carrying whatever address
+    /// was displaced to make room), and `Refused` when the table is full and
+    /// nothing present is worth displacing.
+    ///
+    /// `connected` and `at` come from the caller: the session table is not
+    /// owned here, and must never be locked while this manager is held.
+    fn admit(
+        &mut self,
+        addr: SocketAddr,
+        source: PeerSource,
+        quality: i32,
+        now: u64,
+        at: Instant,
+        connected: &HashSet<SocketAddr>,
+    ) -> Admission {
+        if self.entries.contains_key(&addr) {
+            return Admission::AlreadyKnown;
+        }
+        let evicted = if self.entries.len() >= MAX_KNOWN_PEERS {
+            let Some(victim) = admit_peer(&self.entries, &self.scores, connected, addr, quality)
+            else {
+                return Admission::Refused;
+            };
+            self.remove(&victim);
+            Some(victim)
+        } else {
+            None
+        };
+        self.entries.insert(addr, AddressEntry::new(source, now, at));
+        Admission::Inserted { evicted }
+    }
+
+    // --- scores ----------------------------------------------------------
+
+    fn is_banned(&self, addr: SocketAddr) -> bool {
+        self.scores.get(&addr).map(|s| s.is_banned()).unwrap_or(false)
+    }
+
+    fn banned_until(&self, addr: SocketAddr) -> Option<Instant> {
+        self.scores.get(&addr).and_then(|s| s.banned_until)
+    }
+
+    /// Penalize and, when the threshold is crossed, ban. Returns the score
+    /// after the penalty *only* when a ban was triggered, so the caller can log
+    /// it — an address with no score is left untouched, exactly as before.
+    fn penalize_and_ban(&mut self, addr: SocketAddr, penalty: i32) -> Option<i32> {
+        let s = self.scores.get_mut(&addr)?;
+        if s.penalize(penalty) {
+            s.ban();
+            return Some(s.score);
+        }
+        None
+    }
+
+    /// Decay (or create) the score for an address we are about to dial.
+    fn decay_score(&mut self, addr: SocketAddr) {
+        match self.scores.get_mut(&addr) {
+            Some(s) => s.decay(),
+            None => {
+                self.scores.insert(addr, PeerScore::new());
+            }
+        }
+    }
+
+    // --- PEX -------------------------------------------------------------
+
+    fn set_origin(&mut self, addr: SocketAddr, from: SocketAddr) {
+        self.origins.insert(addr, from);
+    }
+
+    fn sample_for_pex(
+        &self,
+        local: SocketAddr,
+        recipient: SocketAddr,
+        now: u64,
+        limit: usize,
+    ) -> Vec<SocketAddr> {
+        pex_sample(
+            &self.entries,
+            &self.scores,
+            &self.origins,
+            local,
+            recipient,
+            now,
+            limit,
+        )
+    }
+
+    // --- anchors ---------------------------------------------------------
+
+    fn anchor_addresses(&self) -> Vec<(SocketAddr, u64)> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| e.anchor)
+            .map(|(a, e)| (*a, e.last_success.unwrap_or(e.first_seen)))
+            .collect()
+    }
+
+    /// Live sessions that have completed at least one handshake — the only
+    /// legitimate promotion source for an anchor.
+    fn anchor_candidates(&self, connected: &HashSet<SocketAddr>) -> Vec<(SocketAddr, u64)> {
+        connected
+            .iter()
+            .filter_map(|a| {
+                let e = self.entries.get(a)?;
+                e.last_success.map(|t| (*a, t))
+            })
+            .collect()
+    }
+
+    /// Apply a freshly computed anchor set. Returns `(promoted, demoted)`.
+    fn apply_anchors(&mut self, wanted: &HashSet<SocketAddr>) -> (usize, usize) {
+        let mut promoted = 0usize;
+        let mut demoted = 0usize;
+        for (a, e) in self.entries.iter_mut() {
+            let should = wanted.contains(a);
+            if e.anchor == should {
+                continue;
+            }
+            e.anchor = should;
+            if should {
+                e.source = PeerSource::Anchor;
+                promoted += 1;
+            } else {
+                demoted += 1;
+            }
+        }
+        (promoted, demoted)
+    }
+
+    // --- TTL -------------------------------------------------------------
+
+    /// One pass of the Phase-1 TTL sweep: refresh the clock of every live
+    /// session, then drop addresses we have not heard from inside the window
+    /// (along with their metadata and PEX origin). Returns
+    /// `(refreshed, expired)`.
+    fn refresh_and_expire(
+        &mut self,
+        connected: &HashSet<SocketAddr>,
+        now: Instant,
+        ttl: Duration,
+    ) -> (usize, usize) {
+        let mut refreshed = 0usize;
+        for a in connected {
+            if let Some(e) = self.entries.get_mut(a) {
+                e.last_seen = now;
+                refreshed += 1;
+            }
+        }
+        let expired: Vec<SocketAddr> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| now.duration_since(e.last_seen) > ttl)
+            .map(|(a, _)| *a)
+            .collect();
+        for a in &expired {
+            self.origins.remove(a);
+        }
+        for a in &expired {
+            self.entries.remove(a);
+        }
+        (refreshed, expired.len())
+    }
+
+    // --- views -----------------------------------------------------------
+
+    /// Per-category census for diagnostics (D7).
+    fn categories(&self, connected: &HashSet<SocketAddr>, now: u64) -> [usize; 5] {
+        let mut counts = [0usize; 5];
+        for (a, e) in self.entries.iter() {
+            let penalized = e.quality <= PEER_QUALITY_PENALIZED
+                || self
+                    .scores
+                    .get(a)
+                    .map(|s| s.is_banned() || s.score <= PEER_QUALITY_PENALIZED)
+                    .unwrap_or(false);
+            let c = categorise(
+                connected.contains(a),
+                e.anchor,
+                penalized,
+                e.last_success,
+                now,
+            );
+            counts[c as usize] += 1;
+        }
+        counts
+    }
+
+    // --- persistence -----------------------------------------------------
+
+    /// Build the on-disk v2 document. Addresses without metadata are written
+    /// with defaults rather than dropped, so nothing is silently lost.
+    fn to_store(&self) -> PeerStoreFile {
+        let entries = self
+            .entries
+            .iter()
+            .map(|(a, e)| PeerStoreEntry {
+                addr: a.to_string(),
+                source: e.source,
+                first_seen: e.first_seen,
+                last_success: e.last_success,
+                attempts: e.attempts,
+                failures: e.failures,
+                quality: e.quality,
+                anchor: e.anchor,
+            })
+            .collect();
+        PeerStoreFile {
+            version: PEER_STORE_VERSION,
+            entries,
+        }
+    }
+
+    /// Load a parsed v2 document. Returns how many addresses were adopted.
+    fn load_v2(&mut self, file: &PeerStoreFile, local: SocketAddr, now: u64, at: Instant) -> usize {
+        let mut count = 0usize;
+        for e in &file.entries {
+            let Ok(addr) = e.addr.parse::<SocketAddr>() else {
+                continue;
+            };
+            if addr == local {
+                continue;
+            }
+            let entry = AddressEntry {
+                source: e.source,
+                first_seen: if e.first_seen > 0 { e.first_seen } else { now },
+                last_seen: at,
+                last_success: e.last_success,
+                attempts: e.attempts,
+                failures: e.failures,
+                quality: e.quality,
+                anchor: e.anchor,
+            };
+            let fresh = !self.entries.contains_key(&addr);
+            self.entries.insert(addr, entry);
+            count += fresh as usize;
+        }
+        count
+    }
+
+    /// Adopt addresses from a legacy `Vec<String>` store (R3). v1 carried no
+    /// timestamps and no origin, so there is nothing to recover but the
+    /// addresses themselves.
+    fn load_legacy(&mut self, addrs: &[String], local: SocketAddr, now: u64, at: Instant) -> usize {
+        let mut count = 0usize;
+        for s in addrs {
+            let Ok(addr) = s.parse::<SocketAddr>() else {
+                continue;
+            };
+            if addr == local {
+                continue;
+            }
+            let fresh = !self.entries.contains_key(&addr);
+            self.entries
+                .insert(addr, AddressEntry::new(PeerSource::Restored, now, at));
+            count += fresh as usize;
+        }
+        count
+    }
+
+    // --- test accessors --------------------------------------------------
+    //
+    // Deliberately `#[cfg(test)]`: production code goes through the methods
+    // above, so these never widen the real API surface and never show up as
+    // dead code in a normal build.
+
+    #[cfg(test)]
+    fn entry(&self, addr: SocketAddr) -> Option<&AddressEntry> {
+        self.entries.get(&addr)
+    }
+
+    #[cfg(test)]
+    fn entries_mut(&mut self) -> &mut HashMap<SocketAddr, AddressEntry> {
+        &mut self.entries
+    }
+
+    #[cfg(test)]
+    fn scores_mut(&mut self) -> &mut HashMap<SocketAddr, PeerScore> {
+        &mut self.scores
+    }
+
+    #[cfg(test)]
+    fn origin_of(&self, addr: SocketAddr) -> Option<SocketAddr> {
+        self.origins.get(&addr).copied()
     }
 }
 
@@ -806,29 +1172,26 @@ struct SeenTxEntry {
 pub struct P2PNetwork {
     config: P2PConfig,
     peers: Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
-    known_peers: Arc<RwLock<HashSet<SocketAddr>>>,
-    /// Phase 1 TTL: last time each known peer was seen (connected or heard via PEX).
-    peer_last_seen: Arc<RwLock<HashMap<SocketAddr, Instant>>>,
     /// Phase 2A: addresses with an outbound dial in flight. The initial sweep,
     /// heartbeat, redial loop and PEX can all reach `connect_to_peer` for the
     /// same address concurrently; without this guard a peer gets two sessions
     /// and the `peers` map silently drops one of them.
     dialing: Arc<RwLock<HashSet<SocketAddr>>>,
-    /// Phase 2B (D7/D8): per-address metadata alongside `known_peers`, which
-    /// stays the canonical membership index so the ~40 existing call sites are
-    /// untouched (full `AddressManager` migration is a separate change).
-    peer_meta: Arc<RwLock<HashMap<SocketAddr, PeerMeta>>>,
-    /// Phase 2B (D5): which peer told us about each address, so PEX never
-    /// echoes an address straight back to its own source.
-    pex_origins: Arc<RwLock<HashMap<SocketAddr, SocketAddr>>>,
+    /// Phase 2B: the single owner of everything the node knows about
+    /// addresses — membership, metadata, TTL clock, PEX origins and scores.
+    /// Supersedes the former `known_peers` / `peer_last_seen` / `peer_meta` /
+    /// `pex_origins` / `peer_scores` quintet.
+    ///
+    /// **Lock discipline**: this guard and `peers` (the session map) must never
+    /// be held at the same time. Snapshot one, release it, then take the other.
+    /// Holding both is the deadlock this migration exists to eliminate.
+    addresses: Arc<RwLock<AddressManager>>,
     tx_channel: mpsc::UnboundedSender<Transaction>,
     peer_discovery_tx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<SocketAddr>>>>,
     get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
     get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
     get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
     seen_transactions: Arc<RwLock<HashMap<Vec<u8>, SeenTxEntry>>>,
-    /// Per-peer reputation scores
-    peer_scores: Arc<RwLock<HashMap<SocketAddr, PeerScore>>>,
     /// B4: shared bootstrap state (counters, parent-request dedup, orphan TTL)
     sync_ctx: Arc<SyncContext>,
     /// B4: true when the hash is already in the orphan store (sync dedup)
@@ -849,18 +1212,14 @@ impl P2PNetwork {
         Self {
             config,
             peers: Arc::new(RwLock::new(HashMap::new())),
-            known_peers: Arc::new(RwLock::new(HashSet::new())),
-            peer_last_seen: Arc::new(RwLock::new(HashMap::new())),
             dialing: Arc::new(RwLock::new(HashSet::new())),
-            peer_meta: Arc::new(RwLock::new(HashMap::new())),
-            pex_origins: Arc::new(RwLock::new(HashMap::new())),
+            addresses: Arc::new(RwLock::new(AddressManager::new())),
             tx_channel,
             peer_discovery_tx: Arc::new(tokio::sync::Mutex::new(None)),
             get_dag_hashes,
             get_transaction_by_hash,
             get_tips,
             seen_transactions: Arc::new(RwLock::new(HashMap::new())),
-            peer_scores: Arc::new(RwLock::new(HashMap::new())),
             sync_ctx,
             is_orphan,
         }
@@ -881,14 +1240,10 @@ impl P2PNetwork {
         let get_transaction_by_hash = Arc::clone(&self.get_transaction_by_hash);
         let get_tips = Arc::clone(&self.get_tips);
         let seen_transactions = Arc::clone(&self.seen_transactions);
-        let peer_scores = Arc::clone(&self.peer_scores);
         let sync_ctx = Arc::clone(&self.sync_ctx);
         let is_orphan = Arc::clone(&self.is_orphan);
         let local_addr = self.config.listen_addr;
-        let known_peers = self.known_peers.clone();
-        let peer_last_seen = self.peer_last_seen.clone();
-        let peer_meta = self.peer_meta.clone();
-        let pex_origins = self.pex_origins.clone();
+        let addresses = self.addresses.clone();
         let (peer_discovery_tx, mut peer_discovery_rx) = mpsc::unbounded_channel::<SocketAddr>();
         {
             let mut tx_lock = self.peer_discovery_tx.lock().await;
@@ -905,16 +1260,12 @@ impl P2PNetwork {
                 listener,
                 peers,
                 local_addr,
-                known_peers,
-                peer_last_seen,
-                peer_meta,
-                pex_origins,
+                addresses,
                 tx_channel,
                 get_dag_hashes,
                 get_transaction_by_hash,
                 get_tips,
                 seen_transactions,
-                peer_scores,
                 peer_discovery_tx,
                 sync_ctx,
                 is_orphan,
@@ -974,7 +1325,7 @@ impl P2PNetwork {
             self.connect_to_peer(*seed).await;
         }
 
-        let restored: Vec<SocketAddr> = self.known_peers.read().await.iter().copied().collect();
+        let restored: Vec<SocketAddr> = self.addresses.read().await.addresses();
         for addr in restored {
             if addr != self.config.listen_addr {
                 self.connect_to_peer(addr).await;
@@ -1000,75 +1351,40 @@ impl P2PNetwork {
         };
 
         let now = unix_now();
-        let mut loaded: Vec<(SocketAddr, PeerMeta)> = Vec::new();
-        let mut legacy = false;
+        let at = Instant::now();
+        let local = self.config.listen_addr;
 
-        match serde_json::from_str::<PeerStoreFile>(&raw) {
-            Ok(file) if file.version >= PEER_STORE_VERSION => {
-                for e in file.entries {
-                    if let Ok(addr) = e.addr.parse::<SocketAddr>() {
-                        loaded.push((
-                            addr,
-                            PeerMeta {
-                                source: e.source,
-                                first_seen: if e.first_seen > 0 { e.first_seen } else { now },
-                                last_success: e.last_success,
-                                attempts: e.attempts,
-                                failures: e.failures,
-                                quality: e.quality,
-                                anchor: e.anchor,
-                            },
-                        ));
-                    }
+        let (count, legacy) = {
+            let mut mgr = self.addresses.write().await;
+            match serde_json::from_str::<PeerStoreFile>(&raw) {
+                Ok(file) if file.version >= PEER_STORE_VERSION => {
+                    (mgr.load_v2(&file, local, now, at), false)
                 }
+                // R3: a v1 store is plain address strings. Adopt every address
+                // we can parse rather than discarding the file wholesale.
+                _ => match serde_json::from_str::<Vec<String>>(&raw) {
+                    Ok(addrs) => (mgr.load_legacy(&addrs, local, now, at), true),
+                    Err(e) => {
+                        warn!("Peer store {:?} unreadable ({}), starting empty", path, e);
+                        return;
+                    }
+                },
             }
-            _ => match serde_json::from_str::<Vec<String>>(&raw) {
-                Ok(addrs) => {
-                    legacy = true;
-                    for s in addrs {
-                        if let Ok(addr) = s.parse::<SocketAddr>() {
-                            // v1 stored neither timestamps nor origin, so there
-                            // is nothing to recover beyond the address itself.
-                            loaded.push((addr, PeerMeta::new(PeerSource::Restored, now)));
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Peer store {:?} unreadable ({}), starting empty", path, e);
-                    return;
-                }
-            },
-        }
+        };
 
-        if loaded.is_empty() {
+        if count == 0 {
             return;
         }
 
-        let mut known = self.known_peers.write().await;
-        let mut meta = self.peer_meta.write().await;
-        let mut seen = self.peer_last_seen.write().await;
-        let mut count = 0usize;
-        for (addr, m) in loaded {
-            if addr == self.config.listen_addr {
-                continue;
-            }
-            if known.insert(addr) {
-                seen.insert(addr, Instant::now());
-                count += 1;
-            }
-            meta.insert(addr, m);
-        }
-        if count > 0 {
-            if legacy {
-                info!(
-                    "💾 Loaded {} known peers from legacy store {:?} (upgrading to v{})",
-                    count,
-                    path,
-                    PEER_STORE_VERSION
-                );
-            } else {
-                info!("💾 Loaded {} known peers from {:?}", count, path);
-            }
+        if legacy {
+            info!(
+                "💾 Loaded {} known peers from legacy store {:?} (upgrading to v{})",
+                count,
+                path,
+                PEER_STORE_VERSION
+            );
+        } else {
+            info!("💾 Loaded {} known peers from {:?}", count, path);
         }
     }
 
@@ -1079,30 +1395,9 @@ impl P2PNetwork {
         let Some(path) = self.config.peer_store_path.clone() else {
             return;
         };
-        let now = unix_now();
-        let entries: Vec<PeerStoreEntry> = {
-            let known = self.known_peers.read().await;
-            let meta = self.peer_meta.read().await;
-            known
-                .iter()
-                .map(|a| {
-                    let m = meta.get(a);
-                    PeerStoreEntry {
-                        addr: a.to_string(),
-                        source: m.map(|m| m.source).unwrap_or(PeerSource::Restored),
-                        first_seen: m.map(|m| m.first_seen).unwrap_or(now),
-                        last_success: m.and_then(|m| m.last_success),
-                        attempts: m.map(|m| m.attempts).unwrap_or(0),
-                        failures: m.map(|m| m.failures).unwrap_or(0),
-                        quality: m.map(|m| m.quality).unwrap_or_else(default_peer_quality),
-                        anchor: m.map(|m| m.anchor).unwrap_or(false),
-                    }
-                })
-                .collect()
-        };
-        let file = PeerStoreFile {
-            version: PEER_STORE_VERSION,
-            entries,
+        let file = {
+            let mgr = self.addresses.read().await;
+            mgr.to_store()
         };
         let json = match serde_json::to_string(&file) {
             Ok(j) => j,
@@ -1126,27 +1421,27 @@ impl P2PNetwork {
 
     /// Phase 1: mark a peer as currently/just known (updates TTL clock).
     async fn touch_peer(&self, addr: SocketAddr) {
-        {
-            let mut known = self.known_peers.write().await;
-            if known.len() >= MAX_KNOWN_PEERS && !known.contains(&addr) {
-                return;
-            }
-            known.insert(addr);
+        let mut mgr = self.addresses.write().await;
+        if mgr.len() >= MAX_KNOWN_PEERS && !mgr.contains(addr) {
+            return;
         }
-        self.peer_last_seen.write().await.insert(addr, Instant::now());
+        mgr.observe(addr, PeerSource::Restored, unix_now(), Instant::now());
     }
 
     /// Phase 2A: refresh the TTL clock for every peer holding a live session, so
     /// a long-lived connection is never expired out of the peer store (and hence
     /// out of the persisted file) just for having stayed up.
     async fn refresh_live_peer_clocks(&self) {
+        // Snapshot the sessions and release before touching the manager: the
+        // two guards are never held at the same time.
         let live: Vec<SocketAddr> = self.peers.read().await.keys().copied().collect();
         if live.is_empty() {
             return;
         }
-        let mut seen = self.peer_last_seen.write().await;
+        let at = Instant::now();
+        let mut mgr = self.addresses.write().await;
         for a in live {
-            seen.insert(a, Instant::now());
+            mgr.touch(a, at);
         }
     }
 
@@ -1164,65 +1459,32 @@ impl P2PNetwork {
                 // precisely because they are reliable.
                 peers.refresh_live_peer_clocks().await;
 
-                // TTL expiry. Lock order here is `known` then `seen` then
-                // `meta`/`origins`, i.e. `known` is always acquired first, the
-                // same prefix `load_known_peers` uses — so no two paths can hold
-                // these in reverse order.
+                // TTL expiry. The four guards the sweep used to hold in a fixed
+                // order are now one, so there is no order left to invert.
                 {
+                    let live: HashSet<SocketAddr> =
+                        peers.peers.read().await.keys().copied().collect();
                     let now = Instant::now();
-                    let mut known = peers.known_peers.write().await;
-                    let mut seen = peers.peer_last_seen.write().await;
-                    let expired: Vec<SocketAddr> = seen
-                        .iter()
-                        .filter(|(_, at)| now.duration_since(**at) > PEER_TTL)
-                        .map(|(a, _)| *a)
-                        .collect();
-                    for a in &expired {
-                        known.remove(a);
-                        seen.remove(a);
+                    let mut mgr = peers.addresses.write().await;
+                    let (_, expired) = mgr.refresh_and_expire(&live, now, PEER_TTL);
+                    if expired > 0 {
+                        debug!("Peer TTL expired {} entries", expired);
                     }
-                    if !expired.is_empty() {
-                        debug!("Peer TTL expired {} entries", expired.len());
-                    }
-                    // Phase 2B: metadata and PEX-origin records must not outlive
-                    // the address they describe, otherwise both maps grow without
-                    // bound for the lifetime of the process.
-                    let mut meta = peers.peer_meta.write().await;
-                    let mut origins = peers.pex_origins.write().await;
-                    meta.retain(|a, _| known.contains(a));
-                    origins.retain(|a, _| known.contains(a));
                 }
 
                 // Phase 2B (D7): surface the live category mix. This is how an
                 // operator can tell whether the node still has proven reachable
                 // anchors or is running purely on untested candidates.
                 {
-                    let known = peers.known_peers.read().await;
-                    let meta = peers.peer_meta.read().await;
-                    let sessions = peers.peers.read().await;
-                    let scores = peers.peer_scores.read().await;
-                    let now = unix_now();
-                    let mut counts = [0usize; 5];
-                    for a in known.iter() {
-                        let m = meta.get(a);
-                        let penalized = m.map(|x| x.quality <= PEER_QUALITY_PENALIZED).unwrap_or(false)
-                            || scores
-                                .get(a)
-                                .map(|s| s.is_banned() || s.score <= PEER_QUALITY_PENALIZED)
-                                .unwrap_or(false);
-                        let c = categorise(
-                            sessions.contains_key(a),
-                            m.map(|x| x.anchor).unwrap_or(false),
-                            penalized,
-                            m.and_then(|x| x.last_success),
-                            now,
-                        );
-                        counts[c as usize] += 1;
-                    }
-                    if !known.is_empty() {
+                    let live: HashSet<SocketAddr> =
+                        peers.peers.read().await.keys().copied().collect();
+                    let mgr = peers.addresses.read().await;
+                    let total = mgr.len();
+                    if total > 0 {
+                        let counts = mgr.categories(&live, unix_now());
                         debug!(
-                            "Peer categories: active={} recent={} anchor={} candidate={} penalized={}",
-                            counts[0], counts[1], counts[2], counts[3], counts[4]
+                            "Peer categories of {}: active={} recent={} anchor={} candidate={} penalized={}",
+                            total, counts[0], counts[1], counts[2], counts[3], counts[4]
                         );
                     }
                 }
@@ -1260,47 +1522,29 @@ impl P2PNetwork {
     async fn refresh_anchors(&self) {
         let now = unix_now();
 
-        let current: Vec<(SocketAddr, u64)> = {
-            let meta = self.peer_meta.read().await;
-            meta.iter()
-                .filter(|(_, m)| m.anchor)
-                .map(|(a, m)| (*a, m.last_success.unwrap_or(m.first_seen)))
-                .collect()
-        };
-        let dead = expire_anchors(&current, now);
-        let alive: Vec<(SocketAddr, u64)> = current
-            .into_iter()
-            .filter(|(a, _)| !dead.contains(a))
-            .collect();
+        // Snapshot the session map first so the address manager is never held
+        // while `peers` is (the two locks must not nest).
+        let sessions: HashSet<SocketAddr> = self.peers.read().await.keys().copied().collect();
 
-        let candidates: Vec<(SocketAddr, u64)> = {
-            let sessions = self.peers.read().await;
-            let meta = self.peer_meta.read().await;
-            sessions
-                .keys()
-                .filter_map(|a| {
-                    let m = meta.get(a)?;
-                    m.last_success.map(|t| (*a, t))
-                })
-                .collect()
+        let (alive, candidates, dead) = {
+            let mgr = self.addresses.read().await;
+            let current = mgr.anchor_addresses();
+            let dead = expire_anchors(&current, now);
+            let alive: Vec<(SocketAddr, u64)> = current
+                .into_iter()
+                .filter(|(a, _)| !dead.contains(a))
+                .collect();
+            let candidates = mgr.anchor_candidates(&sessions);
+            (alive, candidates, dead)
         };
 
         let wanted = promote_anchors(&alive, &candidates, self.config.listen_addr);
 
-        let mut meta = self.peer_meta.write().await;
-        let mut promoted = 0usize;
-        for (a, m) in meta.iter_mut() {
-            let should = wanted.contains(a);
-            if should && !m.anchor {
-                promoted += 1;
-            }
-            if m.anchor != should {
-                m.anchor = should;
-                if should {
-                    m.source = PeerSource::Anchor;
-                }
-            }
-        }
+        let promoted = {
+            let mut mgr = self.addresses.write().await;
+            mgr.apply_anchors(&wanted).0
+        };
+
         if promoted > 0 || !dead.is_empty() {
             debug!(
                 "Anchor rotation: {} promoted, {} expired, {} total",
@@ -1324,7 +1568,7 @@ impl P2PNetwork {
     async fn start_heartbeat(&self) {
         let peers = self.peers.clone();
         let bootnodes = self.config.bootnodes.clone();
-        let known = self.known_peers.clone();
+        let addresses = self.addresses.clone();
         let local_addr = self.config.listen_addr;
         let p2p_network = self.clone();
 
@@ -1342,8 +1586,9 @@ impl P2PNetwork {
                     // Phase 2A: known peers first, seeds appended as ordinary
                     // unprivileged candidates (Phase 1 dialled every seed first).
                     let candidates = {
-                        let guard = known.read().await;
-                        P2PNetwork::redial_candidates(&guard, &bootnodes, local_addr)
+                        let mgr = addresses.read().await;
+                        let known = mgr.addresses();
+                        P2PNetwork::redial_candidates(&known, &bootnodes, local_addr)
                     };
                     for addr in candidates.iter().take(MAX_REDIAL_PER_CYCLE) {
                         p2p_network.connect_to_peer(*addr).await;
@@ -1360,7 +1605,7 @@ impl P2PNetwork {
     /// fallbacks appended at the end. No seed is ever allowed to outrank a peer
     /// the node already holds, so a dead seed cannot monopolise the cycle.
     fn redial_candidates(
-        known: &HashSet<SocketAddr>,
+        known: &[SocketAddr],
         seeds: &[SocketAddr],
         local: SocketAddr,
     ) -> Vec<SocketAddr> {
@@ -1377,7 +1622,7 @@ impl P2PNetwork {
     async fn start_reconnection_task(&self) {
         let peers = self.peers.clone();
         let bootnodes = self.config.bootnodes.clone();
-        let known = self.known_peers.clone();
+        let addresses = self.addresses.clone();
         let local_addr = self.config.listen_addr;
         let p2p_network = self.clone();
 
@@ -1388,8 +1633,9 @@ impl P2PNetwork {
                 std::collections::HashMap::new();
             loop {
                 let candidates = {
-                    let guard = known.read().await;
-                    Self::redial_candidates(&guard, &bootnodes, local_addr)
+                    let mgr = addresses.read().await;
+                    let known = mgr.addresses();
+                    Self::redial_candidates(&known, &bootnodes, local_addr)
                 };
 
                 let now = Instant::now();
@@ -1476,11 +1722,7 @@ impl P2PNetwork {
                             info!("🌐 DNS seed {} resolved to {} addresses", seed, addrs.len());
                             for addr in &addrs {
                                 let ok = ingress_address(
-                                    &p2p.known_peers,
-                                    &p2p.peer_meta,
-                                    &p2p.peer_last_seen,
-                                    &p2p.pex_origins,
-                                    &p2p.peer_scores,
+                                    &p2p.addresses,
                                     &p2p.peers,
                                     p2p.config.listen_addr,
                                     *addr,
@@ -1517,11 +1759,7 @@ impl P2PNetwork {
                         Ok(addrs) => {
                             for addr in addrs {
                                 let ok = ingress_address(
-                                    &p2p.known_peers,
-                                    &p2p.peer_meta,
-                                    &p2p.peer_last_seen,
-                                    &p2p.pex_origins,
-                                    &p2p.peer_scores,
+                                    &p2p.addresses,
                                     &p2p.peers,
                                     p2p.config.listen_addr,
                                     addr,
@@ -1549,12 +1787,12 @@ impl P2PNetwork {
     /// address we ourselves banned, and never send our own listen address.
     /// Extracted so the filter is unit-testable rather than buried in a loop.
     fn pex_broadcast_list(
-        known: &HashSet<SocketAddr>,
+        entries: &HashMap<SocketAddr, AddressEntry>,
         scores: &HashMap<SocketAddr, PeerScore>,
         local: SocketAddr,
     ) -> Vec<SocketAddr> {
-        known
-            .iter()
+        entries
+            .keys()
             .copied()
             .filter(|a| *a != local)
             .filter(|a| !scores.get(a).map(|s| s.is_banned()).unwrap_or(false))
@@ -1570,18 +1808,15 @@ impl P2PNetwork {
     /// penalized entries and aged-out hints, and is capped at `PEX_MAX_SEND`.
     async fn start_pex(&self) {
         let peers = self.peers.clone();
-        let known_peers = self.known_peers.clone();
-        let peer_scores = self.peer_scores.clone();
-        let peer_meta = self.peer_meta.clone();
-        let pex_origins = self.pex_origins.clone();
+        let addresses = self.addresses.clone();
         let local_addr = self.config.listen_addr;
 
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(15)).await; // Every 15 seconds for fast peer discovery
 
-                // Snapshot senders first so no session lock is held while the
-                // address-map guards are acquired.
+                // Snapshot senders first and release, so no session lock is held
+                // while the address manager is acquired.
                 let targets: Vec<(SocketAddr, mpsc::UnboundedSender<Vec<u8>>)> = {
                     let guard = peers.read().await;
                     guard.iter().map(|(a, s)| (*a, s.clone())).collect()
@@ -1590,23 +1825,11 @@ impl P2PNetwork {
                     continue;
                 }
 
-                let known = known_peers.read().await;
-                let scores = peer_scores.read().await;
-                let meta = peer_meta.read().await;
-                let origins = pex_origins.read().await;
                 let now = unix_now();
+                let mgr = addresses.read().await;
 
                 for (recipient, sender) in &targets {
-                    let list = pex_sample(
-                        &known,
-                        &meta,
-                        &scores,
-                        &origins,
-                        local_addr,
-                        *recipient,
-                        now,
-                        PEX_MAX_SEND,
-                    );
+                    let list = mgr.sample_for_pex(local_addr, *recipient, now, PEX_MAX_SEND);
                     if list.is_empty() {
                         continue;
                     }
@@ -1628,16 +1851,12 @@ impl P2PNetwork {
         listener: TcpListener,
         peers: Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
         local_addr: SocketAddr,
-        known_peers: Arc<RwLock<HashSet<SocketAddr>>>,
-        peer_last_seen: Arc<RwLock<HashMap<SocketAddr, Instant>>>,
-        peer_meta: Arc<RwLock<HashMap<SocketAddr, PeerMeta>>>,
-        pex_origins: Arc<RwLock<HashMap<SocketAddr, SocketAddr>>>,
+        addresses: Arc<RwLock<AddressManager>>,
         tx_channel: mpsc::UnboundedSender<Transaction>,
         get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
         get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         seen_transactions: Arc<RwLock<HashMap<Vec<u8>, SeenTxEntry>>>,
-        peer_scores: Arc<RwLock<HashMap<SocketAddr, PeerScore>>>,
         peer_discovery_tx: mpsc::UnboundedSender<SocketAddr>,
         sync_ctx: Arc<SyncContext>,
         is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
@@ -1668,19 +1887,16 @@ impl P2PNetwork {
                     }
                     // SCORING: check if peer is banned
                     {
-                        let mut scores = peer_scores.write().await;
-                        if let Some(score) = scores.get_mut(&addr) {
-                            score.decay();
-                            if score.is_banned() {
-                                warn!(
-                                    "Rejecting banned peer {}: banned until {:?}",
-                                    addr, score.banned_until
-                                );
-                                drop(socket);
-                                continue;
-                            }
-                        } else {
-                            scores.insert(addr, PeerScore::new());
+                        let mut mgr = addresses.write().await;
+                        mgr.decay_score(addr);
+                        if mgr.is_banned(addr) {
+                            warn!(
+                                "Rejecting banned peer {}: banned until {:?}",
+                                addr,
+                                mgr.banned_until(addr)
+                            );
+                            drop(socket);
+                            continue;
                         }
                     }
                     info!("New peer connected: {}", addr);
@@ -1693,11 +1909,7 @@ impl P2PNetwork {
                     // Phase 2B (D7/D8): record how this address was learned and
                     // admit it through the quality-aware path.
                     ingress_address(
-                        &known_peers,
-                        &peer_meta,
-                        &peer_last_seen,
-                        &pex_origins,
-                        &peer_scores,
+                        &addresses,
                         &peers,
                         local_addr,
                         addr,
@@ -1712,37 +1924,29 @@ impl P2PNetwork {
                     let get_tips = Arc::clone(&get_tips);
                     let seen_transactions = Arc::clone(&seen_transactions);
                     let peer_discovery_tx = peer_discovery_tx.clone();
-        let known_peers = known_peers.clone();
-                            let sync_ctx = Arc::clone(&sync_ctx);
-                            let is_orphan = Arc::clone(&is_orphan);
-                            let peer_scores = Arc::clone(&peer_scores);
-                            let peer_last_seen = peer_last_seen.clone();
-                            let peer_meta = peer_meta.clone();
-                            let pex_origins = pex_origins.clone();
-                            tokio::spawn(async move {
-                                Self::handle_peer(
-                                    socket,
-                                    addr,
-                                    peers_clone,
-                                    local_addr,
-                                    known_peers,
-                                    tx_channel,
-                                    get_dag_hashes,
-                                    get_transaction_by_hash,
-                                    get_tips,
-                                    seen_transactions,
-                                    peer_scores,
-                                    msg_sender,
-                                    msg_receiver,
-                                    peer_discovery_tx,
-                                    sync_ctx,
-                                    is_orphan,
-                                    peer_last_seen,
-                                    peer_meta,
-                                    pex_origins,
-                                )
-                                .await;
-                            });
+                    let addresses = addresses.clone();
+                    let sync_ctx = Arc::clone(&sync_ctx);
+                    let is_orphan = Arc::clone(&is_orphan);
+                    tokio::spawn(async move {
+                        Self::handle_peer(
+                            socket,
+                            addr,
+                            peers_clone,
+                            local_addr,
+                            addresses,
+                            tx_channel,
+                            get_dag_hashes,
+                            get_transaction_by_hash,
+                            get_tips,
+                            seen_transactions,
+                            msg_sender,
+                            msg_receiver,
+                            peer_discovery_tx,
+                            sync_ctx,
+                            is_orphan,
+                        )
+                        .await;
+                    });
                 }
                 Err(e) => {
                     error!("Failed to accept connection: {}", e);
@@ -1868,21 +2072,17 @@ impl P2PNetwork {
         addr: SocketAddr,
         peers: Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
         local_addr: SocketAddr,
-        known_peers: Arc<RwLock<HashSet<SocketAddr>>>,
+        addresses: Arc<RwLock<AddressManager>>,
         tx_channel: mpsc::UnboundedSender<Transaction>,
         get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
         get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         seen_transactions: Arc<RwLock<HashMap<Vec<u8>, SeenTxEntry>>>,
-        peer_scores: Arc<RwLock<HashMap<SocketAddr, PeerScore>>>,
         msg_sender: mpsc::UnboundedSender<Vec<u8>>,
         msg_receiver: mpsc::UnboundedReceiver<Vec<u8>>,
         peer_discovery_tx: mpsc::UnboundedSender<SocketAddr>,
         sync_ctx: Arc<SyncContext>,
         is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
-        peer_last_seen: Arc<RwLock<HashMap<SocketAddr, Instant>>>,
-        peer_meta: Arc<RwLock<HashMap<SocketAddr, PeerMeta>>>,
-        pex_origins: Arc<RwLock<HashMap<SocketAddr, SocketAddr>>>,
     ) {
         // Split socket into read and write halves
         let (mut reader, mut writer) = socket.into_split();
@@ -1903,11 +2103,9 @@ impl P2PNetwork {
                     peers_lock.remove(&addr);
                 }
                 // Phase 1: do NOT drop the address from known_peers on a failed
-                // handshake — keep it for a later redial attempt.
-                {
-                    let mut seen = peer_last_seen.write().await;
-                    seen.insert(addr, Instant::now());
-                }
+                // handshake — keep it for a later redial attempt. Stamping the
+                // TTL clock here is what keeps it alive to be retried.
+                addresses.write().await.touch(addr, Instant::now());
                 return;
             }
         };
@@ -1915,10 +2113,8 @@ impl P2PNetwork {
         // proven reachable peer — the input to `Recent` categorisation and to
         // anchor candidacy.
         {
-            let mut meta = peer_meta.write().await;
-            if let Some(m) = meta.get_mut(&addr) {
-                m.record_success(unix_now());
-            }
+            let mut mgr = addresses.write().await;
+            mgr.record_success(addr, unix_now());
         }
         let key_enc = Arc::new(key_bytes);
         let key_dec = Arc::clone(&key_enc);
@@ -1984,12 +2180,8 @@ impl P2PNetwork {
 
         // Mark peer as known (Phase 1: refresh TTL clock too)
         {
-            let mut known = known_peers.write().await;
-            known.insert(addr);
-        }
-        {
-            let mut seen = peer_last_seen.write().await;
-            seen.insert(addr, Instant::now());
+            let mut mgr = addresses.write().await;
+            mgr.observe(addr, PeerSource::Restored, unix_now(), Instant::now());
         }
 
         let mut msg_count: u64 = 0;
@@ -2032,12 +2224,9 @@ impl P2PNetwork {
                 );
                 // SCORING: penalize flood
                 {
-                    let mut scores = peer_scores.write().await;
-                    if let Some(score) = scores.get_mut(&addr) {
-                        if score.penalize(PEER_PENALTY_FLOOD) {
-                            score.ban();
-                            warn!("Peer {} banned (flood, score={})", addr, score.score);
-                        }
+                    let mut mgr = addresses.write().await;
+                    if let Some(score) = mgr.penalize_and_ban(addr, PEER_PENALTY_FLOOD) {
+                        warn!("Peer {} banned (flood, score={})", addr, score);
                     }
                 }
                 break;
@@ -2075,12 +2264,9 @@ impl P2PNetwork {
                     addr, recv_counter, last_recv_counter
                 );
                 {
-                    let mut scores = peer_scores.write().await;
-                    if let Some(score) = scores.get_mut(&addr) {
-                        if score.penalize(PEER_PENALTY_INVALID_MSG) {
-                            score.ban();
-                            warn!("Peer {} banned (replay, score={})", addr, score.score);
-                        }
+                    let mut mgr = addresses.write().await;
+                    if let Some(score) = mgr.penalize_and_ban(addr, PEER_PENALTY_INVALID_MSG) {
+                        warn!("Peer {} banned (replay, score={})", addr, score);
                     }
                 }
                 break;
@@ -2109,11 +2295,10 @@ impl P2PNetwork {
                 Err(e) => {
                     warn!("Decryption failed for {}: {:?}", addr, e);
                     // SCORING: penalize invalid message
-                    let mut scores = peer_scores.write().await;
-                    if let Some(score) = scores.get_mut(&addr) {
-                        if score.penalize(PEER_PENALTY_INVALID_MSG) {
-                            score.ban();
-                            warn!("Peer {} banned (invalid msg, score={})", addr, score.score);
+                    {
+                        let mut mgr = addresses.write().await;
+                        if let Some(score) = mgr.penalize_and_ban(addr, PEER_PENALTY_INVALID_MSG) {
+                            warn!("Peer {} banned (invalid msg, score={})", addr, score);
                         }
                     }
                     break;
@@ -2497,15 +2682,18 @@ impl P2PNetwork {
                             // DNS seeds stay unrestricted so private testnets
                             // keep working.
                             let to_add: Vec<SocketAddr> = {
-                                let known = known_peers.read().await;
-                                let peers_read = peers.read().await;
+                                // Snapshot the session table and release first:
+                                // `peers` and `addresses` are never held together.
+                                let connected: HashSet<SocketAddr> =
+                                    peers.read().await.keys().copied().collect();
+                                let mgr = addresses.read().await;
                                 peer_list
                                     .iter()
                                     .take(MAX_INV_ITEMS)
                                     .filter(|p| {
-                                        !known.contains(p)
+                                        !mgr.contains(**p)
                                             && **p != local_addr
-                                            && !peers_read.contains_key(p)
+                                            && !connected.contains(p)
                                             && !is_private_or_reserved(**p)
                                     })
                                     .copied()
@@ -2513,11 +2701,7 @@ impl P2PNetwork {
                             };
                             for peer_addr in to_add {
                                 let ok = ingress_address(
-                                    &known_peers,
-                                    &peer_meta,
-                                    &peer_last_seen,
-                                    &pex_origins,
-                                    &peer_scores,
+                                    &addresses,
                                     &peers,
                                     local_addr,
                                     peer_addr,
@@ -2531,7 +2715,7 @@ impl P2PNetwork {
                                 }
                                 // Phase 2B (D5): remember who taught us about
                                 // this address so we never echo it back to them.
-                                pex_origins.write().await.insert(peer_addr, addr);
+                                addresses.write().await.set_origin(peer_addr, addr);
                                 let _ = peer_discovery_tx.send(peer_addr);
                             }
                         }
@@ -2540,11 +2724,10 @@ impl P2PNetwork {
                 Err(e) => {
                     warn!("Failed to deserialize message from {}: {}", addr, e);
                     // SCORING: penalize invalid message
-                    let mut scores = peer_scores.write().await;
-                    if let Some(score) = scores.get_mut(&addr) {
-                        if score.penalize(PEER_PENALTY_INVALID_MSG) {
-                            score.ban();
-                            warn!("Peer {} banned (deser fail, score={})", addr, score.score);
+                    {
+                        let mut mgr = addresses.write().await;
+                        if let Some(score) = mgr.penalize_and_ban(addr, PEER_PENALTY_INVALID_MSG) {
+                            warn!("Peer {} banned (deser fail, score={})", addr, score);
                         }
                     }
                 }
@@ -2559,8 +2742,8 @@ impl P2PNetwork {
             peers_lock.remove(&addr);
         }
         {
-            let mut seen = peer_last_seen.write().await;
-            seen.insert(addr, Instant::now());
+            let mut mgr = addresses.write().await;
+            mgr.touch(addr, Instant::now());
         }
         // DEEP SYNC: failover — move all in-flight requests from this peer back to pending
         {
@@ -2599,20 +2782,14 @@ impl P2PNetwork {
     /// connections have always checked the ban table; outbound never did, so a
     /// node would happily redial a peer it had already banned.
     async fn outbound_dial_blocked(&self, addr: SocketAddr) -> bool {
-        let scores = self.peer_scores.read().await;
-        scores.get(&addr).map(|s| s.is_banned()).unwrap_or(false)
+        self.addresses.read().await.is_banned(addr)
     }
 
     async fn connect_to_peer_inner(&self, addr: SocketAddr) {
         info!("Dialing peer: {}", addr);
 
         if self.outbound_dial_blocked(addr).await {
-            let until = self
-                .peer_scores
-                .read()
-                .await
-                .get(&addr)
-                .and_then(|s| s.banned_until);
+            let until = self.addresses.read().await.banned_until(addr);
             warn!(
                 "Skipping banned peer {} for outbound dial (banned until {:?})",
                 addr, until
@@ -2620,14 +2797,7 @@ impl P2PNetwork {
             return;
         }
 
-        {
-            let mut scores = self.peer_scores.write().await;
-            if let Some(score) = scores.get_mut(&addr) {
-                score.decay();
-            } else {
-                scores.insert(addr, PeerScore::new());
-            }
-        }
+        self.addresses.write().await.decay_score(addr);
 
         {
             let peers_guard = self.peers.read().await;
@@ -2663,11 +2833,7 @@ impl P2PNetwork {
                 // Phase 2B (D7/D8): an address we chose to dial is an outbound
                 // source, admitted through the quality-aware path.
                 ingress_address(
-                    &self.known_peers,
-                    &self.peer_meta,
-                    &self.peer_last_seen,
-                    &self.pex_origins,
-                    &self.peer_scores,
+                    &self.addresses,
                     &self.peers,
                     self.config.listen_addr,
                     addr,
@@ -2676,14 +2842,13 @@ impl P2PNetwork {
                 .await;
 
                 let peers = self.peers.clone();
-                let known_peers = self.known_peers.clone();
+                let addresses = self.addresses.clone();
                 let local_addr = self.config.listen_addr;
                 let tx_channel = self.tx_channel.clone();
                 let get_dag_hashes = Arc::clone(&self.get_dag_hashes);
                 let get_transaction_by_hash = Arc::clone(&self.get_transaction_by_hash);
                 let get_tips = Arc::clone(&self.get_tips);
                 let seen_transactions = Arc::clone(&self.seen_transactions);
-                let peer_scores = Arc::clone(&self.peer_scores);
                 let sync_ctx = Arc::clone(&self.sync_ctx);
                 let is_orphan = Arc::clone(&self.is_orphan);
                 let peer_discovery_tx = {
@@ -2693,30 +2858,23 @@ impl P2PNetwork {
                         tx
                     })
                 };
-                let peer_last_seen = self.peer_last_seen.clone();
-                let peer_meta = self.peer_meta.clone();
-                let pex_origins = self.pex_origins.clone();
                 tokio::spawn(async move {
                     Self::handle_peer(
                         socket,
                         addr,
                         peers,
                         local_addr,
-                        known_peers,
+                        addresses,
                         tx_channel,
                         get_dag_hashes,
                         get_transaction_by_hash,
                         get_tips,
                         seen_transactions,
-                        peer_scores,
                         msg_sender,
                         msg_receiver,
                         peer_discovery_tx,
                         sync_ctx,
                         is_orphan,
-                        peer_last_seen,
-                        peer_meta,
-                        pex_origins,
                     )
                     .await;
                 });
@@ -2737,10 +2895,7 @@ impl P2PNetwork {
     /// table is full (D8), so a repeatedly unreachable address is the first
     /// thing displaced.
     async fn record_dial_failure(&self, addr: SocketAddr) {
-        let mut meta = self.peer_meta.write().await;
-        if let Some(m) = meta.get_mut(&addr) {
-            m.record_failure();
-        }
+        self.addresses.write().await.record_failure(addr);
     }
 
     /// Broadcast a transaction to all connected peers
@@ -3194,10 +3349,7 @@ mod phase2_decentralized_tests {
         let peer_a = addr("203.0.113.10:25565");
         let peer_b = addr("203.0.113.11:25565");
 
-        let mut known = HashSet::new();
-        known.insert(peer_a);
-        known.insert(peer_b);
-        known.insert(seed1); // a seed may also already be a known peer
+        let known = vec![peer_a, peer_b, seed1]; // a seed may also already be a known peer
 
         let out = P2PNetwork::redial_candidates(&known, &[seed1, seed2], local);
 
@@ -3227,9 +3379,7 @@ mod phase2_decentralized_tests {
     fn test_redial_candidates_without_any_seed() {
         let local = addr("127.0.0.1:31001");
         let peer = addr("203.0.113.77:25565");
-        let mut known = HashSet::new();
-        known.insert(peer);
-        known.insert(local);
+        let known = vec![peer, local];
 
         let out = P2PNetwork::redial_candidates(&known, &[], local);
         assert_eq!(out, vec![peer]);
@@ -3248,7 +3398,11 @@ mod phase2_decentralized_tests {
             "unknown address is not blocked"
         );
 
-        net.peer_scores.write().await.insert(banned, banned_score());
+        net.addresses
+            .write()
+            .await
+            .scores_mut()
+            .insert(banned, banned_score());
 
         assert!(
             net.outbound_dial_blocked(banned).await,
@@ -3269,15 +3423,15 @@ mod phase2_decentralized_tests {
         let good = addr("203.0.113.10:25565");
         let banned = addr("203.0.113.66:25565");
 
-        let mut known = HashSet::new();
-        known.insert(local);
-        known.insert(good);
-        known.insert(banned);
+        let mut entries: HashMap<SocketAddr, AddressEntry> = HashMap::new();
+        for a in [local, good, banned] {
+            entries.insert(a, AddressEntry::new(PeerSource::Pex, 1, Instant::now()));
+        }
 
         let mut scores = HashMap::new();
         scores.insert(banned, banned_score());
 
-        let out = P2PNetwork::pex_broadcast_list(&known, &scores, local);
+        let out = P2PNetwork::pex_broadcast_list(&entries, &scores, local);
         assert_eq!(out.len(), 1, "only the healthy address is shared");
         assert!(out.contains(&good));
         assert!(!out.contains(&local));
@@ -3293,19 +3447,32 @@ mod phase2_decentralized_tests {
         let live = addr("203.0.113.20:25565");
         let idle = addr("203.0.113.21:25565");
 
-        net.known_peers.write().await.insert(live);
-        net.known_peers.write().await.insert(idle);
+        {
+            let mut mgr = net.addresses.write().await;
+            mgr.observe(live, PeerSource::Pex, unix_now(), Instant::now());
+            mgr.observe(idle, PeerSource::Pex, unix_now(), Instant::now());
+        }
 
         // A live session exists for `live` only.
         let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
         net.peers.write().await.insert(live, tx);
 
+        let idle_clock = net
+            .addresses
+            .read()
+            .await
+            .entry(idle)
+            .expect("idle is a known address")
+            .last_seen;
         let before = Instant::now();
         net.refresh_live_peer_clocks().await;
         let after = Instant::now();
 
-        let seen = net.peer_last_seen.read().await;
-        let refreshed = *seen.get(&live).expect("live peer must have a clock");
+        let mgr = net.addresses.read().await;
+        let refreshed = mgr
+            .entry(live)
+            .expect("live peer must have a clock")
+            .last_seen;
         assert!(
             refreshed >= before && refreshed <= after,
             "live session clock must be refreshed to now"
@@ -3314,8 +3481,12 @@ mod phase2_decentralized_tests {
             refreshed.elapsed() < PEER_TTL,
             "a live session must stay inside the TTL window"
         );
-        // `idle` has no session and is left untouched (still absent).
-        assert!(!seen.contains_key(&idle));
+        // `idle` has no session, so the refresh pass must leave its clock alone.
+        assert_eq!(
+            mgr.entry(idle).unwrap().last_seen,
+            idle_clock,
+            "an address with no session must not have its TTL clock touched"
+        );
     }
 
     /// PHASE2-2A: one redial cycle must never attempt more dials than the
@@ -3352,14 +3523,14 @@ mod phase2_decentralized_tests {
         let net = net_at(path.clone());
         net.load_known_peers().await;
         {
-            let known = net.known_peers.read().await;
-            assert_eq!(known.len(), 2, "legacy addresses must not be lost");
-            assert!(known.contains(&a) && known.contains(&b));
-        }
-        {
-            let meta = net.peer_meta.read().await;
-            assert_eq!(meta.len(), 2, "every legacy address gains metadata");
-            assert_eq!(meta.get(&a).unwrap().source, PeerSource::Restored);
+            let mgr = net.addresses.read().await;
+            assert_eq!(mgr.len(), 2, "legacy addresses must not be lost");
+            assert!(mgr.contains(a) && mgr.contains(b));
+            assert_eq!(
+                mgr.entry(a).unwrap().source,
+                PeerSource::Restored,
+                "every legacy address gains metadata"
+            );
         }
 
         net.save_known_peers().await;
@@ -3380,15 +3551,13 @@ mod phase2_decentralized_tests {
 
         {
             let net = net_at(path.clone());
-            net.known_peers.write().await.insert(a);
-            net.known_peers.write().await.insert(b);
             {
-                let mut meta = net.peer_meta.write().await;
-                let mut ma = PeerMeta::new(PeerSource::Pex, 1_000_000);
-                ma.record_success(1_000_500);
-                ma.anchor = true;
-                meta.insert(a, ma);
-                meta.insert(b, PeerMeta::new(PeerSource::Dns, 1_000_100));
+                let mut mgr = net.addresses.write().await;
+                mgr.observe(a, PeerSource::Pex, 1_000_000, Instant::now());
+                mgr.observe(b, PeerSource::Dns, 1_000_100, Instant::now());
+                let ea = mgr.entries_mut().get_mut(&a).expect("just inserted");
+                ea.record_success(1_000_500);
+                ea.anchor = true;
             }
             net.save_known_peers().await;
         }
@@ -3400,19 +3569,16 @@ mod phase2_decentralized_tests {
 
         let net2 = net_at(path);
         net2.load_known_peers().await;
-        {
-            let known = net2.known_peers.read().await;
-            assert_eq!(known.len(), 2);
-            assert!(known.contains(&a) && known.contains(&b));
-        }
-        let meta = net2.peer_meta.read().await;
-        let ma = meta.get(&a).expect("metadata must be restored");
+        let mgr = net2.addresses.read().await;
+        assert_eq!(mgr.len(), 2);
+        assert!(mgr.contains(a) && mgr.contains(b));
+        let ma = mgr.entry(a).expect("metadata must be restored");
         assert_eq!(ma.source, PeerSource::Pex);
         assert_eq!(ma.last_success, Some(1_000_500));
         assert_eq!(ma.attempts, 1);
         assert!(ma.quality > default_peer_quality());
         assert!(ma.anchor, "the anchor flag must survive a restart");
-        let mb = meta.get(&b).expect("metadata must be restored");
+        let mb = mgr.entry(b).expect("metadata must be restored");
         assert_eq!(mb.source, PeerSource::Dns);
         assert!(mb.last_success.is_none());
         assert!(!mb.anchor);
@@ -3425,22 +3591,22 @@ mod phase2_decentralized_tests {
         let local = addr("127.0.0.1:31001");
         let recipient = addr("198.51.100.9:25565");
 
-        let mut known = HashSet::new();
-        let mut meta = HashMap::new();
+        let mut entries: HashMap<SocketAddr, AddressEntry> = HashMap::new();
         for i in 0..500u16 {
             let a: SocketAddr = format!("203.0.113.{}:{}", (i % 254) + 1, 30000 + i)
                 .parse()
                 .unwrap();
-            known.insert(a);
-            meta.insert(a, PeerMeta::new(PeerSource::Pex, 1));
+            entries.insert(a, AddressEntry::new(PeerSource::Pex, 1, Instant::now()));
         }
-        known.insert(local);
+        entries.insert(
+            local,
+            AddressEntry::new(PeerSource::Restored, 1, Instant::now()),
+        );
         let scores = HashMap::new();
         let origins = HashMap::new();
 
         let out = pex_sample(
-            &known,
-            &meta,
+            &entries,
             &scores,
             &origins,
             local,
@@ -3449,7 +3615,10 @@ mod phase2_decentralized_tests {
             PEX_MAX_SEND,
         );
         assert_eq!(out.len(), PEX_MAX_SEND, "send side must be capped");
-        assert!(out.len() < known.len(), "must not relay the entire table");
+        assert!(
+            out.len() < entries.len(),
+            "must not relay the entire table"
+        );
         assert!(!out.contains(&local), "never send our own address");
         assert!(!out.contains(&recipient), "never send the address back to its owner");
         let unique: HashSet<SocketAddr> = out.iter().copied().collect();
@@ -3470,15 +3639,19 @@ mod phase2_decentralized_tests {
         let aged_out = now - PEX_SHARE_MAX_AGE_SECS - 10;
         assert!(aged_out > 0, "test clock must stay positive");
 
-        let mut known = HashSet::new();
-        known.insert(from_recipient);
-        known.insert(fresh);
-        known.insert(stale);
-
-        let mut meta = HashMap::new();
-        meta.insert(from_recipient, PeerMeta::new(PeerSource::Pex, now));
-        meta.insert(fresh, PeerMeta::new(PeerSource::Pex, now));
-        meta.insert(stale, PeerMeta::new(PeerSource::Pex, aged_out));
+        let mut entries: HashMap<SocketAddr, AddressEntry> = HashMap::new();
+        entries.insert(
+            from_recipient,
+            AddressEntry::new(PeerSource::Pex, now, Instant::now()),
+        );
+        entries.insert(
+            fresh,
+            AddressEntry::new(PeerSource::Pex, now, Instant::now()),
+        );
+        entries.insert(
+            stale,
+            AddressEntry::new(PeerSource::Pex, aged_out, Instant::now()),
+        );
 
         // `from_recipient` is exactly the hint `recipient` sent us.
         let mut origins = HashMap::new();
@@ -3487,8 +3660,7 @@ mod phase2_decentralized_tests {
         let scores = HashMap::new();
 
         let out = pex_sample(
-            &known,
-            &meta,
+            &entries,
             &scores,
             &origins,
             local,
@@ -3550,8 +3722,7 @@ mod phase2_decentralized_tests {
         let lan_boot = addr("192.168.1.50:30333");
         let public_peer = addr("203.0.113.5:25565");
 
-        let mut known = HashSet::new();
-        known.insert(public_peer);
+        let known = vec![public_peer];
         let out = P2PNetwork::redial_candidates(&known, &[lan_boot], local);
         assert!(
             out.contains(&lan_boot),
@@ -3675,48 +3846,38 @@ mod phase2_decentralized_tests {
     fn test_quality_eviction_replaces_junk() {
         let incoming = addr("203.0.113.80:25565");
 
-        let mut known = HashSet::new();
-        let mut meta = HashMap::new();
+        let mut entries: HashMap<SocketAddr, AddressEntry> = HashMap::new();
         for i in 0..MAX_KNOWN_PEERS {
             let a: SocketAddr = format!("203.0.113.{}:{}", (i % 254) + 1, 20000 + i as u16)
                 .parse()
                 .unwrap();
-            known.insert(a);
-            let mut m = PeerMeta::new(PeerSource::Pex, 1);
-            m.quality = 1;
-            m.failures = 10;
-            meta.insert(a, m);
+            let mut e = AddressEntry::new(PeerSource::Pex, 1, Instant::now());
+            e.quality = 1;
+            e.failures = 10;
+            entries.insert(a, e);
         }
-        assert_eq!(known.len(), MAX_KNOWN_PEERS, "table must start full");
+        assert_eq!(entries.len(), MAX_KNOWN_PEERS, "table must start full");
 
         let scores = HashMap::new();
         let connected: HashSet<SocketAddr> = HashSet::new();
 
-        let victim = admit_peer(
-            &known,
-            &meta,
-            &scores,
-            &connected,
-            incoming,
-            PEER_QUALITY_MAX,
-        )
-        .expect("a full table of junk must yield a victim");
+        let victim = admit_peer(&entries, &scores, &connected, incoming, PEER_QUALITY_MAX)
+            .expect("a full table of junk must yield a victim");
         assert_eq!(
-            meta.get(&victim).unwrap().quality,
+            entries.get(&victim).unwrap().quality,
             1,
             "the weakest entry must be the victim"
         );
 
         // An address weaker than everything present displaces nobody.
-        let weaker = admit_peer(&known, &meta, &scores, &connected, incoming, 0);
+        let weaker = admit_peer(&entries, &scores, &connected, incoming, 0);
         assert!(weaker.is_none(), "a worse address must not displace anyone");
 
         // A live session is never evicted to make room.
-        let all_connected: HashSet<SocketAddr> = known.iter().copied().collect();
+        let all_connected: HashSet<SocketAddr> = entries.keys().copied().collect();
         assert!(
             admit_peer(
-                &known,
-                &meta,
+                &entries,
                 &scores,
                 &all_connected,
                 incoming,
@@ -3727,28 +3888,26 @@ mod phase2_decentralized_tests {
         );
 
         // Neither is an anchor.
-        let mut anchored = meta.clone();
-        for m in anchored.values_mut() {
-            m.anchor = true;
+        let mut anchored = entries.clone();
+        for e in anchored.values_mut() {
+            e.anchor = true;
         }
         assert!(
-            admit_peer(&known, &anchored, &scores, &connected, incoming, PEER_QUALITY_MAX)
-                .is_none(),
+            admit_peer(&anchored, &scores, &connected, incoming, PEER_QUALITY_MAX).is_none(),
             "anchors must never be evicted"
         );
 
         // A banned entry is the first victim even when its quality looks fine.
-        let banned_addr = *known.iter().next().unwrap();
+        let banned_addr = *entries.keys().next().unwrap();
         let mut scores2 = HashMap::new();
         let mut s = PeerScore::new();
         s.score = PEER_SCORE_BAN_THRESHOLD;
         s.ban();
         scores2.insert(banned_addr, s);
-        let mut meta2 = meta.clone();
-        meta2.get_mut(&banned_addr).unwrap().quality = PEER_QUALITY_MAX;
+        let mut entries2 = entries.clone();
+        entries2.get_mut(&banned_addr).unwrap().quality = PEER_QUALITY_MAX;
         let victim = admit_peer(
-            &known,
-            &meta2,
+            &entries2,
             &scores2,
             &connected,
             incoming,
@@ -3758,6 +3917,451 @@ mod phase2_decentralized_tests {
         assert_eq!(
             victim, banned_addr,
             "a banned entry is always the preferred victim"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AddressManager — the single owner of address state
+    //
+    // These drive the manager directly. The sixteen tests above cover the same
+    // invariants through `P2PNetwork` wiring (on-disk store, PEX loop, TTL
+    // task), so nothing here repeats them.
+    // -----------------------------------------------------------------------
+
+    /// Membership, TTL clock and metadata enter through `observe`, and
+    /// `remove` takes them all back out together.
+    #[test]
+    fn test_address_manager_insert() {
+        let mut mgr = AddressManager::new();
+        let a = addr("203.0.113.1:25565");
+        let b = addr("203.0.113.2:25565");
+        let unknown = addr("203.0.113.3:25565");
+
+        assert_eq!(mgr.len(), 0);
+        mgr.observe(a, PeerSource::Dns, 1_000, Instant::now());
+        mgr.observe(b, PeerSource::Pex, 1_001, Instant::now());
+        assert_eq!(mgr.len(), 2);
+        assert!(mgr.contains(a) && mgr.contains(b));
+        assert!(!mgr.contains(unknown));
+
+        // Re-observing something we already hold never duplicates it, and the
+        // clock is the only thing that moves.
+        let clock_before = mgr.entry(a).unwrap().last_seen;
+        mgr.observe(a, PeerSource::Pex, 9_999, Instant::now());
+        assert_eq!(mgr.len(), 2);
+        assert_eq!(mgr.entry(a).unwrap().first_seen, 1_000, "first_seen is written once");
+        assert!(mgr.entry(a).unwrap().last_seen >= clock_before);
+
+        // Eviction removes the entry entirely, twice is reported as removed once.
+        assert!(mgr.remove(&b));
+        assert!(!mgr.remove(&b));
+        assert!(!mgr.contains(b));
+        assert_eq!(mgr.len(), 1);
+    }
+
+    /// `to_store` / `load_v2` carry every field v1 could not express, and the
+    /// node's own address is never round-tripped back into the table.
+    #[test]
+    fn test_address_manager_metadata_roundtrip() {
+        let local = addr("127.0.0.1:31001");
+        let a = addr("203.0.113.11:25565");
+        let b = addr("203.0.113.12:25565");
+
+        let mut src = AddressManager::new();
+        src.observe(a, PeerSource::Pex, 1_000, Instant::now());
+        src.record_success(a, 1_500);
+        {
+            let e = src.entries_mut().get_mut(&a).unwrap();
+            e.anchor = true;
+            e.failures = 3;
+        }
+        src.observe(b, PeerSource::Dns, 2_000, Instant::now());
+        src.observe(local, PeerSource::Configured, 3_000, Instant::now());
+
+        let file = src.to_store();
+        assert_eq!(file.version, PEER_STORE_VERSION);
+        assert_eq!(file.entries.len(), 3, "nothing on disk is dropped");
+
+        let mut dst = AddressManager::new();
+        assert_eq!(
+            dst.load_v2(&file, local, 5_000, Instant::now()),
+            2,
+            "our own address is skipped on load"
+        );
+        assert!(!dst.contains(local));
+
+        let ea = dst.entry(a).expect("a must round-trip");
+        assert_eq!(ea.source, PeerSource::Pex);
+        assert_eq!(ea.first_seen, 1_000);
+        assert_eq!(ea.last_success, Some(1_500));
+        assert_eq!(ea.attempts, 1);
+        assert_eq!(ea.failures, 3);
+        assert!(ea.quality > default_peer_quality(), "a success raises quality");
+        assert!(ea.anchor, "the anchor flag must survive");
+
+        let eb = dst.entry(b).expect("b must round-trip");
+        assert_eq!(eb.source, PeerSource::Dns);
+        assert_eq!(eb.first_seen, 2_000);
+        assert!(eb.last_success.is_none());
+        assert!(!eb.anchor);
+    }
+
+    /// R3: a bare `Vec<String>` from a pre-versioned store is adopted rather
+    /// than discarded — skipping anything unparseable and our own address.
+    #[test]
+    fn test_address_manager_legacy_fallback() {
+        let local = addr("127.0.0.1:31001");
+        let a = addr("203.0.113.21:25565");
+        let b = addr("203.0.113.22:25565");
+        let legacy = vec![
+            a.to_string(),
+            "not-an-address".to_string(),
+            b.to_string(),
+            local.to_string(),
+        ];
+
+        let mut mgr = AddressManager::new();
+        assert_eq!(mgr.load_legacy(&legacy, local, 7_000, Instant::now()), 2);
+        assert!(mgr.contains(a) && mgr.contains(b));
+        assert!(!mgr.contains(local), "our own address is never adopted");
+        let ea = mgr.entry(a).unwrap();
+        assert_eq!(ea.source, PeerSource::Restored, "v1 carried no origin");
+        assert_eq!(ea.first_seen, 7_000, "v1 carried no clock");
+        assert!(ea.last_success.is_none());
+    }
+
+    /// D8: the three admission outcomes — adopted, already present, and
+    /// refused because nothing present is worth displacing.
+    #[test]
+    fn test_address_manager_admission() {
+        let connected = HashSet::new();
+        let mut mgr = AddressManager::new();
+
+        let first = addr("203.0.113.31:25565");
+        assert_eq!(
+            mgr.admit(first, PeerSource::Pex, 50, 1_000, Instant::now(), &connected),
+            Admission::Inserted { evicted: None },
+            "below capacity the address is simply adopted"
+        );
+        assert_eq!(
+            mgr.admit(first, PeerSource::Dns, 50, 1_000, Instant::now(), &connected),
+            Admission::AlreadyKnown,
+            "admitting twice never duplicates"
+        );
+
+        // Fill to capacity with junk so a newcomer must displace someone.
+        let mut junk: Vec<SocketAddr> = Vec::new();
+        for i in 0..(MAX_KNOWN_PEERS - 1) {
+            let a: SocketAddr = format!("203.0.113.{}:{}", (i % 254) + 1, 40000 + i as u16)
+                .parse()
+                .unwrap();
+            mgr.observe(a, PeerSource::Pex, 1, Instant::now());
+            mgr.entries_mut().get_mut(&a).unwrap().quality = 1;
+            junk.push(a);
+        }
+        assert_eq!(mgr.len(), MAX_KNOWN_PEERS, "table is at capacity");
+
+        let newcomer = addr("198.51.100.77:25565");
+        match mgr.admit(
+            newcomer,
+            PeerSource::Pex,
+            PEER_QUALITY_MAX,
+            1_000,
+            Instant::now(),
+            &connected,
+        ) {
+            Admission::Inserted { evicted: Some(victim) } => {
+                assert!(
+                    junk.contains(&victim),
+                    "only an existing junk entry can be displaced"
+                );
+                assert!(!mgr.contains(victim), "the victim must be gone");
+            }
+            other => panic!("a full table of junk must evict, got {:?}", other),
+        }
+        assert_eq!(mgr.len(), MAX_KNOWN_PEERS, "capacity stays a hard cap");
+        assert!(mgr.contains(newcomer));
+
+        // A table where nothing is worth dropping refuses instead.
+        let mut keepers = AddressManager::new();
+        for i in 0..MAX_KNOWN_PEERS {
+            let a: SocketAddr = format!("198.51.100.{}:{}", (i % 254) + 1, 50000 + i as u16)
+                .parse()
+                .unwrap();
+            keepers.observe(a, PeerSource::Dns, 1, Instant::now());
+            keepers.entries_mut().get_mut(&a).unwrap().anchor = true;
+        }
+        assert_eq!(
+            keepers.admit(
+                newcomer,
+                PeerSource::Pex,
+                PEER_QUALITY_MAX,
+                1_000,
+                Instant::now(),
+                &connected
+            ),
+            Admission::Refused,
+            "anchors are never displaced, so the newcomer is refused"
+        );
+    }
+
+    /// D8: live sessions are protected even when every other entry is equally
+    /// worthless, so a full table can never evict its own working peers.
+    #[test]
+    fn test_address_manager_quality_eviction() {
+        let mut mgr = AddressManager::new();
+        let mut all: Vec<SocketAddr> = Vec::new();
+        for i in 0..MAX_KNOWN_PEERS {
+            let a: SocketAddr = format!("203.0.113.{}:{}", (i % 254) + 1, 60000 + i as u16)
+                .parse()
+                .unwrap();
+            mgr.observe(a, PeerSource::Pex, 1, Instant::now());
+            mgr.entries_mut().get_mut(&a).unwrap().quality = 1;
+            all.push(a);
+        }
+
+        let live = all[0];
+        let mut live_set = HashSet::new();
+        live_set.insert(live);
+
+        let newcomer = addr("198.51.100.88:25565");
+        let Admission::Inserted { evicted: Some(victim) } = mgr.admit(
+            newcomer,
+            PeerSource::Pex,
+            PEER_QUALITY_MAX,
+            1_000,
+            Instant::now(),
+            &live_set,
+        ) else {
+            panic!("a full table must yield a victim");
+        };
+        assert_ne!(victim, live, "a live session is never evicted");
+        assert!(!mgr.contains(victim));
+        assert!(mgr.contains(live), "the working peer stays");
+        assert!(mgr.contains(newcomer));
+    }
+
+    /// D9: anchors come only from sessions that completed a handshake, are
+    /// applied as a whole set, and record their promotion as a source change.
+    #[test]
+    fn test_address_manager_anchor_rotation() {
+        let local = addr("127.0.0.1:31001");
+        let a = addr("203.0.113.41:25565");
+        let b = addr("203.0.113.42:25565");
+        let c = addr("203.0.113.43:25565");
+        let d = addr("203.0.113.44:25565");
+
+        let mut mgr = AddressManager::new();
+        for x in [a, b, c, d] {
+            mgr.observe(x, PeerSource::Pex, 1, Instant::now());
+        }
+        // `c` never reaches a handshake, so it can never become an anchor.
+        mgr.record_success(a, 100);
+        mgr.record_success(b, 200);
+        mgr.record_success(d, 300);
+
+        let live: HashSet<SocketAddr> = [a, b, d].into_iter().collect();
+        let candidates = mgr.anchor_candidates(&live);
+        assert_eq!(candidates.len(), 3, "only proven sessions are candidates");
+        assert!(
+            !candidates.iter().any(|(x, _)| *x == c),
+            "an address with no success is never a candidate"
+        );
+        // A known address with no live session is not a candidate either.
+        let idle_live: HashSet<SocketAddr> = [c].into_iter().collect();
+        assert!(mgr.anchor_candidates(&idle_live).is_empty());
+
+        let wanted = promote_anchors(&[], &candidates, local);
+        assert!(wanted.len() <= MAX_ANCHORS && wanted.len() >= MIN_ANCHORS);
+        let (promoted, demoted) = mgr.apply_anchors(&wanted);
+        assert_eq!(promoted, wanted.len(), "they were plain addresses before");
+        assert_eq!(demoted, 0);
+        assert_eq!(mgr.anchor_addresses().len(), wanted.len());
+        assert_eq!(
+            mgr.entry(a).unwrap().source,
+            PeerSource::Anchor,
+            "promotion records how the address became an anchor"
+        );
+
+        // Shrinking the wanted set demotes, never silently keeps stale anchors.
+        let (promoted2, demoted2) = mgr.apply_anchors(&[a].into_iter().collect::<HashSet<_>>());
+        assert_eq!(promoted2, 0);
+        assert_eq!(demoted2, 2);
+        assert!(!mgr.entry(b).unwrap().anchor);
+        assert_eq!(
+            mgr.anchor_addresses(),
+            vec![(a, 100)],
+            "the surviving anchor keeps its last-success time"
+        );
+    }
+
+    /// D9 + Phase 1 TTL: an address we stop hearing from is swept out of the
+    /// table — and an anchor among them stops being an anchor.
+    #[test]
+    fn test_address_manager_anchor_expiry() {
+        let stale = addr("203.0.113.51:25565");
+        let fresh = addr("203.0.113.52:25565");
+
+        let mut mgr = AddressManager::new();
+        mgr.observe(stale, PeerSource::Dns, 1, Instant::now());
+        mgr.observe(fresh, PeerSource::Dns, 2, Instant::now());
+        mgr.record_success(stale, 10);
+        mgr.entries_mut().get_mut(&stale).unwrap().anchor = true;
+        assert_eq!(mgr.anchor_addresses().len(), 1);
+
+        // Give the sweep a window: `fresh` is reachable, `stale` is not.
+        std::thread::sleep(Duration::from_millis(10));
+        let mut live = HashSet::new();
+        live.insert(fresh);
+        let (refreshed, expired) =
+            mgr.refresh_and_expire(&live, Instant::now(), Duration::from_millis(1));
+
+        assert_eq!(refreshed, 1, "the live session's clock was refreshed");
+        assert_eq!(expired, 1, "only the unheard-from address is swept");
+        assert!(!mgr.contains(stale));
+        assert!(mgr.contains(fresh), "a refreshed address stays");
+        assert!(
+            mgr.anchor_addresses().is_empty(),
+            "an expired anchor stops being an anchor"
+        );
+    }
+
+    /// D5: the per-recipient sample honours the recipient exclusion, origin
+    /// echo suppression, PEX aging, the ban table and our own listen address.
+    #[test]
+    fn test_address_manager_pex_sampling() {
+        let local = addr("127.0.0.1:31001");
+        let recipient = addr("198.51.100.9:25565");
+        let from_recipient = addr("203.0.113.61:25565");
+        let fresh = addr("203.0.113.62:25565");
+        let stale = addr("203.0.113.63:25565");
+        let banned = addr("203.0.113.64:25565");
+
+        let now = 10_000_000u64;
+        let aged_out = now - PEX_SHARE_MAX_AGE_SECS - 10;
+        assert!(aged_out > 0, "test clock must stay positive");
+
+        let mut mgr = AddressManager::new();
+        for (a, seen) in [
+            (recipient, now),
+            (from_recipient, now),
+            (fresh, now),
+            (stale, aged_out),
+            (banned, now),
+        ] {
+            mgr.observe(a, PeerSource::Pex, seen, Instant::now());
+        }
+        mgr.observe(local, PeerSource::Restored, now, Instant::now());
+        mgr.set_origin(from_recipient, recipient);
+        mgr.scores_mut().insert(banned, banned_score());
+
+        let out = mgr.sample_for_pex(local, recipient, now, PEX_MAX_SEND);
+        assert!(out.contains(&fresh), "a fresh, healthy address is shared");
+        assert!(!out.contains(&recipient), "never send the address back to its owner");
+        assert!(!out.contains(&from_recipient), "never echo an address to its own source");
+        assert!(!out.contains(&stale), "aged-out hints stop being gossiped");
+        assert!(!out.contains(&banned), "we never re-share what we banned");
+        assert!(!out.contains(&local), "never send our own listen address");
+        assert!(out.len() <= PEX_MAX_SEND, "the sample stays bounded");
+    }
+
+    /// The first observer names an address; later hints never relabel it, and
+    /// the hint's own origin is tracked separately from that source.
+    #[test]
+    fn test_address_manager_source_tracking() {
+        let a = addr("203.0.113.71:25565");
+        let peer = addr("198.51.100.5:25565");
+        let mut mgr = AddressManager::new();
+
+        mgr.observe(a, PeerSource::Dns, 1_000, Instant::now());
+        assert_eq!(mgr.entry(a).unwrap().source, PeerSource::Dns);
+
+        mgr.observe(a, PeerSource::Pex, 9_999, Instant::now());
+        assert_eq!(mgr.entry(a).unwrap().source, PeerSource::Dns, "first observer names it");
+        assert_eq!(mgr.entry(a).unwrap().first_seen, 1_000);
+        assert!(mgr.origin_of(a).is_none(), "no origin was recorded yet");
+
+        mgr.set_origin(a, peer);
+        assert_eq!(mgr.origin_of(a), Some(peer));
+        mgr.observe(a, PeerSource::Configured, 9_999, Instant::now());
+        assert_eq!(mgr.entry(a).unwrap().source, PeerSource::Dns, "still not relabelled");
+        assert_eq!(mgr.origin_of(a), Some(peer), "the origin is independent");
+    }
+
+    /// Quality follows dial outcomes, bans only bite once the threshold is
+    /// crossed, and a ban survives the TTL sweep that removes its address.
+    #[test]
+    fn test_address_manager_failure_scoring() {
+        let a = addr("203.0.113.81:25565");
+        let mut mgr = AddressManager::new();
+        mgr.observe(a, PeerSource::Outbound, 1_000, Instant::now());
+        let base = mgr.entry(a).unwrap().quality;
+
+        for _ in 0..3 {
+            mgr.record_failure(a);
+        }
+        {
+            let e = mgr.entry(a).unwrap();
+            assert_eq!(e.attempts, 3);
+            assert_eq!(e.failures, 3);
+            assert!(e.quality < base, "repeated dial failures must lower quality");
+        }
+
+        mgr.record_success(a, 2_000);
+        {
+            let e = mgr.entry(a).unwrap();
+            assert_eq!(e.last_success, Some(2_000));
+            assert_eq!(e.attempts, 4);
+            assert!(e.quality > base - 15, "a success pays some of it back");
+        }
+
+        // An address we do not track is left completely alone.
+        let unknown = addr("203.0.113.82:25565");
+        mgr.record_failure(unknown);
+        assert!(!mgr.contains(unknown));
+
+        // An address with no score is never silently banned by a penalty.
+        let unscored = addr("203.0.113.84:25565");
+        mgr.observe(unscored, PeerSource::Inbound, 1_000, Instant::now());
+        assert!(
+            mgr.penalize_and_ban(unscored, -10_000).is_none(),
+            "penalties only apply to a score we already keep"
+        );
+        assert!(!mgr.is_banned(unscored));
+
+        // One point short of the threshold is not a ban; the next one is.
+        let hot = addr("203.0.113.83:25565");
+        mgr.observe(hot, PeerSource::Inbound, 1_000, Instant::now());
+        mgr.decay_score(hot);
+        assert!(
+            mgr.penalize_and_ban(hot, PEER_SCORE_BAN_THRESHOLD + 1 - PEER_SCORE_INITIAL)
+                .is_none(),
+            "score still above the threshold"
+        );
+        assert!(!mgr.is_banned(hot));
+        assert_eq!(
+            mgr.penalize_and_ban(hot, -1),
+            Some(PEER_SCORE_BAN_THRESHOLD),
+            "crossing the threshold bans and reports the score"
+        );
+        assert!(mgr.is_banned(hot));
+
+        // A ban must outlive the address it belongs to: sweeping the entry out
+        // of the table must never quietly un-ban it.
+        let evicted = addr("203.0.113.85:25565");
+        let mut ban_mgr = AddressManager::new();
+        ban_mgr.observe(evicted, PeerSource::Pex, 1_000, Instant::now());
+        ban_mgr.scores_mut().insert(evicted, banned_score());
+        assert!(ban_mgr.is_banned(evicted));
+
+        std::thread::sleep(Duration::from_millis(10));
+        let (_, expired) =
+            ban_mgr.refresh_and_expire(&HashSet::new(), Instant::now(), Duration::from_millis(1));
+        assert_eq!(expired, 1, "the stale entry is swept");
+        assert!(!ban_mgr.contains(evicted), "membership is gone");
+        assert!(
+            ban_mgr.is_banned(evicted),
+            "the ban must survive the sweep, or expiry becomes an un-ban"
         );
     }
 }
@@ -3798,8 +4402,14 @@ mod bootstrap_phase1_tests {
             is_orphan.clone(),
         );
 
-        net.known_peers.write().await.insert(addr("10.0.0.1:25565"));
-        net.known_peers.write().await.insert(addr("10.0.0.2:25565"));
+        net.addresses
+            .write()
+            .await
+            .observe(addr("10.0.0.1:25565"), PeerSource::Restored, unix_now(), Instant::now());
+        net.addresses
+            .write()
+            .await
+            .observe(addr("10.0.0.2:25565"), PeerSource::Restored, unix_now(), Instant::now());
         net.save_known_peers().await;
         assert!(path.exists());
 
@@ -3821,11 +4431,11 @@ mod bootstrap_phase1_tests {
             sync_ctx2,
             is_orphan.clone(),
         );
-        assert!(net2.known_peers.read().await.is_empty());
+        assert_eq!(net2.addresses.read().await.len(), 0);
         net2.load_known_peers().await;
-        let known = net2.known_peers.read().await;
-        assert!(known.contains(&addr("10.0.0.1:25565")));
-        assert!(known.contains(&addr("10.0.0.2:25565")));
+        let known = net2.addresses.read().await;
+        assert!(known.contains(addr("10.0.0.1:25565")));
+        assert!(known.contains(addr("10.0.0.2:25565")));
         assert_eq!(known.len(), 2);
     }
 
@@ -3855,14 +4465,26 @@ mod bootstrap_phase1_tests {
         );
 
         let peer = addr("192.168.1.10:25565");
-        net.known_peers.write().await.insert(peer);
+        net.addresses
+            .write()
+            .await
+            .observe(peer, PeerSource::Outbound, unix_now(), Instant::now());
         // Simulate disconnect bookkeeping (what handle_peer does at exit):
         net.peers.write().await.remove(&peer);
-        net.peer_last_seen.write().await.insert(peer, Instant::now());
+        net.addresses.write().await.touch(peer, Instant::now());
         // Address must still be known (TTL keeps it).
-        assert!(net.known_peers.read().await.contains(&peer));
+        assert!(net.addresses.read().await.contains(peer));
         // TTL clock is recorded.
-        assert!(net.peer_last_seen.read().await.contains_key(&peer));
+        assert!(
+            net.addresses
+                .read()
+                .await
+                .entry(peer)
+                .expect("known address carries a TTL clock")
+                .last_seen
+                .elapsed()
+                < PEER_TTL
+        );
         // Expire only after PEER_TTL.
         assert!(PEER_TTL > Duration::from_secs(60));
     }
@@ -3923,13 +4545,16 @@ mod bootstrap_phase1_tests {
             sync_ctx,
             is_orphan.clone(),
         );
-        net.known_peers.write().await.insert(boot);
-        net.known_peers.write().await.insert(non_boot);
+        net.addresses.write().await.observe(boot, PeerSource::Restored, unix_now(), Instant::now());
+        net.addresses
+            .write()
+            .await
+            .observe(non_boot, PeerSource::Restored, unix_now(), Instant::now());
 
         // Reconstruct the candidate set the way start_reconnection_task does.
         let local = net.config.listen_addr;
         let mut candidates: Vec<SocketAddr> = net.config.bootnodes.clone();
-        for a in net.known_peers.read().await.iter().copied() {
+        for a in net.addresses.read().await.addresses() {
             if a != local && !candidates.contains(&a) {
                 candidates.push(a);
             }
@@ -3984,12 +4609,12 @@ mod bootstrap_phase1_tests {
             is_orphan.clone(),
         );
         net.load_known_peers().await;
-        let known = net.known_peers.read().await;
-        assert!(known.contains(&peer), "cold start must restore the peer");
+        let known = net.addresses.read().await;
+        assert!(known.contains(peer), "cold start must restore the peer");
         // General redial set (what start() dials after bootnodes) is non-empty.
         let candidates: Vec<SocketAddr> = known
-            .iter()
-            .copied()
+            .addresses()
+            .into_iter()
             .filter(|a| *a != net.config.listen_addr && !net.config.bootnodes.contains(a))
             .collect();
         assert_eq!(candidates.len(), 1);
@@ -4216,15 +4841,18 @@ mod bootstrap_phase1_tests {
             is_orphan.clone(),
         );
         let peer = addr("198.51.100.7:25565");
-        net.known_peers.write().await.insert(peer);
+        net.addresses
+            .write()
+            .await
+            .observe(peer, PeerSource::Pex, unix_now(), Instant::now());
 
         // Simulate a partition: active map wiped, known set retained (TTL).
         net.peers.write().await.clear();
-        net.peer_last_seen.write().await.insert(peer, Instant::now());
-        assert!(net.known_peers.read().await.contains(&peer));
+        net.addresses.write().await.touch(peer, Instant::now());
+        assert!(net.addresses.read().await.contains(peer));
         // Reconnect candidate reconstruction (same as start_reconnection_task).
         let mut candidates: Vec<SocketAddr> = net.config.bootnodes.clone();
-        for a in net.known_peers.read().await.iter().copied() {
+        for a in net.addresses.read().await.addresses() {
             if a != net.config.listen_addr && !candidates.contains(&a) {
                 candidates.push(a);
             }
@@ -4261,24 +4889,27 @@ mod bootstrap_phase1_tests {
             is_orphan.clone(),
         );
         // After PEX, A knows B and (locally) itself is not redialled.
-        net.known_peers.write().await.insert(b);
-        net.known_peers.write().await.insert(boot);
+        {
+            let mut mgr = net.addresses.write().await;
+            mgr.observe(b, PeerSource::Pex, unix_now(), Instant::now());
+            mgr.observe(boot, PeerSource::Restored, unix_now(), Instant::now());
+        }
 
         // Bootnode dies: it is no longer a usable dial target, but B remains.
         let mut candidates: Vec<SocketAddr> = Vec::new();
-        for x in net.known_peers.read().await.iter().copied() {
+        for x in net.addresses.read().await.addresses() {
             if x != a {
                 candidates.push(x);
             }
         }
         // B survives as a general-redial candidate even if boot is removed.
-        net.known_peers.write().await.remove(&boot);
+        net.addresses.write().await.remove(&boot);
         let after: Vec<SocketAddr> = net
-            .known_peers
+            .addresses
             .read()
             .await
-            .iter()
-            .copied()
+            .addresses()
+            .into_iter()
             .filter(|x| *x != a)
             .collect();
         assert!(after.contains(&b), "A must still redial B after bootnode loss");
