@@ -580,6 +580,8 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             .map_err(|e| format!("Failed to parse P2P listen address: {}", e))?,
         bootnodes,
         dns_seeds: cfg.dns_seeds.clone(),
+        // Phase 1: persist known peers under the node data directory.
+        peer_store_path: Some(data_dir.join("known_peers.json")),
     };
 
     tracing::info!("🌐 Initializing P2P network...");

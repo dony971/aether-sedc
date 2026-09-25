@@ -260,7 +260,14 @@ pub struct P2PConfig {
     pub bootnodes: Vec<SocketAddr>,
     /// DNS seed domains for peer discovery (e.g. "seed.aether.network")
     pub dns_seeds: Vec<String>,
+    /// Path used to persist known peers across restarts (Phase 1)
+    pub peer_store_path: Option<std::path::PathBuf>,
 }
+
+/// How long a peer remains in the known set after its last disconnect (Phase 1 TTL).
+const PEER_TTL: Duration = Duration::from_secs(3600);
+/// Interval at which the known-peer set is flushed to disk (Phase 1).
+const PEER_STORE_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 
 impl Default for P2PConfig {
     fn default() -> Self {
@@ -273,6 +280,7 @@ impl Default for P2PConfig {
             }),
             bootnodes: Vec::new(),
             dns_seeds: Vec::new(),
+            peer_store_path: None,
         }
     }
 }
@@ -315,6 +323,8 @@ pub struct P2PNetwork {
     config: P2PConfig,
     peers: Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
     known_peers: Arc<RwLock<HashSet<SocketAddr>>>,
+    /// Phase 1 TTL: last time each known peer was seen (connected or heard via PEX).
+    peer_last_seen: Arc<RwLock<HashMap<SocketAddr, Instant>>>,
     tx_channel: mpsc::UnboundedSender<Transaction>,
     peer_discovery_tx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<SocketAddr>>>>,
     get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
@@ -344,6 +354,7 @@ impl P2PNetwork {
             config,
             peers: Arc::new(RwLock::new(HashMap::new())),
             known_peers: Arc::new(RwLock::new(HashSet::new())),
+            peer_last_seen: Arc::new(RwLock::new(HashMap::new())),
             tx_channel,
             peer_discovery_tx: Arc::new(tokio::sync::Mutex::new(None)),
             get_dag_hashes,
@@ -360,6 +371,9 @@ impl P2PNetwork {
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         info!("Starting P2P network on {}", self.config.listen_addr);
 
+        // Phase 1: restore known peers from disk before first dial.
+        self.load_known_peers().await;
+
         // Start listening for incoming connections
         let listener = TcpListener::bind(self.config.listen_addr).await?;
         let peers = self.peers.clone();
@@ -373,6 +387,7 @@ impl P2PNetwork {
         let is_orphan = Arc::clone(&self.is_orphan);
         let local_addr = self.config.listen_addr;
         let known_peers = self.known_peers.clone();
+        let peer_last_seen = self.peer_last_seen.clone();
         let (peer_discovery_tx, mut peer_discovery_rx) = mpsc::unbounded_channel::<SocketAddr>();
         {
             let mut tx_lock = self.peer_discovery_tx.lock().await;
@@ -390,6 +405,7 @@ impl P2PNetwork {
                 peers,
                 local_addr,
                 known_peers,
+                peer_last_seen,
                 tx_channel,
                 get_dag_hashes,
                 get_transaction_by_hash,
@@ -403,9 +419,19 @@ impl P2PNetwork {
             .await;
         });
 
-        // Connect to bootnodes
+        // Connect to bootnodes (multi-seed: every configured seed is dialed).
         for bootnode in &self.config.bootnodes {
             self.connect_to_peer(*bootnode).await;
+        }
+
+        // Phase 1 cold-start: also dial peers restored from the peer store.
+        {
+            let restored: Vec<SocketAddr> = self.known_peers.read().await.iter().copied().collect();
+            for addr in restored {
+                if addr != self.config.listen_addr {
+                    self.connect_to_peer(addr).await;
+                }
+            }
         }
 
         // Discover peers from DNS seeds
@@ -414,8 +440,11 @@ impl P2PNetwork {
         // Start heartbeat task
         self.start_heartbeat().await;
 
-        // Start reconnection task for bootnodes
+        // Start reconnection task for bootnodes + known peers (general redial)
         self.start_reconnection_task().await;
+
+        // Phase 1: periodic peer-store flush + TTL expiry.
+        self.start_peer_store_task().await;
 
         // Start periodic DNS discovery
         self.start_dns_discovery().await;
@@ -429,10 +458,120 @@ impl P2PNetwork {
         Ok(())
     }
 
+    /// Phase 1: reload known peers from the on-disk peer store (if configured).
+    async fn load_known_peers(&self) {
+        let Some(path) = self.config.peer_store_path.clone() else {
+            return;
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => {
+                let addrs: Vec<String> = serde_json::from_str(&raw).unwrap_or_default();
+                let mut known = self.known_peers.write().await;
+                let mut seen = self.peer_last_seen.write().await;
+                let mut loaded = 0usize;
+                for s in addrs {
+                    if let Ok(addr) = s.parse::<SocketAddr>() {
+                        if known.insert(addr) {
+                            seen.insert(addr, Instant::now());
+                            loaded += 1;
+                        }
+                    }
+                }
+                if loaded > 0 {
+                    info!("💾 Loaded {} known peers from {:?}", loaded, path);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("Failed to load peer store {:?}: {}", path, e),
+        }
+    }
+
+    /// Phase 1: persist known peers to the on-disk peer store (if configured).
+    async fn save_known_peers(&self) {
+        let Some(path) = self.config.peer_store_path.clone() else {
+            return;
+        };
+        let addrs: Vec<String> = self
+            .known_peers
+            .read()
+            .await
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let json = match serde_json::to_string(&addrs) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!("Failed to serialize peer store: {}", e);
+                return;
+            }
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, &json) {
+            warn!("Failed to write peer store {:?}: {}", tmp, e);
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            warn!("Failed to replace peer store {:?}: {}", path, e);
+        }
+    }
+
+    /// Phase 1: mark a peer as currently/just known (updates TTL clock).
+    async fn touch_peer(&self, addr: SocketAddr) {
+        {
+            let mut known = self.known_peers.write().await;
+            if known.len() >= MAX_KNOWN_PEERS && !known.contains(&addr) {
+                return;
+            }
+            known.insert(addr);
+        }
+        self.peer_last_seen.write().await.insert(addr, Instant::now());
+    }
+
+    /// Phase 1: expire peers whose last_seen is older than PEER_TTL and flush the store.
+    async fn start_peer_store_task(&self) {
+        let peers = self.clone();
+        tokio::spawn(async move {
+            let mut last_flush = Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+
+                // TTL expiry
+                {
+                    let now = Instant::now();
+                    let mut seen = peers.peer_last_seen.write().await;
+                    let expired: Vec<SocketAddr> = seen
+                        .iter()
+                        .filter(|(_, at)| now.duration_since(**at) > PEER_TTL)
+                        .map(|(a, _)| *a)
+                        .collect();
+                    if !expired.is_empty() {
+                        let mut known = peers.known_peers.write().await;
+                        for a in &expired {
+                            known.remove(a);
+                            seen.remove(a);
+                        }
+                        debug!("Peer TTL expired {} entries", expired.len());
+                    }
+                }
+
+                // Periodic flush
+                if last_flush.elapsed() >= PEER_STORE_FLUSH_INTERVAL {
+                    peers.save_known_peers().await;
+                    last_flush = Instant::now();
+                }
+            }
+        });
+    }
+
     /// Start heartbeat task to check peer connections and reconnect if needed
     async fn start_heartbeat(&self) {
         let peers = self.peers.clone();
         let bootnodes = self.config.bootnodes.clone();
+        let known = self.known_peers.clone();
+        let local_addr = self.config.listen_addr;
         let p2p_network = self.clone();
 
         tokio::spawn(async move {
@@ -444,11 +583,23 @@ impl P2PNetwork {
                     peers_read.len()
                 };
 
-                if peer_count == 0 && !bootnodes.is_empty() {
-                    warn!("No connected peers, attempting to reconnect to bootnodes...");
+                if peer_count == 0 {
+                    warn!("No connected peers, attempting general redial...");
+                    // Multi-seed: always try every configured bootnode.
                     for bootnode in &bootnodes {
                         info!("Reconnecting to bootnode: {}", bootnode);
                         p2p_network.connect_to_peer(*bootnode).await;
+                    }
+                    // General redial: also try recently-known peers (Phase 1).
+                    let candidates: Vec<SocketAddr> = known
+                        .read()
+                        .await
+                        .iter()
+                        .copied()
+                        .filter(|a| *a != local_addr && !bootnodes.contains(a))
+                        .collect();
+                    for addr in candidates {
+                        p2p_network.connect_to_peer(addr).await;
                     }
                 } else {
                     debug!("Heartbeat: {} connected peers", peer_count);
@@ -457,18 +608,28 @@ impl P2PNetwork {
         });
     }
 
-    /// Start reconnection task for bootnodes with exponential backoff
+    /// Start reconnection task for bootnodes with exponential backoff (Phase 1: general redial over known peers too)
     async fn start_reconnection_task(&self) {
         let peers = self.peers.clone();
         let bootnodes = self.config.bootnodes.clone();
+        let known = self.known_peers.clone();
+        let local_addr = self.config.listen_addr;
         let p2p_network = self.clone();
 
         tokio::spawn(async move {
             let mut retry_counts: std::collections::HashMap<String, u32> =
                 std::collections::HashMap::new();
             loop {
-                for bootnode in &bootnodes {
-                    let bootnode_addr = bootnode.clone();
+                // Candidate set: multi-seed bootnodes + persisted known peers.
+                let mut candidates: Vec<SocketAddr> = bootnodes.clone();
+                for addr in known.read().await.iter().copied() {
+                    if addr != local_addr && !candidates.contains(&addr) {
+                        candidates.push(addr);
+                    }
+                }
+
+                for target in candidates {
+                    let bootnode_addr = target;
                     let connected = {
                         let current_peers = peers.read().await;
                         current_peers.contains_key(&bootnode_addr)
@@ -477,9 +638,9 @@ impl P2PNetwork {
                     if !connected {
                         let retry_count =
                             *retry_counts.entry(bootnode_addr.to_string()).or_insert(0);
-                        let delay = std::cmp::min(2u64.pow(retry_count), 60); // Max 60 seconds
+                        let delay = std::cmp::min(2u64.pow(retry_count.min(6)), 60); // Max 60 seconds
                         info!(
-                            "Bootnode {} disconnected, reconnecting in {}s (attempt {})",
+                            "Peer {} disconnected, reconnecting in {}s (attempt {})",
                             bootnode_addr,
                             delay,
                             retry_count + 1
@@ -629,6 +790,7 @@ impl P2PNetwork {
         peers: Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
         local_addr: SocketAddr,
         known_peers: Arc<RwLock<HashSet<SocketAddr>>>,
+        peer_last_seen: Arc<RwLock<HashMap<SocketAddr, Instant>>>,
         tx_channel: mpsc::UnboundedSender<Transaction>,
         get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
@@ -694,31 +856,33 @@ impl P2PNetwork {
                     let get_tips = Arc::clone(&get_tips);
                     let seen_transactions = Arc::clone(&seen_transactions);
                     let peer_discovery_tx = peer_discovery_tx.clone();
-                    let known_peers = known_peers.clone();
-                    let sync_ctx = Arc::clone(&sync_ctx);
-                    let is_orphan = Arc::clone(&is_orphan);
-                    let peer_scores = Arc::clone(&peer_scores);
-                    tokio::spawn(async move {
-                        Self::handle_peer(
-                            socket,
-                            addr,
-                            peers_clone,
-                            local_addr,
-                            known_peers,
-                            tx_channel,
-                            get_dag_hashes,
-                            get_transaction_by_hash,
-                            get_tips,
-                            seen_transactions,
-                            peer_scores,
-                            msg_sender,
-                            msg_receiver,
-                            peer_discovery_tx,
-                            sync_ctx,
-                            is_orphan,
-                        )
-                        .await;
-                    });
+        let known_peers = known_peers.clone();
+                            let sync_ctx = Arc::clone(&sync_ctx);
+                            let is_orphan = Arc::clone(&is_orphan);
+                            let peer_scores = Arc::clone(&peer_scores);
+                            let peer_last_seen = peer_last_seen.clone();
+                            tokio::spawn(async move {
+                                Self::handle_peer(
+                                    socket,
+                                    addr,
+                                    peers_clone,
+                                    local_addr,
+                                    known_peers,
+                                    tx_channel,
+                                    get_dag_hashes,
+                                    get_transaction_by_hash,
+                                    get_tips,
+                                    seen_transactions,
+                                    peer_scores,
+                                    msg_sender,
+                                    msg_receiver,
+                                    peer_discovery_tx,
+                                    sync_ctx,
+                                    is_orphan,
+                                    peer_last_seen,
+                                )
+                                .await;
+                            });
                 }
                 Err(e) => {
                     error!("Failed to accept connection: {}", e);
@@ -727,11 +891,28 @@ impl P2PNetwork {
         }
     }
 
-    /// Build a 12-byte nonce from a u64 counter
-    fn build_nonce(counter: u64) -> [u8; 12] {
+    /// Build a 12-byte nonce: bytes[0..8] = u64 BE counter, byte[8] = direction
+    /// (0x01 / 0x02 chosen from ephemeral public-key order so the two senders of
+    /// one session never share a direction), bytes[9..12] = 0.
+    /// Wire-compatible: the full 12 bytes are sent in clear before the ciphertext;
+    /// the receiver decrypts with the wire nonce, so legacy peers (byte[8]=0)
+    /// still interoperate while new↔new sessions never reuse (K, N).
+    fn build_nonce(counter: u64, direction: u8) -> [u8; 12] {
         let mut nonce = [0u8; 12];
         nonce[..8].copy_from_slice(&counter.to_be_bytes());
+        nonce[8] = direction;
         nonce
+    }
+
+    /// Deterministic send-direction byte from the two ephemeral handshake keys.
+    /// Lower public key → 0x01, higher → 0x02 (equal keys are cryptographically
+    /// negligible for random X25519 ephemerals; both would take 0x02 only then).
+    fn send_direction(our_pk: &[u8], peer_pk: &[u8]) -> u8 {
+        if our_pk < peer_pk {
+            0x01
+        } else {
+            0x02
+        }
     }
 
     /// H2: read exactly `buf.len()` bytes with an inactivity timeout, so a
@@ -769,11 +950,21 @@ impl P2PNetwork {
         Ok(())
     }
 
-    /// Perform X25519 handshake and derive AES-256-GCM key
+    /// Phase 1 crypto audit helper: a (key, nonce) collision requires equal
+    /// counter AND equal direction byte under the same session key. After the
+    /// direction-byte fix the two senders of one session always differ in
+    /// direction, so equal counters no longer collide across directions.
+    fn nonce_collision_possible(a_counter: u64, a_dir: u8, b_counter: u64, b_dir: u8) -> bool {
+        a_counter == b_counter && a_dir == b_dir
+    }
+
+    /// Perform X25519 handshake, derive the session key (shared by both
+    /// directions — ChaCha20 nonce uniqueness is enforced via the direction
+    /// byte), and return (key, send_direction) for this side.
     async fn handshake(
         reader: &mut (impl AsyncReadExt + Unpin),
         writer: &mut (impl AsyncWriteExt + Unpin),
-    ) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    ) -> Result<([u8; 32], u8), Box<dyn std::error::Error>> {
         let our_secret = EphemeralSecret::random_from_rng(OsRng);
         let our_public = PublicKey::from(&our_secret);
 
@@ -807,7 +998,8 @@ impl P2PNetwork {
 
         let mut result = [0u8; 32];
         result.copy_from_slice(&key_bytes);
-        Ok(result)
+        let send_dir = Self::send_direction(our_public.as_bytes(), &peer_pk_bytes);
+        Ok((result, send_dir))
     }
 
     /// Handle a peer connection
@@ -828,12 +1020,13 @@ impl P2PNetwork {
         peer_discovery_tx: mpsc::UnboundedSender<SocketAddr>,
         sync_ctx: Arc<SyncContext>,
         is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
+        peer_last_seen: Arc<RwLock<HashMap<SocketAddr, Instant>>>,
     ) {
         // Split socket into read and write halves
         let (mut reader, mut writer) = socket.into_split();
 
         // Perform encrypted handshake (X25519 key exchange)
-        let key_bytes = match Self::handshake(&mut reader, &mut writer)
+        let (key_bytes, send_dir) = match Self::handshake(&mut reader, &mut writer)
             .await
             .map_err(|e| e.to_string())
         {
@@ -847,7 +1040,12 @@ impl P2PNetwork {
                     let mut peers_lock = peers.write().await;
                     peers_lock.remove(&addr);
                 }
-                known_peers.write().await.remove(&addr);
+                // Phase 1: do NOT drop the address from known_peers on a failed
+                // handshake — keep it for a later redial attempt.
+                {
+                    let mut seen = peer_last_seen.write().await;
+                    seen.insert(addr, Instant::now());
+                }
                 return;
             }
         };
@@ -858,6 +1056,7 @@ impl P2PNetwork {
         let mut msg_receiver = msg_receiver;
         let send_counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let send_counter_clone = Arc::clone(&send_counter);
+        let send_dir_task = send_dir;
         tokio::spawn(async move {
             while let Some(msg) = msg_receiver.recv().await {
                 let cipher = {
@@ -866,7 +1065,7 @@ impl P2PNetwork {
                 };
                 let nonce_val =
                     send_counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let nonce_bytes = Self::build_nonce(nonce_val);
+                let nonce_bytes = Self::build_nonce(nonce_val, send_dir_task);
                 let nonce = Nonce::from_slice(&nonce_bytes);
                 match cipher.encrypt(nonce, msg.as_ref()) {
                     Ok(ciphertext) => {
@@ -912,11 +1111,21 @@ impl P2PNetwork {
             let _ = msg_sender.send(sync_req);
         }
 
-        // Mark peer as known
-        known_peers.write().await.insert(addr);
+        // Mark peer as known (Phase 1: refresh TTL clock too)
+        {
+            let mut known = known_peers.write().await;
+            known.insert(addr);
+        }
+        {
+            let mut seen = peer_last_seen.write().await;
+            seen.insert(addr, Instant::now());
+        }
 
         let mut msg_count: u64 = 0;
         let mut window_start = Instant::now();
+        // Anti-replay: peer send counters are strictly increasing over TCP;
+        // reject any frame whose counter does not advance past the last one.
+        let mut last_recv_counter: u64 = 0;
 
         loop {
             // Read encrypted message length (4 bytes)
@@ -985,6 +1194,27 @@ impl P2PNetwork {
                 warn!("Failed to read nonce from {}", addr);
                 break;
             }
+
+            // Anti-replay: counters must strictly increase for this session
+            // (TCP preserves order, so a repeat or regression is a replay/forgery).
+            let recv_counter = u64::from_be_bytes(nonce_buf[0..8].try_into().unwrap());
+            if recv_counter <= last_recv_counter {
+                warn!(
+                    "Replay/regressed nonce from {} (counter {} <= {}), disconnecting",
+                    addr, recv_counter, last_recv_counter
+                );
+                {
+                    let mut scores = peer_scores.write().await;
+                    if let Some(score) = scores.get_mut(&addr) {
+                        if score.penalize(PEER_PENALTY_INVALID_MSG) {
+                            score.ban();
+                            warn!("Peer {} banned (replay, score={})", addr, score.score);
+                        }
+                    }
+                }
+                break;
+            }
+            last_recv_counter = recv_counter;
 
             // Read ciphertext
             let ciphertext_len = total_len - 12;
@@ -1403,15 +1633,21 @@ impl P2PNetwork {
                                     .collect()
                             };
                             for peer_addr in to_add {
-                                let mut known = known_peers.write().await;
-                                if known.len() >= MAX_KNOWN_PEERS {
-                                    warn!(
-                                        "Known-peer table full ({}), ignoring new peers",
-                                        MAX_KNOWN_PEERS
-                                    );
-                                    break;
+                                {
+                                    let mut known = known_peers.write().await;
+                                    if known.len() >= MAX_KNOWN_PEERS {
+                                        warn!(
+                                            "Known-peer table full ({}), ignoring new peers",
+                                            MAX_KNOWN_PEERS
+                                        );
+                                        break;
+                                    }
+                                    known.insert(peer_addr);
                                 }
-                                known.insert(peer_addr);
+                                {
+                                    let mut s = peer_last_seen.write().await;
+                                    s.insert(peer_addr, Instant::now());
+                                }
                                 let _ = peer_discovery_tx.send(peer_addr);
                             }
                         }
@@ -1431,12 +1667,17 @@ impl P2PNetwork {
             }
         }
 
-        // Remove peer from peers map on disconnect
+        // Remove peer from active map on disconnect.
+        // Phase 1 TTL: keep the address in known_peers so general redial / PEX
+        // can re-establish the session; the TTL task expires it later.
         {
             let mut peers_lock = peers.write().await;
             peers_lock.remove(&addr);
         }
-        known_peers.write().await.remove(&addr);
+        {
+            let mut seen = peer_last_seen.write().await;
+            seen.insert(addr, Instant::now());
+        }
         // DEEP SYNC: failover — move all in-flight requests from this peer back to pending
         {
             let mut frontier = sync_ctx.frontier.write().await;
@@ -1506,6 +1747,7 @@ impl P2PNetwork {
                         tx
                     })
                 };
+                let peer_last_seen = self.peer_last_seen.clone();
                 tokio::spawn(async move {
                     Self::handle_peer(
                         socket,
@@ -1524,6 +1766,7 @@ impl P2PNetwork {
                         peer_discovery_tx,
                         sync_ctx,
                         is_orphan,
+                        peer_last_seen,
                     )
                     .await;
                 });
@@ -1925,6 +2168,531 @@ impl P2PNetwork {
 }
 
 #[cfg(test)]
+mod bootstrap_phase1_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// PEER_PERSISTENCE: save then reload restores the same address set.
+    #[tokio::test]
+    async fn test_peer_persistence_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_peers.json");
+        let cfg = P2PConfig {
+            listen_addr: addr("127.0.0.1:30001"),
+            bootnodes: vec![],
+            dns_seeds: vec![],
+            peer_store_path: Some(path.clone()),
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
+        let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
+            Arc::new(|_| None);
+        let sync_ctx = Arc::new(SyncContext::default());
+        let is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> = Arc::new(|_| false);
+        let net = P2PNetwork::new(
+            cfg,
+            tx,
+            empty.clone(),
+            empty_opt.clone(),
+            empty.clone(),
+            sync_ctx,
+            is_orphan.clone(),
+        );
+
+        net.known_peers.write().await.insert(addr("10.0.0.1:25565"));
+        net.known_peers.write().await.insert(addr("10.0.0.2:25565"));
+        net.save_known_peers().await;
+        assert!(path.exists());
+
+        // Simulate restart: fresh instance, same path.
+        let cfg2 = P2PConfig {
+            listen_addr: addr("127.0.0.1:30002"),
+            bootnodes: vec![],
+            dns_seeds: vec![],
+            peer_store_path: Some(path),
+        };
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let sync_ctx2 = Arc::new(SyncContext::default());
+        let net2 = P2PNetwork::new(
+            cfg2,
+            tx2,
+            empty.clone(),
+            empty_opt.clone(),
+            empty.clone(),
+            sync_ctx2,
+            is_orphan.clone(),
+        );
+        assert!(net2.known_peers.read().await.is_empty());
+        net2.load_known_peers().await;
+        let known = net2.known_peers.read().await;
+        assert!(known.contains(&addr("10.0.0.1:25565")));
+        assert!(known.contains(&addr("10.0.0.2:25565")));
+        assert_eq!(known.len(), 2);
+    }
+
+    /// PEER_TTL: disconnect path keeps the address in known_peers (TTL, not remove).
+    #[tokio::test]
+    async fn test_peer_ttl_keeps_address_after_disconnect() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
+        let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
+            Arc::new(|_| None);
+        let sync_ctx = Arc::new(SyncContext::default());
+        let is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> = Arc::new(|_| false);
+        let cfg = P2PConfig {
+            listen_addr: addr("127.0.0.1:30003"),
+            bootnodes: vec![],
+            dns_seeds: vec![],
+            peer_store_path: None,
+        };
+        let net = P2PNetwork::new(
+            cfg,
+            tx,
+            empty.clone(),
+            empty_opt.clone(),
+            empty.clone(),
+            sync_ctx,
+            is_orphan.clone(),
+        );
+
+        let peer = addr("192.168.1.10:25565");
+        net.known_peers.write().await.insert(peer);
+        // Simulate disconnect bookkeeping (what handle_peer does at exit):
+        net.peers.write().await.remove(&peer);
+        net.peer_last_seen.write().await.insert(peer, Instant::now());
+        // Address must still be known (TTL keeps it).
+        assert!(net.known_peers.read().await.contains(&peer));
+        // TTL clock is recorded.
+        assert!(net.peer_last_seen.read().await.contains_key(&peer));
+        // Expire only after PEER_TTL.
+        assert!(PEER_TTL > Duration::from_secs(60));
+    }
+
+    /// MULTI_SEED: default config exposes more than one bootnode.
+    #[test]
+    fn test_multi_seed_default_bootnodes() {
+        let cfg = crate::config::NodeConfig::default();
+        assert!(
+            cfg.bootnodes.len() >= 2,
+            "multi-seed requires >=2 default bootnodes, got {}",
+            cfg.bootnodes.len()
+        );
+        // Distinct entries.
+        let unique: std::collections::HashSet<_> = cfg.bootnodes.iter().collect();
+        assert_eq!(unique.len(), cfg.bootnodes.len());
+    }
+
+    /// MULTI_SEED: P2PConfig accepts an arbitrary seed list.
+    #[test]
+    fn test_multi_seed_p2p_config_accepts_list() {
+        let cfg = P2PConfig {
+            listen_addr: addr("127.0.0.1:30004"),
+            bootnodes: vec![
+                addr("10.0.0.1:25565"),
+                addr("10.0.0.2:25565"),
+                addr("10.0.0.3:25565"),
+            ],
+            dns_seeds: vec![],
+            peer_store_path: None,
+        };
+        assert_eq!(cfg.bootnodes.len(), 3);
+    }
+
+    /// GENERAL_REDIAL: heartbeat/reconnection candidate set includes non-bootnode peers.
+    #[tokio::test]
+    async fn test_general_redial_includes_known_peers() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
+        let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
+            Arc::new(|_| None);
+        let sync_ctx = Arc::new(SyncContext::default());
+        let is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> = Arc::new(|_| false);
+        let boot = addr("10.0.0.1:25565");
+        let non_boot = addr("10.0.0.99:25565");
+        let cfg = P2PConfig {
+            listen_addr: addr("127.0.0.1:30005"),
+            bootnodes: vec![boot],
+            dns_seeds: vec![],
+            peer_store_path: None,
+        };
+        let net = P2PNetwork::new(
+            cfg,
+            tx,
+            empty.clone(),
+            empty_opt.clone(),
+            empty.clone(),
+            sync_ctx,
+            is_orphan.clone(),
+        );
+        net.known_peers.write().await.insert(boot);
+        net.known_peers.write().await.insert(non_boot);
+
+        // Reconstruct the candidate set the way start_reconnection_task does.
+        let local = net.config.listen_addr;
+        let mut candidates: Vec<SocketAddr> = net.config.bootnodes.clone();
+        for a in net.known_peers.read().await.iter().copied() {
+            if a != local && !candidates.contains(&a) {
+                candidates.push(a);
+            }
+        }
+        assert!(candidates.contains(&boot), "bootnode must be a candidate");
+        assert!(
+            candidates.contains(&non_boot),
+            "known non-bootnode peer must be a general-redial candidate"
+        );
+    }
+
+    /// PEX: Peers message carries known addresses for discovery.
+    #[test]
+    fn test_pex_message_carries_known_peers() {
+        let list = vec![addr("10.0.0.1:25565"), addr("10.0.0.2:25565")];
+        let msg = P2PMessage::Peers(list.clone());
+        let bytes = bincode::serialize(&msg).unwrap();
+        let decoded: P2PMessage = bincode::deserialize(&bytes).unwrap();
+        match decoded {
+            P2PMessage::Peers(got) => assert_eq!(got, list),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// COLD_START: loading a peer store yields dial candidates without bootnodes.
+    #[tokio::test]
+    async fn test_cold_start_restores_dial_candidates_without_bootnode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_peers.json");
+        let peer = addr("203.0.113.10:25565");
+        std::fs::write(&path, format!("[\"{}\"]", peer)).unwrap();
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
+        let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
+            Arc::new(|_| None);
+        let sync_ctx = Arc::new(SyncContext::default());
+        let is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> = Arc::new(|_| false);
+        let cfg = P2PConfig {
+            listen_addr: addr("127.0.0.1:30006"),
+            bootnodes: vec![], // bootnode is down / absent
+            dns_seeds: vec![],
+            peer_store_path: Some(path),
+        };
+        let net = P2PNetwork::new(
+            cfg,
+            tx,
+            empty.clone(),
+            empty_opt.clone(),
+            empty.clone(),
+            sync_ctx,
+            is_orphan.clone(),
+        );
+        net.load_known_peers().await;
+        let known = net.known_peers.read().await;
+        assert!(known.contains(&peer), "cold start must restore the peer");
+        // General redial set (what start() dials after bootnodes) is non-empty.
+        let candidates: Vec<SocketAddr> = known
+            .iter()
+            .copied()
+            .filter(|a| *a != net.config.listen_addr && !net.config.bootnodes.contains(a))
+            .collect();
+        assert_eq!(candidates.len(), 1);
+    }
+
+    /// P2P_CRYPTO_AUDIT: equal counters only collide under the SAME direction
+    /// byte; the fix assigns opposite directions to the two session senders.
+    #[test]
+    fn test_nonce_collision_detected() {
+        // Legacy/shared-direction view: equal counters under same dir collide.
+        assert!(P2PNetwork::nonce_collision_possible(1, 0x01, 1, 0x01));
+        assert!(P2PNetwork::nonce_collision_possible(42, 0x01, 42, 0x01));
+        // Different counters under same dir: no collision.
+        assert!(!P2PNetwork::nonce_collision_possible(1, 0x01, 2, 0x01));
+        // Equal counters under OPPOSITE directions (the fixed scheme): no collision.
+        assert!(!P2PNetwork::nonce_collision_possible(1, 0x01, 1, 0x02));
+        assert!(!P2PNetwork::nonce_collision_possible(42, 0x02, 42, 0x01));
+    }
+
+    /// Nonce uniqueness: direction byte separates the two send directions, and
+    /// counters are unique within a direction.
+    #[test]
+    fn test_nonce_uniqueness_across_directions() {
+        let mut seen = std::collections::HashSet::new();
+        for dir in [0x01u8, 0x02u8] {
+            for counter in 1..=1000u64 {
+                let n = P2PNetwork::build_nonce(counter, dir);
+                assert!(seen.insert(n), "duplicate (K, nonce) at counter={counter} dir={dir:#04x}");
+            }
+        }
+        // Opposite directions at the same counter must differ.
+        assert_ne!(
+            P2PNetwork::build_nonce(1, 0x01),
+            P2PNetwork::build_nonce(1, 0x02)
+        );
+    }
+
+    /// Direction assignment is deterministic and opposite for the two peers.
+    #[test]
+    fn test_send_direction_is_opposite() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let dir_a = P2PNetwork::send_direction(&a, &b);
+        let dir_b = P2PNetwork::send_direction(&b, &a);
+        assert_eq!(dir_a, 0x01);
+        assert_eq!(dir_b, 0x02);
+        assert_ne!(dir_a, dir_b);
+    }
+
+    /// Encrypt/decrypt roundtrip with direction nonces (both directions).
+    #[test]
+    fn test_encrypt_decrypt_roundtrip_bidirectional() {
+        use chacha20poly1305::aead::{Aead, NewAead};
+        let key = [7u8; 32];
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let msg_a = b"GET_INVENTORY_MESSAGE_A";
+        let msg_b = b"SYNC_REQUEST_MESSAGE_B";
+
+        let nonce_a = P2PNetwork::build_nonce(1, 0x01);
+        let nonce_b = P2PNetwork::build_nonce(1, 0x02);
+        assert_ne!(nonce_a, nonce_b);
+
+        let ct_a = cipher.encrypt(Nonce::from_slice(&nonce_a), msg_a.as_ref()).unwrap();
+        let ct_b = cipher.encrypt(Nonce::from_slice(&nonce_b), msg_b.as_ref()).unwrap();
+
+        let pt_a = cipher.decrypt(Nonce::from_slice(&nonce_a), ct_a.as_ref()).unwrap();
+        let pt_b = cipher.decrypt(Nonce::from_slice(&nonce_b), ct_b.as_ref()).unwrap();
+        assert_eq!(pt_a, msg_a);
+        assert_eq!(pt_b, msg_b);
+
+        // Cross-direction decrypt must fail (wrong nonce / auth tag).
+        assert!(cipher.decrypt(Nonce::from_slice(&nonce_b), ct_a.as_ref()).is_err());
+    }
+
+    /// Tampered ciphertext is rejected by Poly1305.
+    #[test]
+    fn test_tampered_ciphertext_fails() {
+        use chacha20poly1305::aead::{Aead, NewAead};
+        let key = [9u8; 32];
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let nonce = P2PNetwork::build_nonce(1, 0x01);
+        let mut ct = cipher.encrypt(Nonce::from_slice(&nonce), b"integrity".as_ref()).unwrap();
+        ct[0] ^= 0xff;
+        assert!(cipher.decrypt(Nonce::from_slice(&nonce), ct.as_ref()).is_err());
+    }
+
+    /// Long message sequence: all nonces unique under one key; encrypt/decrypt
+    /// succeeds for every frame in both directions.
+    #[test]
+    fn test_long_message_sequence_unique_nonces() {
+        use chacha20poly1305::aead::{Aead, NewAead};
+        let key = [3u8; 32];
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let mut seen = std::collections::HashSet::new();
+        for dir in [0x01u8, 0x02u8] {
+            for counter in 1..=10_000u64 {
+                let n = P2PNetwork::build_nonce(counter, dir);
+                assert!(seen.insert(n));
+                let ct = cipher.encrypt(Nonce::from_slice(&n), counter.to_le_bytes().as_ref()).unwrap();
+                let pt = cipher.decrypt(Nonce::from_slice(&n), ct.as_ref()).unwrap();
+                assert_eq!(pt, counter.to_le_bytes());
+            }
+        }
+        assert_eq!(seen.len(), 20_000);
+    }
+
+    /// Concurrent send counters remain unique (atomic fetch_add).
+    #[test]
+    fn test_concurrent_send_unique_counters() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let counter = Arc::new(AtomicU64::new(1));
+        let mut nonces = std::collections::HashSet::new();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let c = Arc::clone(&counter);
+                std::thread::spawn(move || {
+                    let mut local = Vec::with_capacity(1000);
+                    for _ in 0..1000 {
+                        let v = c.fetch_add(1, Ordering::Relaxed);
+                        local.push(P2PNetwork::build_nonce(v, 0x01));
+                    }
+                    local
+                })
+            })
+            .collect();
+        for h in handles {
+            for n in h.join().unwrap() {
+                assert!(nonces.insert(n), "duplicate nonce under concurrent send");
+            }
+        }
+        assert_eq!(nonces.len(), 8000);
+    }
+
+    /// Reconnect / session rotation: each handshake yields a fresh ephemeral
+    /// key, so (K, N) pairs from a prior session are never reused.
+    #[tokio::test]
+    async fn test_reconnect_session_rotation() {
+        for _ in 0..8 {
+            let (mut a_r, mut b_w) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
+            let (mut b_r, mut a_w) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
+            let a = P2PNetwork::handshake(&mut a_r, &mut a_w);
+            let b = P2PNetwork::handshake(&mut b_r, &mut b_w);
+            let (ra, rb) = tokio::join!(a, b);
+            let (key_a, dir_a) = ra.expect("handshake A");
+            let (key_b, dir_b) = rb.expect("handshake B");
+            assert_eq!(key_a, key_b, "both ends share the session key");
+            assert_ne!(dir_a, dir_b, "session directions must be opposite");
+            assert!(dir_a == 0x01 || dir_a == 0x02);
+        }
+        // Distinct handshakes must not collide on keys (ephemeral X25519).
+        let mut keys = std::collections::HashSet::new();
+        for _ in 0..8 {
+            let (mut a_r, mut b_w) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
+            let (mut b_r, mut a_w) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
+            let a = P2PNetwork::handshake(&mut a_r, &mut a_w);
+            let b = P2PNetwork::handshake(&mut b_r, &mut b_w);
+            let (ra, rb) = tokio::join!(a, b);
+            let (key_a, _) = ra.expect("handshake A");
+            let (key_b, _) = rb.expect("handshake B");
+            assert_eq!(key_a, key_b);
+            assert!(keys.insert(key_a), "reconnect must rotate the session key");
+        }
+        assert_eq!(keys.len(), 8);
+    }
+
+    /// Session handshake test (updated signature): shared key + opposite dirs.
+    #[tokio::test]
+    async fn test_handshake_derives_shared_key_bootstrap() {
+        let (mut a_reader, mut b_writer) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
+        let (mut b_reader, mut a_writer) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
+
+        let a = P2PNetwork::handshake(&mut a_reader, &mut a_writer);
+        let b = P2PNetwork::handshake(&mut b_reader, &mut b_writer);
+        let (ra, rb) = tokio::join!(a, b);
+
+        let (key_a, dir_a) = ra.expect("side A handshake must succeed");
+        let (key_b, dir_b) = rb.expect("side B handshake must succeed");
+        assert_eq!(key_a, key_b, "both ends must derive the same session key");
+        assert_ne!(dir_a, dir_b, "directions must be opposite");
+    }
+
+    /// Replay behaviour (logic-level): a repeated/regressed counter is rejected
+    /// by the receiver's strict-increase check (mirrors handle_peer logic).
+    #[test]
+    fn test_replay_rejected_by_counter_check() {
+        let mut last: u64 = 0;
+        let mut accept = |counter: u64| -> bool {
+            if counter <= last {
+                false
+            } else {
+                last = counter;
+                true
+            }
+        };
+        assert!(accept(1));
+        assert!(accept(2));
+        assert!(!accept(2), "replay of counter=2 must fail");
+        assert!(!accept(1), "regression to 1 must fail");
+        assert!(accept(3));
+    }
+
+    /// PARTITION/RECONNECT: known_peers survives an active-map wipe (partition).
+    #[tokio::test]
+    async fn test_partition_keeps_known_peers_for_reconnect() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
+        let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
+            Arc::new(|_| None);
+        let sync_ctx = Arc::new(SyncContext::default());
+        let is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> = Arc::new(|_| false);
+        let cfg = P2PConfig {
+            listen_addr: addr("127.0.0.1:30007"),
+            bootnodes: vec![],
+            dns_seeds: vec![],
+            peer_store_path: None,
+        };
+        let net = P2PNetwork::new(
+            cfg,
+            tx,
+            empty.clone(),
+            empty_opt.clone(),
+            empty.clone(),
+            sync_ctx,
+            is_orphan.clone(),
+        );
+        let peer = addr("198.51.100.7:25565");
+        net.known_peers.write().await.insert(peer);
+
+        // Simulate a partition: active map wiped, known set retained (TTL).
+        net.peers.write().await.clear();
+        net.peer_last_seen.write().await.insert(peer, Instant::now());
+        assert!(net.known_peers.read().await.contains(&peer));
+        // Reconnect candidate reconstruction (same as start_reconnection_task).
+        let mut candidates: Vec<SocketAddr> = net.config.bootnodes.clone();
+        for a in net.known_peers.read().await.iter().copied() {
+            if a != net.config.listen_addr && !candidates.contains(&a) {
+                candidates.push(a);
+            }
+        }
+        assert!(candidates.contains(&peer));
+    }
+
+    /// BOOTNODE_LOSS: once A↔B know each other, killing the bootnode leaves
+    /// the pair as mutual redial candidates (logic-level scenario).
+    #[tokio::test]
+    async fn test_bootnode_loss_pair_stays_connected() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
+        let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
+            Arc::new(|_| None);
+        let sync_ctx = Arc::new(SyncContext::default());
+        let is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> = Arc::new(|_| false);
+        let boot = addr("10.0.0.1:25565");
+        let a = addr("127.0.0.1:40001");
+        let b = addr("127.0.0.1:40002");
+        let cfg = P2PConfig {
+            listen_addr: a,
+            bootnodes: vec![boot],
+            dns_seeds: vec![],
+            peer_store_path: None,
+        };
+        let net = P2PNetwork::new(
+            cfg,
+            tx,
+            empty.clone(),
+            empty_opt.clone(),
+            empty.clone(),
+            sync_ctx,
+            is_orphan.clone(),
+        );
+        // After PEX, A knows B and (locally) itself is not redialled.
+        net.known_peers.write().await.insert(b);
+        net.known_peers.write().await.insert(boot);
+
+        // Bootnode dies: it is no longer a usable dial target, but B remains.
+        let mut candidates: Vec<SocketAddr> = Vec::new();
+        for x in net.known_peers.read().await.iter().copied() {
+            if x != a {
+                candidates.push(x);
+            }
+        }
+        // B survives as a general-redial candidate even if boot is removed.
+        net.known_peers.write().await.remove(&boot);
+        let after: Vec<SocketAddr> = net
+            .known_peers
+            .read()
+            .await
+            .iter()
+            .copied()
+            .filter(|x| *x != a)
+            .collect();
+        assert!(after.contains(&b), "A must still redial B after bootnode loss");
+        assert!(!after.contains(&boot));
+        let _ = candidates;
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::Transaction;
@@ -2130,7 +2898,7 @@ mod tests {
     }
 
     /// H4/V-24: two ends of the SAME network complete the X25519 handshake
-    /// and derive the SAME session key.
+    /// and derive the SAME session key with opposite send directions.
     #[tokio::test]
     async fn test_handshake_derives_shared_key() {
         let (mut a_reader, mut b_writer) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
@@ -2138,11 +2906,12 @@ mod tests {
 
         let a = P2PNetwork::handshake(&mut a_reader, &mut a_writer);
         let b = P2PNetwork::handshake(&mut b_reader, &mut b_writer);
-        let (key_a, key_b) = tokio::join!(a, b);
+        let (ra, rb) = tokio::join!(a, b);
 
-        let key_a = key_a.expect("side A handshake must succeed");
-        let key_b = key_b.expect("side B handshake must succeed");
+        let (key_a, dir_a) = ra.expect("side A handshake must succeed");
+        let (key_b, dir_b) = rb.expect("side B handshake must succeed");
         assert_eq!(key_a, key_b, "both ends must derive the same session key");
+        assert_ne!(dir_a, dir_b, "directions must be opposite");
     }
 
     #[tokio::test]

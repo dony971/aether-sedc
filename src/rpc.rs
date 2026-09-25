@@ -1009,8 +1009,8 @@ impl AetherRpcImpl {
                 bytes
             }
             Err(e) => {
-                tracing::error!("❌ Reception - Erreur hex decode: {}", e);
-                tracing::error!("Données reçues: {}", tx_data);
+                tracing::error!("Reception - hex decode error: {}", e);
+                tracing::error!("Received data: {}", tx_data);
                 return Err(RpcError(format!("Invalid hex data: {}", e)));
             }
         };
@@ -1040,8 +1040,8 @@ impl AetherRpcImpl {
                 transaction
             }
             Err(e) => {
-                tracing::error!("❌ Parsing - Erreur deserialize: {}", e);
-                tracing::error!("Taille des données: {} bytes", tx_bytes.len());
+                tracing::error!("Parsing - deserialize error: {}", e);
+                tracing::error!("Data size: {} bytes", tx_bytes.len());
 
                 // Hex Dump of first 16 bytes for debugging
                 let hex_dump = if tx_bytes.len() >= 16 {
@@ -2950,6 +2950,7 @@ mod tests {
                 listen_addr: "0.0.0.0:0".parse().unwrap(),
                 bootnodes: vec![],
                 dns_seeds: vec![],
+                peer_store_path: None,
             },
             tx_channel,
             Arc::new(|| Vec::new()),

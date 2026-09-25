@@ -56,7 +56,14 @@ impl Default for NodeConfig {
             p2p_port: 25565,
             rpc_port: 9933,
             rpc_bind: "127.0.0.1".into(),
-            bootnodes: vec!["103.102.135.123:25565".to_string()],
+            // Multi-seed defaults (Phase 1): several independent entry points so
+            // the network does not depend on a single VPS. Operators can still
+            // override via --bootnodes / TOML.
+            bootnodes: vec![
+                "103.102.135.123:25565".to_string(),
+                "103.102.135.124:25565".to_string(),
+                "103.102.135.125:25565".to_string(),
+            ],
             dns_seeds: Vec::new(),
             miner_address: None,
             reset: false,
