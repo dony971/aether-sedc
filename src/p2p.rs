@@ -41,6 +41,11 @@ const PROTECTED_OUTBOUND_SLOTS: usize = 8;
 /// Maximum number of known peer addresses retained (PEX/DNS growth bound)
 const MAX_KNOWN_PEERS: usize = 1000;
 
+/// Maximum outbound dials attempted in a single reconnection cycle (Phase 2A).
+/// Without this a peer store full of dead addresses turns one cycle into an
+/// hours-long serial sweep; the budget lets the loop move on to the next cycle.
+const MAX_REDIAL_PER_CYCLE: usize = 32;
+
 /// Maximum entries in the seen-transaction cache (memory bound)
 const MAX_SEEN_TXS: usize = 50_000;
 
@@ -325,6 +330,11 @@ pub struct P2PNetwork {
     known_peers: Arc<RwLock<HashSet<SocketAddr>>>,
     /// Phase 1 TTL: last time each known peer was seen (connected or heard via PEX).
     peer_last_seen: Arc<RwLock<HashMap<SocketAddr, Instant>>>,
+    /// Phase 2A: addresses with an outbound dial in flight. The initial sweep,
+    /// heartbeat, redial loop and PEX can all reach `connect_to_peer` for the
+    /// same address concurrently; without this guard a peer gets two sessions
+    /// and the `peers` map silently drops one of them.
+    dialing: Arc<RwLock<HashSet<SocketAddr>>>,
     tx_channel: mpsc::UnboundedSender<Transaction>,
     peer_discovery_tx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<SocketAddr>>>>,
     get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
@@ -355,6 +365,7 @@ impl P2PNetwork {
             peers: Arc::new(RwLock::new(HashMap::new())),
             known_peers: Arc::new(RwLock::new(HashSet::new())),
             peer_last_seen: Arc::new(RwLock::new(HashMap::new())),
+            dialing: Arc::new(RwLock::new(HashSet::new())),
             tx_channel,
             peer_discovery_tx: Arc::new(tokio::sync::Mutex::new(None)),
             get_dag_hashes,
@@ -419,20 +430,10 @@ impl P2PNetwork {
             .await;
         });
 
-        // Connect to bootnodes (multi-seed: every configured seed is dialed).
-        for bootnode in &self.config.bootnodes {
-            self.connect_to_peer(*bootnode).await;
-        }
-
-        // Phase 1 cold-start: also dial peers restored from the peer store.
-        {
-            let restored: Vec<SocketAddr> = self.known_peers.read().await.iter().copied().collect();
-            for addr in restored {
-                if addr != self.config.listen_addr {
-                    self.connect_to_peer(addr).await;
-                }
-            }
-        }
+        // Phase 2A: bring the recovery machinery up BEFORE the first dial pass.
+        // The initial sweep used to run first and block here, so a peer store
+        // full of dead addresses left the node with no heartbeat, no PEX and no
+        // TTL task while it churned through timeouts.
 
         // Discover peers from DNS seeds
         self.discover_from_dns().await;
@@ -440,7 +441,7 @@ impl P2PNetwork {
         // Start heartbeat task
         self.start_heartbeat().await;
 
-        // Start reconnection task for bootnodes + known peers (general redial)
+        // Start reconnection task (known peers first, seeds unprivileged)
         self.start_reconnection_task().await;
 
         // Phase 1: periodic peer-store flush + TTL expiry.
@@ -455,7 +456,35 @@ impl P2PNetwork {
         // Start cache cleanup task
         self.start_cache_cleanup().await;
 
+        // First outbound pass, off the critical path: seeds first (on a brand-new
+        // node they are the only known address source), then everything restored
+        // from the peer store. Runs as its own task so `start()` is never gated
+        // on a serial sweep of possibly-dead addresses.
+        {
+            let sweep = self.clone();
+            tokio::spawn(async move {
+                sweep.initial_dial_sweep().await;
+            });
+        }
+
         Ok(())
+    }
+
+    /// Phase 2A: the very first outbound dial pass. Seeds go first because a
+    /// node with an empty peer store has no other address source; afterwards the
+    /// restored store is dialed. This is the only place where seeds lead, and it
+    /// runs once — steady-state redial never privileges them.
+    async fn initial_dial_sweep(&self) {
+        for seed in &self.config.bootnodes {
+            self.connect_to_peer(*seed).await;
+        }
+
+        let restored: Vec<SocketAddr> = self.known_peers.read().await.iter().copied().collect();
+        for addr in restored {
+            if addr != self.config.listen_addr {
+                self.connect_to_peer(addr).await;
+            }
+        }
     }
 
     /// Phase 1: reload known peers from the on-disk peer store (if configured).
@@ -530,6 +559,20 @@ impl P2PNetwork {
         self.peer_last_seen.write().await.insert(addr, Instant::now());
     }
 
+    /// Phase 2A: refresh the TTL clock for every peer holding a live session, so
+    /// a long-lived connection is never expired out of the peer store (and hence
+    /// out of the persisted file) just for having stayed up.
+    async fn refresh_live_peer_clocks(&self) {
+        let live: Vec<SocketAddr> = self.peers.read().await.keys().copied().collect();
+        if live.is_empty() {
+            return;
+        }
+        let mut seen = self.peer_last_seen.write().await;
+        for a in live {
+            seen.insert(a, Instant::now());
+        }
+    }
+
     /// Phase 1: expire peers whose last_seen is older than PEER_TTL and flush the store.
     async fn start_peer_store_task(&self) {
         let peers = self.clone();
@@ -537,6 +580,12 @@ impl P2PNetwork {
             let mut last_flush = Instant::now();
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
+
+                // Phase 2A: a peer that stays connected longer than PEER_TTL must
+                // not be expired out of the store. Refresh the clock for every live
+                // session first, otherwise the node forgets its most reliable peers
+                // precisely because they are reliable.
+                peers.refresh_live_peer_clocks().await;
 
                 // TTL expiry
                 {
@@ -585,21 +634,14 @@ impl P2PNetwork {
 
                 if peer_count == 0 {
                     warn!("No connected peers, attempting general redial...");
-                    // Multi-seed: always try every configured bootnode.
-                    for bootnode in &bootnodes {
-                        info!("Reconnecting to bootnode: {}", bootnode);
-                        p2p_network.connect_to_peer(*bootnode).await;
-                    }
-                    // General redial: also try recently-known peers (Phase 1).
-                    let candidates: Vec<SocketAddr> = known
-                        .read()
-                        .await
-                        .iter()
-                        .copied()
-                        .filter(|a| *a != local_addr && !bootnodes.contains(a))
-                        .collect();
-                    for addr in candidates {
-                        p2p_network.connect_to_peer(addr).await;
+                    // Phase 2A: known peers first, seeds appended as ordinary
+                    // unprivileged candidates (Phase 1 dialled every seed first).
+                    let candidates = {
+                        let guard = known.read().await;
+                        P2PNetwork::redial_candidates(&guard, &bootnodes, local_addr)
+                    };
+                    for addr in candidates.iter().take(MAX_REDIAL_PER_CYCLE) {
+                        p2p_network.connect_to_peer(*addr).await;
                     }
                 } else {
                     debug!("Heartbeat: {} connected peers", peer_count);
@@ -608,7 +650,25 @@ impl P2PNetwork {
         });
     }
 
-    /// Start reconnection task for bootnodes with exponential backoff (Phase 1: general redial over known peers too)
+    /// Phase 2A candidate ordering for the redial loop: addresses the node
+    /// already knows come first, configured seeds are ordinary unprivileged
+    /// fallbacks appended at the end. No seed is ever allowed to outrank a peer
+    /// the node already holds, so a dead seed cannot monopolise the cycle.
+    fn redial_candidates(
+        known: &HashSet<SocketAddr>,
+        seeds: &[SocketAddr],
+        local: SocketAddr,
+    ) -> Vec<SocketAddr> {
+        let mut out: Vec<SocketAddr> = known.iter().copied().filter(|a| *a != local).collect();
+        for seed in seeds {
+            if *seed != local && !out.contains(seed) {
+                out.push(*seed);
+            }
+        }
+        out
+    }
+
+    /// Start the general redial task (Phase 1: known peers + seeds, Phase 2A: seeds unprivileged).
     async fn start_reconnection_task(&self) {
         let peers = self.peers.clone();
         let bootnodes = self.config.bootnodes.clone();
@@ -619,43 +679,54 @@ impl P2PNetwork {
         tokio::spawn(async move {
             let mut retry_counts: std::collections::HashMap<String, u32> =
                 std::collections::HashMap::new();
+            let mut next_attempt: std::collections::HashMap<String, Instant> =
+                std::collections::HashMap::new();
             loop {
-                // Candidate set: multi-seed bootnodes + persisted known peers.
-                let mut candidates: Vec<SocketAddr> = bootnodes.clone();
-                for addr in known.read().await.iter().copied() {
-                    if addr != local_addr && !candidates.contains(&addr) {
-                        candidates.push(addr);
-                    }
-                }
+                let candidates = {
+                    let guard = known.read().await;
+                    Self::redial_candidates(&guard, &bootnodes, local_addr)
+                };
+
+                let now = Instant::now();
+                let mut dials = 0usize;
 
                 for target in candidates {
-                    let bootnode_addr = target;
-                    let connected = {
-                        let current_peers = peers.read().await;
-                        current_peers.contains_key(&bootnode_addr)
-                    };
-
-                    if !connected {
-                        let retry_count =
-                            *retry_counts.entry(bootnode_addr.to_string()).or_insert(0);
-                        let delay = std::cmp::min(2u64.pow(retry_count.min(6)), 60); // Max 60 seconds
-                        info!(
-                            "Peer {} disconnected, reconnecting in {}s (attempt {})",
-                            bootnode_addr,
-                            delay,
-                            retry_count + 1
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
-
-                        p2p_network.connect_to_peer(bootnode_addr.clone()).await;
-                        retry_counts.insert(
-                            bootnode_addr.to_string(),
-                            std::cmp::min(retry_count + 1, 6), // Cap at 6 (max delay 64s)
-                        );
-                    } else {
-                        retry_counts.insert(bootnode_addr.to_string(), 0); // Reset retry count if connected
+                    if dials >= MAX_REDIAL_PER_CYCLE {
+                        break;
                     }
+                    let key = target.to_string();
+
+                    if peers.read().await.contains_key(&target) {
+                        retry_counts.remove(&key);
+                        next_attempt.remove(&key);
+                        continue;
+                    }
+
+                    // Exponential backoff is tracked per candidate instead of
+                    // sleeping inside the loop. Phase 1 slept here, so one
+                    // black-holed seed delayed every other candidate behind it.
+                    if let Some(due) = next_attempt.get(&key) {
+                        if now < *due {
+                            continue;
+                        }
+                    }
+
+                    let attempt = *retry_counts.get(&key).unwrap_or(&0);
+                    let backoff = std::cmp::min(2u64.pow(attempt.min(6)), 60); // Max 60s
+                    debug!(
+                        "Redial candidate {} (attempt {}, backoff {}s)",
+                        target,
+                        attempt + 1,
+                        backoff
+                    );
+
+                    p2p_network.connect_to_peer(target).await;
+                    dials += 1;
+
+                    retry_counts.insert(key.clone(), std::cmp::min(attempt + 1, 6));
+                    next_attempt.insert(key, Instant::now() + Duration::from_secs(backoff));
                 }
+
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
         });
@@ -753,17 +824,36 @@ impl P2PNetwork {
         });
     }
 
+    /// Phase 2A: addresses eligible for a PEX broadcast. We never re-share an
+    /// address we ourselves banned, and never send our own listen address.
+    /// Extracted so the filter is unit-testable rather than buried in a loop.
+    fn pex_broadcast_list(
+        known: &HashSet<SocketAddr>,
+        scores: &HashMap<SocketAddr, PeerScore>,
+        local: SocketAddr,
+    ) -> Vec<SocketAddr> {
+        known
+            .iter()
+            .copied()
+            .filter(|a| *a != local)
+            .filter(|a| !scores.get(a).map(|s| s.is_banned()).unwrap_or(false))
+            .collect()
+    }
+
     /// Periodically broadcast known peers to connected peers (PEX)
     async fn start_pex(&self) {
         let peers = self.peers.clone();
         let known_peers = self.known_peers.clone();
+        let peer_scores = self.peer_scores.clone();
+        let local_addr = self.config.listen_addr;
 
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(15)).await; // Every 15 seconds for fast peer discovery
                 let peer_list: Vec<SocketAddr> = {
                     let known = known_peers.read().await;
-                    known.iter().copied().collect()
+                    let scores = peer_scores.read().await;
+                    Self::pex_broadcast_list(&known, &scores, local_addr)
                 };
                 if peer_list.is_empty() {
                     continue;
@@ -1695,8 +1785,55 @@ impl P2PNetwork {
     }
 
     /// Connect to a peer
+    /// Dial `addr`, tolerating concurrent callers. The initial sweep, heartbeat,
+    /// redial loop and PEX can all ask for the same address at the same time;
+    /// the in-flight set collapses them into a single session so the `peers` map
+    /// never gets a sender silently overwritten by a duplicate connection.
     async fn connect_to_peer(&self, addr: SocketAddr) {
-        info!("Tentative de connexion au bootnode: {}", addr);
+        {
+            let mut dialing = self.dialing.write().await;
+            if !dialing.insert(addr) {
+                debug!("Dial to {} already in flight, skipping", addr);
+                return;
+            }
+        }
+        self.connect_to_peer_inner(addr).await;
+        self.dialing.write().await.remove(&addr);
+    }
+
+    /// Phase 2A: read-only guard consulted before any outbound dial. Inbound
+    /// connections have always checked the ban table; outbound never did, so a
+    /// node would happily redial a peer it had already banned.
+    async fn outbound_dial_blocked(&self, addr: SocketAddr) -> bool {
+        let scores = self.peer_scores.read().await;
+        scores.get(&addr).map(|s| s.is_banned()).unwrap_or(false)
+    }
+
+    async fn connect_to_peer_inner(&self, addr: SocketAddr) {
+        info!("Dialing peer: {}", addr);
+
+        if self.outbound_dial_blocked(addr).await {
+            let until = self
+                .peer_scores
+                .read()
+                .await
+                .get(&addr)
+                .and_then(|s| s.banned_until);
+            warn!(
+                "Skipping banned peer {} for outbound dial (banned until {:?})",
+                addr, until
+            );
+            return;
+        }
+
+        {
+            let mut scores = self.peer_scores.write().await;
+            if let Some(score) = scores.get_mut(&addr) {
+                score.decay();
+            } else {
+                scores.insert(addr, PeerScore::new());
+            }
+        }
 
         {
             let peers_guard = self.peers.read().await;
@@ -2164,6 +2301,193 @@ impl P2PNetwork {
                 warn!("Failed to send SyncRequest to {}: channel closed", addr);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod phase2_decentralized_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn net_with(bootnodes: Vec<SocketAddr>) -> P2PNetwork {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
+        let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
+            Arc::new(|_| None);
+        let sync_ctx = Arc::new(SyncContext::default());
+        let is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> = Arc::new(|_| false);
+        P2PNetwork::new(
+            P2PConfig {
+                listen_addr: addr("127.0.0.1:31001"),
+                bootnodes,
+                dns_seeds: vec![],
+                peer_store_path: None,
+            },
+            tx,
+            empty.clone(),
+            empty_opt,
+            empty,
+            sync_ctx,
+            is_orphan,
+        )
+    }
+
+    fn banned_score() -> PeerScore {
+        let mut s = PeerScore::new();
+        s.score = PEER_SCORE_BAN_THRESHOLD;
+        s.ban();
+        s
+    }
+
+    /// PHASE2-2A / PRINCIPE 2: seeds are ordinary fallbacks in the redial
+    /// ordering. A peer the node already knows always outranks an unknown seed,
+    /// so one dead seed can no longer monopolise the redial cycle.
+    #[test]
+    fn test_seeds_are_unprivileged_in_redial() {
+        let local = addr("127.0.0.1:31001");
+        let seed1 = addr("10.0.0.1:25565");
+        let seed2 = addr("10.0.0.2:25565");
+        let peer_a = addr("203.0.113.10:25565");
+        let peer_b = addr("203.0.113.11:25565");
+
+        let mut known = HashSet::new();
+        known.insert(peer_a);
+        known.insert(peer_b);
+        known.insert(seed1); // a seed may also already be a known peer
+
+        let out = P2PNetwork::redial_candidates(&known, &[seed1, seed2], local);
+
+        assert_eq!(out.iter().filter(|a| **a == peer_a).count(), 1);
+        assert_eq!(out.iter().filter(|a| **a == peer_b).count(), 1);
+        assert!(
+            out.iter().filter(|a| **a == seed1).count() == 1,
+            "seed already known must not be duplicated"
+        );
+        assert!(out.contains(&seed2), "unconfigured-seen seed still reachable");
+        assert!(!out.contains(&local), "own listen address must never be dialled");
+
+        let first_known = out
+            .iter()
+            .position(|a| *a == peer_a || *a == peer_b)
+            .expect("known peers must be present");
+        let last_seed = out.iter().position(|a| *a == seed2).unwrap();
+        assert!(
+            first_known < last_seed,
+            "known peers must be redialled before an unknown seed"
+        );
+    }
+
+    /// PHASE2-2A / PRINCIPE 1: a node that never configured any seed still has a
+    /// usable candidate set — discovery does not require a bootnode.
+    #[test]
+    fn test_redial_candidates_without_any_seed() {
+        let local = addr("127.0.0.1:31001");
+        let peer = addr("203.0.113.77:25565");
+        let mut known = HashSet::new();
+        known.insert(peer);
+        known.insert(local);
+
+        let out = P2PNetwork::redial_candidates(&known, &[], local);
+        assert_eq!(out, vec![peer]);
+    }
+
+    /// PHASE2-2A / PRINCIPE 1: outbound dials must respect the ban table.
+    /// Inbound connections have always checked it; outbound never did.
+    #[tokio::test]
+    async fn test_outbound_dial_blocked_for_banned_peer() {
+        let net = net_with(vec![]);
+        let banned = addr("203.0.113.50:25565");
+        let clean = addr("203.0.113.51:25565");
+
+        assert!(
+            !net.outbound_dial_blocked(banned).await,
+            "unknown address is not blocked"
+        );
+
+        net.peer_scores.write().await.insert(banned, banned_score());
+
+        assert!(
+            net.outbound_dial_blocked(banned).await,
+            "banned peer must not be redialled outbound"
+        );
+        assert!(
+            !net.outbound_dial_blocked(clean).await,
+            "clean peer must stay dialable"
+        );
+    }
+
+    /// PHASE2-2A / PRINCIPE 3: PEX must not re-share addresses we banned, nor
+    /// our own listen address (which would let peers dial us back pointlessly
+    /// and would leak a self-reference into the address pool).
+    #[test]
+    fn test_pex_omits_banned_and_local() {
+        let local = addr("127.0.0.1:31001");
+        let good = addr("203.0.113.10:25565");
+        let banned = addr("203.0.113.66:25565");
+
+        let mut known = HashSet::new();
+        known.insert(local);
+        known.insert(good);
+        known.insert(banned);
+
+        let mut scores = HashMap::new();
+        scores.insert(banned, banned_score());
+
+        let out = P2PNetwork::pex_broadcast_list(&known, &scores, local);
+        assert_eq!(out.len(), 1, "only the healthy address is shared");
+        assert!(out.contains(&good));
+        assert!(!out.contains(&local));
+        assert!(!out.contains(&banned));
+    }
+
+    /// PHASE2-2A: a peer with a live session must never have its TTL clock
+    /// expire. Before this fix the clock was only touched at handshake and at
+    /// disconnect, so a reliably-connected peer was dropped from the store.
+    #[tokio::test]
+    async fn test_connected_peer_survives_ttl_refresh() {
+        let net = net_with(vec![]);
+        let live = addr("203.0.113.20:25565");
+        let idle = addr("203.0.113.21:25565");
+
+        net.known_peers.write().await.insert(live);
+        net.known_peers.write().await.insert(idle);
+
+        // A live session exists for `live` only.
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        net.peers.write().await.insert(live, tx);
+
+        let before = Instant::now();
+        net.refresh_live_peer_clocks().await;
+        let after = Instant::now();
+
+        let seen = net.peer_last_seen.read().await;
+        let refreshed = *seen.get(&live).expect("live peer must have a clock");
+        assert!(
+            refreshed >= before && refreshed <= after,
+            "live session clock must be refreshed to now"
+        );
+        assert!(
+            refreshed.elapsed() < PEER_TTL,
+            "a live session must stay inside the TTL window"
+        );
+        // `idle` has no session and is left untouched (still absent).
+        assert!(!seen.contains_key(&idle));
+    }
+
+    /// PHASE2-2A: one redial cycle must never attempt more dials than the
+    /// connection cap allows — that is what keeps a large stale peer store from
+    /// turning a cycle into an hours-long serial sweep.
+    #[test]
+    fn test_redial_cycle_budget_is_sane() {
+        assert!(MAX_REDIAL_PER_CYCLE >= 1);
+        assert!(
+            MAX_REDIAL_PER_CYCLE <= MAX_PEERS,
+            "per-cycle budget must not exceed the connection cap"
+        );
     }
 }
 
