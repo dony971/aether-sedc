@@ -139,6 +139,65 @@ const MIN_SELECT_WEIGHT: u64 = 1;
 /// entries — never a healthy peer it happens to outnumber.
 const PEX_ADMISSION_QUALITY: i32 = PEER_SCORE_INITIAL / 2;
 
+// ---------------------------------------------------------------------------
+// Phase 2D — self-healing (bounded, hysteretic peer recovery).
+//
+// Every threshold below is *derived* from a constant that already exists in
+// this file; none of them was chosen to make a test pass. Full derivation:
+// docs/AETHER_PHASE2_SELF_HEALING_AUDIT.md §E.6.
+// ---------------------------------------------------------------------------
+
+/// Hysteresis **exit** threshold, and the count recovery aims at.
+///
+/// Exactly `PROTECTED_OUTBOUND_SLOTS`, whose own doc says *"8 = 2 x
+/// MAX_PEERS_PER_SUBNET: the reserve covers two complete network groups, i.e.
+/// at least two independent paths"*. Recovery declares itself finished only
+/// once the node holds the diversity 2C already reserves slots for.
+const RECOVERY_COMFORT_PEERS: usize = PROTECTED_OUTBOUND_SLOTS;
+
+/// Hysteresis **entry** threshold.
+///
+/// Exactly `MAX_PEERS_PER_SUBNET`: below one full group the node no longer
+/// holds even the quota a single group is allowed, which is an observed loss
+/// of diversity rather than a gradual dip. `RECOVERY_THRESHOLD <
+/// RECOVERY_COMFORT_PEERS` is what makes the band `[4, 8)` wide enough that a
+/// count oscillating between 7 and 8 can never start and stop recovery.
+const RECOVERY_THRESHOLD: usize = MAX_PEERS_PER_SUBNET;
+
+/// Diagnostic floor, never a trigger: `MIN_ANCHORS` is already documented as
+/// *"Several, never one"*. Logged on the deep-loss transition only.
+const RECOVERY_MIN_PEERS: usize = MIN_ANCHORS;
+
+/// Upper bound on dials issued by a single recovery round.
+///
+/// `PROTECTED_OUTBOUND_SLOTS` again: a round never opens more dials than the
+/// number of outbound slots Phase 2C reserves, and is therefore always below
+/// `MAX_REDIAL_PER_CYCLE` by construction.
+const MAX_DIALS_PER_ROUND: usize = PROTECTED_OUTBOUND_SLOTS;
+
+/// Cadence of the recovery loop — the same 5s the existing redial loop uses,
+/// so there is one familiar clock rather than a second one to reason about.
+const RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// First backoff step after a failed round. Same base as the existing
+/// per-candidate redial backoff (`2 ^ attempt` seconds at `:2076`).
+const RECOVERY_BACKOFF_BASE_SECS: u64 = 5;
+
+/// Backoff ceiling, identical to the existing per-candidate ceiling
+/// (`min(.., 60)` at `:2076`).
+const RECOVERY_BACKOFF_MAX_SECS: u64 = 60;
+
+/// Levels of backoff before the delay stops growing. The existing redial loop
+/// caps its own counter at 6 (`min(attempt + 1, 6)` at `:2087`) because
+/// `2 ^ 6 = 64` already exceeds the 60s ceiling — same reason, same number.
+const RECOVERY_MAX_LEVEL: u32 = 6;
+
+/// Rounds that may open no session at all before recovery gives up and moves
+/// to `Exhausted`. Same bounded counter as above; this is what makes an
+/// infinite redial loop impossible at the controller level.
+const RECOVERY_MAX_CONSECUTIVE_FAILURES: u32 = 6;
+
+
 /// Maximum entries in the seen-transaction cache (memory bound)
 const MAX_SEEN_TXS: usize = 50_000;
 
@@ -790,6 +849,303 @@ fn select_outbound<R: Rng + ?Sized>(
     }
 
     picked
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2D — self-healing. Pure and I/O-free, so every transition and every
+// bound is directly testable without a socket: the recovery task below is only
+// the loop around these functions.
+// ---------------------------------------------------------------------------
+
+/// Where the node stands relative to its peer count.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RecoveryState {
+    /// `count >= RECOVERY_COMFORT_PEERS`: nothing to do. No dial, no log.
+    Healthy,
+    /// Below comfort with a dialable source left and no backoff pending:
+    /// a round may run.
+    Recovering,
+    /// Below `RECOVERY_THRESHOLD` while the controller backoff is still
+    /// running: recovery is throttled, not stalled — the next round re-checks.
+    Degraded,
+    /// Below `RECOVERY_THRESHOLD` with no dialable source left, or the
+    /// consecutive-failure budget is spent. No further dial is issued.
+    Exhausted,
+}
+
+/// Bounded controller state. Holds no session or address lock, ever.
+#[derive(Clone, Copy, Debug)]
+struct PeerRecoveryController {
+    state: RecoveryState,
+    /// When the last round issued its dials.
+    last_attempt: Option<Instant>,
+    /// Consecutive rounds that opened no session, `0 ..= RECOVERY_MAX_LEVEL`.
+    backoff_level: u32,
+    /// Consecutive rounds that opened no session,
+    /// `0 ..= RECOVERY_MAX_CONSECUTIVE_FAILURES`.
+    consecutive_failures: u32,
+}
+
+impl PeerRecoveryController {
+    fn new() -> Self {
+        Self {
+            state: RecoveryState::Healthy,
+            last_attempt: None,
+            backoff_level: 0,
+            consecutive_failures: 0,
+        }
+    }
+
+    /// Delay before the *next* round may dial. Level 0 means "no extra delay",
+    /// so a healthy controller never throttles anything.
+    fn backoff(&self) -> Duration {
+        recovery_backoff(self.backoff_level)
+    }
+
+    fn backoff_due(&self, now: Instant) -> bool {
+        match self.last_attempt {
+            None => true,
+            Some(t) => now >= t + self.backoff(),
+        }
+    }
+
+    /// One round finished. Any session opened counts as success and clears the
+    /// backoff completely; a round that opened none climbs one level, bounded.
+    fn record_round(&mut self, opened: usize, now: Instant) {
+        self.last_attempt = Some(now);
+        if opened > 0 {
+            self.backoff_level = 0;
+            self.consecutive_failures = 0;
+        } else {
+            self.backoff_level = (self.backoff_level + 1).min(RECOVERY_MAX_LEVEL);
+            self.consecutive_failures = (self.consecutive_failures + 1)
+                .min(RECOVERY_MAX_CONSECUTIVE_FAILURES);
+        }
+    }
+
+    /// Back to `Healthy`: the hysteresis band is left, so every accumulated
+    /// throttle is discarded rather than carried into the next incident.
+    fn reset(&mut self) {
+        self.state = RecoveryState::Healthy;
+        self.last_attempt = None;
+        self.backoff_level = 0;
+        self.consecutive_failures = 0;
+    }
+
+    fn set_state(&mut self, state: RecoveryState) {
+        self.state = state;
+    }
+
+    /// Clear the consecutive-failure latch once a full backoff has expired.
+    ///
+    /// Without it `Exhausted` would be terminal and a node whose peers came
+    /// back later would never probe again. With it the controller settles into
+    /// one probe per `RECOVERY_BACKOFF_MAX_SECS` (60s) — strictly slower than
+    /// the pre-existing 5s redial loop, so recovery never becomes the
+    /// aggressor, and never a hot loop.
+    fn open_probe_window(&mut self) {
+        self.consecutive_failures = 0;
+    }
+}
+
+/// `5s, 10s, 20s, 40s, 60s, 60s` for levels `1..=6`, `0` for level `0`.
+///
+/// Identical in shape to the existing per-candidate backoff
+/// (`min(2 ^ min(attempt, 6), 60)` at `:2076`) so the codebase does not end up
+/// with two different notions of "how long to wait".
+fn recovery_backoff(level: u32) -> Duration {
+    if level == 0 {
+        return Duration::ZERO;
+    }
+    let shift = (level - 1).min(RECOVERY_MAX_LEVEL - 1);
+    let secs = (RECOVERY_BACKOFF_BASE_SECS << shift).min(RECOVERY_BACKOFF_MAX_SECS);
+    Duration::from_secs(secs)
+}
+
+/// The whole state machine, as one pure function.
+///
+/// The hysteresis is `RECOVERY_THRESHOLD (4) < RECOVERY_COMFORT_PEERS (8)`:
+/// recovery *starts* only below 4 and *stops* only at 8, so a count sitting in
+/// `[4, 8)` neither starts nor stops it. From `Healthy`, a dip to 7 therefore
+/// does nothing at all — which is exactly the `7 -> recovery, 8 -> stop, 7 ->
+/// recovery` flapping this band exists to prevent.
+fn next_state(
+    prev: RecoveryState,
+    count: usize,
+    sources_left: bool,
+    backoff_pending: bool,
+    failures_exhausted: bool,
+) -> RecoveryState {
+    if count >= RECOVERY_COMFORT_PEERS {
+        return RecoveryState::Healthy;
+    }
+    let deep = count < RECOVERY_THRESHOLD;
+    if failures_exhausted || (deep && !sources_left) {
+        return RecoveryState::Exhausted;
+    }
+    if prev != RecoveryState::Healthy || deep {
+        if backoff_pending {
+            RecoveryState::Degraded
+        } else {
+            RecoveryState::Recovering
+        }
+    } else {
+        // Inside the band, entering from `Healthy`: hold. Nothing is broken
+        // enough to warrant a round, and nothing recovers "just in case".
+        RecoveryState::Healthy
+    }
+}
+
+/// The outcome of one recovery round: the state it lands in and, if it may
+/// dial, the addresses to dial in tier order. The per-tier counts exist only
+/// for the round's diagnostic line — they describe where the dial budget went.
+#[derive(Debug)]
+struct RecoveryRound {
+    state: RecoveryState,
+    dial: Vec<SocketAddr>,
+    /// Addresses taken from each tier, in ladder order.
+    tier1_anchors: usize,
+    tier2_known: usize,
+    tier3_seeds: usize,
+    /// At least one address across the three tiers is dialable at all.
+    sources_left: bool,
+}
+
+/// The source ladder for one round.
+///
+/// Tier 1 anchors — addresses we have already reached and deliberately kept,
+/// most recently proven first. Tier 2 everything else the node knows (peer
+/// store + PEX), already ranked and network-group quota'd by Phase 2C's
+/// `select_outbound`. Tier 3 configured seeds, **withheld** while tiers 1 and
+/// 2 still hold something to try, and released only when a round has already
+/// failed (`consecutive_failures > 0`) or when there is nothing else at all.
+///
+/// The seed is therefore a genuine last resort rather than a quota every round
+/// — the gap Phase 2D exists to close (audit §C.1).
+///
+/// Tiers 1 and 3 bypass `select_outbound`, so they re-apply the same `/24`
+/// invariant here with the same primitives (`network_group`, `group_counts`,
+/// `MAX_PEERS_PER_SUBNET`); `connect_to_peer_inner` enforces it again per dial.
+/// The `/24` room check shared by tiers 1 and 3 (tier 2 gets it for free from
+/// `select_outbound`). Returns false when taking `a` would push its network
+/// group past `MAX_PEERS_PER_SUBNET`, counting both live sessions and the
+/// candidates already taken this round. On success it records the take.
+///
+/// A free function rather than a closure so the `used` tally can be updated
+/// in place between checks without borrowing it twice.
+fn recovery_group_room(
+    a: SocketAddr,
+    live: &HashMap<NetworkGroup, usize>,
+    used: &mut HashMap<NetworkGroup, usize>,
+) -> bool {
+    let g = network_group(a);
+    let live_n = live.get(&g).copied().unwrap_or(0);
+    let used_n = used.get(&g).copied().unwrap_or(0);
+    if live_n + used_n >= MAX_PEERS_PER_SUBNET {
+        return false;
+    }
+    *used.entry(g).or_insert(0) += 1;
+    true
+}
+
+fn plan_recovery(
+    local: SocketAddr,
+    count: usize,
+    anchors: &[(SocketAddr, u64)],
+    known: &[SocketAddr],
+    seeds: &[SocketAddr],
+    connected: &HashSet<SocketAddr>,
+    is_banned: &dyn Fn(&SocketAddr) -> bool,
+    controller: &PeerRecoveryController,
+    now: Instant,
+) -> RecoveryRound {
+    let live = group_counts(connected.iter().copied());
+    let mut used: HashMap<NetworkGroup, usize> = HashMap::new();
+    let mut dial: Vec<SocketAddr> = Vec::with_capacity(MAX_DIALS_PER_ROUND);
+    let mut picked: HashSet<SocketAddr> = HashSet::new();
+
+    // Tier 1: anchors, most recently proven first.
+    let mut ranked: Vec<(SocketAddr, u64)> = anchors
+        .iter()
+        .filter(|(a, _)| !connected.contains(a) && !is_banned(a) && *a != local)
+        .copied()
+        .collect();
+    ranked.sort_by_key(|(_, at)| std::cmp::Reverse(*at));
+    for (a, _) in ranked {
+        if dial.len() >= MAX_DIALS_PER_ROUND {
+            break;
+        }
+        if !recovery_group_room(a, &live, &mut used) {
+            continue;
+        }
+        picked.insert(a);
+        dial.push(a);
+    }
+    let tier1_anchors = dial.len();
+
+    // Tier 2: everything else the node knows, in the order 2C ranked it.
+    for a in known {
+        if dial.len() >= MAX_DIALS_PER_ROUND {
+            break;
+        }
+        if picked.contains(a) || *a == local || connected.contains(a) || is_banned(a) {
+            continue;
+        }
+        // Tier 2 already passed this quota inside `select_outbound`; re-applying
+        // it here keeps tiers 1 and 2 from each spending the same group's room.
+        if !recovery_group_room(*a, &live, &mut used) {
+            continue;
+        }
+        picked.insert(*a);
+        dial.push(*a);
+    }
+    let primary_empty = dial.is_empty();
+    let tier2_known = dial.len() - tier1_anchors;
+
+    // Tier 3: configured seeds, last resort.
+    if primary_empty || controller.consecutive_failures > 0 {
+        for s in seeds {
+            if dial.len() >= MAX_DIALS_PER_ROUND {
+                break;
+            }
+            if picked.contains(s) || *s == local || connected.contains(s) || is_banned(s) {
+                continue;
+            }
+            if !recovery_group_room(*s, &live, &mut used) {
+                continue;
+            }
+            picked.insert(*s);
+            dial.push(*s);
+        }
+    }
+
+    // Whether *any* tier still holds a dialable address, quota aside. This is
+    // what tells `Exhausted` apart from "nothing left to try".
+    let sources_left = anchors
+        .iter()
+        .map(|(a, _)| a)
+        .chain(known.iter())
+        .chain(seeds.iter())
+        .any(|a| *a != local && !connected.contains(a) && !is_banned(a));
+
+    let state = next_state(
+        controller.state,
+        count,
+        sources_left,
+        !controller.backoff_due(now),
+        controller.consecutive_failures >= RECOVERY_MAX_CONSECUTIVE_FAILURES,
+    );
+
+    let tier3_seeds = dial.len() - tier1_anchors - tier2_known;
+
+    RecoveryRound {
+        state,
+        dial,
+        tier1_anchors,
+        tier2_known,
+        tier3_seeds,
+        sources_left,
+    }
 }
 
 /// Phase 2B: the shared ingress point for a newly-discovered address, usable by
@@ -1545,6 +1901,12 @@ pub struct P2PNetwork {
     /// be held at the same time. Snapshot one, release it, then take the other.
     /// Holding both is the deadlock this migration exists to eliminate.
     addresses: Arc<RwLock<AddressManager>>,
+    /// Phase 2D: the self-healing controller. Observes the peer count and
+    /// decides whether a recovery round may run. Holds no session or address
+    /// lock itself, so it can be read for diagnostics at any time. Written only
+    /// by the recovery task, which is also the sole dialer it drives, so there
+    /// is exactly one writer.
+    recovery: Arc<RwLock<PeerRecoveryController>>,
     tx_channel: mpsc::UnboundedSender<Transaction>,
     peer_discovery_tx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<SocketAddr>>>>,
     get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
@@ -1574,6 +1936,7 @@ impl P2PNetwork {
             dialing: Arc::new(RwLock::new(HashSet::new())),
             outbound_sessions: Arc::new(RwLock::new(HashSet::new())),
             addresses: Arc::new(RwLock::new(AddressManager::new())),
+            recovery: Arc::new(RwLock::new(PeerRecoveryController::new())),
             tx_channel,
             peer_discovery_tx: Arc::new(tokio::sync::Mutex::new(None)),
             get_dag_hashes,
@@ -1643,8 +2006,8 @@ impl P2PNetwork {
         // Discover peers from DNS seeds
         self.discover_from_dns().await;
 
-        // Start heartbeat task
-        self.start_heartbeat().await;
+        // Phase 2D: self-healing loop (replaces the peer_count == 0 heartbeat)
+        self.start_recovery_task().await;
 
         // Start reconnection task (known peers first, seeds unprivileged)
         self.start_reconnection_task().await;
@@ -1927,35 +2290,163 @@ impl P2PNetwork {
         }
     }
 
-    /// Start heartbeat task to check peer connections and reconnect if needed
-    async fn start_heartbeat(&self) {
-        let peers = self.peers.clone();
-        let p2p_network = self.clone();
-
+    /// Phase 2D: the self-healing loop.
+    ///
+    /// Replaces the old heartbeat, which only reacted to `peer_count == 0` and
+    /// therefore could not tell a node that lost 6 of its 8 peers from a node
+    /// holding 128. This task observes the count every `RECOVERY_INTERVAL`,
+    /// drives the controller through `Healthy` / `Recovering` / `Degraded` /
+    /// `Exhausted`, and dials at most `MAX_DIALS_PER_ROUND` addresses per round
+    /// in the anchor -> known -> seed order of `plan_recovery`.
+    ///
+    /// Silent while `Healthy`; only state transitions are logged. The existing
+    /// redial loop is left untouched — this task is inactive in the common
+    /// case, so it never doubles the dial pressure of a healthy node.
+    async fn start_recovery_task(&self) {
+        let node = self.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-
-                let peer_count = {
-                    let peers_read = peers.read().await;
-                    peers_read.len()
-                };
-
-                if peer_count == 0 {
-                    warn!("No connected peers, attempting general redial...");
-                    // Phase 2A: known peers first, seeds appended as ordinary
-                    // unprivileged candidates (Phase 1 dialled every seed first).
-                    // Phase 2C: that order is now weighed, quota'd per network
-                    // group and re-drawn each round instead of replayed.
-                    let candidates = p2p_network.outbound_candidates(MAX_REDIAL_PER_CYCLE).await;
-                    for addr in candidates {
-                        p2p_network.connect_to_peer(addr).await;
-                    }
-                } else {
-                    debug!("Heartbeat: {} connected peers", peer_count);
-                }
+                tokio::time::sleep(RECOVERY_INTERVAL).await;
+                node.recovery_round().await;
             }
         });
+    }
+
+    /// One full self-healing round: observe, decide, dial, record.
+    ///
+    /// Deliberately a method rather than inlined in the loop, so an integration
+    /// test can drive the exact production round without waiting on wall-clock
+    /// time. Returns the whole plan, including which tier supplied each dial.
+    async fn recovery_round(&self) -> RecoveryRound {
+        // Snapshot the session table and release before touching the
+        // address manager: the two locks are never held together.
+        let (count, connected) = {
+            let guard = self.peers.read().await;
+            (
+                guard.len(),
+                guard.keys().copied().collect::<HashSet<SocketAddr>>(),
+            )
+        };
+
+        let mut ctl = *self.recovery.read().await;
+        let now = Instant::now();
+
+        if count >= RECOVERY_COMFORT_PEERS {
+            if ctl.state != RecoveryState::Healthy {
+                self.recovery.write().await.reset();
+                info!(
+                    "self-heal: peer_count {} >= comfort {} -> recovery complete, backoff reset",
+                    count, RECOVERY_COMFORT_PEERS
+                );
+            }
+            return RecoveryRound {
+                state: RecoveryState::Healthy,
+                dial: Vec::new(),
+                tier1_anchors: 0,
+                tier2_known: 0,
+                tier3_seeds: 0,
+                sources_left: true,
+            };
+        }
+
+        // `Exhausted` is not a latch: once its backoff has fully expired, open
+        // one slow probe window again (see `open_probe_window`).
+        if ctl.state == RecoveryState::Exhausted && ctl.backoff_due(now) {
+            self.recovery.write().await.open_probe_window();
+            ctl = *self.recovery.read().await;
+        }
+
+        // Tier 2/3 come from the unchanged Phase 2C selection. Seeds
+        // are split back out here so the ladder can withhold them.
+        let ranked = self.outbound_candidates(MAX_DIALS_PER_ROUND).await;
+        let seeds = self.config.bootnodes.clone();
+        let seed_set: HashSet<SocketAddr> = seeds.iter().copied().collect();
+        let known: Vec<SocketAddr> = ranked
+            .iter()
+            .copied()
+            .filter(|a| !seed_set.contains(a))
+            .collect();
+
+        let round = {
+            let mgr = self.addresses.read().await;
+            let anchors = mgr.anchor_addresses();
+            let banned = |a: &SocketAddr| mgr.is_banned(*a);
+            plan_recovery(
+                self.config.listen_addr,
+                count,
+                &anchors,
+                &known,
+                &seeds,
+                &connected,
+                &banned,
+                &ctl,
+                now,
+            )
+        };
+
+        if round.state != ctl.state {
+            match round.state {
+                RecoveryState::Healthy => {}
+                RecoveryState::Recovering => info!(
+                    "self-heal: peer_count {} < comfort {} (threshold {}, min {}) -> entering recovery, planning {} anchor / {} known / {} seed dial(s)",
+                    count,
+                    RECOVERY_COMFORT_PEERS,
+                    RECOVERY_THRESHOLD,
+                    RECOVERY_MIN_PEERS,
+                    round.tier1_anchors,
+                    round.tier2_known,
+                    round.tier3_seeds,
+                ),
+                RecoveryState::Degraded => info!(
+                    "self-heal: peer_count {} -> recovery throttled for {:?} ({} consecutive failed round(s))",
+                    count,
+                    ctl.backoff(),
+                    ctl.consecutive_failures
+                ),
+                RecoveryState::Exhausted => warn!(
+                    "self-heal: peer_count {} below threshold {} with no dialable source (or {} consecutive failed rounds) -> exhausted, probing every {:?}",
+                    count,
+                    RECOVERY_THRESHOLD,
+                    ctl.consecutive_failures,
+                    recovery_backoff(RECOVERY_MAX_LEVEL)
+                ),
+            }
+        }
+        self.recovery.write().await.set_state(round.state);
+
+        if round.state != RecoveryState::Recovering {
+            return round;
+        }
+
+        debug!(
+            "self-heal: round of {} dial(s): {} anchor, {} known, {} seed; {} source(s) left",
+            round.dial.len(),
+            round.tier1_anchors,
+            round.tier2_known,
+            round.tier3_seeds,
+            round.sources_left
+        );
+        for addr in &round.dial {
+            self.connect_to_peer(*addr).await;
+        }
+
+        // Success is measured by the planned addresses that now hold a
+        // session — not by the raw count, which a concurrent inbound
+        // connection could move underneath us.
+        let opened = {
+            let guard = self.peers.read().await;
+            round.dial.iter().filter(|a| guard.contains_key(*a)).count()
+        };
+        debug!(
+            "self-heal: round opened {} of {} planned session(s)",
+            opened,
+            round.dial.len()
+        );
+        self.recovery
+            .write()
+            .await
+            .record_round(opened, Instant::now());
+        round
     }
 
     /// Phase 2A candidate ordering for the redial loop: addresses the node
@@ -5711,6 +6202,759 @@ mod phase2_eclipse_tests {
             network_group(v6_other),
             "the first 24 bits are fixed inside one provider allocation"
         );
+    }
+}
+
+#[cfg(test)]
+mod phase2_self_healing_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    /// Fixed metadata timestamp, so nothing depends on wall-clock time.
+    const NOW: u64 = 1_700_000_000;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// `count` distinct addresses inside the /24 `o1.o2.o3.0`.
+    fn net4(o1: u8, o2: u8, o3: u8, count: usize) -> Vec<SocketAddr> {
+        (0..count)
+            .map(|i| addr(&format!("{o1}.{o2}.{o3}.{i}:25565")))
+            .collect()
+    }
+
+    /// `count` network groups, `per_group` addresses each.
+    fn groups(start: u8, count: usize, per_group: usize) -> Vec<Vec<SocketAddr>> {
+        (0..count)
+            .map(|i| net4(203, 0, start + i as u8, per_group))
+            .collect()
+    }
+
+    fn flatten(gs: &[Vec<SocketAddr>]) -> Vec<SocketAddr> {
+        gs.iter().flatten().copied().collect()
+    }
+
+    fn not_banned(_: &SocketAddr) -> bool {
+        false
+    }
+
+    fn fresh() -> PeerRecoveryController {
+        PeerRecoveryController::new()
+    }
+
+    /// Anchors as `anchor_addresses()` reports them: `(address, last success)`,
+    /// the first element being the most recently proven one.
+    fn anchor_list(addrs: &[SocketAddr]) -> Vec<(SocketAddr, u64)> {
+        addrs.iter()
+            .enumerate()
+            .map(|(i, a)| (*a, NOW - i as u64))
+            .collect()
+    }
+
+    fn plan(
+        count: usize,
+        anchors: &[(SocketAddr, u64)],
+        known: &[SocketAddr],
+        seeds: &[SocketAddr],
+        connected: &HashSet<SocketAddr>,
+        ctl: &PeerRecoveryController,
+    ) -> RecoveryRound {
+        plan_recovery(
+            addr("127.0.0.1:31001"),
+            count,
+            anchors,
+            known,
+            seeds,
+            connected,
+            &not_banned,
+            ctl,
+            Instant::now(),
+        )
+    }
+
+    fn net_with(bootnodes: Vec<SocketAddr>) -> P2PNetwork {
+        net_at_config(P2PConfig {
+            listen_addr: addr("127.0.0.1:31001"),
+            bootnodes,
+            dns_seeds: vec![],
+            peer_store_path: None,
+        })
+    }
+
+    fn net_at(path: std::path::PathBuf) -> P2PNetwork {
+        net_at_config(P2PConfig {
+            listen_addr: addr("127.0.0.1:31001"),
+            bootnodes: vec![],
+            dns_seeds: vec![],
+            peer_store_path: Some(path),
+        })
+    }
+
+    fn net_at_config(cfg: P2PConfig) -> P2PNetwork {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
+        let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
+            Arc::new(|_| None);
+        let sync_ctx = Arc::new(SyncContext::default());
+        let is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> = Arc::new(|_| false);
+        P2PNetwork::new(
+            cfg,
+            tx,
+            empty.clone(),
+            empty_opt,
+            empty,
+            sync_ctx,
+            is_orphan,
+        )
+    }
+
+    /// A listener that accepts and holds, standing in for a live peer. Loopback
+    /// is a single network group, so one of these can host at most
+    /// `MAX_PEERS_PER_SUBNET` real sessions — which is exactly the invariant
+    /// recovery must respect.
+    async fn live_peer() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((mut sock, _)) => {
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 1024];
+                            loop {
+                                match tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(_) => {}
+                                }
+                            }
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        local
+    }
+
+    /// Modelled sessions for peers the ladder is not expected to dial.
+    ///
+    /// Used only to move the *count* to `RECOVERY_COMFORT_PEERS`: a test host
+    /// only has loopback, and loopback is one `/24`, so no more than
+    /// `MAX_PEERS_PER_SUBNET` real sockets can ever be opened here.
+    async fn insert_session(net: &P2PNetwork, a: SocketAddr) {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        net.peers.write().await.insert(a, tx);
+    }
+
+    // -----------------------------------------------------------------------
+    // Controller transitions and bounds (pure).
+    // -----------------------------------------------------------------------
+
+    /// S1 — one peer of eight disappears. Seven is still above the entry
+    /// threshold, so recovery must not start: no state change, no dial, and
+    /// nothing disturbs the seven sessions that remain.
+    #[test]
+    fn test_self_healing_single_peer_loss() {
+        let peers: Vec<SocketAddr> = flatten(&groups(100, 8, 1));
+        let connected: HashSet<SocketAddr> = peers[..7].iter().copied().collect();
+
+        let round = plan(
+            7,
+            &anchor_list(&peers),
+            &peers,
+            &[],
+            &connected,
+            &fresh(),
+        );
+
+        assert_eq!(
+            round.state,
+            RecoveryState::Healthy,
+            "losing one peer of eight must not trigger recovery"
+        );
+        assert!(round.sources_left, "the lost peer is still a known candidate");
+        assert_eq!(connected.len(), 7, "existing sessions are untouched");
+    }
+
+    /// S2 — eight peers collapse to two. Recovery starts, and the round stays
+    /// inside `MAX_DIALS_PER_ROUND`.
+    #[test]
+    fn test_self_healing_majority_peer_loss() {
+        let peers: Vec<SocketAddr> = flatten(&groups(100, 8, 1));
+        let connected: HashSet<SocketAddr> = peers[..2].iter().copied().collect();
+        let anchors = anchor_list(&peers[..3]);
+
+        let round = plan(2, &anchors, &peers, &[], &connected, &fresh());
+
+        assert_eq!(round.state, RecoveryState::Recovering);
+        assert!(round.dial.len() <= MAX_DIALS_PER_ROUND, "rounds are bounded");
+        assert!(!round.dial.is_empty(), "recovery must actually plan dials");
+        assert!(round.tier1_anchors >= 1, "an anchor that dropped leads");
+        assert!(round.tier2_known >= 1, "the rest of the store fills in");
+        for a in &round.dial {
+            assert!(!connected.contains(a), "never re-dial a live session");
+        }
+    }
+
+    /// S3 — the table is empty: anchors first, then everything else the node
+    /// knows. Configured seeds stay out of it while primaries exist.
+    #[test]
+    fn test_self_healing_zero_peers() {
+        let anchors_src: Vec<SocketAddr> = flatten(&groups(100, 3, 1));
+        let known: Vec<SocketAddr> = flatten(&groups(110, 10, 1));
+        let seeds: Vec<SocketAddr> = flatten(&groups(120, 2, 1));
+
+        let round = plan(
+            0,
+            &anchor_list(&anchors_src),
+            &known,
+            &seeds,
+            &HashSet::new(),
+            &fresh(),
+        );
+
+        assert_eq!(round.state, RecoveryState::Recovering);
+        assert_eq!(round.tier1_anchors, anchors_src.len(), "anchors lead");
+        for (i, a) in anchors_src.iter().enumerate() {
+            assert_eq!(round.dial[i], *a, "most recently proven anchor first");
+        }
+        assert!(round.tier2_known > 0, "the address manager fills the rest");
+        assert_eq!(round.tier3_seeds, 0, "seeds are a last resort");
+        assert!(round.dial.len() <= MAX_DIALS_PER_ROUND);
+    }
+
+    /// S4 — the bootnode is gone entirely. Recovery runs off anchors and the
+    /// peer store, never touches the seed, and is not blocked on it.
+    #[test]
+    fn test_self_healing_bootnode_down() {
+        let dead_seed = addr("192.0.2.9:25565");
+        let anchors_src: Vec<SocketAddr> = flatten(&groups(100, 4, 1));
+        let known: Vec<SocketAddr> = flatten(&groups(110, 6, 1));
+
+        let round = plan(
+            0,
+            &anchor_list(&anchors_src),
+            &known,
+            &[dead_seed],
+            &HashSet::new(),
+            &fresh(),
+        );
+
+        assert_eq!(round.state, RecoveryState::Recovering);
+        assert!(!round.dial.contains(&dead_seed), "the dead seed is not dialed");
+        assert!(!round.dial.is_empty(), "recovery proceeds without it");
+        assert!(round.sources_left);
+
+        // Same setup with the seed removed changes nothing: it was never a
+        // dependency, only a candidate.
+        let without = plan(
+            0,
+            &anchor_list(&anchors_src),
+            &known,
+            &[],
+            &HashSet::new(),
+            &fresh(),
+        );
+        assert_eq!(without.dial, round.dial);
+        assert_eq!(without.sources_left, true);
+    }
+
+    /// S6 — dials fail: the address is penalised, rounds stay bounded, and a
+    /// run of them terminates in `Exhausted` rather than looping forever.
+    #[test]
+    fn test_self_healing_dial_failures() {
+        // (a) `record_failure` — the path `connect_to_peer_inner` takes after
+        // a refused or timed-out dial — lowers the address's quality.
+        let mut mgr = AddressManager::new();
+        let miss = addr("198.51.100.7:25565");
+        mgr.observe(miss, PeerSource::Restored, NOW, Instant::now());
+        let before = mgr.selection_tables().0.get(&miss).unwrap().quality;
+        mgr.record_failure(miss);
+        let after = mgr.selection_tables().0.get(&miss).unwrap().quality;
+        assert_eq!(after, before - 5, "each failed dial must cost quality");
+
+        // (b) Six rounds that open nothing exhaust the controller, and a plan
+        // built from it is therefore not dialable.
+        let mut ctl = fresh();
+        let t = Instant::now();
+        for i in 0..RECOVERY_MAX_CONSECUTIVE_FAILURES {
+            ctl.record_round(0, t + Duration::from_secs(3600 * (i as u64 + 1)));
+        }
+        assert_eq!(ctl.consecutive_failures, RECOVERY_MAX_CONSECUTIVE_FAILURES);
+        assert_eq!(ctl.backoff_level, RECOVERY_MAX_LEVEL);
+
+        let candidate: Vec<SocketAddr> = flatten(&groups(130, 8, 1));
+        let round = plan(
+            0,
+            &anchor_list(&candidate),
+            &[],
+            &[],
+            &HashSet::new(),
+            &ctl,
+        );
+        assert_eq!(round.state, RecoveryState::Exhausted);
+
+        // (c) While recovering, every round is bounded and offers *fresh*
+        // candidates rather than replaying one bad address.
+        let early = plan(
+            0,
+            &[],
+            &flatten(&groups(140, 20, 1)),
+            &[],
+            &HashSet::new(),
+            &fresh(),
+        );
+        assert_eq!(early.state, RecoveryState::Recovering);
+        assert!(early.dial.len() <= MAX_DIALS_PER_ROUND);
+        assert_eq!(
+            early.dial.iter().collect::<HashSet<_>>().len(),
+            early.dial.len(),
+            "no address is planned twice in one round"
+        );
+    }
+
+    /// The backoff is bounded and monotone: 0, 5, 10, 20, 40, 60, 60 seconds.
+    #[test]
+    fn test_self_healing_backoff() {
+        let levels: Vec<u64> = (0..=RECOVERY_MAX_LEVEL)
+            .map(|l| recovery_backoff(l).as_secs())
+            .collect();
+
+        assert_eq!(levels, vec![0, 5, 10, 20, 40, 60, 60]);
+        assert!(
+            levels.windows(2).all(|w| w[0] <= w[1]),
+            "backoff must never shrink as failures accumulate"
+        );
+        assert!(
+            levels.iter().all(|s| *s <= RECOVERY_BACKOFF_MAX_SECS),
+            "backoff is capped"
+        );
+        assert_eq!(recovery_backoff(RECOVERY_MAX_LEVEL + 99), recovery_backoff(RECOVERY_MAX_LEVEL));
+    }
+
+    /// One opened session clears the throttle completely; a failed round
+    /// climbs exactly one level.
+    #[test]
+    fn test_self_healing_backoff_reset() {
+        let mut ctl = fresh();
+        let t = Instant::now();
+
+        ctl.record_round(0, t);
+        ctl.record_round(0, t + Duration::from_secs(10));
+        ctl.record_round(0, t + Duration::from_secs(30));
+        assert_eq!(ctl.backoff_level, 3);
+        assert_eq!(ctl.consecutive_failures, 3);
+        assert!(!ctl.backoff_due(t));
+
+        ctl.record_round(2, t + Duration::from_secs(60));
+        assert_eq!(ctl.backoff_level, 0, "success resets the backoff");
+        assert_eq!(ctl.consecutive_failures, 0, "success resets the failures");
+        assert_eq!(ctl.backoff(), Duration::ZERO);
+        assert!(ctl.backoff_due(t + Duration::from_secs(61)));
+    }
+
+    /// A round never exceeds `MAX_DIALS_PER_ROUND`, whatever the store holds,
+    /// and never over-fills one network group.
+    #[test]
+    fn test_self_healing_respects_outbound_limits() {
+        assert!(MAX_DIALS_PER_ROUND <= MAX_REDIAL_PER_CYCLE);
+        assert_eq!(MAX_DIALS_PER_ROUND, PROTECTED_OUTBOUND_SLOTS);
+
+        // 200 candidates, 200 distinct network groups.
+        let spread: Vec<SocketAddr> = (0..200u16)
+            .map(|i| addr(&format!("10.{}.{}.7:25565", i / 256, i % 256)))
+            .collect();
+        let round = plan(
+            0,
+            &anchor_list(&spread),
+            &spread,
+            &[],
+            &HashSet::new(),
+            &fresh(),
+        );
+        assert_eq!(
+            round.dial.len(),
+            MAX_DIALS_PER_ROUND,
+            "a large store yields exactly one bounded round"
+        );
+
+        // 64 candidates all inside a single /24: the subnet gate caps it.
+        let one_group = net4(198, 51, 100, 64);
+        let round = plan(
+            0,
+            &anchor_list(&one_group),
+            &[],
+            &[],
+            &HashSet::new(),
+            &fresh(),
+        );
+        assert!(
+            round.dial.len() <= MAX_PEERS_PER_SUBNET,
+            "one /24 can never fill a round: {} > {}",
+            round.dial.len(),
+            MAX_PEERS_PER_SUBNET
+        );
+    }
+
+    /// The `/24` invariant of Phase 2C still holds while recovering, even for
+    /// the tiers that bypass `select_outbound`.
+    #[test]
+    fn test_self_healing_preserves_diversity() {
+        let crowded = net4(203, 0, 100, 8);
+        let connected: HashSet<SocketAddr> = crowded[..3].iter().copied().collect();
+
+        let mut candidates: Vec<SocketAddr> = crowded[3..].to_vec();
+        candidates.extend(flatten(&groups(110, 8, 4)));
+
+        let round = plan(
+            3,
+            &anchor_list(&candidates),
+            &[],
+            &[],
+            &connected,
+            &fresh(),
+        );
+
+        let mut all: Vec<SocketAddr> = connected.iter().copied().collect();
+        all.extend(round.dial.iter().copied());
+
+        let counts = group_counts(all.iter().copied());
+        assert!(
+            counts.values().all(|n| *n <= MAX_PEERS_PER_SUBNET),
+            "recovery must never push a group past {}: {:?}",
+            MAX_PEERS_PER_SUBNET,
+            counts
+        );
+        assert_eq!(
+            counts.get(&network_group(crowded[0])).copied().unwrap(),
+            MAX_PEERS_PER_SUBNET,
+            "the crowded group gains exactly the one slot it still had"
+        );
+        assert!(round.dial.len() <= MAX_DIALS_PER_ROUND);
+    }
+
+    /// Tier 1 is the anchor set, ordered by recency, and it goes first.
+    #[test]
+    fn test_self_healing_uses_anchors() {
+        let older = addr("203.0.113.1:25565");
+        let newer = addr("203.0.114.1:25565");
+        let anchors = vec![(older, NOW - 100), (newer, NOW)];
+        let known = vec![
+            addr("203.0.115.1:25565"),
+            addr("203.0.116.1:25565"),
+        ];
+
+        let round = plan(0, &anchors, &known, &[], &HashSet::new(), &fresh());
+
+        assert_eq!(round.tier1_anchors, 2);
+        assert_eq!(round.dial[0], newer, "most recently proven anchor first");
+        assert_eq!(round.dial[1], older);
+        assert_eq!(round.tier2_known, known.len());
+        assert_eq!(&round.dial[2..], &known[..]);
+    }
+
+    /// With no anchors at all, tier 2 — the Phase 2C view of the address
+    /// manager — supplies the whole round.
+    #[test]
+    fn test_self_healing_uses_address_manager() {
+        let known: Vec<SocketAddr> = flatten(&groups(100, 6, 1));
+
+        let round = plan(0, &[], &known, &[], &HashSet::new(), &fresh());
+
+        assert_eq!(round.state, RecoveryState::Recovering);
+        assert_eq!(round.tier1_anchors, 0);
+        assert_eq!(round.tier2_known, known.len());
+        assert_eq!(round.dial, known);
+    }
+
+    /// An address learned only from PEX still reaches the ladder, at the
+    /// quality Phase 2B assigns to gossip.
+    #[tokio::test]
+    async fn test_self_healing_uses_pex() {
+        let net = net_with(vec![]);
+        let hint = addr("203.0.113.42:25565");
+
+        let ok = ingress_address(
+            &net.addresses,
+            &net.peers,
+            net.config.listen_addr,
+            hint,
+            PeerSource::Pex,
+        )
+        .await;
+        assert!(ok, "the hint must be admitted to the store");
+        {
+            let mgr = net.addresses.read().await;
+            let (entries, _) = mgr.selection_tables();
+            let e = entries.get(&hint).expect("PEX hint is stored");
+            assert_eq!(e.source, PeerSource::Pex);
+        }
+        // The table is not full, so `admit` inserted at the default quality;
+        // what matters is that the *admission decision* weighed the hint at
+        // gossip quality, below anything the node observed itself.
+        assert_eq!(admission_quality(PeerSource::Pex), PEX_ADMISSION_QUALITY);
+        assert!(
+            admission_quality(PeerSource::Pex) < admission_quality(PeerSource::Outbound),
+            "a gossip hint may never outrank direct evidence"
+        );
+
+        let ranked = net.outbound_candidates(MAX_DIALS_PER_ROUND).await;
+        let seeds: HashSet<SocketAddr> = net.config.bootnodes.iter().copied().collect();
+        let known: Vec<SocketAddr> = ranked
+            .iter()
+            .copied()
+            .filter(|a| !seeds.contains(a))
+            .collect();
+        assert!(known.contains(&hint), "the PEX hint reaches the ladder");
+
+        let ctl = *net.recovery.read().await;
+        let connected: HashSet<SocketAddr> = net.peers.read().await.keys().copied().collect();
+        let round = plan_recovery(
+            net.config.listen_addr,
+            connected.len(),
+            &[],
+            &known,
+            &net.config.bootnodes,
+            &connected,
+            &not_banned,
+            &ctl,
+            Instant::now(),
+        );
+        assert_eq!(round.state, RecoveryState::Recovering);
+        assert!(round.dial.contains(&hint), "the PEX hint is dialed");
+    }
+
+    /// The seed is withheld while anything else is left to try, offered when
+    /// there is nothing else, and released after a round has failed.
+    #[test]
+    fn test_self_healing_seed_last_resort() {
+        let seed = addr("192.0.2.9:25565");
+        let known: Vec<SocketAddr> = flatten(&groups(100, 6, 1));
+
+        let first = plan(0, &[], &known, &[seed], &HashSet::new(), &fresh());
+        assert!(
+            !first.dial.contains(&seed),
+            "with known candidates the seed must not appear"
+        );
+        assert_eq!(first.tier3_seeds, 0);
+
+        let empty = plan(0, &[], &[], &[seed], &HashSet::new(), &fresh());
+        assert_eq!(empty.tier3_seeds, 1, "with nothing else, the seed is used");
+        assert!(empty.sources_left);
+
+        let mut failed = fresh();
+        failed.record_round(0, Instant::now() - Duration::from_secs(3600));
+        let after = plan(0, &[], &known, &[seed], &HashSet::new(), &failed);
+        assert!(
+            after.dial.contains(&seed),
+            "a failed round releases the last resort"
+        );
+    }
+
+    /// S7 — a restarted node with an empty table rebuilds from its peer store
+    /// and anchors, without waiting on a bootnode.
+    #[tokio::test]
+    async fn test_self_healing_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_peers.json");
+
+        let a1 = addr("203.0.113.1:25565");
+        let a2 = addr("203.0.114.1:25565");
+        {
+            let net = net_at(path.clone());
+            {
+                let mut mgr = net.addresses.write().await;
+                mgr.observe(a1, PeerSource::Restored, unix_now(), Instant::now());
+                mgr.observe(a2, PeerSource::Restored, unix_now(), Instant::now());
+                mgr.apply_anchors(&HashSet::from([a1, a2]));
+            }
+            net.save_known_peers().await;
+        }
+
+        let net2 = net_at(path.clone());
+        assert_eq!(net2.peer_count().await, 0, "restart opens with no session");
+        net2.load_known_peers().await;
+        {
+            let mgr = net2.addresses.read().await;
+            assert!(mgr.contains(a1) && mgr.contains(a2));
+            assert_eq!(mgr.anchor_addresses().len(), 2, "anchors survived the restart");
+        }
+
+        let ctl = *net2.recovery.read().await;
+        let round = plan_recovery(
+            net2.config.listen_addr,
+            0,
+            &net2.addresses.read().await.anchor_addresses(),
+            &[],
+            &[],
+            &HashSet::new(),
+            &not_banned,
+            &ctl,
+            Instant::now(),
+        );
+        assert_eq!(round.state, RecoveryState::Recovering);
+        assert_eq!(round.tier1_anchors, 2, "the restored anchors lead");
+        let mut got = round.dial.clone();
+        got.sort();
+        assert_eq!(got, vec![a1, a2], "both restored anchors are dialed");
+    }
+
+    /// S8 — loss plus a poisoned store plus a dead bootnode: recovery stays
+    /// group-quota'd, leads with anchors, withholds the seed, and stops.
+    #[test]
+    fn test_self_healing_attack_scenario() {
+        // The attacker owns one routable /24 and floods it with 64 candidates.
+        let evil: Vec<SocketAddr> = net4(198, 51, 100, 64);
+        // Honest anchors live in four other groups.
+        let good: Vec<SocketAddr> = flatten(&groups(203, 4, 1));
+        let seed = addr("192.0.2.9:25565");
+
+        let mut known: Vec<SocketAddr> = evil.clone();
+        known.extend(good.iter().copied());
+
+        let round = plan(
+            0,
+            &anchor_list(&good),
+            &known,
+            &[seed],
+            &HashSet::new(),
+            &fresh(),
+        );
+
+        assert_eq!(round.state, RecoveryState::Recovering);
+        assert!(round.dial.len() <= MAX_DIALS_PER_ROUND);
+        for a in &round.dial[..round.tier1_anchors] {
+            assert!(good.contains(a), "anchors always lead");
+        }
+        let evil_taken = round.dial.iter().filter(|a| evil.contains(a)).count();
+        assert!(
+            evil_taken <= MAX_PEERS_PER_SUBNET,
+            "one attacker allocation can take at most a subnet's worth: {}",
+            evil_taken
+        );
+        assert!(!round.dial.contains(&seed), "the seed is not the way out");
+
+        // Bounded: six fruitless rounds end it instead of feeding the attacker.
+        let mut ctl = fresh();
+        let t = Instant::now();
+        for i in 0..RECOVERY_MAX_CONSECUTIVE_FAILURES {
+            ctl.record_round(0, t + Duration::from_secs(3600 * (i as u64 + 1)));
+        }
+        let stopped = plan(0, &anchor_list(&good), &known, &[seed], &HashSet::new(), &ctl);
+        assert_eq!(stopped.state, RecoveryState::Exhausted);
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration: the production round, real sockets, real address manager.
+    // -----------------------------------------------------------------------
+
+    /// Loss of the majority with the bootnode cut, then recovery to a
+    /// converged, healthy neighbourhood.
+    ///
+    /// Drives `recovery_round` — the exact function the background task calls.
+    #[tokio::test]
+    async fn test_self_healing_integration_bootnode_down_convergence() {
+        let mut peers_live = Vec::new();
+        for _ in 0..MAX_PEERS_PER_SUBNET {
+            peers_live.push(live_peer().await);
+        }
+        let bootnode = addr("127.0.0.1:9"); // present in config, answers nothing
+
+        let net = net_with(vec![bootnode]);
+        {
+            let mut mgr = net.addresses.write().await;
+            for a in &peers_live {
+                mgr.observe(*a, PeerSource::Restored, unix_now(), Instant::now());
+            }
+            let wanted: HashSet<SocketAddr> = peers_live.iter().copied().collect();
+            mgr.apply_anchors(&wanted);
+        }
+
+        // The node has just lost every session it had.
+        assert_eq!(net.peer_count().await, 0);
+
+        let round = net.recovery_round().await;
+        assert_eq!(round.state, RecoveryState::Recovering, "S2 detection");
+        assert_eq!(round.tier1_anchors, peers_live.len(), "anchors lead");
+        assert!(
+            !round.dial.contains(&bootnode),
+            "SEED_LAST_RESORT: the bootnode is not dialed while anchors exist"
+        );
+        assert_eq!(
+            net.peer_count().await,
+            peers_live.len(),
+            "S4: recovery opened the neighbourhood without the bootnode"
+        );
+        {
+            let ctl = net.recovery.read().await;
+            assert_eq!(ctl.consecutive_failures, 0, "success clears the throttle");
+            assert_eq!(ctl.backoff_level, 0);
+        }
+
+        // Bring the table to comfort and confirm the loop stands down.
+        for i in 0..RECOVERY_COMFORT_PEERS.saturating_sub(peers_live.len()) {
+            insert_session(
+                &net,
+                addr(&format!("203.0.{}.1:25565", 100 + i)),
+            )
+            .await;
+        }
+        let round = net.recovery_round().await;
+        assert_eq!(
+            round.state,
+            RecoveryState::Healthy,
+            "recovery ends once the count reaches comfort"
+        );
+        assert!(round.dial.is_empty(), "Healthy issues no dial at all");
+        {
+            let ctl = net.recovery.read().await;
+            assert_eq!(ctl.backoff_level, 0);
+            assert_eq!(ctl.consecutive_failures, 0);
+        }
+    }
+
+    /// Restart with nothing connected, rebuild from the store and its anchors,
+    /// and return to `Healthy`.
+    #[tokio::test]
+    async fn test_self_healing_integration_restart_to_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_peers.json");
+
+        let first = live_peer().await;
+        let second = live_peer().await;
+        {
+            let net = net_at(path.clone());
+            {
+                let mut mgr = net.addresses.write().await;
+                mgr.observe(first, PeerSource::Restored, unix_now(), Instant::now());
+                mgr.observe(second, PeerSource::Restored, unix_now(), Instant::now());
+                mgr.apply_anchors(&HashSet::from([first, second]));
+            }
+            net.save_known_peers().await;
+        }
+
+        // Restart: zero sessions, store and anchors on disk.
+        let net = net_at(path.clone());
+        assert_eq!(net.peer_count().await, 0);
+        net.load_known_peers().await;
+
+        let round = net.recovery_round().await;
+        assert_eq!(round.state, RecoveryState::Recovering);
+        assert_eq!(round.tier1_anchors, 2, "recovered from the restored anchors");
+        assert_eq!(net.peer_count().await, 2, "sessions reopened from the store");
+        {
+            let ctl = net.recovery.read().await;
+            assert_eq!(ctl.consecutive_failures, 0);
+            assert_eq!(ctl.backoff_level, 0);
+        }
+
+        for i in 0..RECOVERY_COMFORT_PEERS.saturating_sub(2) {
+            insert_session(&net, addr(&format!("203.0.{}.1:25565", 120 + i))).await;
+        }
+        let round = net.recovery_round().await;
+        assert_eq!(round.state, RecoveryState::Healthy, "back to a healthy count");
+        assert!(round.dial.is_empty());
     }
 }
 
