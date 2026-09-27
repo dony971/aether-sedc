@@ -7,7 +7,8 @@
 use crate::transaction::Transaction;
 use chacha20poly1305::aead::{Aead, NewAead};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use rand::rngs::OsRng;
+use rand::rngs::{OsRng, StdRng};
+use rand::{Rng, SeedableRng};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -90,6 +91,53 @@ const PEER_QUALITY_PENALIZED: i32 = PEER_SCORE_BAN_THRESHOLD;
 
 /// Highest quality score a `PeerMeta` can carry (mirrors PeerScore ceiling).
 const PEER_QUALITY_MAX: i32 = 200;
+
+// ---------------------------------------------------------------------------
+// Phase 2C — eclipse resistance (diversified, rotated outbound selection).
+//
+// Every coefficient below is expressed as a fraction of `PEER_SCORE_INITIAL`
+// so that address quality — which starts at exactly `PEER_SCORE_INITIAL` —
+// stays the dominant term in the selection weight. None of them is a number
+// chosen to make a test pass; the fraction they represent is the justification.
+// Full derivation: docs/AETHER_PHASE2_ECLIPSE_AUDIT.md §13.
+// ---------------------------------------------------------------------------
+
+/// Maximum addresses one network group may contribute to a *single* outbound
+/// selection round. Half of `MAX_PEERS_PER_SUBNET` by construction: a round of
+/// `MAX_REDIAL_PER_CYCLE` dials therefore spans at least 16 groups when the
+/// pool allows, while two consecutive rounds can still fill a group right up
+/// to its session cap.
+const MAX_CANDIDATES_PER_GROUP: usize = MAX_PEERS_PER_SUBNET / 2;
+
+/// Rank bonus for an address promoted as an anchor. Half of the initial score:
+/// an anchor is an address we have *already* reached and deliberately kept, so
+/// it must outrank an unknown candidate — but never outrank the gap between a
+/// healthy peer and one that keeps failing.
+const ANCHOR_SELECT_BONUS: i32 = PEER_SCORE_INITIAL / 2;
+
+/// Rank bonus for a successful handshake inside `RECENT_PEER_WINDOW_SECS`.
+/// A quarter of the initial score: fresh proof, worth less than the persisted
+/// proof an anchor represents.
+const RECENT_SUCCESS_BONUS: i32 = PEER_SCORE_INITIAL / 4;
+
+/// Rank penalty applied once per live session already held in the same network
+/// group. Four sessions in one group cost 80, making an over-represented group
+/// roughly five times less likely to be picked than an empty one of equal
+/// quality — which is what turns "diversity" into a selection property rather
+/// than a post-hoc admission check.
+const GROUP_OVERREPRESENTATION_PENALTY: i32 = PEER_SCORE_INITIAL / 5;
+
+/// Selection weights are offset by one so a never-tried candidate can never
+/// score zero: the node must always be able to try *something*.
+const MIN_SELECT_WEIGHT: u64 = 1;
+
+/// Quality assigned to an address learned **only** from a PEX gossip hint.
+/// Half of `PEER_SCORE_INITIAL`, therefore strictly below every entry we
+/// observed through a channel we control (inbound, outbound dial, DNS,
+/// operator config). `admit_peer` evicts when `victim_quality <= incoming`,
+/// so at this value a PEX burst can displace only already-degraded or banned
+/// entries — never a healthy peer it happens to outnumber.
+const PEX_ADMISSION_QUALITY: i32 = PEER_SCORE_INITIAL / 2;
 
 /// Maximum entries in the seen-transaction cache (memory bound)
 const MAX_SEEN_TXS: usize = 50_000;
@@ -205,21 +253,73 @@ impl PeerScore {
 /// Maximum frames accepted from a peer per second (rate limit)
 const MAX_MSGS_PER_SEC: u64 = 400;
 
-/// Extract the /24 subnet prefix from a SocketAddr (first 3 bytes of IPv4).
-/// Returns None for IPv6 (handled separately) or invalid addresses.
-fn subnet_24(addr: SocketAddr) -> Option<[u8; 3]> {
-    match addr {
-        SocketAddr::V4(v4) => {
-            let octets = v4.ip().octets();
-            Some([octets[0], octets[1], octets[2]])
-        }
-        SocketAddr::V6(v6) => {
-            let octets = v6.ip().octets();
-            // Use first 3 bytes as synthetic /24-equivalent
-            Some([octets[0], octets[1], octets[2]])
+/// Phase 2C: the network group an endpoint belongs to. One group is one
+/// unit of eclipse exposure — an attacker who owns one routable allocation
+/// occupies exactly one group, so a per-group cap bounds what they can take.
+///
+/// Derivation of the granularity, and of why IPv6 uses 24 bits rather than a
+/// finer /48, in docs/AETHER_PHASE2_ECLIPSE_AUDIT.md §13.1. The short version:
+/// the only dangerous direction is *under*-grouping (one real allocation
+/// spread over many groups), and every realistic single allocation — IPv4 /24
+/// or larger, IPv6 /32 or larger — sits inside exactly one 24-bit group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum NetworkGroup {
+    /// First three octets of an IPv4 address (a /24).
+    V4([u8; 3]),
+    /// First 24 bits of a native IPv6 address. Coarser than a /48 on purpose:
+    /// a /48 would let a single provider allocation span thousands of groups.
+    V6([u8; 3]),
+}
+
+impl NetworkGroup {
+    /// The lossy three-byte projection used by the legacy `subnet_24` helpers.
+    /// Erasing the family bit can only ever *merge* two groups, never split
+    /// one, so the projection stays on the conservative side.
+    fn prefix3(self) -> [u8; 3] {
+        match self {
+            NetworkGroup::V4(p) | NetworkGroup::V6(p) => p,
         }
     }
 }
+
+/// Phase 2C: the single grouping rule for endpoints.
+///
+/// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is judged as IPv4. Without this every
+/// mapped address collapses into the one group `[0, 0, 0]`, because the first
+/// three octets of `::ffff:x.x.x.x` are zero — and a dual-stack listener on
+/// Windows returns exactly that form from `accept()`, which would cap a
+/// healthy node at four inbound sessions in total.
+fn network_group(addr: SocketAddr) -> NetworkGroup {
+    match addr {
+        SocketAddr::V4(v4) => {
+            let o = v4.ip().octets();
+            NetworkGroup::V4([o[0], o[1], o[2]])
+        }
+        SocketAddr::V6(v6) => {
+            let o = v6.ip().octets();
+            // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d):
+            // judge the embedded v4 address, exactly as `is_private_or_reserved`
+            // already does, so the two rules can never disagree.
+            if o[..10] == [0u8; 10]
+                && ((o[10] == 0xff && o[11] == 0xff) || o[10..12] == [0, 0])
+            {
+                return network_group(SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15])),
+                    addr.port(),
+                ));
+            }
+            NetworkGroup::V6([o[0], o[1], o[2]])
+        }
+    }
+}
+
+/// Phase 1 helper, retained unchanged in signature because the Phase 1/8 tests
+/// assert on it directly. Now a projection of `network_group`, so the two can
+/// never drift apart.
+fn subnet_24(addr: SocketAddr) -> Option<[u8; 3]> {
+    Some(network_group(addr).prefix3())
+}
+
 
 /// Count how many connected peers share the same /24 subnet as `addr`.
 async fn count_subnet_peers(
@@ -250,6 +350,56 @@ async fn count_subnet_peers_excluding(
         .keys()
         .filter(|k| **k != addr && subnet_24(**k) == Some(target))
         .count()
+}
+
+/// Phase 2C: histogram of `addr` over network groups — how many distinct
+/// groups are represented, and how many endpoints each holds. Consumed by the
+/// selection debug log and by the Phase 2C tests as the diversity metric.
+fn group_counts<'a, I>(addrs: I) -> HashMap<NetworkGroup, usize>
+where
+    I: IntoIterator<Item = SocketAddr>,
+{
+    let mut counts: HashMap<NetworkGroup, usize> = HashMap::new();
+    for a in addrs {
+        *counts.entry(network_group(a)).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// Phase 2C: may one more *inbound* connection be accepted?
+///
+/// The guarantee, and the whole point of `PROTECTED_OUTBOUND_SLOTS`:
+///
+/// > whenever this returns true, `(total - outbound) + PROTECTED_OUTBOUND_SLOTS
+/// > <= MAX_PEERS` — i.e. the reservation still fits in the table *after* this
+/// > connection is admitted, so `outbound_admitted` keeps holding for at least
+/// > `PROTECTED_OUTBOUND_SLOTS - outbound` further dials.
+///
+/// Without it a client that opens 128 connections fills the shared `MAX_PEERS`
+/// table and `connect_to_peer_inner` refuses every subsequent dial — the node
+/// keeps gossiping while being unable to initiate a single session (audit L1,
+/// scenario A). `outbound` is passed in because a node that already holds its
+/// reserved outbound sessions owes no further reservation: counting against the
+/// *total* alone would throttle inbound on an outbound-heavy node.
+fn inbound_admitted(total: usize, outbound: usize) -> bool {
+    if outbound > total {
+        // Direction bookkeeping can only ever be a subset of the session map;
+        // treat anything else as "admit nothing" rather than unwrap it.
+        return false;
+    }
+    // Sessions we still owe outbound. Each already-open outbound session counts
+    // towards that target, so the reservation shrinks as they are filled.
+    let reserve = PROTECTED_OUTBOUND_SLOTS.saturating_sub(outbound);
+    // `total + 1` is the table once this inbound is admitted. It may enter only
+    // if what outbound is still owed still fits alongside it.
+    total + 1 + reserve <= MAX_PEERS
+}
+
+/// Phase 2C: may one more *outbound* connection be opened? Deliberately looser
+/// than the inbound rule — the reserved slots exist precisely so this keeps
+/// holding while inbound traffic saturates everything else.
+fn outbound_admitted(total: usize) -> bool {
+    total < MAX_PEERS
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +637,161 @@ fn expire_anchors(anchors: &[(SocketAddr, u64)], now_unix: u64) -> Vec<SocketAdd
         .collect()
 }
 
+/// Phase 2C: the outbound candidate order (audit L2).
+///
+/// Before this function existed the order came from `HashMap` iteration —
+/// unpredictable to a distant attacker, but *stable inside a process* and
+/// completely indifferent to quality, freshness, anchors, reputation and
+/// network group. Every redial cycle therefore restarted from the same order
+/// with the same budget, so the node never "discovered" anything its initial
+/// hashing had not already placed first.
+///
+/// Two phases, so the Phase-2A invariant survives: **every known candidate
+/// precedes every configured seed** (`test_seeds_are_unprivileged_in_redial`).
+///
+/// 1. **Known addresses** — weighted random sampling without replacement.
+///    Weight is quality plus an anchor bonus plus a recency bonus, minus a
+///    penalty per live session already held in the same network group. Every
+///    coefficient is a fraction of `PEER_SCORE_INITIAL`, keeping quality the
+///    dominant term (see the constant block).
+/// 2. **Configured seeds** — appended afterwards, in configuration order, under
+///    the same per-group quota. Unprivileged, but *reserved* a slice of the
+///    round: without it a store that is already full pushes every seed out of
+///    every round, which is seed authority by absence rather than by rank.
+///
+/// `ordered` is the Phase-2A candidate order produced by
+/// `P2PNetwork::redial_candidates`: every address the node already knows first,
+/// configured seeds appended last, its own listen address removed. `seed_tail`
+/// marks which members of `ordered` are those appended seeds, so phase 1 can
+/// re-rank the known half freely while phase 2 still keeps the tail behind it.
+///
+/// The RNG is injected so tests are deterministic (`StdRng::seed_from_u64`);
+/// production reseeds from the OS each round, which is also what makes the
+/// order differ from cycle to cycle.
+///
+/// Returns *fewer* than `limit` rather than relaxing the group quota: filling
+/// the last slots from one over-represented group is exactly what scenario B
+/// forbids. Progress is still guaranteed because the quota is recomputed from
+/// live sessions every round, so a group climbs towards `MAX_PEERS_PER_SUBNET`
+/// a few candidates at a time and then steps aside.
+fn select_outbound<R: Rng + ?Sized>(
+    ordered: &[SocketAddr],
+    seed_tail: &HashSet<SocketAddr>,
+    entries: &HashMap<SocketAddr, AddressEntry>,
+    scores: &HashMap<SocketAddr, PeerScore>,
+    connected: &HashSet<SocketAddr>,
+    limit: usize,
+    now_unix: u64,
+    rng: &mut R,
+) -> Vec<SocketAddr> {
+    use rand::distributions::{Distribution, WeightedIndex};
+
+    let live_by_group = group_counts(connected.iter().copied());
+    let mut used: HashMap<NetworkGroup, usize> = HashMap::new();
+    let mut picked: Vec<SocketAddr> = Vec::with_capacity(limit);
+    let mut seen: HashSet<SocketAddr> = HashSet::new();
+
+    let banned = |a: &SocketAddr| scores.get(a).map(|s| s.is_banned()).unwrap_or(false);
+
+    /// Still dialable this round: not holding a session, not already picked,
+    /// not banned.
+    fn eligible(
+        a: &SocketAddr,
+        connected: &HashSet<SocketAddr>,
+        seen: &HashSet<SocketAddr>,
+        banned: &impl Fn(&SocketAddr) -> bool,
+    ) -> bool {
+        !connected.contains(a) && !seen.contains(a) && !banned(a)
+    }
+    let is_eligible =
+        |a: &SocketAddr, seen: &HashSet<SocketAddr>| eligible(a, connected, seen, &banned);
+
+    // A candidate may be taken only while it still has quota left: never more
+    // than `MAX_CANDIDATES_PER_GROUP` in one round, and never enough to push
+    // the group past `MAX_PEERS_PER_SUBNET` once live sessions are counted.
+    let quota_left = |g: NetworkGroup, used: &HashMap<NetworkGroup, usize>| -> bool {
+        let u = used.get(&g).copied().unwrap_or(0);
+        if u >= MAX_CANDIDATES_PER_GROUP {
+            return false;
+        }
+        let live = live_by_group.get(&g).copied().unwrap_or(0);
+        live + u < MAX_PEERS_PER_SUBNET
+    };
+
+    // Reserve a slice of the round for configured seeds so a store that is
+    // already full — poisoned or merely large — cannot push every seed out of
+    // every round. One group's worth, i.e. the same quota any candidate gets.
+    let seed_reserve = ordered
+        .iter()
+        .filter(|a| seed_tail.contains(*a) && is_eligible(a, &seen))
+        .take(MAX_CANDIDATES_PER_GROUP)
+        .count();
+    let known_limit = limit.saturating_sub(seed_reserve);
+
+    // Phase 1: known addresses, weighted and group-quota'd.
+    loop {
+        if picked.len() >= known_limit {
+            break;
+        }
+        let mut pool: Vec<(SocketAddr, u64)> = Vec::new();
+        for a in ordered {
+            if seed_tail.contains(a) || !is_eligible(a, &seen) {
+                continue;
+            }
+            let g = network_group(*a);
+            if !quota_left(g, &used) {
+                continue;
+            }
+            let live = live_by_group.get(&g).copied().unwrap_or(0);
+            let e = entries.get(a);
+            let mut w = i64::from(e.map(|e| e.quality).unwrap_or_else(default_peer_quality));
+            if e.map(|e| e.anchor).unwrap_or(false) {
+                w += i64::from(ANCHOR_SELECT_BONUS);
+            }
+            if e.and_then(|e| e.last_success)
+                .map(|t| now_unix.saturating_sub(t) <= RECENT_PEER_WINDOW_SECS)
+                .unwrap_or(false)
+            {
+                w += i64::from(RECENT_SUCCESS_BONUS);
+            }
+            w -= i64::from(GROUP_OVERREPRESENTATION_PENALTY) * live as i64;
+            pool.push((*a, (w.max(0) as u64).saturating_add(MIN_SELECT_WEIGHT)));
+        }
+        if pool.is_empty() {
+            break;
+        }
+        let Ok(dist) = WeightedIndex::new(pool.iter().map(|(_, w)| *w)) else {
+            break;
+        };
+        let (addr, _) = pool[dist.sample(rng)];
+        *used.entry(network_group(addr)).or_insert(0) += 1;
+        seen.insert(addr);
+        picked.push(addr);
+    }
+
+    // Phase 2: configured seeds, always behind every known candidate.
+    for a in ordered {
+        if !seed_tail.contains(a) {
+            continue;
+        }
+        if picked.len() >= limit {
+            break;
+        }
+        if !is_eligible(a, &seen) {
+            continue;
+        }
+        let g = network_group(*a);
+        if !quota_left(g, &used) {
+            continue;
+        }
+        *used.entry(g).or_insert(0) += 1;
+        seen.insert(*a);
+        picked.push(*a);
+    }
+
+    picked
+}
+
 /// Phase 2B: the shared ingress point for a newly-discovered address, usable by
 /// callers that only hold the raw table guards (`accept_loop` and the PEX
 /// branch of `handle_peer`). Records how the address was learned, stamps the
@@ -512,7 +817,7 @@ async fn ingress_address(
     let connected: HashSet<SocketAddr> = sessions.read().await.keys().copied().collect();
 
     let mut mgr = addresses.write().await;
-    match mgr.admit(addr, source, default_peer_quality(), now, at, &connected) {
+    match mgr.admit(addr, source, admission_quality(source), now, at, &connected) {
         // Already present: just refresh the TTL clock.
         Admission::AlreadyKnown => {
             mgr.touch(addr, at);
@@ -652,6 +957,25 @@ enum PeerCategory {
 /// Default quality assigned to an address we know nothing else about.
 fn default_peer_quality() -> i32 {
     PEER_SCORE_INITIAL
+}
+
+/// Phase 2C (audit L6): the quality an address enters the table with.
+///
+/// `admit_peer` displaces an entry when `victim_quality <= incoming_quality`.
+/// Everything the node itself observed — a peer that dialled us, an address we
+/// chose to dial, a DNS answer, an operator-configured bootnode — keeps the
+/// historical `PEER_SCORE_INITIAL`. A pure gossip hint enters at half of that,
+/// so a PEX burst can only target entries that are already degraded or banned.
+/// It can never flush a healthy table it merely outnumbers.
+///
+/// A PEX address that proves itself climbs back through `record_success`
+/// (+10 per successful handshake), so this is a head start for evidence, not a
+/// permanent class.
+fn admission_quality(source: PeerSource) -> i32 {
+    match source {
+        PeerSource::Pex => PEX_ADMISSION_QUALITY,
+        _ => default_peer_quality(),
+    }
 }
 
 /// Everything the node records about one address: where it came from, when it
@@ -980,6 +1304,19 @@ impl AddressManager {
         for a in &expired {
             self.entries.remove(a);
         }
+        // Phase 2C (audit L7): a score that is neither banned nor attached to
+        // anything we still track carries no information — `decay_score`
+        // recreates it if the address ever returns. Without this pass the map
+        // grew by one entry per *distinct* address ever dialled, which a peer
+        // cycling fresh hints through the table could drive without bound.
+        //
+        // A ban always survives: that is the invariant that makes `scores` a
+        // separate map in the first place. So does a live session, which may
+        // hold a score even when the address itself was refused by a full
+        // table.
+        self.scores.retain(|a, s| {
+            self.entries.contains_key(a) || connected.contains(a) || s.is_banned()
+        });
         (refreshed, expired.len())
     }
 
@@ -1085,6 +1422,19 @@ impl AddressManager {
     // above, so these never widen the real API surface and never show up as
     // dead code in a normal build.
 
+    /// Phase 2C: metadata and reputation together, because the outbound
+    /// selector needs both and a caller must never be able to observe one
+    /// without the other. Read-only, and the guard is released by the caller
+    /// as soon as selection returns.
+    fn selection_tables(
+        &self,
+    ) -> (
+        &HashMap<SocketAddr, AddressEntry>,
+        &HashMap<SocketAddr, PeerScore>,
+    ) {
+        (&self.entries, &self.scores)
+    }
+
     #[cfg(test)]
     fn entry(&self, addr: SocketAddr) -> Option<&AddressEntry> {
         self.entries.get(&addr)
@@ -1177,6 +1527,15 @@ pub struct P2PNetwork {
     /// same address concurrently; without this guard a peer gets two sessions
     /// and the `peers` map silently drops one of them.
     dialing: Arc<RwLock<HashSet<SocketAddr>>>,
+    /// Phase 2C: the subset of `peers` sessions this node itself initiated.
+    ///
+    /// Session *direction* lives with the sessions, not with the address book:
+    /// an address's `PeerSource` records how we first learned it and is
+    /// deliberately never relabelled, so it cannot answer "is this live session
+    /// ours?". Exactly two writers — the dial path inserts, the task wrapping
+    /// `handle_peer` removes — so it cannot drift from `peers` without `peers`
+    /// drifting too. Never held together with `peers` or `addresses`.
+    outbound_sessions: Arc<RwLock<HashSet<SocketAddr>>>,
     /// Phase 2B: the single owner of everything the node knows about
     /// addresses — membership, metadata, TTL clock, PEX origins and scores.
     /// Supersedes the former `known_peers` / `peer_last_seen` / `peer_meta` /
@@ -1213,6 +1572,7 @@ impl P2PNetwork {
             config,
             peers: Arc::new(RwLock::new(HashMap::new())),
             dialing: Arc::new(RwLock::new(HashSet::new())),
+            outbound_sessions: Arc::new(RwLock::new(HashSet::new())),
             addresses: Arc::new(RwLock::new(AddressManager::new())),
             tx_channel,
             peer_discovery_tx: Arc::new(tokio::sync::Mutex::new(None)),
@@ -1235,6 +1595,7 @@ impl P2PNetwork {
         // Start listening for incoming connections
         let listener = TcpListener::bind(self.config.listen_addr).await?;
         let peers = self.peers.clone();
+        let outbound_sessions = self.outbound_sessions.clone();
         let tx_channel = self.tx_channel.clone();
         let get_dag_hashes = Arc::clone(&self.get_dag_hashes);
         let get_transaction_by_hash = Arc::clone(&self.get_transaction_by_hash);
@@ -1261,6 +1622,7 @@ impl P2PNetwork {
                 peers,
                 local_addr,
                 addresses,
+                outbound_sessions,
                 tx_channel,
                 get_dag_hashes,
                 get_transaction_by_hash,
@@ -1325,11 +1687,12 @@ impl P2PNetwork {
             self.connect_to_peer(*seed).await;
         }
 
-        let restored: Vec<SocketAddr> = self.addresses.read().await.addresses();
-        for addr in restored {
-            if addr != self.config.listen_addr {
-                self.connect_to_peer(addr).await;
-            }
+        // Phase 2C: the restored store is dialed through the same selection
+        // every other redial round uses, bounded per cycle. A store restored
+        // from a poisoned file must not be able to open every slot in one burst
+        // before any selection has had a chance to weigh it.
+        for addr in self.outbound_candidates(MAX_REDIAL_PER_CYCLE).await {
+            self.connect_to_peer(addr).await;
         }
     }
 
@@ -1567,9 +1930,6 @@ impl P2PNetwork {
     /// Start heartbeat task to check peer connections and reconnect if needed
     async fn start_heartbeat(&self) {
         let peers = self.peers.clone();
-        let bootnodes = self.config.bootnodes.clone();
-        let addresses = self.addresses.clone();
-        let local_addr = self.config.listen_addr;
         let p2p_network = self.clone();
 
         tokio::spawn(async move {
@@ -1585,13 +1945,11 @@ impl P2PNetwork {
                     warn!("No connected peers, attempting general redial...");
                     // Phase 2A: known peers first, seeds appended as ordinary
                     // unprivileged candidates (Phase 1 dialled every seed first).
-                    let candidates = {
-                        let mgr = addresses.read().await;
-                        let known = mgr.addresses();
-                        P2PNetwork::redial_candidates(&known, &bootnodes, local_addr)
-                    };
-                    for addr in candidates.iter().take(MAX_REDIAL_PER_CYCLE) {
-                        p2p_network.connect_to_peer(*addr).await;
+                    // Phase 2C: that order is now weighed, quota'd per network
+                    // group and re-drawn each round instead of replayed.
+                    let candidates = p2p_network.outbound_candidates(MAX_REDIAL_PER_CYCLE).await;
+                    for addr in candidates {
+                        p2p_network.connect_to_peer(addr).await;
                     }
                 } else {
                     debug!("Heartbeat: {} connected peers", peer_count);
@@ -1618,12 +1976,65 @@ impl P2PNetwork {
         out
     }
 
+    /// Phase 2C: one round of outbound candidates, ready to dial.
+    ///
+    /// This is the single production entry point that replaces the raw
+    /// `redial_candidates` list in every redial path. `redial_candidates` still
+    /// builds the order (Phase-2A invariant: known addresses before configured
+    /// seeds), but the round itself is now bounded, reputation-weighted and
+    /// network-group aware, so a store that an attacker has filled with one
+    /// routable allocation can no longer decide who the node talks to.
+    ///
+    /// Lock discipline: the session table is snapshotted and released *before*
+    /// the address manager is acquired, so `peers` and `addresses` are never
+    /// held at the same time.
+    async fn outbound_candidates(&self, limit: usize) -> Vec<SocketAddr> {
+        let connected: HashSet<SocketAddr> = {
+            let guard = self.peers.read().await;
+            guard.keys().copied().collect()
+        };
+
+        let local = self.config.listen_addr;
+        let seeds = self.config.bootnodes.clone();
+
+        let picked = {
+            let mgr = self.addresses.read().await;
+            let known = mgr.addresses();
+            let ordered = Self::redial_candidates(&known, &seeds, local);
+            // Everything `redial_candidates` appended sits behind the known
+            // half; that exact tail — not "is this a configured seed" — is what
+            // phase 2 of the selection preserves.
+            let known_len = known.iter().filter(|a| **a != local).count();
+            let seed_tail: HashSet<SocketAddr> =
+                ordered.iter().skip(known_len).copied().collect();
+
+            let (entries, scores) = mgr.selection_tables();
+            let mut rng = StdRng::from_entropy();
+            let picked = select_outbound(
+                &ordered,
+                &seed_tail,
+                entries,
+                scores,
+                &connected,
+                limit,
+                unix_now(),
+                &mut rng,
+            );
+            debug!(
+                "Outbound round: {} of {} ordered candidates over {} network groups",
+                picked.len(),
+                ordered.len(),
+                group_counts(picked.iter().copied()).len()
+            );
+            picked
+        };
+
+        picked
+    }
+
     /// Start the general redial task (Phase 1: known peers + seeds, Phase 2A: seeds unprivileged).
     async fn start_reconnection_task(&self) {
         let peers = self.peers.clone();
-        let bootnodes = self.config.bootnodes.clone();
-        let addresses = self.addresses.clone();
-        let local_addr = self.config.listen_addr;
         let p2p_network = self.clone();
 
         tokio::spawn(async move {
@@ -1632,11 +2043,10 @@ impl P2PNetwork {
             let mut next_attempt: std::collections::HashMap<String, Instant> =
                 std::collections::HashMap::new();
             loop {
-                let candidates = {
-                    let mgr = addresses.read().await;
-                    let known = mgr.addresses();
-                    Self::redial_candidates(&known, &bootnodes, local_addr)
-                };
+                // Phase 2C: the round is drawn by the group-aware selection, so
+                // a store dominated by one attacker-controlled group cannot
+                // occupy the whole budget cycle after cycle.
+                let candidates = p2p_network.outbound_candidates(MAX_REDIAL_PER_CYCLE).await;
 
                 let now = Instant::now();
                 let mut dials = 0usize;
@@ -1852,6 +2262,7 @@ impl P2PNetwork {
         peers: Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
         local_addr: SocketAddr,
         addresses: Arc<RwLock<AddressManager>>,
+        outbound_sessions: Arc<RwLock<HashSet<SocketAddr>>>,
         tx_channel: mpsc::UnboundedSender<Transaction>,
         get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
@@ -1864,12 +2275,24 @@ impl P2PNetwork {
         loop {
             match listener.accept().await {
                 Ok((socket, addr)) => {
+                    // Phase 2C / scenario A: `PROTECTED_OUTBOUND_SLOTS` is read
+                    // on its own so the direction map and the session map are
+                    // never held at the same time.
+                    let outbound = outbound_sessions.read().await.len();
                     {
                         let peers_guard = peers.read().await;
-                        if peers_guard.len() >= MAX_PEERS {
+                        let total = peers_guard.len();
+                        // Without this a client that opened MAX_PEERS
+                        // connections used to leave the node with zero
+                        // capacity for outbound dials: it kept gossiping while
+                        // being unable to initiate a single session.
+                        if !inbound_admitted(total, outbound) {
                             warn!(
-                                "Rejecting incoming peer {}: connection limit reached ({})",
-                                addr, MAX_PEERS
+                                "Rejecting incoming peer {}: {} inbound of {} usable, {} outbound slot(s) reserved",
+                                addr,
+                                total.saturating_sub(outbound),
+                                MAX_PEERS.saturating_sub(PROTECTED_OUTBOUND_SLOTS),
+                                PROTECTED_OUTBOUND_SLOTS
                             );
                             drop(socket);
                             continue;
@@ -2801,7 +3224,10 @@ impl P2PNetwork {
 
         {
             let peers_guard = self.peers.read().await;
-            if peers_guard.len() >= MAX_PEERS {
+            // Phase 2C: outbound is admitted against the *total* only — the
+            // inbound side already keeps `PROTECTED_OUTBOUND_SLOTS` free for
+            // exactly this check.
+            if !outbound_admitted(peers_guard.len()) {
                 warn!(
                     "Skipping connect to {}: connection limit reached ({})",
                     addr, MAX_PEERS
@@ -2828,6 +3254,12 @@ impl P2PNetwork {
                 {
                     let mut peers = self.peers.write().await;
                     peers.insert(addr, msg_sender.clone());
+                }
+                // Phase 2C: record that *we* opened this session, so the
+                // inbound admission gate can keep its reservation intact.
+                {
+                    let mut outbound = self.outbound_sessions.write().await;
+                    outbound.insert(addr);
                 }
 
                 // Phase 2B (D7/D8): an address we chose to dial is an outbound
@@ -2858,6 +3290,7 @@ impl P2PNetwork {
                         tx
                     })
                 };
+                let outbound_sessions = self.outbound_sessions.clone();
                 tokio::spawn(async move {
                     Self::handle_peer(
                         socket,
@@ -2877,6 +3310,11 @@ impl P2PNetwork {
                         is_orphan,
                     )
                     .await;
+                    // Phase 2C: release the reservation only once the session
+                    // is really gone. Cleaning up here rather than inside
+                    // `handle_peer` keeps `handle_peer`'s signature — and
+                    // therefore the inbound path — untouched.
+                    outbound_sessions.write().await.remove(&addr);
                 });
             }
             Ok(Err(e)) => {
@@ -4362,6 +4800,916 @@ mod phase2_decentralized_tests {
         assert!(
             ban_mgr.is_banned(evicted),
             "the ban must survive the sweep, or expiry becomes an un-ban"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2C — eclipse resistance. Every property below is one line of
+// docs/AETHER_PHASE2_ECLIPSE_AUDIT.md §14; nothing here asserts on a number
+// that was chosen to make it pass.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod phase2_eclipse_tests {
+    use super::*;
+
+    /// Selection is replayed, not observed: metadata timestamps are persisted
+    /// Unix seconds, so they must not move between two runs of one test.
+    const NOW: u64 = 1_700_000_000;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn no_scores() -> HashMap<SocketAddr, PeerScore> {
+        HashMap::new()
+    }
+
+    fn banned_score() -> PeerScore {
+        let mut s = PeerScore::new();
+        s.score = PEER_SCORE_BAN_THRESHOLD;
+        s.ban();
+        s
+    }
+
+    fn entry() -> AddressEntry {
+        AddressEntry::new(PeerSource::Restored, NOW, Instant::now())
+    }
+
+    /// A store of fresh, healthy, non-anchor entries — the state an honest node
+    /// is in right after restoring its peer store.
+    fn store(addrs: &[SocketAddr]) -> HashMap<SocketAddr, AddressEntry> {
+        addrs.iter().map(|a| (*a, entry())).collect()
+    }
+
+    /// `count` distinct addresses inside the /24 `o1.o2.o3.0`.
+    fn net4(o1: u8, o2: u8, o3: u8, count: usize) -> Vec<SocketAddr> {
+        assert!(count <= 256, "a /24 only holds 256 addresses");
+        (0..count)
+            .map(|i| addr(&format!("{o1}.{o2}.{o3}.{i}:25565")))
+            .collect()
+    }
+
+    /// `count` distinct addresses inside the /24 `203.0.x.0`, one group per
+    /// value of `x`. Convenience for building a pool of several groups.
+    fn groups(start: u8, count: usize, per_group: usize) -> Vec<Vec<SocketAddr>> {
+        (0..count)
+            .map(|i| net4(203, 0, start + i as u8, per_group))
+            .collect()
+    }
+
+    fn flatten(gs: &[Vec<SocketAddr>]) -> Vec<SocketAddr> {
+        gs.iter().flatten().copied().collect()
+    }
+
+    /// Exactly what `P2PNetwork::outbound_candidates` computes, with the RNG
+    /// injected so a round can be replayed byte for byte.
+    fn round(
+        known: &[SocketAddr],
+        seeds: &[SocketAddr],
+        local: SocketAddr,
+        entries: &HashMap<SocketAddr, AddressEntry>,
+        scores: &HashMap<SocketAddr, PeerScore>,
+        connected: &HashSet<SocketAddr>,
+        limit: usize,
+        seed: u64,
+    ) -> Vec<SocketAddr> {
+        let ordered = P2PNetwork::redial_candidates(known, seeds, local);
+        let known_len = known.iter().filter(|a| **a != local).count();
+        let tail: HashSet<SocketAddr> = ordered.iter().skip(known_len).copied().collect();
+        let mut rng = StdRng::seed_from_u64(seed);
+        select_outbound(&ordered, &tail, entries, scores, connected, limit, NOW, &mut rng)
+    }
+
+    fn counts_of(addrs: &[SocketAddr]) -> HashMap<NetworkGroup, usize> {
+        group_counts(addrs.iter().copied())
+    }
+
+    /// L2 / L4: a round does not simply fill its budget from whichever
+    /// addresses happen to hash first — it spans the network groups the pool
+    /// actually offers.
+    #[test]
+    fn test_outbound_diversity() {
+        let local = addr("127.0.0.1:31001");
+        let gs = groups(100, 8, 4); // 8 groups, 4 addresses each, no sessions
+        let known = flatten(&gs);
+        let entries = store(&known);
+
+        let picked = round(
+            &known,
+            &[],
+            local,
+            &entries,
+            &no_scores(),
+            &HashSet::new(),
+            16,
+            7,
+        );
+
+        assert_eq!(picked.len(), 16, "the pool supports a full round");
+        assert_eq!(
+            counts_of(&picked).len(),
+            8,
+            "a round of 16 must reach all 8 available network groups, got {:?}",
+            counts_of(&picked)
+        );
+        for (g, c) in counts_of(&picked) {
+            assert!(
+                c <= MAX_CANDIDATES_PER_GROUP,
+                "group {g:?} took {c} of a round it may only contribute {MAX_CANDIDATES_PER_GROUP} to"
+            );
+        }
+    }
+
+    /// L4: one dominant network group can never take more than its round
+    /// quota, and once it also holds the maximum number of live sessions its
+    /// quota drops to zero and the round moves elsewhere.
+    #[test]
+    fn test_same_network_group_limited() {
+        let local = addr("127.0.0.1:31001");
+        let mut known = net4(10, 0, 0, 60);
+        known.extend(net4(203, 0, 113, 4));
+        let entries = store(&known);
+        let attacker = network_group(addr("10.0.0.1:25565"));
+        let honest = network_group(addr("203.0.113.1:25565"));
+
+        let picked = round(
+            &known,
+            &[],
+            local,
+            &entries,
+            &no_scores(),
+            &HashSet::new(),
+            32,
+            3,
+        );
+        let counts = counts_of(&picked);
+        assert_eq!(
+            counts.get(&attacker).copied(),
+            Some(MAX_CANDIDATES_PER_GROUP),
+            "60 addresses in one /24 may still only open the round quota"
+        );
+        assert_eq!(counts.get(&honest).copied(), Some(MAX_CANDIDATES_PER_GROUP));
+
+        // Four live sessions already: the group is at MAX_PEERS_PER_SUBNET and
+        // must contribute nothing at all.
+        let saturated: HashSet<SocketAddr> = known
+            .iter()
+            .filter(|a| network_group(**a) == attacker)
+            .take(MAX_PEERS_PER_SUBNET)
+            .copied()
+            .collect();
+        assert_eq!(saturated.len(), MAX_PEERS_PER_SUBNET);
+
+        let picked = round(
+            &known,
+            &[],
+            local,
+            &entries,
+            &no_scores(),
+            &saturated,
+            32,
+            3,
+        );
+        let counts = counts_of(&picked);
+        assert_eq!(
+            counts.get(&attacker).copied().unwrap_or(0),
+            0,
+            "a group already holding MAX_PEERS_PER_SUBNET sessions gets no candidate"
+        );
+        assert!(
+            counts.get(&honest).copied().unwrap_or(0) > 0,
+            "the round must fall back to a group that still has room"
+        );
+    }
+
+    /// L4: several groups stay live at once and each one is held inside its
+    /// bound, including when live sessions already eat into the round quota.
+    #[test]
+    fn test_multi_group_selection() {
+        let local = addr("127.0.0.1:31001");
+        let gs = groups(100, 4, 8);
+        let known = flatten(&gs);
+        let entries = store(&known);
+
+        let picked = round(
+            &known,
+            &[],
+            local,
+            &entries,
+            &no_scores(),
+            &HashSet::new(),
+            16,
+            12,
+        );
+        let counts = counts_of(&picked);
+        assert_eq!(counts.len(), 4, "every group stays in the round");
+        assert_eq!(
+            picked.len(),
+            4 * MAX_CANDIDATES_PER_GROUP,
+            "the round is capped per group, not at the requested limit"
+        );
+        for (g, c) in &counts {
+            assert!(*c <= MAX_CANDIDATES_PER_GROUP, "group {g:?} over its quota");
+        }
+
+        // Three live sessions per group: only one slot is left below
+        // MAX_PEERS_PER_SUBNET, so the round quota narrows to a single address.
+        let nearly_full: HashSet<SocketAddr> = gs
+            .iter()
+            .flat_map(|g| g.iter().take(MAX_PEERS_PER_SUBNET - 1).copied())
+            .collect();
+        let picked = round(
+            &known,
+            &[],
+            local,
+            &entries,
+            &no_scores(),
+            &nearly_full,
+            16,
+            12,
+        );
+        let counts = counts_of(&picked);
+        assert_eq!(counts.len(), 4);
+        assert_eq!(picked.len(), 4, "one further candidate per group");
+        for (g, c) in &counts {
+            assert_eq!(*c, 1, "group {g:?} narrowed its quota with its live sessions");
+        }
+    }
+
+    /// L1: the outbound reservation is a real invariant over the whole state
+    /// space, not a value observed once. Whenever inbound is admitted, the
+    /// reservation still fits in the table afterwards.
+    #[test]
+    fn test_protected_outbound_slots() {
+        assert!(
+            PROTECTED_OUTBOUND_SLOTS >= 2 * MAX_PEERS_PER_SUBNET,
+            "the reservation must cover at least two complete network groups"
+        );
+
+        let mut admitted = 0usize;
+        for total in 0..=(MAX_PEERS + 2) {
+            for outbound in 0..=total {
+                if !inbound_admitted(total, outbound) {
+                    continue;
+                }
+                admitted += 1;
+                assert!(
+                    total - outbound + PROTECTED_OUTBOUND_SLOTS <= MAX_PEERS,
+                    "inbound admitted at total={total} outbound={outbound} but the \
+                     outbound reservation no longer fits"
+                );
+                assert!(outbound_admitted(total), "outbound must keep working");
+                assert!(total < MAX_PEERS, "never admit past the table size");
+            }
+        }
+        assert!(admitted > 0, "the invariant must describe reachable states");
+
+        // An inbound-only node stops at MAX_PEERS - PROTECTED_OUTBOUND_SLOTS.
+        assert!(inbound_admitted(
+            MAX_PEERS - PROTECTED_OUTBOUND_SLOTS - 1,
+            0
+        ));
+        assert!(!inbound_admitted(MAX_PEERS - PROTECTED_OUTBOUND_SLOTS, 0));
+
+        // An outbound-heavy node already holds its reservation, so inbound may
+        // fill the rest of the table rather than being throttled by it.
+        assert!(inbound_admitted(MAX_PEERS - 1, PROTECTED_OUTBOUND_SLOTS));
+        assert!(!inbound_admitted(MAX_PEERS, PROTECTED_OUTBOUND_SLOTS));
+
+        assert!(outbound_admitted(MAX_PEERS - 1));
+        assert!(!outbound_admitted(MAX_PEERS));
+        assert!(
+            !inbound_admitted(0, 1),
+            "outbound can never exceed the sessions that exist"
+        );
+    }
+
+    /// L9: rotation of the *selection*, not forced disconnection. Each round is
+    /// a fresh draw, so the union of successive rounds widens instead of the
+    /// node replaying one fixed order forever.
+    #[test]
+    fn test_outbound_rotation() {
+        let local = addr("127.0.0.1:31001");
+        let gs = groups(100, 8, 6);
+        let known = flatten(&gs);
+        let entries = store(&known);
+
+        let rounds: Vec<Vec<SocketAddr>> = (0..6)
+            .map(|s| {
+                round(
+                    &known,
+                    &[],
+                    local,
+                    &entries,
+                    &no_scores(),
+                    &HashSet::new(),
+                    8,
+                    s,
+                )
+            })
+            .collect();
+
+        for (i, r) in rounds.iter().enumerate() {
+            assert_eq!(r.len(), 8, "round {i} did not fill its budget");
+        }
+        for (i, w) in rounds.windows(2).enumerate() {
+            assert_ne!(
+                w[0], w[1],
+                "round {i} and round {} drew the same order — the RNG is not re-seeded",
+                i + 1
+            );
+        }
+        let union: HashSet<SocketAddr> = rounds.iter().flatten().copied().collect();
+        assert!(
+            union.len() > 8,
+            "successive rounds must widen the set actually dialled ({} of 48)",
+            union.len()
+        );
+    }
+
+    /// L3: a compromised bootnode is still only a seed. It never outranks an
+    /// address the node already holds, it is never picked when banned, and
+    /// when the budget is tiny it still gets its reserved slice rather than
+    /// being squeezed out by a large store.
+    #[test]
+    fn test_bootnode_compromised() {
+        let local = addr("127.0.0.1:31001");
+        let bootnode = addr("198.51.100.9:25565");
+        let seeds = vec![bootnode];
+        let known = flatten(&groups(100, 6, 5));
+        let entries = store(&known);
+
+        let picked = round(
+            &known,
+            &seeds,
+            local,
+            &entries,
+            &no_scores(),
+            &HashSet::new(),
+            16,
+            11,
+        );
+        let at = picked
+            .iter()
+            .position(|a| *a == bootnode)
+            .expect("an unprivileged seed still gets its slice of the round");
+        for (i, a) in picked.iter().enumerate() {
+            if i < at {
+                assert!(
+                    known.contains(a),
+                    "only addresses we already hold may precede the bootnode"
+                );
+            }
+        }
+        assert_eq!(
+            picked.last(),
+            Some(&bootnode),
+            "the bootnode belongs at the tail of the round, never the head"
+        );
+
+        // A banned bootnode is not a candidate at all.
+        let mut scores = HashMap::new();
+        scores.insert(bootnode, banned_score());
+        let picked = round(&known, &seeds, local, &entries, &scores, &HashSet::new(), 16, 11);
+        assert!(
+            !picked.contains(&bootnode),
+            "a banned bootnode must never be dialled"
+        );
+        assert!(!picked.is_empty(), "the rest of the round still proceeds");
+
+        // A budget of four is entirely spoken for by known addresses plus the
+        // single reserved seed slot.
+        let picked = round(
+            &known,
+            &seeds,
+            local,
+            &entries,
+            &no_scores(),
+            &HashSet::new(),
+            4,
+            11,
+        );
+        assert_eq!(picked.len(), 4);
+        assert_eq!(
+            picked.last(),
+            Some(&bootnode),
+            "even a four-slot round keeps the bootnode last"
+        );
+    }
+
+    /// L3 / L4: a swarm of configured seeds cannot buy more than one round
+    /// quota of slots, no matter how many are configured.
+    #[test]
+    fn test_seed_compromised() {
+        let local = addr("127.0.0.1:31001");
+        let known = flatten(&groups(100, 4, 8));
+        let seeds = net4(198, 51, 100, 10);
+        let entries = store(&known);
+
+        let picked = round(
+            &known,
+            &seeds,
+            local,
+            &entries,
+            &no_scores(),
+            &HashSet::new(),
+            8,
+            5,
+        );
+
+        let seed_count = picked.iter().filter(|a| seeds.contains(a)).count();
+        let known_count = picked.iter().filter(|a| known.contains(a)).count();
+
+        assert_eq!(picked.len(), 8, "the round fills its budget");
+        assert_eq!(
+            seed_count, MAX_CANDIDATES_PER_GROUP,
+            "ten configured seeds may only take the round quota"
+        );
+        assert_eq!(
+            known_count,
+            8 - MAX_CANDIDATES_PER_GROUP,
+            "the remainder belongs to addresses the node already holds"
+        );
+    }
+
+    /// L6 / L7 / L8: the store stays bounded, gossip cannot displace a peer we
+    /// observed ourselves, degraded entries remain evictable, and the score map
+    /// stops growing without bound.
+    #[test]
+    fn test_peer_store_poisoning() {
+        let healthy: Vec<SocketAddr> = (0..MAX_KNOWN_PEERS)
+            .map(|i| addr(&format!("203.0.{}.{}:25565", i / 256, i % 256)))
+            .collect();
+        let mut mgr = AddressManager::new();
+        for a in &healthy {
+            mgr.observe(*a, PeerSource::Outbound, NOW, Instant::now());
+        }
+        assert_eq!(mgr.len(), MAX_KNOWN_PEERS, "the store is at capacity");
+
+        let connected = HashSet::new();
+        let noisy = addr("198.51.100.7:25565");
+
+        // A PEX hint at half quality may not displace an entry we observed.
+        let (entries, scores) = mgr.selection_tables();
+        assert_eq!(
+            admit_peer(
+                entries,
+                scores,
+                &connected,
+                noisy,
+                admission_quality(PeerSource::Pex)
+            ),
+            None,
+            "gossip must never evict a healthy entry it merely outnumbers"
+        );
+        assert_eq!(
+            admission_quality(PeerSource::Pex),
+            PEX_ADMISSION_QUALITY,
+            "a pure gossip hint enters at half the score we give our own observations"
+        );
+        assert!(
+            admission_quality(PeerSource::Pex) < admission_quality(PeerSource::Outbound),
+            "gossip must rank below anything we observed ourselves"
+        );
+
+        // Degrade exactly one entry: now gossip may target it, and only it.
+        let weak = healthy[42];
+        mgr.entries_mut().get_mut(&weak).unwrap().quality = PEX_ADMISSION_QUALITY;
+        let (entries, scores) = mgr.selection_tables();
+        assert_eq!(
+            admit_peer(
+                entries,
+                scores,
+                &connected,
+                noisy,
+                admission_quality(PeerSource::Pex)
+            ),
+            Some(weak),
+            "an already-degraded entry is exactly what gossip is allowed to replace"
+        );
+
+        // L7: a score that is neither banned nor attached to anything we still
+        // track carries no information and must not accumulate.
+        let orphan = addr("192.0.2.99:25565");
+        let banned = addr("192.0.2.100:25565");
+        mgr.scores_mut().insert(orphan, PeerScore::new());
+        mgr.scores_mut().insert(banned, banned_score());
+        assert!(mgr.scores.len() >= 2);
+
+        let (_refreshed, _expired) =
+            mgr.refresh_and_expire(&HashSet::new(), Instant::now(), Duration::from_secs(365 * 86_400));
+        assert!(
+            !mgr.scores.contains_key(&orphan),
+            "an unattached, unbanned score must be purged"
+        );
+        assert!(
+            mgr.scores.contains_key(&banned),
+            "a ban always survives the sweep — that is why scores are a separate map"
+        );
+        assert_eq!(
+            mgr.len(),
+            MAX_KNOWN_PEERS,
+            "the sweep must not have evicted anything the store still holds"
+        );
+    }
+
+    /// L3: after a restart under attack, the anchors the node persisted are
+    /// restored, still win their slots, and the rebuilt round spans several
+    /// independent network groups rather than the attacker's.
+    #[test]
+    fn test_restart_under_peer_attack() {
+        let local = addr("127.0.0.1:31001");
+        let attacker = net4(10, 0, 0, 40);
+        let anchors: Vec<SocketAddr> = net4(203, 0, 113, 2)
+            .into_iter()
+            .chain(net4(192, 0, 2, 2))
+            .chain(net4(198, 51, 100, 2))
+            .collect();
+        let known: Vec<SocketAddr> = attacker.iter().chain(anchors.iter()).copied().collect();
+
+        let mut mgr = AddressManager::new();
+        for a in &known {
+            mgr.observe(*a, PeerSource::Outbound, NOW, Instant::now());
+        }
+        for a in &anchors {
+            let e = mgr.entries_mut().get_mut(a).unwrap();
+            e.anchor = true;
+            e.record_success(NOW);
+        }
+
+        // Restart: everything is re-read from the versioned store.
+        let file = mgr.to_store();
+        let mut restored = AddressManager::new();
+        let loaded = restored.load_v2(&file, local, NOW, Instant::now());
+        assert_eq!(loaded, known.len(), "the whole store comes back");
+        for a in &anchors {
+            let e = restored.entry(*a).expect("anchor must survive the restart");
+            assert!(e.anchor, "the anchor flag is persisted, not re-derived");
+        }
+
+        let (entries, scores) = restored.selection_tables();
+        let known = restored.addresses();
+        let picked = round(
+            &known,
+            &[],
+            local,
+            entries,
+            scores,
+            &HashSet::new(),
+            8,
+            21,
+        );
+
+        assert_eq!(picked.len(), 8, "the round fills its budget after restart");
+        for a in &anchors {
+            assert!(
+                picked.contains(a),
+                "every persisted anchor must be offered first, got {:?}",
+                picked
+            );
+        }
+        let counts = counts_of(&picked);
+        assert!(
+            counts.len() >= 2,
+            "reconnect must offer several independent network groups, got {counts:?}"
+        );
+        assert!(
+            counts
+                .get(&network_group(attacker[0]))
+                .copied()
+                .unwrap_or(0)
+                <= MAX_CANDIDATES_PER_GROUP,
+            "the attacker's group stays inside the round quota after a restart"
+        );
+    }
+
+    /// L2 / L3: losing every session must not lose the ability to choose. The
+    /// addresses are still known, so the very next round is both non-empty and
+    /// spread across groups.
+    #[test]
+    fn test_mass_peer_loss() {
+        let local = addr("127.0.0.1:31001");
+        let gs = groups(100, 4, 6);
+        let known = flatten(&gs);
+        let entries = store(&known);
+
+        // Before: every group already holds MAX_PEERS_PER_SUBNET sessions, so
+        // there is nothing left to dial.
+        let saturated: HashSet<SocketAddr> = gs
+            .iter()
+            .flat_map(|g| g.iter().take(MAX_PEERS_PER_SUBNET).copied())
+            .collect();
+        assert_eq!(saturated.len(), 4 * MAX_PEERS_PER_SUBNET);
+        let before = round(
+            &known,
+            &[],
+            local,
+            &entries,
+            &no_scores(),
+            &saturated,
+            32,
+            9,
+        );
+        assert!(
+            before.is_empty(),
+            "a saturated node correctly offers no dial at all"
+        );
+
+        // After: every session is gone, the addresses are not.
+        let after = round(
+            &known,
+            &[],
+            local,
+            &entries,
+            &no_scores(),
+            &HashSet::new(),
+            32,
+            9,
+        );
+        assert!(!after.is_empty(), "the node must rebuild after a mass loss");
+        assert_eq!(
+            after.len(),
+            4 * MAX_CANDIDATES_PER_GROUP,
+            "each group contributes its round quota"
+        );
+        assert!(
+            counts_of(&after).len() >= 2,
+            "the rebuild spans several network groups: {:?}",
+            counts_of(&after)
+        );
+    }
+
+    /// L3: an anchor is never a victim of admission, and in selection it is
+    /// ranked above an unknown candidate of the same quality.
+    #[test]
+    fn test_anchor_protection() {
+        let local = addr("127.0.0.1:31001");
+
+        // (a) Admission: a table made entirely of anchors yields no victim,
+        // even for an incoming address of arbitrary quality.
+        let full: Vec<SocketAddr> = (0..MAX_KNOWN_PEERS)
+            .map(|i| addr(&format!("203.0.{}.{}:25565", i / 256, i % 256)))
+            .collect();
+        let mut entries = store(&full);
+        for e in entries.values_mut() {
+            e.anchor = true;
+        }
+        assert_eq!(
+            admit_peer(
+                &entries,
+                &no_scores(),
+                &HashSet::new(),
+                addr("198.51.100.1:25565"),
+                i32::MAX
+            ),
+            None,
+            "an anchor is never offered up for eviction"
+        );
+
+        // (b) Selection: one anchor against one unknown candidate, one slot.
+        let anchor = addr("203.0.113.1:25565");
+        let plain = addr("192.0.2.1:25565");
+        let known = vec![anchor, plain];
+        let mut entries = store(&known);
+        let e = entries.get_mut(&anchor).unwrap();
+        e.anchor = true;
+        e.record_success(NOW);
+
+        let mut anchor_wins = 0usize;
+        for s in 0..128u64 {
+            let picked = round(
+                &known,
+                &[],
+                local,
+                &entries,
+                &no_scores(),
+                &HashSet::new(),
+                1,
+                s,
+            );
+            assert_eq!(picked.len(), 1);
+            if picked[0] == anchor {
+                anchor_wins += 1;
+            }
+        }
+        assert!(
+            anchor_wins * 2 > 128,
+            "an anchor must be preferred over an unknown candidate ({anchor_wins}/128)"
+        );
+    }
+
+    /// L6: a PEX hint at half quality never displaces a healthy peer, but a
+    /// degraded one remains replaceable so the table cannot freeze.
+    #[test]
+    fn test_low_quality_candidate_eviction() {
+        assert!(
+            admission_quality(PeerSource::Pex) < default_peer_quality(),
+            "gossip must enter below the quality we grant our own observations"
+        );
+
+        let healthy: Vec<SocketAddr> = (0..MAX_KNOWN_PEERS)
+            .map(|i| addr(&format!("198.51.{}.{}:25565", i / 256, i % 256)))
+            .collect();
+        let entries = store(&healthy);
+        let incoming = addr("203.0.113.50:25565");
+        let connected = HashSet::new();
+
+        assert_eq!(
+            admit_peer(
+                &entries,
+                &no_scores(),
+                &connected,
+                incoming,
+                admission_quality(PeerSource::Pex)
+            ),
+            None,
+            "a full table of healthy peers is not open to gossip"
+        );
+
+        // Same table, one entry degraded: now gossip has a legitimate target.
+        let mut entries = entries;
+        let weak = healthy[7];
+        entries.get_mut(&weak).unwrap().quality = PEX_ADMISSION_QUALITY - 1;
+        assert_eq!(
+            admit_peer(
+                &entries,
+                &no_scores(),
+                &connected,
+                incoming,
+                admission_quality(PeerSource::Pex)
+            ),
+            Some(weak),
+            "only the degraded entry may be replaced"
+        );
+
+        // A connected peer is never a victim either, healthy or not.
+        let mut connected = HashSet::new();
+        connected.insert(weak);
+        entries.get_mut(&healthy[8]).unwrap().quality = 0;
+        assert_eq!(
+            admit_peer(
+                &entries,
+                &no_scores(),
+                &connected,
+                incoming,
+                admission_quality(PeerSource::Pex)
+            ),
+            Some(healthy[8]),
+            "the victim must come from the entries we are not holding a session with"
+        );
+    }
+
+    /// L9: the round quota is recomputed from live sessions, so a saturated
+    /// group falls to zero and the selection necessarily moves elsewhere.
+    #[test]
+    fn test_peer_group_rotation() {
+        let local = addr("127.0.0.1:31001");
+        let group_a = net4(10, 0, 0, 8);
+        let group_b = net4(203, 0, 113, 8);
+        let known: Vec<SocketAddr> = group_a.iter().chain(group_b.iter()).copied().collect();
+        let entries = store(&known);
+        let a = network_group(group_a[0]);
+        let b = network_group(group_b[0]);
+
+        let saturated: HashSet<SocketAddr> = group_a
+            .iter()
+            .take(MAX_PEERS_PER_SUBNET)
+            .copied()
+            .collect();
+        let picked = round(
+            &known,
+            &[],
+            local,
+            &entries,
+            &no_scores(),
+            &saturated,
+            16,
+            4,
+        );
+        let counts = counts_of(&picked);
+        assert!(
+            !counts.contains_key(&a),
+            "a saturated group must not be offered at all"
+        );
+        assert!(
+            counts.get(&b).copied().unwrap_or(0) > 0,
+            "the selection has to fall back to a group with room"
+        );
+
+        // One session released: exactly one slot is left in the group, so its
+        // round quota is one and the group is reachable again.
+        let partial: HashSet<SocketAddr> = group_a
+            .iter()
+            .take(MAX_PEERS_PER_SUBNET - 1)
+            .copied()
+            .collect();
+        assert_eq!(partial.len(), MAX_PEERS_PER_SUBNET - 1);
+        let picked = round(
+            &known,
+            &[],
+            local,
+            &entries,
+            &no_scores(),
+            &partial,
+            16,
+            4,
+        );
+        let counts = counts_of(&picked);
+        assert_eq!(
+            counts.get(&a).copied(),
+            Some(1),
+            "the last free slot in a group yields exactly one candidate"
+        );
+        assert_eq!(
+            counts.get(&b).copied(),
+            Some(MAX_CANDIDATES_PER_GROUP),
+            "the untouched group keeps its full quota"
+        );
+    }
+
+    /// L2: the selection is a pure function of (order, metadata, sessions,
+    /// limit, seed). Same seed, same list; a different seed, a different one.
+    #[test]
+    fn test_selection_deterministic_under_seed() {
+        let local = addr("127.0.0.1:31001");
+        let gs = groups(100, 6, 5);
+        let known = flatten(&gs);
+        let entries = store(&known);
+        let connected: HashSet<SocketAddr> = known.iter().take(3).copied().collect();
+
+        let run = |seed: u64| {
+            round(
+                &known,
+                &[],
+                local,
+                &entries,
+                &no_scores(),
+                &connected,
+                8,
+                seed,
+            )
+        };
+
+        let a = run(42);
+        let b = run(42);
+        assert_eq!(a, b, "the same seed must replay the same selection");
+
+        let c = run(43);
+        assert_eq!(c.len(), a.len(), "only the order may differ");
+        assert_ne!(a, c, "a different seed must draw a different selection");
+
+        // Determinism does not depend on HashMap iteration order: rebuilding
+        // the metadata table must not move a single address.
+        let rebuilt = store(&known);
+        let d = round(
+            &known,
+            &[],
+            local,
+            &rebuilt,
+            &no_scores(),
+            &connected,
+            8,
+            42,
+        );
+        assert_eq!(a, d, "selection must not depend on hash iteration order");
+    }
+
+    /// L5: the grouping rule unwraps IPv4-mapped IPv6 instead of collapsing
+    /// every dual-stack listener into the single group `[0, 0, 0]`.
+    #[test]
+    fn test_network_group_unwraps_ipv4_mapped() {
+        let plain = addr("203.0.113.7:25565");
+        let mapped: SocketAddr = "[::ffff:203.0.113.7]:25565".parse().unwrap();
+        let compatible: SocketAddr = "[::203.0.113.7]:25565".parse().unwrap();
+
+        assert_eq!(network_group(plain), NetworkGroup::V4([203, 0, 113]));
+        assert_eq!(
+            network_group(mapped),
+            network_group(plain),
+            "a mapped address belongs to the IPv4 group it embeds"
+        );
+        assert_eq!(
+            network_group(compatible),
+            network_group(plain),
+            "the IPv4-compatible form is judged the same way"
+        );
+
+        // subnet_24 is a projection of the same rule, never a second opinion.
+        assert_eq!(subnet_24(mapped), Some([203, 0, 113]));
+        assert_eq!(subnet_24(plain), Some([203, 0, 113]));
+
+        // Native IPv6 groups on its first 24 bits — `2001:0db8:abcd::1` and
+        // `2001:0db8:ffff::9` differ only after that prefix, so a whole
+        // provider allocation lands in one group, never one group per address.
+        let v6: SocketAddr = "[2001:db8:abcd::1]:25565".parse().unwrap();
+        let v6_other: SocketAddr = "[2001:db8:ffff::9]:25565".parse().unwrap();
+        assert_eq!(network_group(v6), NetworkGroup::V6([0x20, 0x01, 0x0d]));
+        assert_eq!(
+            network_group(v6),
+            network_group(v6_other),
+            "the first 24 bits are fixed inside one provider allocation"
         );
     }
 }
