@@ -337,7 +337,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|| "node".to_string());
         let prev_clean = nl::previous_shutdown_clean(&cfg.data_dir);
         // Keep the guard alive for the whole process (file sink).
-        let _log_guard = nl::init_node_logging(&cfg.data_dir, &tag)
+        // 2E-A (A.1): installs the same two layers as `nl::init_node_logging`,
+        // but the FILE layer writes through the address mask, so raw
+        // SocketAddrs never reach `logs/node.log`. stdout is unchanged.
+        let _log_guard = aether_unified::log_privacy::init_masked_node_logging(&cfg.data_dir, &tag)
             .map_err(|e| format!("Failed to initialize node file logging: {}", e))?;
         // Re-emit what the pre-init config resolution decided (those
         // tracing! calls above were no-ops without a subscriber).

@@ -824,12 +824,14 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                 }
             }
 
-            // V-22 FIX: periodic full reconciliation. The tip-based sync only
+            // V-22 FIX: periodic reconciliation. The tip-based sync only
             // runs once at connection time; a node that missed transactions
             // (offline, or a stale inventory at handshake) would otherwise
-            // never recover them. Every cycle we request the full inventory
-            // of every connected peer, diff it against our DAG and fetch what
-            // is missing, until all nodes converge on the same transaction set.
+            // never recover them. Every cycle we request an inventory window
+            // of every connected peer (2E-A: bounded and rotating, so the
+            // frame length stops revealing the DAG size), diff it against our
+            // DAG and fetch what is missing, until all nodes converge on the
+            // same transaction set.
             p2p_periodic.request_full_sync().await;
         }
     });

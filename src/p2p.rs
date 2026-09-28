@@ -12,6 +12,7 @@ use rand::{Rng, SeedableRng};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,13 +23,71 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::sync_stats::{SyncContext, TOPO_ORDER_CAP};
 
-/// P2P handshake magic bytes ("AETH")
+/// P2P handshake magic bytes ("AETH") — LOGICAL network identifier only.
+///
+/// 2E-A (A.3): the literal ASCII signature is never put on the wire. The
+/// handshake transmits `handshake_wire_magic()` (this constant XOR
+/// `HANDSHAKE_MAGIC_MASK`), so a passive packet inspection that greps for
+/// `AETH` no longer classifies the flow. This is **obfuscation, not
+/// anonymity**: the mask is a public constant and trivially reversible by
+/// anyone who knows the format, and the version byte next to it is in clear
+/// anyway. It removes a signature; it hides nothing else.
 const HANDSHAKE_MAGIC: [u8; 4] = [0x41, 0x45, 0x54, 0x48];
+/// Fixed, public XOR mask applied to `HANDSHAKE_MAGIC` before it is written
+/// to (and after it is read from) the socket. No zero bytes, and byte 0 must
+/// not cancel `HANDSHAKE_MAGIC[0]` (see `test_handshake_magic_is_obfuscated`).
+const HANDSHAKE_MAGIC_MASK: [u8; 4] = [0x3F, 0x71, 0xA5, 0x1C];
 
 /// Maximum accepted encrypted message size (16 MiB). The length prefix is a
 /// u32: without this cap a peer could advertise a 4 GiB frame and force a
 /// giant allocation (memory DoS, V-09).
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Phase 2E-A (A.3) — frame length padding ("paliers de padding sur total_len").
+//
+// Threat addressed: the clear `u32 total_len` prefix tells any passive
+// observer the EXACT size of every message, which sizes the DAG inventory
+// (SyncRequest), fingerprints PEX vs transaction vs gossip frames, and gives
+// an exact plaintext length to correlate. Padding collapses those lengths
+// onto a bucket: an observer now learns "somewhere in [k*B, (k+1)*B)" instead
+// of the exact value.
+//
+// Layout (v4):
+//   u32 total_len (always a multiple of FRAME_PAD_BUCKET)
+//   | 12-byte nonce (unchanged, still clear — see FRAME_COUNTER note in 2E-A)
+//   | ChaCha20Poly1305( pad_message(msg) )
+// where pad_message appends zeros and a u16-LE pad length INSIDE the AEAD, so
+// the padding is authenticated: a frame whose padding is stripped, added to or
+// truncated fails Poly1305 verification instead of silently parsing.
+// ---------------------------------------------------------------------------
+
+/// Every frame's `total_len` is padded up to a multiple of this bucket.
+/// 256 B: worst-case overhead 255 B/frame (0.8 % on a 32 KiB inventory),
+/// while collapsing the common message classes (a ~300 B transaction and a
+/// ~450 B PEX list land in the SAME bucket 513..768, so length no longer
+/// distinguishes them).
+const FRAME_PAD_BUCKET: usize = 256;
+/// Hard cap on padding added to one frame — `FRAME_PAD_BUCKET - 1`. Enforced
+/// by construction and asserted by `test_padding_bounds`.
+const MAX_FRAME_PADDING: usize = FRAME_PAD_BUCKET - 1;
+/// Trailing `u16`-LE pad length carried inside the ciphertext.
+const FRAME_PAD_TAIL: usize = 2;
+/// Length of the clear nonce prefix of every frame.
+const NONCE_LEN: usize = 12;
+/// ChaCha20-Poly1305 authentication tag appended to every ciphertext.
+const AEAD_TAG_LEN: usize = 16;
+/// Everything the receiver's `total_len` covers besides the payload itself:
+/// 12-byte nonce + 16-byte tag + 2-byte in-ciphertext pad length (= 30).
+/// This is the offset the bucket alignment is computed against — getting it
+/// wrong by the nonce or tag size silently mis-aligns every frame.
+const FRAME_FIXED_OVERHEAD: usize = NONCE_LEN + AEAD_TAG_LEN + FRAME_PAD_TAIL;
+/// Largest `total_len` we will ever emit. Padding must not push a legal
+/// message past `MAX_MESSAGE_SIZE` (the receiver rejects on it), so the
+/// effective payload ceiling is reduced by one bucket. Anything this large is
+/// rejected before the padding is even considered — unreachable in practice
+/// (the biggest message type, a 1000-hash inventory, is ~32 KiB).
+const FRAME_MAX_EMIT: usize = MAX_MESSAGE_SIZE - FRAME_PAD_BUCKET;
 
 /// Maximum number of concurrently connected peers (V-10)
 const MAX_PEERS: usize = 128;
@@ -179,6 +238,31 @@ const MAX_DIALS_PER_ROUND: usize = PROTECTED_OUTBOUND_SLOTS;
 /// so there is one familiar clock rather than a second one to reason about.
 const RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
 
+// ---------------------------------------------------------------------------
+// Phase 2E-A (A.2 ii/iii) — bounded cadence jitter.
+//
+// Threat addressed: three of this node's maintenance tasks fire on a fixed
+// period (PEX 15 s, recovery 5 s, redial 5 s). A passive observer sees a
+// three-lane metronome and can fingerprint the client, phase-lock onto it and
+// estimate session start/end from the beat alone. Adding a bounded, one-sided
+// jitter removes the exact period without ever firing FASTER than baseline
+// (no extra traffic, no extra dial pressure) and without ever blocking: the
+// sleep is the only thing that changes, the tasks themselves are untouched.
+//
+// Deliberately scoped to exactly these three loops — relay jitter belongs to
+// 2E-D and must NOT be smuggled in here.
+// ---------------------------------------------------------------------------
+
+/// Base PEX cadence (was the literal `Duration::from_secs(15)` inline).
+const PEX_INTERVAL: Duration = Duration::from_secs(15);
+/// Extra delay uniformly added to the PEX period: actual sleep is
+/// `[PEX_INTERVAL, PEX_INTERVAL + PEX_INTERVAL_JITTER)`.
+const PEX_INTERVAL_JITTER: Duration = Duration::from_secs(4);
+/// Extra delay uniformly added to the recovery period (5s → [5s, 7s)).
+const RECOVERY_INTERVAL_JITTER: Duration = Duration::from_secs(2);
+/// Extra delay uniformly added to the redial period (5s → [5s, 8s)).
+const REDIAL_INTERVAL_JITTER: Duration = Duration::from_secs(3);
+
 /// First backoff step after a failed round. Same base as the existing
 /// per-candidate redial backoff (`2 ^ attempt` seconds at `:2076`).
 const RECOVERY_BACKOFF_BASE_SECS: u64 = 5;
@@ -204,6 +288,45 @@ const MAX_SEEN_TXS: usize = 50_000;
 /// Maximum items accepted from a single Inventory/GetData/GetInventory/Peers
 /// message (vector-of-vectors amplification bound)
 const MAX_INV_ITEMS: usize = 1000;
+
+/// 2E-A (A.2 i): rotating read cursor for the bounded `SyncRequest`
+/// advertisement (see `inventory_window`). Process-wide on purpose — it is
+/// only an offset, and sharing it across peers widens the rotation rather
+/// than narrowing it.
+static SYNC_WINDOW_CURSOR: AtomicU64 = AtomicU64::new(0);
+
+/// 2E-A (A.1): write `contents` to `path` so the peer store is readable by
+/// its owner only (0600) instead of inheriting a world-readable umask
+/// (0644). The file holds every IP this node has ever dialed, which is the
+/// local half of `LOCAL_METADATA_EXPOSURE`.
+///
+/// Written via `OpenOptions::mode()` because `std::fs::write` cannot set a
+/// mode, and `mode()` only applies at creation — so permissions are re-asserted
+/// after the write for the case where a crash left a wide-permission `.tmp`
+/// behind. `rename()` in `save_known_peers` carries these permissions onto the
+/// final file. On Windows the mode bits do not exist; the file is still
+/// created fresh through the same path so behaviour stays uniform.
+fn write_private_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents.as_bytes())?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.flush()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
 
 /// DEEP SYNC: maximum transactions per SyncResponse page.
 /// Each page is ancestor-closed and topologically sorted.
@@ -1206,9 +1329,20 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // mixed-version peers would disagree on finality — the version bump splits
 // old and new networks. Deployment MUST rotate the genesis (ceremony) so the
 // new network starts from a clean state.
+// v3 → v4 (2E-A METADATA HARDENING): the frame layout changed. Every frame's
+// `total_len` is now padded up to a `FRAME_PAD_BUCKET` multiple, the
+// ciphertext carries `pad_message()` (pad + u16-LE pad length, authenticated
+// by Poly1305), and the handshake magic is the obfuscated
+// `handshake_wire_magic()` instead of the ASCII "AETH". v3 peers send
+// unpadded frames whose `total_len` is not bucket-aligned and an unobfuscated
+// magic, so `verify_handshake_identity` and the frame-length check both reject
+// them. THIS IS A BREAKING CHANGE: PROTOCOL_COMPATIBILITY = BREAKING. A v3
+// peer is rejected at the handshake (magic first, then version), so a mixed
+// network partitions cleanly along the version byte rather than desyncing
+// later on a padded frame — the same strategy v2→v3 used.
 /// Wire format version of the P2P handshake.
 // OBSERVABILITY-ONLY visibility: `pub` so the boot banner can log it.
-pub const P2P_PROTOCOL_VERSION: u8 = 3;
+pub const P2P_PROTOCOL_VERSION: u8 = 4;
 /// Handshake frame: magic(4) | version(1) | genesis hash(32) | ephemeral key(32)
 const HANDSHAKE_FRAME_LEN: usize = 4 + 1 + 32 + 32;
 
@@ -2136,7 +2270,7 @@ impl P2PNetwork {
             let _ = std::fs::create_dir_all(parent);
         }
         let tmp = path.with_extension("json.tmp");
-        if let Err(e) = std::fs::write(&tmp, &json) {
+        if let Err(e) = write_private_file(&tmp, &json) {
             warn!("Failed to write peer store {:?}: {}", tmp, e);
             return;
         }
@@ -2306,7 +2440,16 @@ impl P2PNetwork {
         let node = self.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(RECOVERY_INTERVAL).await;
+                // 2E-A (A.2 iii): bounded jitter on the recovery cadence so
+                // the 5s self-heal beat is not a fixed fingerprint. The
+                // controller and `recovery_round()` are untouched — only the
+                // sleep changes, and never below the 5s baseline.
+                tokio::time::sleep(Self::jittered_interval(
+                    RECOVERY_INTERVAL,
+                    RECOVERY_INTERVAL_JITTER,
+                    rand::random::<u64>(),
+                ))
+                .await;
                 node.recovery_round().await;
             }
         });
@@ -2579,7 +2722,15 @@ impl P2PNetwork {
                     next_attempt.insert(key, Instant::now() + Duration::from_secs(backoff));
                 }
 
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                // 2E-A (A.2 iii): bounded jitter on the redial cycle. The
+                // dial budget, backoff and candidate selection above are
+                // untouched; only this sleep is randomised, never below 5s.
+                tokio::time::sleep(Self::jittered_interval(
+                    Duration::from_secs(5),
+                    REDIAL_INTERVAL_JITTER,
+                    rand::random::<u64>(),
+                ))
+                .await;
             }
         });
     }
@@ -2714,7 +2865,16 @@ impl P2PNetwork {
 
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(15)).await; // Every 15 seconds for fast peer discovery
+                // 2E-A (A.2 ii): bounded jitter around the 15s baseline. The
+                // exact period used to be a clean metronome a passive
+                // observer could phase-lock onto; the sleep is now drawn from
+                // [15s, 19s) — never faster, so traffic never increases.
+                tokio::time::sleep(Self::jittered_interval(
+                    PEX_INTERVAL,
+                    PEX_INTERVAL_JITTER,
+                    rand::random::<u64>(),
+                ))
+                .await;
 
                 // Snapshot senders first and release, so no session lock is held
                 // while the address manager is acquired.
@@ -2910,13 +3070,28 @@ impl P2PNetwork {
         }
     }
 
+    /// 2E-A (A.3): the bytes actually written to / read from the socket for
+    /// the handshake magic. Pure XOR with the public mask — an obfuscation of
+    /// the ASCII signature, NOT an encryption and NOT anonymity.
+    fn handshake_wire_magic() -> [u8; 4] {
+        let mut m = [0u8; 4];
+        for i in 0..4 {
+            m[i] = HANDSHAKE_MAGIC[i] ^ HANDSHAKE_MAGIC_MASK[i];
+        }
+        m
+    }
+
     /// H4/V-24: verify the network identity of a received handshake frame
     /// (magic + protocol version + genesis hash). Unit-testable pure check.
+    ///
+    /// 2E-A: compares against `handshake_wire_magic()`, so a v3 peer that
+    /// still sends the literal "AETH" fails here with the magic error and is
+    /// disconnected before it can send an unpadded frame.
     fn verify_handshake_identity(incoming: &[u8]) -> Result<(), &'static str> {
         if incoming.len() < HANDSHAKE_FRAME_LEN {
             return Err("Short P2P handshake frame");
         }
-        if incoming[..4] != HANDSHAKE_MAGIC {
+        if incoming[..4] != Self::handshake_wire_magic() {
             return Err("Invalid P2P handshake magic — not an Aether node");
         }
         if incoming[4] != P2P_PROTOCOL_VERSION {
@@ -2926,6 +3101,124 @@ impl P2PNetwork {
             return Err("Network mismatch: peer genesis hash differs from ours");
         }
         Ok(())
+    }
+
+    /// 2E-A (A.2 ii/iii): bounded, one-sided cadence jitter.
+    ///
+    /// `r` is any u64 (production passes `rand::random()`, tests pass a fixed
+    /// value, so the function is deterministic and unit-testable). The result
+    /// is always in `[base, base + max_jitter]` — never faster than the
+    /// baseline, so jitter can never increase traffic or dial pressure, and
+    /// never unbounded, so no sleep can grow without limit.
+    fn jittered_interval(base: Duration, max_jitter: Duration, r: u64) -> Duration {
+        let span = max_jitter.as_millis() as u64;
+        if span == 0 {
+            return base;
+        }
+        base + Duration::from_millis(r % (span + 1))
+    }
+
+    /// 2E-A (A.3): the only `total_len` values a v4 peer is allowed to send.
+    /// A v3 frame's length is the raw message size and is virtually never a
+    /// multiple of `FRAME_PAD_BUCKET`, so this is what rejects an unpadded
+    /// (old) frame even if it somehow got past the handshake version check.
+    fn valid_frame_len(total_len: usize) -> bool {
+        total_len >= FRAME_PAD_BUCKET
+            && total_len % FRAME_PAD_BUCKET == 0
+            && total_len <= MAX_MESSAGE_SIZE
+    }
+
+    /// 2E-A (A.3): clear length this message will occupy on the wire once
+    /// padded, or `None` when the message is too large to pad legally.
+    /// Always a multiple of `FRAME_PAD_BUCKET`, always `>= FRAME_PAD_BUCKET`.
+    fn padded_total_len(msg_len: usize) -> Option<usize> {
+        // What the receiver's `total_len` covers without any padding:
+        // nonce(12) + tag(16) + msg + pad-length tail(2).
+        let unpadded = FRAME_FIXED_OVERHEAD.checked_add(msg_len)?;
+        if unpadded > FRAME_MAX_EMIT {
+            return None;
+        }
+        let padded = unpadded
+            .checked_add(FRAME_PAD_BUCKET - 1)?
+            .checked_div(FRAME_PAD_BUCKET)?
+            .checked_mul(FRAME_PAD_BUCKET)?;
+        // Rounding up can only cross FRAME_MAX_EMIT by < FRAME_PAD_BUCKET,
+        // which the FRAME_MAX_EMIT headroom above already absorbed.
+        if padded > MAX_MESSAGE_SIZE {
+            return None;
+        }
+        Some(padded)
+    }
+
+    /// 2E-A (A.3): append zeros + a u16-LE pad length so the padded plaintext
+    /// fills exactly one bucket. The tail lives INSIDE the AEAD plaintext, so
+    /// the receiver learns the pad length only by decrypting first, and any
+    /// third party that edits the padding breaks Poly1305 verification.
+    ///
+    /// Returns `None` for a message that cannot be padded under
+    /// `MAX_MESSAGE_SIZE` (see `padded_total_len`).
+    fn pad_message(msg: &[u8]) -> Option<Vec<u8>> {
+        // Same base as padded_total_len: this is `total_len` before padding.
+        let unpadded = FRAME_FIXED_OVERHEAD.checked_add(msg.len())?;
+        if unpadded > FRAME_MAX_EMIT {
+            return None;
+        }
+        let pad = (FRAME_PAD_BUCKET - (unpadded % FRAME_PAD_BUCKET)) % FRAME_PAD_BUCKET;
+        debug_assert!(pad <= MAX_FRAME_PADDING);
+        let mut out = Vec::with_capacity(unpadded + pad);
+        out.extend_from_slice(msg);
+        out.resize(msg.len() + pad, 0u8);
+        out.extend_from_slice(&(pad as u16).to_le_bytes());
+        Some(out)
+    }
+
+    /// Inverse of `pad_message`. Rejects a truncated, oversized or otherwise
+    /// malformed tail instead of guessing.
+    fn unpad_message(pt: &[u8]) -> Result<Vec<u8>, &'static str> {
+        if pt.len() < FRAME_PAD_TAIL {
+            return Err("Padded frame too short");
+        }
+        let tail = &pt[pt.len() - FRAME_PAD_TAIL..];
+        let pad = u16::from_le_bytes([tail[0], tail[1]]) as usize;
+        if pad > MAX_FRAME_PADDING {
+            return Err("Frame padding exceeds bucket");
+        }
+        let body = pt.len() - FRAME_PAD_TAIL;
+        if pad > body {
+            return Err("Frame padding longer than body");
+        }
+        Ok(pt[..body - pad].to_vec())
+    }
+
+    /// 2E-A (A.2 i): bounded, rotating advertisement for a `SyncRequest`.
+    ///
+    /// The response used to be the ENTIRE DAG (`get_dag_hashes()` verbatim),
+    /// so `total_len` alone told any passive observer the exact transaction
+    /// count. It is now capped at `MAX_INV_ITEMS`.
+    ///
+    /// A plain `take(MAX_INV_ITEMS)` would be WRONG here: `get_dag_hashes()`
+    /// iterates a `HashMap`, so its order is fixed for a given process — a
+    /// fixed prefix would advertise the same 1000 hashes forever and a late
+    /// joiner would never learn the rest (this exact failure shipped once in
+    /// the Phase D live campaign, see the comment on the `Inventory` receive
+    /// arm). The window therefore ROTATES: `cursor` advances by a full window
+    /// per request, so consecutive windows are disjoint until they wrap and
+    /// the whole set is advertised after `ceil(n / MAX_INV_ITEMS)` rounds.
+    ///
+    /// Convergence rate is unchanged: the receive side already caps its
+    /// `GetData` at `MAX_INV_ITEMS` per round, so that cap — not this one —
+    /// has always been the throughput limiter.
+    fn inventory_window(all: &[Vec<u8>], cursor: &AtomicU64) -> Vec<Vec<u8>> {
+        if all.len() <= MAX_INV_ITEMS {
+            return all.to_vec();
+        }
+        let n = all.len();
+        let start = (cursor.fetch_add(MAX_INV_ITEMS as u64, Ordering::Relaxed) as usize) % n;
+        let mut out = Vec::with_capacity(MAX_INV_ITEMS);
+        for i in 0..MAX_INV_ITEMS {
+            out.push(all[(start + i) % n].clone());
+        }
+        out
     }
 
     /// Phase 1 crypto audit helper: a (key, nonce) collision requires equal
@@ -2947,7 +3240,7 @@ impl P2PNetwork {
         let our_public = PublicKey::from(&our_secret);
 
         let mut outgoing = Vec::with_capacity(HANDSHAKE_FRAME_LEN);
-        outgoing.extend_from_slice(&HANDSHAKE_MAGIC);
+        outgoing.extend_from_slice(&Self::handshake_wire_magic());
         outgoing.push(P2P_PROTOCOL_VERSION);
         outgoing.extend_from_slice(&crate::genesis::GENESIS_HASH);
         outgoing.extend_from_slice(our_public.as_bytes());
@@ -3044,13 +3337,40 @@ impl P2PNetwork {
                     let key = Key::from_slice(key_enc.as_ref());
                     ChaCha20Poly1305::new(key)
                 };
+                // 2E-A (A.3): pad the plaintext up to a bucket BEFORE
+                // encrypting, so the clear `total_len` reveals only the
+                // bucket. The pad length travels inside the AEAD, so it is
+                // authenticated and invisible until decryption.
+                let padded = match Self::pad_message(msg.as_ref()) {
+                    Some(p) => p,
+                    None => {
+                        // Unreachable for any realistic message: the ceiling
+                        // is one bucket below the 16 MiB receiver bound.
+                        warn!(
+                            "Dropping message of {} bytes to {}: exceeds padded frame limit",
+                            msg.len(),
+                            addr
+                        );
+                        continue;
+                    }
+                };
                 let nonce_val =
                     send_counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let nonce_bytes = Self::build_nonce(nonce_val, send_dir_task);
                 let nonce = Nonce::from_slice(&nonce_bytes);
-                match cipher.encrypt(nonce, msg.as_ref()) {
+                match cipher.encrypt(nonce, padded.as_ref()) {
                     Ok(ciphertext) => {
                         let total_len = 12 + ciphertext.len();
+                        debug_assert_eq!(
+                            total_len % FRAME_PAD_BUCKET,
+                            0,
+                            "every emitted frame must land on a bucket"
+                        );
+                        debug_assert_eq!(
+                            Some(total_len),
+                            Self::padded_total_len(msg.len()),
+                            "padded frame length must match the declared layout"
+                        );
                         if writer
                             .write_all(&(total_len as u32).to_be_bytes())
                             .await
@@ -3147,14 +3467,22 @@ impl P2PNetwork {
             }
 
             let total_len = u32::from_be_bytes(len_buf) as usize;
-            if total_len < 12 {
-                warn!("Peer {} sent invalid message length {}", addr, total_len);
-                break;
-            }
             if total_len > MAX_MESSAGE_SIZE {
                 warn!(
                     "Peer {} sent oversized message ({} bytes > {}), disconnecting",
                     addr, total_len, MAX_MESSAGE_SIZE
+                );
+                break;
+            }
+            // 2E-A (A.3): every v4 frame is bucket-aligned and at least one
+            // bucket long. A v3 peer (or a forger) sending a raw, unpadded
+            // length is rejected here — second layer behind the handshake
+            // version check, and the guarantee that `total_len` never leaks an
+            // exact message size.
+            if !Self::valid_frame_len(total_len) {
+                warn!(
+                    "Peer {} sent non-padded frame length {} (must be a multiple of {}), disconnecting",
+                    addr, total_len, FRAME_PAD_BUCKET
                 );
                 break;
             }
@@ -3213,6 +3541,24 @@ impl P2PNetwork {
                         let mut mgr = addresses.write().await;
                         if let Some(score) = mgr.penalize_and_ban(addr, PEER_PENALTY_INVALID_MSG) {
                             warn!("Peer {} banned (invalid msg, score={})", addr, score);
+                        }
+                    }
+                    break;
+                }
+            };
+
+            // 2E-A (A.3): strip the authenticated padding. Done AFTER
+            // decryption on purpose — the pad length only exists inside the
+            // AEAD plaintext, and a malformed tail is a protocol violation
+            // (penalised like any other invalid message), not a parse guess.
+            let plaintext = match Self::unpad_message(&plaintext) {
+                Ok(p) => p,
+                Err(reason) => {
+                    warn!("Peer {} sent malformed frame padding: {}", addr, reason);
+                    {
+                        let mut mgr = addresses.write().await;
+                        if let Some(score) = mgr.penalize_and_ban(addr, PEER_PENALTY_INVALID_MSG) {
+                            warn!("Peer {} banned (bad padding, score={})", addr, score);
                         }
                     }
                     break;
@@ -3454,14 +3800,20 @@ impl P2PNetwork {
                             }
                         }
                         P2PMessage::SyncRequest => {
-                            // Respond with full inventory. LOG NOISE (soak):
-                            // periodic full-inventory announcements (10k hashes
-                            // each on a big DAG) — DEBUG only. Sync progress
-                            // stays visible via the maintenance summary line.
-                            let our_hashes = get_dag_hashes();
+                            // 2E-A (A.2 i): respond with a BOUNDED, ROTATING
+                            // inventory window instead of the whole DAG. The
+                            // old "full inventory" reply made `total_len` an
+                            // exact DAG-size oracle for any passive observer
+                            // and a free amplification lever. See
+                            // `inventory_window` for why a plain `take()` was
+                            // not an option (it stranded late joiners).
+                            // LOG NOISE (soak): announcements are DEBUG only.
+                            let all_hashes = get_dag_hashes();
+                            let our_hashes = Self::inventory_window(&all_hashes, &SYNC_WINDOW_CURSOR);
                             tracing::debug!(
-                                "[Sync] Sending inventory with {} hashes to {}",
+                                "[Sync] Sending inventory window of {} ({} total known) to {}",
                                 our_hashes.len(),
+                                all_hashes.len(),
                                 addr
                             );
                             if let Ok(inv_msg) =
@@ -4186,16 +4538,19 @@ impl P2PNetwork {
         }
     }
 
-    /// V-22 FIX: request the FULL inventory from every connected peer.
+    /// V-22 FIX: request the inventory window from every connected peer.
     ///
-    /// The peer answers with `Inventory(all its transaction hashes)`, we
-    /// diff it against our DAG and fetch what we are missing via GetData.
-    /// Called periodically (see the node's 10s maintenance loop) and after
-    /// boot, so a node that missed transactions while offline - or received
-    /// a stale inventory at handshake time - keeps reconciling until it
-    /// converges to the exact same transaction set as its peers. This never
-    /// assumes the node already knows the parents: missing ancestors are
-    /// fetched recursively through the orphan flow.
+    /// The peer answers with a bounded `Inventory` window (2E-A: capped at
+    /// `MAX_INV_ITEMS` and rotated per request, so the frame length stops
+    /// revealing the DAG size), we diff it against our DAG and fetch what we
+    /// are missing via GetData. Called periodically (see the node's 10s
+    /// maintenance loop) and after boot, so a node that missed transactions
+    /// while offline - or received a stale inventory at handshake time -
+    /// keeps reconciling until it converges to the exact same transaction set
+    /// as its peers. The rotation means every window is a fresh slice, so the
+    /// same convergence holds without ever sending the whole set in one
+    /// frame. This never assumes the node already knows the parents: missing
+    /// ancestors are fetched recursively through the orphan flow.
     pub async fn request_full_sync(&self) {
         let msg = match bincode::serialize(&P2PMessage::SyncRequest) {
             Ok(bytes) => bytes,
@@ -7510,6 +7865,612 @@ mod bootstrap_phase1_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2E-A — metadata hardening tests. Every test here covers a change that
+// actually shipped in this commit; nothing is a placeholder. See
+// docs/AETHER_PHASE2_METADATA_HARDENING.md for the threat each one binds to.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod phase2_privacy_tests {
+    use super::*;
+
+    /// Payload sizes spanning several buckets, including the exact boundaries.
+    fn sample_lengths() -> Vec<usize> {
+        vec![
+            0, 1, 2, 17, 63, 64, 100, 162, 163, 200, 226, 227, 300, 449, 450, 1000, 4096, 32000,
+        ]
+    }
+
+    fn unique_hashes(n: usize) -> Vec<Vec<u8>> {
+        (0..n)
+            .map(|i| {
+                let mut h = vec![0u8; 32];
+                h[0] = ((i >> 8) & 0xff) as u8;
+                h[1] = (i & 0xff) as u8;
+                h[2] = 0xA5;
+                h
+            })
+            .collect()
+    }
+
+    // --- A.3 protocol version / handshake metadata -------------------------
+
+    /// A.3: exactly ONE bump for this wire change, and an old peer is
+    /// refused at the handshake (magic first, then version).
+    #[test]
+    fn test_protocol_version_bump() {
+        assert_eq!(
+            P2P_PROTOCOL_VERSION, 4,
+            "2E-A bumps the wire version exactly once (3 -> 4)"
+        );
+
+        // v3 peer: literal ASCII magic → refused by the magic check.
+        let mut v3 = vec![0u8; HANDSHAKE_FRAME_LEN];
+        v3[..4].copy_from_slice(&HANDSHAKE_MAGIC);
+        v3[4] = 3;
+        v3[5..37].copy_from_slice(&crate::genesis::GENESIS_HASH);
+        let err = P2PNetwork::verify_handshake_identity(&v3).unwrap_err();
+        assert!(err.contains("magic"), "old magic must fail first: {err}");
+
+        // Correct magic, stale version → refused by the version check.
+        let mut stale = v3.clone();
+        stale[..4].copy_from_slice(&P2PNetwork::handshake_wire_magic());
+        stale[4] = P2P_PROTOCOL_VERSION - 1;
+        let err = P2PNetwork::verify_handshake_identity(&stale).unwrap_err();
+        assert!(err.contains("version"), "old version must be refused: {err}");
+
+        stale[4] = P2P_PROTOCOL_VERSION;
+        assert!(
+            P2PNetwork::verify_handshake_identity(&stale).is_ok(),
+            "a current-version same-network frame must pass"
+        );
+    }
+
+    /// A.3: the ASCII signature "AETH" is no longer the bytes on the wire.
+    /// XOR is an involution — this is obfuscation of a public constant, NOT
+    /// secrecy, and the test says so rather than overclaiming.
+    #[test]
+    fn test_handshake_magic_is_obfuscated() {
+        let wire = P2PNetwork::handshake_wire_magic();
+        assert_ne!(wire, HANDSHAKE_MAGIC, "wire magic must differ");
+        assert_ne!(&wire, b"AETH", "the literal signature must not be sent");
+        let mut back = [0u8; 4];
+        for i in 0..4 {
+            back[i] = wire[i] ^ HANDSHAKE_MAGIC_MASK[i];
+        }
+        assert_eq!(back, HANDSHAKE_MAGIC, "peers must still be able to recover it");
+    }
+
+    /// A.3: the handshake is exactly 69 bytes decomposing into magic(4) |
+    /// version(1) | genesis(32) | ephemeral key(32) — nothing else fits, so
+    /// no address, node id or timestamp can ride along with it. (Encrypting
+    /// or authenticating the handshake is OUT OF SCOPE for 2E-A.)
+    #[test]
+    fn test_handshake_metadata_exposure() {
+        assert_eq!(HANDSHAKE_FRAME_LEN, 69, "layout is magic4+ver1+genesis32+key32");
+        let mut key = [0u8; 32];
+        key[0] = 0xAB;
+        key[31] = 0xCD;
+
+        let mut frame = Vec::with_capacity(HANDSHAKE_FRAME_LEN);
+        frame.extend_from_slice(&P2PNetwork::handshake_wire_magic());
+        frame.push(P2P_PROTOCOL_VERSION);
+        frame.extend_from_slice(&crate::genesis::GENESIS_HASH);
+        frame.extend_from_slice(&key);
+
+        assert_eq!(frame.len(), HANDSHAKE_FRAME_LEN);
+        assert!(P2PNetwork::verify_handshake_identity(&frame).is_ok());
+        // Byte-exact decomposition: every byte is accounted for by a declared
+        // field, so there is no room for a peer address or an identifier.
+        assert_eq!(&frame[..4], &P2PNetwork::handshake_wire_magic());
+        assert_ne!(&frame[..4], b"AETH", "signature never on the wire");
+        assert_eq!(frame[4], P2P_PROTOCOL_VERSION);
+        assert_eq!(&frame[5..37], &crate::genesis::GENESIS_HASH[..]);
+        assert_eq!(&frame[37..69], &key[..]);
+    }
+
+    // --- A.3 frame length padding -----------------------------------------
+
+    /// A.3: every emitted length lands on a bucket, and two different payload
+    /// sizes inside one bucket are indistinguishable by `total_len`.
+    #[test]
+    fn test_frame_size_buckets() {
+        for len in sample_lengths() {
+            let msg = vec![0x5Au8; len];
+            let padded = P2PNetwork::pad_message(&msg).expect("sample must pad");
+            let total = NONCE_LEN + (padded.len() + AEAD_TAG_LEN);
+            assert_eq!(total % FRAME_PAD_BUCKET, 0, "len={len} total={total}");
+            assert_eq!(Some(total), P2PNetwork::padded_total_len(len));
+            assert!(P2PNetwork::valid_frame_len(total), "len={len} total={total}");
+        }
+        // The actual privacy property: 100 B and 200 B share a bucket, so the
+        // clear length cannot tell them apart; 1000 B lands elsewhere.
+        assert_eq!(
+            P2PNetwork::padded_total_len(100),
+            P2PNetwork::padded_total_len(200),
+            "same bucket must give the same clear length"
+        );
+        assert_ne!(
+            P2PNetwork::padded_total_len(100),
+            P2PNetwork::padded_total_len(1000)
+        );
+    }
+
+    /// A.3: padding is bounded, reversible and never overflows the bucket.
+    #[test]
+    fn test_padding_bounds() {
+        for len in sample_lengths() {
+            let msg = vec![7u8; len];
+            let padded = P2PNetwork::pad_message(&msg).expect("sample must pad");
+            assert!(padded.len() >= len, "padding must never shrink");
+            let pad = padded.len() - len - FRAME_PAD_TAIL;
+            assert!(pad <= MAX_FRAME_PADDING, "len={len} pad={pad}");
+            let back = P2PNetwork::unpad_message(&padded).expect("must unpad");
+            assert_eq!(back, msg, "roundtrip must be exact");
+        }
+    }
+
+    /// A.3: `MAX_FRAME_PADDING` is reachable (so the bound is tight, not
+    /// decorative) and never exceeded across a dense sweep.
+    #[test]
+    fn test_max_padding() {
+        // FRAME_FIXED_OVERHEAD(30) + 227 = 257 ≡ 1 (mod 256) → pad = 255.
+        let msg = vec![1u8; 227];
+        let padded = P2PNetwork::pad_message(&msg).expect("must pad");
+        assert_eq!(
+            padded.len() - 227 - FRAME_PAD_TAIL,
+            MAX_FRAME_PADDING,
+            "the bound must be reachable, otherwise it proves nothing"
+        );
+        for len in 0..2000usize {
+            let p = P2PNetwork::pad_message(&vec![0u8; len]).expect("must pad");
+            assert!(p.len() - len - FRAME_PAD_TAIL <= MAX_FRAME_PADDING, "len={len}");
+        }
+    }
+
+    /// A.3: padding is a pure function of the payload — no RNG in the frame
+    /// path, so tests and reproductions stay deterministic.
+    #[test]
+    fn test_padding_determinism() {
+        let a = P2PNetwork::pad_message(b"deterministic").expect("must pad");
+        let b = P2PNetwork::pad_message(b"deterministic").expect("must pad");
+        assert_eq!(a, b, "same payload → same padding");
+        let c = P2PNetwork::pad_message(b"deterministiC").expect("must pad");
+        assert_ne!(a, c, "different payloads must not collide");
+        assert_eq!(
+            P2PNetwork::padded_total_len(500),
+            P2PNetwork::padded_total_len(500)
+        );
+        // A payload that cannot be padded under MAX_MESSAGE_SIZE is refused
+        // (returns None) rather than emitted mis-aligned.
+        assert!(P2PNetwork::padded_total_len(FRAME_MAX_EMIT - FRAME_FIXED_OVERHEAD).is_some());
+        assert!(P2PNetwork::padded_total_len(FRAME_MAX_EMIT - FRAME_FIXED_OVERHEAD + 1).is_none());
+    }
+
+    /// A.3: an unaligned (v3 / forged) length is refused before any
+    /// allocation happens.
+    #[test]
+    fn test_old_frame_rejected() {
+        // Typical v3 frame: raw message size, never bucket-aligned.
+        assert!(!P2PNetwork::valid_frame_len(12 + 37));
+        assert!(!P2PNetwork::valid_frame_len(0));
+        assert!(!P2PNetwork::valid_frame_len(FRAME_PAD_BUCKET - 1));
+        assert!(!P2PNetwork::valid_frame_len(FRAME_PAD_BUCKET + 1));
+        assert!(P2PNetwork::valid_frame_len(FRAME_PAD_BUCKET));
+        assert!(P2PNetwork::valid_frame_len(2 * FRAME_PAD_BUCKET));
+        assert!(P2PNetwork::valid_frame_len(MAX_MESSAGE_SIZE));
+        assert!(!P2PNetwork::valid_frame_len(MAX_MESSAGE_SIZE + FRAME_PAD_BUCKET));
+    }
+
+    // --- A.3 frame metadata end-to-end ------------------------------------
+
+    /// A.3: one real frame on the wire. The clear part is length + nonce
+    /// only, the length is bucket-aligned, and the address travels solely
+    /// inside the AEAD.
+    #[test]
+    fn test_frame_metadata_hardening() {
+        let key = [0x2Au8; 32];
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let addr: SocketAddr = "203.0.113.7:40001".parse().unwrap();
+        let payload = bincode::serialize(&P2PMessage::Peers(vec![addr])).expect("serialize");
+        // The peer address as it really appears on the wire (bincode writes
+        // a `SocketAddr` as octets + port, not as text).
+        let addr_bytes = bincode::serialize(&addr).expect("serialize addr");
+        assert!(
+            payload
+                .windows(addr_bytes.len())
+                .any(|w| w == addr_bytes),
+            "sanity: the address really is in the payload"
+        );
+
+        let padded = P2PNetwork::pad_message(&payload).expect("must pad");
+        let nonce = P2PNetwork::build_nonce(1, 0x01);
+        let ct = cipher
+            .encrypt(Nonce::from_slice(&nonce), padded.as_ref())
+            .expect("encrypt");
+        let total = NONCE_LEN + ct.len();
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(total as u32).to_be_bytes());
+        frame.extend_from_slice(&nonce);
+        frame.extend_from_slice(&ct);
+
+        // Clear length is bucketed and matches the declared layout.
+        assert_eq!(total % FRAME_PAD_BUCKET, 0);
+        assert_eq!(Some(total), P2PNetwork::padded_total_len(payload.len()));
+        assert!(P2PNetwork::valid_frame_len(total));
+        // Nothing identifying survives outside the ciphertext.
+        assert!(
+            !frame.windows(addr_bytes.len()).any(|w| w == addr_bytes),
+            "peer address leaked outside the ciphertext"
+        );
+        // And the frame still round-trips through the real unpad path.
+        let on_wire_header = 4 + NONCE_LEN;
+        let pt = cipher
+            .decrypt(Nonce::from_slice(&nonce), &frame[on_wire_header..])
+            .expect("decrypt");
+        assert_eq!(P2PNetwork::unpad_message(&pt).expect("unpad"), payload);
+    }
+
+    /// A.3: for several message types carrying peer metadata, no part of the
+    /// serialized message appears anywhere in the bytes handed to the socket.
+    #[test]
+    fn test_no_plaintext_peer_metadata() {
+        let key = [0x77u8; 32];
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+
+        let peers: Vec<SocketAddr> = vec![
+            "198.51.100.10:40001".parse().unwrap(),
+            "198.51.100.11:40002".parse().unwrap(),
+            "[2001:db8::1]:40003".parse().unwrap(),
+        ];
+        let inventory = unique_hashes(64);
+        // Needles are the identifying bytes as bincode really emits them:
+        // `SocketAddr` as octets+port, inventory entries as raw digests.
+        let cases: Vec<(Vec<u8>, Vec<Vec<u8>>)> = vec![
+            (
+                bincode::serialize(&P2PMessage::Peers(peers.clone())).expect("ser"),
+                vec![
+                    bincode::serialize(&peers[0]).expect("ser"),
+                    bincode::serialize(&peers[2]).expect("ser"),
+                ],
+            ),
+            (
+                bincode::serialize(&P2PMessage::Inventory(inventory.clone())).expect("ser"),
+                vec![inventory[7].clone(), inventory[63].clone()],
+            ),
+        ];
+
+        for (idx, (payload, needles)) in cases.iter().enumerate() {
+            for needle in needles {
+                assert!(
+                    payload.windows(needle.len()).any(|w| w == needle.as_slice()),
+                    "case {idx}: needle must be in the payload"
+                );
+            }
+            let padded = P2PNetwork::pad_message(payload).expect("must pad");
+            let nonce = P2PNetwork::build_nonce(u64::from(idx as u32) + 1, 0x01);
+            let ct = cipher
+                .encrypt(Nonce::from_slice(&nonce), padded.as_ref())
+                .expect("encrypt");
+            let total = NONCE_LEN + ct.len();
+            let mut frame = Vec::new();
+            frame.extend_from_slice(&(total as u32).to_be_bytes());
+            frame.extend_from_slice(&nonce);
+            frame.extend_from_slice(&ct);
+
+            assert_eq!(total % FRAME_PAD_BUCKET, 0, "case {idx}: length must be bucketed");
+            for needle in needles {
+                assert!(
+                    !frame.windows(needle.len()).any(|w| w == needle.as_slice()),
+                    "case {idx}: peer metadata on the wire outside the ciphertext"
+                );
+            }
+        }
+    }
+
+    /// A.3: the padding lives INSIDE the AEAD, so flipping it is a
+    /// cryptographic failure and cannot be used to reallocate a frame.
+    #[test]
+    fn test_padding_is_authenticated() {
+        let key = [0x5Cu8; 32];
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let payload = vec![0xEEu8; 100];
+        let padded = P2PNetwork::pad_message(&payload).expect("must pad");
+        assert!(
+            padded.len() > payload.len(),
+            "there must be padding to tamper with"
+        );
+        let nonce = P2PNetwork::build_nonce(9, 0x02);
+        let mut ct = cipher
+            .encrypt(Nonce::from_slice(&nonce), padded.as_ref())
+            .expect("encrypt");
+        // Flip a byte inside the padded tail (just before the 16-byte tag).
+        let target = ct.len() - AEAD_TAG_LEN - 1;
+        ct[target] ^= 0xFF;
+        assert!(
+            cipher.decrypt(Nonce::from_slice(&nonce), ct.as_ref()).is_err(),
+            "tampered padding must fail Poly1305"
+        );
+    }
+
+    // --- A.2 (i) DAG size -------------------------------------------------
+
+    /// A.2: the `SyncRequest` answer is bounded at `MAX_INV_ITEMS` whatever
+    /// the DAG holds, so `total_len` stops being a DAG-size oracle — while
+    /// rotating, so the whole set is still advertised over time.
+    #[test]
+    fn test_inventory_size_not_leaked() {
+        let small = unique_hashes(10);
+        let c_small = AtomicU64::new(0);
+        assert_eq!(
+            P2PNetwork::inventory_window(&small, &c_small).len(),
+            10,
+            "a small DAG is returned whole (nothing to hide behind a cap)"
+        );
+
+        let big = unique_hashes(MAX_INV_ITEMS * 5);
+        let c1 = AtomicU64::new(0);
+        let w1 = P2PNetwork::inventory_window(&big, &c1);
+        assert_eq!(w1.len(), MAX_INV_ITEMS, "advertised set must be bounded");
+
+        let bigger = unique_hashes(MAX_INV_ITEMS * 9);
+        let c2 = AtomicU64::new(0);
+        let w2 = P2PNetwork::inventory_window(&bigger, &c2);
+        assert_eq!(
+            w1.len(),
+            w2.len(),
+            "frame size must not track DAG size — that is the leak"
+        );
+
+        // Rotation: five consecutive windows are disjoint and cover the DAG,
+        // which is what keeps a plain `take()` from stranding a late joiner.
+        let c3 = AtomicU64::new(0);
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        for _ in 0..5 {
+            for h in P2PNetwork::inventory_window(&big, &c3) {
+                assert!(seen.insert(h), "windows must not repeat while rotating");
+            }
+        }
+        assert_eq!(seen.len(), MAX_INV_ITEMS * 5, "rotation must cover the whole set");
+    }
+
+    // --- A.2 (ii)/(iii) cadence jitter ------------------------------------
+
+    /// A.2: the PEX period stays inside its declared band — never faster
+    /// than baseline (that would raise traffic), never unbounded.
+    #[test]
+    fn test_pex_privacy_bounds() {
+        for r in 0..10_000u64 {
+            let d = P2PNetwork::jittered_interval(PEX_INTERVAL, PEX_INTERVAL_JITTER, r);
+            assert!(d >= PEX_INTERVAL, "r={r}: jitter must not shorten the period");
+            assert!(
+                d <= PEX_INTERVAL + PEX_INTERVAL_JITTER,
+                "r={r}: jitter must stay bounded"
+            );
+        }
+    }
+
+    /// A.2: the jitter is real (the fixed 15s metronome is gone) and it never
+    /// lets any of the three loops beat its baseline rate. Deterministic in
+    /// `r`, so the assertions are exact rather than statistical.
+    #[test]
+    fn test_pex_rate_limit() {
+        let mut seen: HashSet<Duration> = HashSet::new();
+        for r in 0..1000u64 {
+            seen.insert(P2PNetwork::jittered_interval(PEX_INTERVAL, PEX_INTERVAL_JITTER, r));
+        }
+        assert!(seen.len() > 1, "a constant period is not jitter");
+        assert_eq!(
+            *seen.iter().min().expect("non-empty"),
+            PEX_INTERVAL,
+            "the baseline must still be reachable"
+        );
+        assert!(*seen.iter().max().expect("non-empty") <= PEX_INTERVAL + PEX_INTERVAL_JITTER);
+
+        for r in 0..1000u64 {
+            let rec = P2PNetwork::jittered_interval(RECOVERY_INTERVAL, RECOVERY_INTERVAL_JITTER, r);
+            assert!(rec >= RECOVERY_INTERVAL);
+            assert!(rec <= RECOVERY_INTERVAL + RECOVERY_INTERVAL_JITTER);
+            let red = P2PNetwork::jittered_interval(
+                Duration::from_secs(5),
+                REDIAL_INTERVAL_JITTER,
+                r,
+            );
+            assert!(red >= Duration::from_secs(5));
+            assert!(red <= Duration::from_secs(5) + REDIAL_INTERVAL_JITTER);
+        }
+
+        // Zero jitter degenerates to the exact baseline (no silent drift).
+        assert_eq!(
+            P2PNetwork::jittered_interval(PEX_INTERVAL, Duration::ZERO, 12345),
+            PEX_INTERVAL
+        );
+    }
+
+    // --- A.1 local metadata -----------------------------------------------
+
+    /// A.1: the peer store (every IP this node ever dialled) is written
+    /// owner-only on Unix. Windows has no POSIX mode bits, so there the test
+    /// still pins the write path — it must create the file and preserve the
+    /// bytes exactly.
+    #[test]
+    fn test_peer_store_privacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_peers.json");
+        let body = r#"{"version":2,"peers":[]}"#;
+        write_private_file(&path, body).expect("write");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), body);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "peer store must be owner-only");
+
+            // A `.tmp` left wide by a previous crash must be re-tightened:
+            // `OpenOptions::mode()` only applies at creation.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .expect("widen");
+            write_private_file(&path, body).expect("rewrite");
+            let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "an existing file must be re-tightened");
+        }
+    }
+
+    /// A.1: an INFO line exactly as `NodeLineFormat` emits it reaches the
+    /// file without a raw address, while the timestamp, target and peer
+    /// distinguishability survive.
+    #[test]
+    fn test_peer_store_no_addresses_in_logs() {
+        let line = "2026-01-01T00:00:00Z | node1 | INFO | aether_unified::p2p | \u{1f510} P2P encrypted handshake complete with 10.0.0.5:40001";
+        let masked = crate::log_privacy::mask_socket_addrs_with_salt(line, 0xdead_beef);
+        assert!(
+            !masked.contains("10.0.0.5"),
+            "raw IP must never reach node.log: {masked}"
+        );
+        assert!(masked.contains("p2p."), "peer must stay distinguishable: {masked}");
+        assert!(
+            masked.contains("2026-01-01T00:00:00Z"),
+            "timestamp must survive: {masked}"
+        );
+        assert!(
+            masked.contains("aether_unified::p2p"),
+            "target must survive: {masked}"
+        );
+    }
+
+    // --- cost benchmark ----------------------------------------------------
+    //
+    // Deterministic parts (byte overhead) are ASSERTED; timing parts are only
+    // reported, never asserted, because wall-clock assertions are flaky.
+    // Run: cargo test --release --lib p2p::phase2_privacy_tests::bench_2e_a_costs -- --ignored --nocapture
+
+    /// v3 on-wire `total_len` for a payload of `msg_len` bytes: nonce + tag,
+    /// no padding.
+    fn v3_total_len(msg_len: usize) -> usize {
+        NONCE_LEN + msg_len + AEAD_TAG_LEN
+    }
+
+    #[test]
+    #[ignore = "2E-A cost benchmark: run with --ignored --nocapture in release mode"]
+    fn bench_2e_a_costs() {
+        use std::time::Instant;
+
+        // ---- METADATA_OVERHEAD: exact, asserted -------------------------
+        //
+        // Sweep every payload size in [0, 4096] and report the real
+        // overhead distribution rather than a single cherry-picked figure.
+        let mut pad_sum = 0u64;
+        let mut worst = 0usize;
+        let mut count = 0u64;
+        for len in 0..=4096usize {
+            let new = P2PNetwork::padded_total_len(len).expect("fits");
+            let old = v3_total_len(len);
+            assert!(new >= old, "len={len}: padding must never shrink a frame");
+            let extra = new - old;
+            assert!(extra <= 2 + MAX_FRAME_PADDING, "len={len}: extra={extra}");
+            assert_eq!(new % FRAME_PAD_BUCKET, 0, "len={len}");
+            pad_sum += extra as u64;
+            worst = worst.max(extra);
+            count += 1;
+        }
+        let mean = pad_sum as f64 / count as f64;
+        println!("METADATA_OVERHEAD mean_bytes={mean:.1} worst_bytes={worst} (sweep 0..=4096, {count} sizes)");
+        assert_eq!(worst, 2 + MAX_FRAME_PADDING, "worst case must be reachable");
+
+        // Representative real messages.
+        let addrs: Vec<SocketAddr> = (0..8)
+            .map(|i| format!("203.0.113.{}:40001", i + 1).parse().unwrap())
+            .collect();
+        let msgs: Vec<(&str, Vec<u8>)> = vec![
+            ("peers(8)", bincode::serialize(&P2PMessage::Peers(addrs)).unwrap()),
+            ("inventory(100)", bincode::serialize(&P2PMessage::Inventory(unique_hashes(100))).unwrap()),
+            ("inventory(1000)", bincode::serialize(&P2PMessage::Inventory(unique_hashes(1000))).unwrap()),
+        ];
+        let mut worst_pct = 0f64;
+        for (name, payload) in &msgs {
+            let old = v3_total_len(payload.len());
+            let new = P2PNetwork::padded_total_len(payload.len()).expect("fits");
+            let pct = (new as f64 - old as f64) / old as f64 * 100.0;
+            worst_pct = worst_pct.max(pct);
+            println!(
+                "METADATA_OVERHEAD {name}: msg={}B old_total_len={new_display} new_total_len={new} extra={e} ({p:.2}%)",
+                payload.len(),
+                new_display = old,
+                e = new - old,
+                p = pct,
+            );
+            assert!(new >= old);
+            assert_eq!(new % FRAME_PAD_BUCKET, 0);
+        }
+        println!("METADATA_OVERHEAD worst_case_pct={worst_pct:.2}");
+
+        // ---- LATENCY_IMPACT / THROUGHPUT_IMPACT: measured, not asserted --
+        let key = [0x33u8; 32];
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let nonce = P2PNetwork::build_nonce(1, 0x01);
+        let payload = unique_hashes(1000); // ~32 KB, the SyncResponse shape
+        let raw = bincode::serialize(&P2PMessage::Inventory(payload)).unwrap();
+        let padded = P2PNetwork::pad_message(&raw).expect("must pad");
+
+        // pad + unpad round trip, per frame — small frame first, so the
+        // padding-specific cost can be separated from the payload memcpy.
+        let iters = 200_000u32;
+        let small = vec![0u8; 92];
+        let t_small = Instant::now();
+        for _ in 0..iters {
+            let p = P2PNetwork::pad_message(&small).expect("pad");
+            std::hint::black_box(P2PNetwork::unpad_message(&p).expect("unpad"));
+        }
+        let pad_small_ns = t_small.elapsed().as_nanos() as f64 / iters as f64;
+        println!("LATENCY_IMPACT pad+unpad small frame (92B): {pad_small_ns:.1} ns");
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let p = P2PNetwork::pad_message(&raw).expect("pad");
+            std::hint::black_box(P2PNetwork::unpad_message(&p).expect("unpad"));
+        }
+        let pad_ns = t0.elapsed().as_nanos() as f64 / iters as f64;
+        println!("LATENCY_IMPACT pad+unpad large frame ({}B): {pad_ns:.1} ns", raw.len());
+        println!(
+            "LATENCY_IMPACT payload-copy share: {:.1} ns/frame (large - small)",
+            pad_ns - pad_small_ns
+        );
+
+        // encrypt throughput, un-padded (v3 shape) vs padded (v4 shape)
+        let bench_cipher = |data: &[u8]| -> (f64, f64) {
+            let runs = 6u32;
+            let mut best = f64::MAX;
+            for _ in 0..runs {
+                let iters = 300u32;
+                let t = Instant::now();
+                for _ in 0..iters {
+                    std::hint::black_box(cipher.encrypt(Nonce::from_slice(&nonce), data).expect("enc"));
+                }
+                let secs = t.elapsed().as_secs_f64() / iters as f64;
+                best = best.min(secs);
+            }
+            let mbps = data.len() as f64 / best / 1e6;
+            (best * 1e9, mbps)
+        };
+        let (old_ns, old_mbps) = bench_cipher(&raw);
+        let (new_ns, new_mbps) = bench_cipher(&padded);
+        let delta_ns = new_ns - old_ns;
+        let impact = delta_ns / old_ns * 100.0;
+        println!(
+            "THROUGHPUT_IMPACT old={old_mbps:.1} MB/s new={new_mbps:.1} MB/s (best of 6 runs)",
+        );
+        println!(
+            "LATENCY_IMPACT encrypt per frame: old={old_ns:.0} ns new={new_ns:.0} ns delta={delta_ns:+.0} ns ({impact:+.2}%)"
+        );
+
+        // Extra bytes really do cost encrypt time, and both directions are
+        // consistent: the added work is proportional to the added bytes.
+        assert!(new_ns >= old_ns * 0.9, "padded must not be dramatically faster (sanity)");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7683,7 +8644,10 @@ mod tests {
     #[test]
     fn test_handshake_identity_mismatch_rejected() {
         let mut frame = vec![0u8; HANDSHAKE_FRAME_LEN];
-        frame[..4].copy_from_slice(&HANDSHAKE_MAGIC);
+        // 2E-A: the wire carries the obfuscated magic, not the ASCII "AETH".
+        // Fixture update for the intentional v3→v4 change; the assertions
+        // below are untouched.
+        frame[..4].copy_from_slice(&P2PNetwork::handshake_wire_magic());
         frame[4] = P2P_PROTOCOL_VERSION;
         frame[5..37].copy_from_slice(&crate::genesis::GENESIS_HASH);
 
