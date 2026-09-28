@@ -1,30 +1,38 @@
 # AETHER — Roadmap confidentialité réseau (Phase 2E et au-delà)
 
 **Statut : `2E_ROADMAP = COMPLETE` (la roadmap est rédigée) ·
-`2E-A = IMPLEMENTED` · `2E-D = IMPLEMENTED` · `2E-B … 2E-C = PROPOSED` ·
-`2E-E = NOT SCHEDULED`**
+`2E-A = IMPLEMENTED` · `2E-D = IMPLEMENTED` · `2E-B = IMPLEMENTED` ·
+`2E-C = PROPOSED` · `2E-E = NOT SCHEDULED`**
 
-> **Ce document reste un document de planification. Deux étapes ont été
+> **Ce document reste un document de planification. Trois étapes ont été
 > livrées, chacune par un commit dédié : 2E-A
-> (`phase2: harden network metadata privacy`) et 2E-D
-> (`phase2: harden transaction propagation privacy`).**
+> (`phase2: harden network metadata privacy`), 2E-D
+> (`phase2: harden transaction propagation privacy`) et 2E-B
+> (`phase2: abstract network transport`).**
 >
-> Les étapes 2E-B à 2E-C restent des **propositions**. Aucune n'est engagée,
-> aucune n'a commencé, et le passage d'une étape à l'autre exige une décision
-> explicite — il ne se fait pas automatiquement.
+> **2E-B n'implémente qu'un transport TCP.** `TCP = IMPLEMENTED` ·
+> `TOR = NOT IMPLEMENTED` · `I2P = NOT IMPLEMENTED` · `ANONYMITY = NONE`.
+> La présence d'un `trait Transport` ne signifie **pas** qu'un transport
+> anonymisant existe, et 2E-B ne protège rien.
+>
+> L'étape 2E-C reste une **proposition**. Aucune n'est engagée, aucune n'a
+> commencé, et le passage d'une étape à l'autre exige une décision explicite
+> — il ne se fait pas automatiquement.
 >
 > Détail et preuves de ce qui a réellement été codé (et de ce qui ne l'a pas
-> été) : `docs/AETHER_PHASE2_METADATA_HARDENING.md` (2E-A) et
-> `docs/AETHER_PHASE2_PRIVACY_PROPAGATION.md` (2E-D).
+> été) : `docs/AETHER_PHASE2_METADATA_HARDENING.md` (2E-A),
+> `docs/AETHER_PHASE2_PRIVACY_PROPAGATION.md` (2E-D) et
+> `docs/AETHER_PHASE2_TRANSPORT_ABSTRACTION.md` (2E-B).
 
-Branche : `dev/phase2-decentralized-network` · HEAD précédent `b3f9839 phase2: harden network metadata privacy`
+Branche : `dev/phase2-decentralized-network` · HEAD précédent `028cca9 phase2: harden transaction propagation privacy`
 RELEASE `v1.4.0-testnet` = `ad08e308ffbb96152f1ed6d4d7a2ea8e9ed54316` (inchangée)
-`2E_CODE_CHANGES = 2E-A · 2E-D` · `2E_COMMITS = phase2: harden network metadata privacy (2E-A) · phase2: harden transaction propagation privacy (2E-D)` · `DEPLOYMENT = NONE`
+`2E_CODE_CHANGES = 2E-A · 2E-D · 2E-B` · `2E_COMMITS = phase2: harden network metadata privacy (2E-A) · phase2: harden transaction propagation privacy (2E-D) · phase2: abstract network transport (2E-B)` · `DEPLOYMENT = NONE`
 
 Entrées de cette roadmap :
 
 * `docs/AETHER_PHASE2_PRIVACY_THREAT_MODEL.md` — étapes 1-8 et 15 de l'audit.
 * `docs/AETHER_TRANSPORT_COMPARISON.md` — étapes 9-12.
+* `docs/AETHER_PHASE2_TRANSPORT_ABSTRACTION.md` — preuves du 2E-B livré.
 
 ---
 
@@ -39,8 +47,8 @@ conduit à **un ordre différent** :
 2E-D  privacy-aware propagation ┘ LIVRÉ (commit dédié)
         │
         ▼
-2E-B  transport abstraction   ── prérequis obligatoire de 2E-C   [PROPOSED]
-        │
+2E-B  transport abstraction   ── LIVRÉ (commit dédié) — TCP SEUL   [LIVRÉ]
+        │                        TOR / I2P = NOT IMPLEMENTED
         ▼
 2E-C  optional Tor transport                                     [PROPOSED]
         │
@@ -152,45 +160,84 @@ vertes (115 + 16 nouveaux tests P2P) ; `METRICS_REVIEW = CLEAN`.
 
 ### 2E-B — Transport abstraction
 
+**STATUT — IMPLÉMENTÉ** (commit `phase2: abstract network transport`).
+**Portée réelle : `TCP = IMPLEMENTED`, et TCP seul.**
+`TOR = NOT IMPLEMENTED` · `I2P = NOT IMPLEMENTED` · `ANONYMITY = NONE`.
+Preuves et diff : `docs/AETHER_PHASE2_TRANSPORT_ABSTRACTION.md`.
+
 **OBJECTIVE**
 Séparer « qui je veux parler » (peer manager) de « comment j'arrive jusqu'à
 lui » (transport), pour rendre 2E-C possible sans réécrire la Phase 2.
 
-**CHANGE**
-Introduction de `AetherTransport` (dial/accept/supports_inbound), d'un
-`PeerAddr` enum `Ip(SocketAddr) | Onion(String) | I2p(String)`, et d'un
-**groupement de repli** pour les variantes sans IP ; extraction des points de
-couplage listés en §5 du document de comparaison : `connect_to_peer`,
-`accept_loop`, `handle_peer`, `peers: HashMap<SocketAddr, …>`,
-`NetworkGroup` / `subnet_24`, `PeerStoreEntry.addr`.
+**CHANGE — ce qui a été codé**
+
+* `src/transport.rs` (nouveau) : `PeerAddr` avec la **seule** variante `Ip`,
+  `TransportError`, `trait Transport` (`dial` + `bind` uniquement,
+  dyn-compatible, boxed futures natives, **sans `async_trait`**),
+  `TransportStream` / `TransportListener` en enums, `TcpTransport`.
+* Les **3 seuls points de couplage** de l'audit sont détournés :
+  `TcpStream::connect` → `transport.dial(&PeerAddr::Ip(..))`,
+  `TcpListener::bind` → `transport.bind(..)`,
+  `listener.accept()` → `TransportListener::accept()`.
+* `handle_peer` reçoit un `TransportStream` ; `into_split()` rend des halves
+  **possédées**, `Send`, `'static` — obligatoire puisque le write half part
+  dans `tokio::spawn`.
+* `TransportGroupKey { Ip(NetworkGroup), NoNetworkGroup }`, projection
+  **directe** de `network_group()` : une seule source de vérité.
+* `NetworkGroup` : privé → `pub`. **Visibilité seule**, aucun comportement.
+
+**CHANGE — ce qui n'a PAS été codé (décision explicite)**
+
+* `PeerAddr` ne remplace **pas** `SocketAddr` comme clé. Sessions,
+  `AddressManager`, `sync_stats`, wire PEX et peer store restent
+  `SocketAddr` / `String`. Conversion au boundary, 2 sites. Contrainte dure :
+  `src/sync_stats.rs` (intouchable) expose `peer: SocketAddr`.
+* **Aucune variante `Onion` / `I2p`** : ajoutée « pour faire joli », elle
+  serait du code mort présentant comme une fonctionnalité.
+* `peers: HashMap<SocketAddr, …>`, `NetworkGroup` / `subnet_24`,
+  `PeerStoreEntry.addr` : **inchangés** — conformément à l'interdiction de
+  réécrire les défenses de Phase 2C.
+* Pas de bump de store (`PEER_STORE_VERSION` reste **2**), pas de bump de
+  protocole (`P2P_PROTOCOL_VERSION = 4`, `PROTOCOL_CHANGE = NONE`).
 
 **SECURITY BENEFIT**
 **Aucun directement.** Bénéfice purement conditionnel : c'est le prix d'entrée
-de 2E-C et de tout travail de transport ultérieur.
+de 2E-C et de tout travail de transport ultérieur. 2E-B ne protège rien.
 
 **COST**
-Modéré à élevé. Le poste le plus risqué n'est pas le trait, c'est
-**`NetworkGroup` / `subnet_24`** : ce sont des défenses de sécurité de la
-Phase 2C, pas des utilitaires. Toute réécriture doit re-passer les 15 tests
-`phase2_eclipse_tests` **et** les 17 `phase2_self_healing_tests` sans
-modification d'un seul test existant.
+Réalisé à **faible coût** : 3 points de couplage, `NetworkGroup` non touchée
+(visibilité seule), 0 test existant modifié. Le scénario redouté — devoir
+convertir les 277 occurrences de `SocketAddr` — **ne s'est pas produit** :
+`TRANSPORT_ABSTRACTION_BOUNDARY = OK`.
 
 **NEW ATTACK SURFACE**
 Un groupement de repli mal défini rend les quotas 2C/2D **silencieusement
 no-ops** : le pire des cas est un quota qui croit s'appliquer alors qu'il ne
 s'applique plus. C'est le risque structurel principal de toute cette roadmap.
+Atténué ici : `NoNetworkGroup` existe et est testé, mais **n'est rempli par
+personne** — TCP passe toujours par `network_group()`, et aucun /24 n'est
+inventé pour un endpoint non-IP.
 
-**TEST REQUIREMENTS**
-`test_transport_pluggability`, `test_transport_identity_separation`,
-`test_network_group_fallback_bounds` (nouveau : un `PeerAddr` non-IP tombe
-dans un groupe défini et reste borné), plus la régression complète.
+**TEST REQUIREMENTS — état réel**
+Module `transport::phase2_transport_tests`, **11 tests** :
+`test_peer_addr_ip_roundtrip`, `test_peer_addr_invalid_conversion`,
+`test_tcp_transport_dial`, `test_tcp_transport_accept`,
+`test_tcp_transport_bind_reports_endpoint`, `test_tcp_transport_roundtrip`,
+`test_transport_stream_split_owned` (les 2 halves dans `tokio::spawn`),
+`test_transport_listener_returns_peer_addr`, `test_transport_group_ip`,
+`test_transport_group_no_network_group` (← couvre le n° 16 du tableau §3),
+`test_legacy_peer_store_transport_boundary`.
+Les n° 14 et 15 du tableau **restent non écrits** — voir §3.
 
 **DEPENDENCIES**
-Aucune pour B lui-même. **B est le prérequis obligatoire de 2E-C.**
+Aucune pour B lui-même. **B est le prérequis obligatoire de 2E-C**, qu'elle
+reste **PROPOSED** : rien n'est engagé.
 
-**CONDITION DE SORTIE**
+**CONDITION DE SORTIE — remplie**
 `phase2_eclipse_tests` 15/15 et `phase2_self_healing_tests` 17/17 **inchangés**
-(donc : aucun test existant modifié), `p2p::` 115/115.
+(donc : aucun test existant modifié), `p2p::` **149/149**,
+`bootstrap_phase1` 19/19, `transport::` 11/11,
+`cargo check --lib` 9 warnings / 0 nouveau.
 
 ---
 
@@ -349,7 +396,7 @@ roadmap dont on affirme explicitement qu'on ne sait pas ce qu'elle contient.
 
 ---
 
-## 3. Tests à prévoir (étape 14) — **7 des 8 tests 2E-A écrits ; les tests 2E-D n° 9, 11, 12 couverts ; n° 13 à 18 non**
+## 3. Tests à prévoir (étape 14) — **n° 1-7 écrits ; n° 9, 11, 12 couverts ; n° 16 couvert par 2E-B ; n° 8, 10 écartés ; n° 14, 15 non écrits ; n° 13, 17, 18 restent 2E-C**
 
 | # | Test | Étape | Ce qu'il vérifierait |
 |---|---|---|---|
@@ -422,6 +469,30 @@ roadmap dont on affirme explicitement qu'on ne sait pas ce qu'elle contient.
   `test_invalid_transaction_is_never_scheduled_for_relay`, + le n° 11 ci-dessus ;
   `#[ignore] bench_transaction_propagation` (release).
 
+**Statut après 2E-B — module `transport::phase2_transport_tests`, 11 tests :**
+
+* n° **14** (`transport_identity_separation`) : **non écrit** — le concept
+  suppose que l'identité d'un pair est détachable du transport. Or, dans ce
+  commit, la clé de session **reste `SocketAddr`** par choix de frontière
+  (`sync_stats.rs` intouchable) : il n'y a donc pas deux identités à séparer.
+  Écrire ce test maintenant testerait une propriété que l'étape ne donne pas ;
+* n° **15** (`transport_pluggability`) : **non écrit** — il exigeait un
+  transport en mémoire (`MockTransport`) exerçant le trait à côté de TCP.
+  Aucun `MockTransport` n'a été construit : le trait n'a qu'une seule
+  implémentation réelle, et un mock n'aurait rien vérifié de plus que les 6
+  tests TCP déjà écrits. **`supports_inbound()` n'existe pas** dans le trait
+  livré — l'API est `dial` + `bind` ;
+* n° **16** (`network_group_fallback_bounds`) : **écrit** —
+  `test_transport_group_no_network_group` (un `TransportGroupKey` non-IP n'est
+  **jamais** assimilé à un groupe IP, donc aucun quota ne devient no-op),
+  complété par `test_transport_group_ip` (v4 → `/24`, v6 → 24 bits) ;
+* hors tableau (10 tests) : `test_peer_addr_ip_roundtrip`,
+  `test_peer_addr_invalid_conversion`, `test_tcp_transport_dial`,
+  `test_tcp_transport_accept`, `test_tcp_transport_bind_reports_endpoint`,
+  `test_tcp_transport_roundtrip`, `test_transport_stream_split_owned`,
+  `test_transport_listener_returns_peer_addr`,
+  `test_legacy_peer_store_transport_boundary`.
+
 **Gates de régression obligatoires pour chacun de ces tests, sans exception :**
 
 ```
@@ -433,15 +504,18 @@ cargo test --lib phase2_self_healing_tests   # 17/17
 cargo test --lib bootstrap_phase1            # 19/19
 cargo test --lib p2p::phase2_privacy_tests   # 16/16
 cargo test --lib p2p::phase2_privacy_propagation_tests  # 18/18 + 1 ignored
+cargo test --lib transport::phase2_transport_tests      # 11/11   (2E-B)
 cargo test --lib log_privacy                 # 12/12
 cargo check --lib                            # 9 warnings, 0 nouveau
 cargo test --release --lib bench_transaction_propagation -- --ignored  # PASS
 ```
 
-**12 tests sur 18 du tableau sont codés (7 pour 2E-A dont 2 renommés et 9
-ajoutés hors tableau ; 2 pour 2E-D au sens strict, 1 partiellement), 2 sont
-écartés dûment justifiés (n° 8 et n° 10), et les n° 13 à 18 restent
-spécifiés, pas codés.** S'y ajoutent 15 tests 2E-D hors tableau (dont le bench).
+**13 tests sur 18 du tableau sont codés (7 pour 2E-A dont 2 renommés et 10
+ajoutés hors tableau ; 2 pour 2E-D au sens strict, 1 partiellement ; 1 pour
+2E-B), 3 sont écartés dûment justifiés (n° 8, 10 et 14), 1 n'a pas été jugé
+utile (n° 15), et les n° 13, 17, 18 restent spécifiés, pas codés (2E-C).**
+S'y ajoutent 15 tests 2E-D hors tableau (dont le bench) et 10 tests 2E-B
+hors tableau.
 
 ---
 
@@ -500,38 +574,52 @@ Chaque étape ne devra communiquer que : *protection contre tel observateur*,
 ## 6. Critère de sortie
 
 ```
-2E_ROADMAP                  = DOC COMPLETE, 2 ÉTAPES LIVRÉES SUR 5
+2E_ROADMAP                  = DOC COMPLETE, 3 ÉTAPES LIVRÉES SUR 5
 
 2E-A  METADATA HARDENING    = IMPLEMENTED  (A.1.a/b/c, A.2.i/ii/iii, A.3.a/b/c)
                               wire : P2P_PROTOCOL_VERSION 3 → 4
                               PROTOCOL_COMPATIBILITY = BREAKING (aucune fenêtre)
                               METRICS_REVIEW = CLEAN (A.1.c : aucun changement)
-2E-B  TRANSPORT ABSTRACTION = PROPOSED  (prérequis obligatoire de 2E-C)
+2E-B  TRANSPORT ABSTRACTION = IMPLEMENTED  (src/transport.rs : PeerAddr + trait
+                              Transport{dial,bind} + TransportStream/Listener
+                              + TcpTransport + TransportGroupKey ; 3 points de
+                              couplage détournés ; 11 tests transport)
+                              TCP = IMPLEMENTED · TOR = NOT IMPLEMENTED
+                              I2P = NOT IMPLEMENTED · ANONYMITY = NONE
+                              wire : aucun changement · PROTOCOL_CHANGE = NONE
+                              P2P_PROTOCOL_VERSION = 4 (inchangé)
+                              PEER_STORE_VERSION = 2 (inchangé)
 2E-C  OPTIONAL TOR          = PROPOSED  (C.1 SOCKS sortant, C.2 onion bilatéral)
+                              non engagé malgré 2E-B livré — décision requise
 2E-D  PRIVACY PROPAGATION   = IMPLEMENTED  (D.1 jitter + D.2 fanout borné/diversifié
                               + dédup de planification + relay pré-validation supprimé
                               + exclusion source)
                               wire : aucun changement · PROTOCOL_CHANGE = NONE
                               P2P_PROTOCOL_VERSION = 4 (inchangé depuis 2E-A)
 2E-E  ADVANCED ANONYMITY    = NOT SCHEDULED (aucune conception, aucune étude)
-SEQUENCE RECOMMANDÉE        = ~~2E-A~~ → ~~2E-D~~ → 2E-B → 2E-C → 2E-E(non planifiée)
+SEQUENCE RECOMMANDÉE        = ~~2E-A~~ → ~~2E-D~~ → ~~2E-B~~ → 2E-C → 2E-E(non planifiée)
 
 METADATA_PRIVACY_CURRENT    = LOW → MEDIUM (borne, PAS suppression — cf.
                               AETHER_PHASE2_METADATA_HARDENING.md §4 et §5)
-IP_PRIVACY_CURRENT          = NONE (inchangé — hors périmètre de 2E-A et 2E-D)
-ANONYMITY_CURRENT           = NONE (inchangé — aucun mécanisme implémenté)
+IP_PRIVACY_CURRENT          = NONE (inchangé — hors périmètre de 2E-A, 2E-D et 2E-B)
+ANONYMITY_CURRENT           = NONE (inchangé — aucun mécanisme implémenté, y
+                              compris avec le trait Transport livré en 2E-B)
 TRANSACTION_CORRELATION_RISK= HIGH → REDUCED (2E-D — borne, PAS suppression — cf.
                               AETHER_PHASE2_PRIVACY_PROPAGATION.md §12)
 
-2E_TESTS_SPECIFIED          = 18 · 9 IMPLEMENTED (7 pour 2E-A, 2 pour 2E-D)
-                              · 1 PARTIEL (n° 11) · 2 ÉCARTÉS JUSTIFIÉS (n° 8, n° 10)
-                              · 6 RESTENT SPÉCIFIÉS, PAS CODÉS (n° 13..18)
-2E_TESTS_NEW                = 47 (p2p::phase2_privacy_tests 16 · log_privacy 12
-                              · p2p::phase2_privacy_propagation_tests 18 + 1 bench)
+2E_TESTS_SPECIFIED          = 18 · 10 IMPLEMENTED (7 pour 2E-A, 2 pour 2E-D,
+                              1 pour 2E-B) · 1 PARTIEL (n° 11)
+                              · 3 ÉCARTÉS JUSTIFIÉS (n° 8, 10, 14)
+                              · 1 NON UTILE (n° 15 — pas de MockTransport)
+                              · 3 RESTENT SPÉCIFIÉS, PAS CODÉS (n° 13, 17, 18)
+2E_TESTS_NEW                = 58 (p2p::phase2_privacy_tests 16 · log_privacy 12
+                              · p2p::phase2_privacy_propagation_tests 18 + 1 bench
+                              · transport::phase2_transport_tests 11)
 2E_TEST_GATES               = p2p:: 149 · phase2_ 92 · bootstrap_phase1 19
                               · phase2_decentralized 26 · phase2_eclipse 15
                               · phase2_self_healing 17 · phase2_privacy_tests 16
                               · phase2_privacy_propagation_tests 18 (+1 ignored)
+                              · transport::phase2_transport_tests 11
                               · log_privacy 12
                               · cargo check --lib 9 warnings / 0 nouveau
 
@@ -551,10 +639,20 @@ TRANSACTION_PROPAGATION_LATENCY  = 0 ms → first 38,6..129,4 ms · last 189,0..
                               p2p::phase2_privacy_propagation_tests::bench_transaction_propagation
                               -- --ignored --nocapture
 
-2E_CODE_CHANGES             = 2E-A · 2E-D
+2E_CODE_CHANGES             = 2E-A · 2E-D · 2E-B
 2E_COMMITS                  = phase2: harden network metadata privacy (2E-A)
                               · phase2: harden transaction propagation privacy (2E-D)
-TRANSPORT_IMPLEMENTED       = NONE
+                              · phase2: abstract network transport (2E-B)
+TRANSPORT_PERFORMANCE_IMPACT= LOW (NEGLIGIBLE) — analyse statique du chemin
+                              P2P → Arc<dyn Transport> → TcpTransport →
+                              TcpStream ; aucune mesure chiffrée n'est revendiquée
+TRANSPORT_IMPLEMENTED       = TCP ONLY
+                              src/transport.rs — un seul impl Transport
+TOR                         = NOT IMPLEMENTED
+I2P                         = NOT IMPLEMENTED
+ANONYMITY                   = NONE
+                            (la présence d'un `trait Transport` ne signifie PAS
+                            qu'un transport anonymisant existe)
 DEPLOYMENT                  = NONE
 V1.4.0_IMMUTABLE            = PASS   (ad08e308ffbb96152f1ed6d4d7a2ea8e9ed54316)
 ```

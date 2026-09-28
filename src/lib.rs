@@ -21,6 +21,7 @@ pub mod storage;
 pub mod sync_stats;
 pub mod transaction;
 pub mod transaction_processor;
+pub mod transport;
 pub mod validation;
 pub mod wallet;
 

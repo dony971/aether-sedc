@@ -16,12 +16,12 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::sync_stats::{SyncContext, TOPO_ORDER_CAP};
+use crate::transport::{PeerAddr, TcpTransport, Transport, TransportListener, TransportStream};
 
 /// P2P handshake magic bytes ("AETH") — LOGICAL network identifier only.
 ///
@@ -501,7 +501,7 @@ const MAX_MSGS_PER_SEC: u64 = 400;
 /// spread over many groups), and every realistic single allocation — IPv4 /24
 /// or larger, IPv6 /32 or larger — sits inside exactly one 24-bit group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-enum NetworkGroup {
+pub enum NetworkGroup {
     /// First three octets of an IPv4 address (a /24).
     V4([u8; 3]),
     /// First 24 bits of a native IPv6 address. Coarser than a /48 on purpose:
@@ -556,6 +556,34 @@ fn network_group(addr: SocketAddr) -> NetworkGroup {
 /// never drift apart.
 fn subnet_24(addr: SocketAddr) -> Option<[u8; 3]> {
     Some(network_group(addr).prefix3())
+}
+
+/// 2E-B: how a transport endpoint is bucketed for diversity accounting.
+///
+/// `Ip` carries the Phase 2C group unchanged — `from_peer_addr` is a thin
+/// projection of `network_group`, never a second rule, so the /24 property
+/// Phase 2C asserts cannot drift. A transport with no subnet notion maps to
+/// `NoNetworkGroup` rather than to an invented group: inventing one would let
+/// a non-IP endpoint claim subnet capacity it does not have.
+///
+/// No production path consumes this key yet — TCP addresses still flow
+/// straight through `network_group`. It exists so that a second transport is
+/// an addition rather than a rewrite of the peer manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransportGroupKey {
+    /// The endpoint is IP-addressable; the Phase 2C grouping rule applies.
+    Ip(NetworkGroup),
+    /// The endpoint belongs to a transport with no subnet notion.
+    NoNetworkGroup,
+}
+
+impl TransportGroupKey {
+    /// Bucket a transport endpoint, using the unchanged Phase 2C rule for IP.
+    pub fn from_peer_addr(addr: &PeerAddr) -> Self {
+        match addr {
+            PeerAddr::Ip(addr) => TransportGroupKey::Ip(network_group(*addr)),
+        }
+    }
 }
 
 
@@ -2308,6 +2336,12 @@ fn bound_payload_cache<T>(map: &mut HashMap<Vec<u8>, T>, age_of: impl Fn(&T) -> 
 #[derive(Clone)]
 pub struct P2PNetwork {
     config: P2PConfig,
+    /// 2E-B: the wire this node opens and accepts sockets on.
+    ///
+    /// Held as `Arc<dyn Transport>` so the peer manager never names a socket
+    /// type: dial and accept go through this, everything else (session keys,
+    /// address book, PEX, sync) stays on `SocketAddr`.
+    transport: Arc<dyn Transport>,
     peers: Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
     /// Phase 2A: addresses with an outbound dial in flight. The initial sweep,
     /// heartbeat, redial loop and PEX can all reach `connect_to_peer` for the
@@ -2377,6 +2411,7 @@ impl P2PNetwork {
     ) -> Self {
         Self {
             config,
+            transport: Arc::new(TcpTransport::new()),
             peers: Arc::new(RwLock::new(HashMap::new())),
             dialing: Arc::new(RwLock::new(HashSet::new())),
             outbound_sessions: Arc::new(RwLock::new(HashSet::new())),
@@ -2407,7 +2442,10 @@ impl P2PNetwork {
         self.load_known_peers().await;
 
         // Start listening for incoming connections
-        let listener = TcpListener::bind(self.config.listen_addr).await?;
+        let listener = self
+            .transport
+            .bind(&PeerAddr::Ip(self.config.listen_addr))
+            .await?;
         let peers = self.peers.clone();
         let outbound_sessions = self.outbound_sessions.clone();
         let tx_channel = self.tx_channel.clone();
@@ -3228,7 +3266,7 @@ impl P2PNetwork {
 
     /// Accept loop for incoming connections
     async fn accept_loop(
-        listener: TcpListener,
+        listener: TransportListener,
         peers: Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
         local_addr: SocketAddr,
         addresses: Arc<RwLock<AddressManager>>,
@@ -3245,7 +3283,21 @@ impl P2PNetwork {
     ) {
         loop {
             match listener.accept().await {
-                Ok((socket, addr)) => {
+                Ok((stream, endpoint)) => {
+                    // 2E-B BOUNDARY: the session table, the address book,
+                    // `sync_stats` and the PEX wire all key on `SocketAddr`.
+                    // `PeerAddr` stops here — an endpoint this build cannot
+                    // express as an IP is dropped, never coerced into one.
+                    let addr = match endpoint.as_socket_addr() {
+                        Some(addr) => addr,
+                        None => {
+                            error!(
+                                "Dropping inbound connection: endpoint {} is not IP-addressable",
+                                endpoint
+                            );
+                            continue;
+                        }
+                    };
                     // Phase 2C / scenario A: `PROTECTED_OUTBOUND_SLOTS` is read
                     // on its own so the direction map and the session map are
                     // never held at the same time.
@@ -3265,7 +3317,7 @@ impl P2PNetwork {
                                 MAX_PEERS.saturating_sub(PROTECTED_OUTBOUND_SLOTS),
                                 PROTECTED_OUTBOUND_SLOTS
                             );
-                            drop(socket);
+                            drop(stream);
                             continue;
                         }
                         // ECLIPSE-01: enforce /24 subnet diversity
@@ -3275,7 +3327,7 @@ impl P2PNetwork {
                                 "Rejecting incoming peer {}: /24 subnet limit reached ({}/{})",
                                 addr, subnet_count, MAX_PEERS_PER_SUBNET
                             );
-                            drop(socket);
+                            drop(stream);
                             continue;
                         }
                     }
@@ -3289,7 +3341,7 @@ impl P2PNetwork {
                                 addr,
                                 mgr.banned_until(addr)
                             );
-                            drop(socket);
+                            drop(stream);
                             continue;
                         }
                     }
@@ -3324,7 +3376,7 @@ impl P2PNetwork {
                     let is_orphan = Arc::clone(&is_orphan);
                     tokio::spawn(async move {
                         Self::handle_peer(
-                            socket,
+                            stream,
                             addr,
                             peers_clone,
                             local_addr,
@@ -3597,7 +3649,7 @@ impl P2PNetwork {
 
     /// Handle a peer connection
     async fn handle_peer(
-        socket: TcpStream,
+        stream: TransportStream,
         addr: SocketAddr,
         peers: Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
         local_addr: SocketAddr,
@@ -3614,8 +3666,9 @@ impl P2PNetwork {
         sync_ctx: Arc<SyncContext>,
         is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
     ) {
-        // Split socket into read and write halves
-        let (mut reader, mut writer) = socket.into_split();
+        // Split stream into read and write halves (both owned, so the write
+        // half can be moved into the send task below).
+        let (mut reader, mut writer) = stream.into_split();
 
         // Perform encrypted handshake (X25519 key exchange)
         let (key_bytes, send_dir) = match Self::handshake(&mut reader, &mut writer)
@@ -4413,8 +4466,12 @@ impl P2PNetwork {
 
         // H2: bound the connect attempt so a black-holed or unroutable peer
         // address cannot stall the outbound discovery loop indefinitely.
-        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
-            Ok(Ok(socket)) => {
+        // 2E-B: the socket itself comes from the transport; the timeout stays
+        // here because when to give up is policy, not mechanism.
+        match tokio::time::timeout(CONNECT_TIMEOUT, self.transport.dial(&PeerAddr::Ip(addr)))
+            .await
+        {
+            Ok(Ok(stream)) => {
                 info!("Connected to peer: {}", addr);
                 let (msg_sender, msg_receiver) = mpsc::unbounded_channel::<Vec<u8>>();
                 {
@@ -4460,7 +4517,7 @@ impl P2PNetwork {
                 let outbound_sessions = self.outbound_sessions.clone();
                 tokio::spawn(async move {
                     Self::handle_peer(
-                        socket,
+                        stream,
                         addr,
                         peers,
                         local_addr,
