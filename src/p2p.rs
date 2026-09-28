@@ -12,7 +12,7 @@ use rand::{Rng, SeedableRng};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -295,6 +295,62 @@ const MAX_INV_ITEMS: usize = 1000;
 /// than narrowing it.
 static SYNC_WINDOW_CURSOR: AtomicU64 = AtomicU64::new(0);
 
+// ---------------------------------------------------------------------------
+// Phase 2E-D — privacy-aware transaction propagation.
+//
+// Threat addressed (threat model §4.3, `TRANSACTION_CORRELATION_RISK = HIGH`):
+// today a node forwards an inbound transaction in the SAME task that received
+// it, to EVERY connected peer, twice (once before validation, once after). An
+// observer of any single link therefore learns (a) the forward happens in the
+// same instant as the receive, (b) every neighbour learns at the same instant,
+// and (c) the receiving node relays even payloads it ends up rejecting. The
+// three constants below are the whole of the timing/topology countermeasure:
+//
+// * relay_t = receive_t + jitter, drawn PER PEER, so no two neighbours see
+//   the same forward instant;
+// * at most `MAX_PROPAGATION_FANOUT` neighbours are told, chosen across
+//   network groups (Phase 2C primitive), so the observing set shrinks;
+// * the payload is scheduled exactly once, and only after `validate_pure`.
+//
+// Bound derivation (not chosen at random):
+//
+// * MIN = 20 ms. The point is only that `relay_t != receive_t` on every link;
+//   20 ms sits above local processing / LAN RTT noise (a few ms) so the gap is
+//   real rather than rounding, and is two orders of magnitude below any
+//   consensus or confirmation cadence, so it cannot be read as a protocol
+//   event.
+// * MAX = 250 ms. It must stay far below the two clocks that already bound
+//   convergence: the inventory sync backstop runs every 10 s
+//   (`node.rs:766`) and `FRAME_TIMEOUT` is 30 s. 250 ms is 2.5 % of the
+//   backstop, so even a full A→B→C→D→E chain costs ≤ 1 s worst case
+//   (≤ 0.5 s expected, uniform) while still spreading a node's fan-out across
+//   a 230 ms window — four orders of magnitude wider than the current 0 ms.
+//   It is a *floor under the observation*, not an anonymity guarantee: a
+//   global observer with both endpoints still sees the pair.
+// * FANOUT = 4. Random gossip with fan-out ≥ 3-5 is the standard working
+//   point; 4^h covers a 128-node table (`MAX_PEERS`) in 4 hops. Crucially it
+//   is NOT the convergence guarantee — `request_full_sync` every 10 s is, and
+//   it is untouched by this step. Lowering the fan-out below the typical
+//   degree would trade real coverage for a privacy gain this step cannot
+//   claim, so it stays deliberately conservative.
+//
+// NO `PROPAGATION_MAX_ROUNDS`: this architecture has no rounds. Each node
+// relays once, on first acceptance; stragglers are covered by the existing
+// inventory sync, not by a second relay wave. Adding a rounds constant here
+// would document a mechanism that does not exist.
+// ---------------------------------------------------------------------------
+
+/// 2E-D: lower bound of the per-peer relay delay. Always > 0, so
+/// `relay_t == receive_t` is impossible by construction.
+const PROPAGATION_JITTER_MIN: Duration = Duration::from_millis(20);
+/// 2E-D: upper bound of the per-peer relay delay (see the derivation above:
+/// 2.5 % of the 10 s sync backstop, ≪ the 30 s `FRAME_TIMEOUT`).
+const PROPAGATION_JITTER_MAX: Duration = Duration::from_millis(250);
+/// 2E-D: maximum number of connected peers a single transaction is forwarded
+/// to. Never raised above the degree: a node with fewer peers forwards to all
+/// of them (minus the source).
+const MAX_PROPAGATION_FANOUT: usize = 4;
+
 /// 2E-A (A.1): write `contents` to `path` so the peer store is readable by
 /// its owner only (0600) instead of inheriting a world-readable umask
 /// (0644). The file holds every IP this node has ever dialed, which is the
@@ -546,6 +602,94 @@ where
         *counts.entry(network_group(a)).or_insert(0) += 1;
     }
     counts
+}
+
+/// 2E-D: how long to hold one outbound copy of a relay, drawn for **this
+/// peer only**.
+///
+/// Uniform over `[PROPAGATION_JITTER_MIN, PROPAGATION_JITTER_MAX]`, both ends
+/// inclusive. Pure in the injected RNG — no clock, no shared state, and
+/// deliberately **no dependence on the transaction**: a delay derived from
+/// the payload would replace the fixed-timing signal with a content
+/// fingerprint, which is strictly worse.
+///
+/// The point is that `relay_t - receive_t > 0` on every link and differs
+/// between neighbours. It is *not* a defence against an observer that sees
+/// both endpoints; 2E-D never claims one.
+fn propagation_delay<R: Rng + ?Sized>(rng: &mut R) -> Duration {
+    let span = (PROPAGATION_JITTER_MAX.as_millis() - PROPAGATION_JITTER_MIN.as_millis()) as u64;
+    PROPAGATION_JITTER_MIN + Duration::from_millis(rng.gen_range(0..=span))
+}
+
+/// 2E-D: which connected peers receive one relay wave.
+///
+/// 1. the upstream peer (`source`) is removed — it already has the payload,
+///    and telling it back is both waste and a first-hop signal;
+/// 2. the remainder is shuffled with the injected RNG, so the choice is never
+///    the `HashMap` iteration order and differs per payload and per seed;
+/// 3. if more peers remain than `limit`, at most
+///    `ceil(limit / distinct_groups)` are taken per network group — the Phase
+///    2C `network_group` primitive, reused rather than reinvented;
+/// 4. if topology leaves fewer groups than `limit`, the quota is relaxed so
+///    the wave still reaches `limit` peers.
+///
+/// Step 4 matters: diversity is a preference, the fan-out size is the
+/// requirement. A node sitting in one /24 must not silently forward to one
+/// peer instead of four.
+///
+/// Returns **fewer** than `limit` only when fewer peers are connected (or the
+/// source accounted for all of them) — never because a quota ran out.
+///
+/// `select_outbound` is NOT reused here, deliberately: it exists to *dial*
+/// addresses the node is not connected to (`!connected.contains(a)`), so fed
+/// the session table it would always return an empty vector.
+fn propagation_targets<R: Rng + ?Sized>(
+    connected: &[SocketAddr],
+    source: Option<SocketAddr>,
+    limit: usize,
+    rng: &mut R,
+) -> Vec<SocketAddr> {
+    // 1. upstream peer out.
+    let mut pool: Vec<SocketAddr> = connected
+        .iter()
+        .copied()
+        .filter(|a| Some(*a) != source)
+        .collect();
+    if pool.len() <= limit {
+        return pool;
+    }
+
+    // 2. uniform shuffle (Fisher-Yates over the injected RNG).
+    for i in (1..pool.len()).rev() {
+        let j = rng.gen_range(0..=i);
+        pool.swap(i, j);
+    }
+
+    // 3. diversity quota: one group may not own the whole wave.
+    let distinct = group_counts(pool.iter().copied()).len().max(1);
+    let quota = limit.div_ceil(distinct);
+    let mut used: HashMap<NetworkGroup, usize> = HashMap::new();
+    let mut picked: Vec<SocketAddr> = Vec::with_capacity(limit);
+    let mut overflow: Vec<SocketAddr> = Vec::new();
+    for a in pool {
+        let g = network_group(a);
+        let n = used.get(&g).copied().unwrap_or(0);
+        if picked.len() < limit && n < quota {
+            *used.entry(g).or_insert(0) += 1;
+            picked.push(a);
+        } else {
+            overflow.push(a);
+        }
+    }
+
+    // 4. relax — fill up to `limit` whatever is left, in shuffled order.
+    for a in overflow {
+        if picked.len() >= limit {
+            break;
+        }
+        picked.push(a);
+    }
+    picked
 }
 
 /// Phase 2C: may one more *inbound* connection be accepted?
@@ -1350,21 +1494,124 @@ const HANDSHAKE_FRAME_LEN: usize = 4 + 1 + 32 + 32;
 /// cache is full so memory stays bounded under flood.
 async fn insert_seen(seen: &RwLock<HashMap<Vec<u8>, SeenTxEntry>>, tx_bytes: Vec<u8>) {
     let mut map = seen.write().await;
-    if map.len() >= MAX_SEEN_TXS {
-        let now = Instant::now();
-        map.retain(|_, e| now.duration_since(e.timestamp) < Duration::from_secs(300));
-        if map.len() >= MAX_SEEN_TXS {
-            if let Some(k) = map.keys().next().cloned() {
-                map.remove(&k);
-            }
-        }
-    }
+    let now = Instant::now();
+    bound_payload_cache(&mut map, |e| now.duration_since(e.timestamp));
     map.insert(
         tx_bytes,
         SeenTxEntry {
             timestamp: Instant::now(),
         },
     );
+}
+
+/// 2E-D: remember which peer an inbound payload arrived from, so the relay
+/// that later runs in `broadcast_transaction` can leave that one peer out.
+///
+/// Called from the two ingress points (the `Transaction` arm and the
+/// `GetData` answer), i.e. exactly where `source` is known. Preserves
+/// whatever is already recorded: first observation wins, and an already
+/// scheduled payload is never un-scheduled by a late duplicate.
+async fn record_propagation_source(
+    state: &RwLock<PropagationState>,
+    tx_bytes: &[u8],
+    source: SocketAddr,
+) {
+    let mut map = state.write().await;
+    let now = Instant::now();
+    bound_payload_cache(&mut map, |e| now.duration_since(e.timestamp));
+    let entry = map.entry(tx_bytes.to_vec()).or_insert_with(|| PropagationEntry {
+        timestamp: now,
+        source: Some(source),
+        scheduled: false,
+    });
+    if !entry.scheduled {
+        entry.source.get_or_insert(source);
+    }
+}
+
+/// 2E-D: claim the single relay wave for this payload.
+///
+/// Returns `Some(source)` the first time (the wave may start, and must skip
+/// `source`), and `None` for every subsequent call — whether the payload came
+/// from the network (`Some(peer)`) or was created locally (`None`). This is
+/// the check that has to happen **before** scheduling; the old code had no
+/// equivalent and transmitted every accepted payload twice per link.
+///
+/// A payload never recorded at ingress (local origin) is recorded here with
+/// `source = None`.
+async fn take_propagation_slot(
+    state: &RwLock<PropagationState>,
+    tx_bytes: &[u8],
+) -> Option<Option<SocketAddr>> {
+    let mut map = state.write().await;
+    let now = Instant::now();
+    bound_payload_cache(&mut map, |e| now.duration_since(e.timestamp));
+    match map.get_mut(tx_bytes) {
+        Some(entry) if entry.scheduled => None,
+        Some(entry) => {
+            entry.scheduled = true;
+            entry.timestamp = now;
+            Some(entry.source)
+        }
+        None => {
+            map.insert(
+                tx_bytes.to_vec(),
+                PropagationEntry {
+                    timestamp: now,
+                    source: None,
+                    scheduled: true,
+                },
+            );
+            Some(None)
+        }
+    }
+}
+
+/// 2E-D: the entire receive stage for one inbound transaction payload.
+///
+/// Returns `true` when the payload was accepted for validation. It performs
+/// **no relay of any kind** — see docs/AETHER_PHASE2_PRIVACY_PROPAGATION.md
+/// §2.9. The old code forwarded from here, before `validate_pure` had run,
+/// which is how (a) payloads the node ends up rejecting still reached the
+/// wire and (b) every accepted payload was transmitted twice per link.
+///
+/// Order is deliberate and is part of the contract the tests assert:
+/// dedup → parse → record receipt + upstream peer → queue. Nothing in here
+/// schedules a relay; that happens exactly once, later, in
+/// `broadcast_transaction`, reachable only after validation and acceptance.
+async fn accept_inbound_transaction(
+    tx_bytes: Vec<u8>,
+    source: SocketAddr,
+    seen: &RwLock<HashMap<Vec<u8>, SeenTxEntry>>,
+    propagation_state: &RwLock<PropagationState>,
+    tx_channel: &mpsc::UnboundedSender<Transaction>,
+) -> bool {
+    // DEDUPE, ahead of anything that could schedule a relay.
+    if seen.read().await.contains_key(&tx_bytes) {
+        return false;
+    }
+
+    let tx = match bincode::deserialize::<Transaction>(&tx_bytes) {
+        Ok(tx) => tx,
+        Err(_) => {
+            warn!("Failed to deserialize transaction from {}", source);
+            return false;
+        }
+    };
+
+    insert_seen(seen, tx_bytes.clone()).await;
+    // The upstream peer must be recorded at ingress, while `source` is still
+    // in scope; the relay wave consults it later in `broadcast_transaction`.
+    record_propagation_source(propagation_state, &tx_bytes, source).await;
+
+    // LOG REVIEW (2E-D §11): this pairs a payload hash with a peer address
+    // and a log timestamp — the (hash, source, time) triple a local reader of
+    // `node.log` should not get for free. Dropped from DEBUG (where it sat)
+    // to TRACE: still reachable for a targeted investigation, not written at
+    // the default level.
+    tracing::trace!("received transaction from {}: {}", source, hex::encode(tx.id));
+
+    tx_channel.send(tx).is_ok()
 }
 
 /// P2P network configuration
@@ -2007,6 +2254,56 @@ struct SeenTxEntry {
     timestamp: Instant,
 }
 
+/// 2E-D: scheduling state for one transaction payload.
+///
+/// Deliberately a *separate* map from `seen_transactions`, not two extra
+/// fields on it: that struct is receipt dedup, it is constructed literally by
+/// several existing tests that assert receipt semantics only, and merging the
+/// two would force those tests to change to describe a mechanism they do not
+/// exercise. The two concerns are also genuinely different — `seen` answers
+/// "have I received this?", this answers "have I already scheduled a relay
+/// wave for this, and from whom did it come?".
+///
+/// Keyed by the same raw payload bytes as `seen_transactions`, bounded by the
+/// same rule, and consulted strictly *before* any scheduling happens.
+#[derive(Clone)]
+struct PropagationEntry {
+    /// When this payload was first recorded here (for the shared bound).
+    timestamp: Instant,
+    /// Peer the payload first arrived from, i.e. the one upstream node that
+    /// must NOT be told about it again. `None` means locally created (RPC,
+    /// faucet, miner) — there is no upstream peer to exclude.
+    source: Option<SocketAddr>,
+    /// Set in the same critical section that hands the payload to the
+    /// scheduler. A second accept therefore schedules nothing: this is the
+    /// dedup that stops the double relay.
+    scheduled: bool,
+}
+
+/// Payload-keyed scheduling state: bytes → `PropagationEntry`.
+type PropagationState = HashMap<Vec<u8>, PropagationEntry>;
+
+/// Shared retention rule for the two payload-keyed caches
+/// (`seen_transactions` and `PropagationState`): once the cap is reached,
+/// drop everything older than the TTL, then — if still at the cap — drop one
+/// arbitrary entry so the insert that follows keeps the map bounded. Memory
+/// stays O(`MAX_SEEN_TXS`) under flood either way.
+const PAYLOAD_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Apply `PAYLOAD_CACHE_TTL` + the hard cap to a payload-keyed map.
+/// `age_of` returns how old an entry is; it is evaluated once per entry.
+fn bound_payload_cache<T>(map: &mut HashMap<Vec<u8>, T>, age_of: impl Fn(&T) -> Duration) {
+    if map.len() < MAX_SEEN_TXS {
+        return;
+    }
+    map.retain(|_, v| age_of(v) < PAYLOAD_CACHE_TTL);
+    if map.len() >= MAX_SEEN_TXS {
+        if let Some(k) = map.keys().next().cloned() {
+            map.remove(&k);
+        }
+    }
+}
+
 /// P2P network manager
 #[derive(Clone)]
 pub struct P2PNetwork {
@@ -2047,6 +2344,20 @@ pub struct P2PNetwork {
     get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
     get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
     seen_transactions: Arc<RwLock<HashMap<Vec<u8>, SeenTxEntry>>>,
+    /// 2E-D: scheduling state for relays — upstream peer + "already
+    /// scheduled". Read strictly before a relay wave is started, so a
+    /// payload can never be transmitted twice per link. Separate from
+    /// `seen_transactions` (receipt dedup); see `PropagationEntry`.
+    propagation_state: Arc<RwLock<PropagationState>>,
+    /// 2E-D: relays currently waiting out their per-peer jitter. Bounded by
+    /// construction (`in-flight accepts × MAX_PROPAGATION_FANOUT`) and
+    /// returned to 0 once the wave has been written out — this is what the
+    /// "no unbounded queue" test observes.
+    propagation_inflight: Arc<AtomicUsize>,
+    /// 2E-D: the one RNG that draws relay delays and fan-out selections.
+    /// Mutex, never held across an `.await`, and short-lived: it exists so a
+    /// test can reseed it and replay a wave byte for byte.
+    propagation_rng: Arc<std::sync::Mutex<StdRng>>,
     /// B4: shared bootstrap state (counters, parent-request dedup, orphan TTL)
     sync_ctx: Arc<SyncContext>,
     /// B4: true when the hash is already in the orphan store (sync dedup)
@@ -2077,6 +2388,12 @@ impl P2PNetwork {
             get_transaction_by_hash,
             get_tips,
             seen_transactions: Arc::new(RwLock::new(HashMap::new())),
+            propagation_state: Arc::new(RwLock::new(HashMap::new())),
+            propagation_inflight: Arc::new(AtomicUsize::new(0)),
+            // OS entropy, same policy as the rest of the node: the choice of
+            // which neighbour hears first must not be predictable, and must
+            // not be reproducible across restarts.
+            propagation_rng: Arc::new(std::sync::Mutex::new(StdRng::from_entropy())),
             sync_ctx,
             is_orphan,
         }
@@ -2098,6 +2415,7 @@ impl P2PNetwork {
         let get_transaction_by_hash = Arc::clone(&self.get_transaction_by_hash);
         let get_tips = Arc::clone(&self.get_tips);
         let seen_transactions = Arc::clone(&self.seen_transactions);
+        let propagation_state = Arc::clone(&self.propagation_state);
         let sync_ctx = Arc::clone(&self.sync_ctx);
         let is_orphan = Arc::clone(&self.is_orphan);
         let local_addr = self.config.listen_addr;
@@ -2125,6 +2443,7 @@ impl P2PNetwork {
                 get_transaction_by_hash,
                 get_tips,
                 seen_transactions,
+                propagation_state,
                 peer_discovery_tx,
                 sync_ctx,
                 is_orphan,
@@ -2919,6 +3238,7 @@ impl P2PNetwork {
         get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
         get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         seen_transactions: Arc<RwLock<HashMap<Vec<u8>, SeenTxEntry>>>,
+        propagation_state: Arc<RwLock<PropagationState>>,
         peer_discovery_tx: mpsc::UnboundedSender<SocketAddr>,
         sync_ctx: Arc<SyncContext>,
         is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
@@ -2997,6 +3317,7 @@ impl P2PNetwork {
                     let get_transaction_by_hash = Arc::clone(&get_transaction_by_hash);
                     let get_tips = Arc::clone(&get_tips);
                     let seen_transactions = Arc::clone(&seen_transactions);
+                    let propagation_state = Arc::clone(&propagation_state);
                     let peer_discovery_tx = peer_discovery_tx.clone();
                     let addresses = addresses.clone();
                     let sync_ctx = Arc::clone(&sync_ctx);
@@ -3013,6 +3334,7 @@ impl P2PNetwork {
                             get_transaction_by_hash,
                             get_tips,
                             seen_transactions,
+                            propagation_state,
                             msg_sender,
                             msg_receiver,
                             peer_discovery_tx,
@@ -3285,6 +3607,7 @@ impl P2PNetwork {
         get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
         get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         seen_transactions: Arc<RwLock<HashMap<Vec<u8>, SeenTxEntry>>>,
+        propagation_state: Arc<RwLock<PropagationState>>,
         msg_sender: mpsc::UnboundedSender<Vec<u8>>,
         msg_receiver: mpsc::UnboundedReceiver<Vec<u8>>,
         peer_discovery_tx: mpsc::UnboundedSender<SocketAddr>,
@@ -3570,40 +3893,27 @@ impl P2PNetwork {
                 Ok(msg) => {
                     match msg {
                         P2PMessage::Transaction(tx_bytes) => {
-                            // Deduplication: check if we've seen this transaction
+                            // 2E-D (§2.9): this arm is now receive → dedup →
+                            // record upstream peer → queue, and NOTHING else.
+                            //
+                            // The relay that used to live here ran *before*
+                            // `validate_pure`, so it forwarded payloads the
+                            // node would go on to reject, to every connected
+                            // peer, in the same instant it received them —
+                            // it was copy #1 of the per-link double relay.
+                            // Aether relays from `broadcast_transaction`
+                            // instead: after validation, once, to a bounded
+                            // fan-out, behind a per-peer jitter.
+                            if !accept_inbound_transaction(
+                                tx_bytes,
+                                addr,
+                                &seen_transactions,
+                                &propagation_state,
+                                &tx_channel,
+                            )
+                            .await
                             {
-                                let seen = seen_transactions.read().await;
-                                if seen.contains_key(&tx_bytes) {
-                                    continue;
-                                }
-                            }
-
-                            // Deserialize transaction
-                            if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
-                                // Mark as seen with timestamp and source (Network) before sending to channel
-                                insert_seen(&seen_transactions, tx_bytes.clone()).await;
-
-                                // LOG NOISE (soak): per-tx line on the hot
-                                // path — DEBUG only (failures keep WARN).
-                                tracing::debug!(
-                                    "Received transaction from {}: {}",
-                                    addr,
-                                    hex::encode(tx.id)
-                                );
-                                let _ = tx_channel.send(tx);
-
-                                // Forward transaction to all other connected peers (relay)
-                                let relay_msg = P2PMessage::Transaction(tx_bytes.clone());
-                                if let Ok(relay_bytes) = bincode::serialize(&relay_msg) {
-                                    let peers_guard = peers.read().await;
-                                    for (peer_addr, sender) in peers_guard.iter() {
-                                        if *peer_addr != addr {
-                                            let _ = sender.send(relay_bytes.clone());
-                                        }
-                                    }
-                                }
-                            } else {
-                                warn!("Failed to deserialize transaction from {}", addr);
+                                continue;
                             }
                         }
                         P2PMessage::Inventory(hashes) => {
@@ -3918,6 +4228,19 @@ impl P2PNetwork {
                                     frontier.mark_applied(&tx.id);
                                     frontier.record_progress();
                                 }
+                                // 2E-D: the deep-sync ingress has to record its
+                                // upstream peer too, otherwise a payload that
+                                // arrives here is later re-sent to the very
+                                // peer that sent it (its `PropagationEntry`
+                                // would be created in `broadcast_transaction`
+                                // with `source = None`). Recorded before the
+                                // bytes are moved into `insert_seen`.
+                                record_propagation_source(
+                                    &propagation_state,
+                                    &tx_bytes,
+                                    addr,
+                                )
+                                .await;
                                 insert_seen(&seen_transactions, tx_bytes).await;
                                 let _ = tx_channel.send(tx);
                                 if delay_ms > 0 {
@@ -4124,6 +4447,7 @@ impl P2PNetwork {
                 let get_transaction_by_hash = Arc::clone(&self.get_transaction_by_hash);
                 let get_tips = Arc::clone(&self.get_tips);
                 let seen_transactions = Arc::clone(&self.seen_transactions);
+                let propagation_state = Arc::clone(&self.propagation_state);
                 let sync_ctx = Arc::clone(&self.sync_ctx);
                 let is_orphan = Arc::clone(&self.is_orphan);
                 let peer_discovery_tx = {
@@ -4146,6 +4470,7 @@ impl P2PNetwork {
                         get_transaction_by_hash,
                         get_tips,
                         seen_transactions,
+                        propagation_state,
                         msg_sender,
                         msg_receiver,
                         peer_discovery_tx,
@@ -4179,7 +4504,29 @@ impl P2PNetwork {
         self.addresses.write().await.record_failure(addr);
     }
 
-    /// Broadcast a transaction to all connected peers
+    /// 2E-D: forward one accepted transaction to a bounded fan-out of peers,
+    /// each behind its own jitter.
+    ///
+    /// This is the ONLY place a `P2PMessage::Transaction` is ever put on the
+    /// wire, and it is reachable only after `process_transaction` has passed
+    /// `validate_pure`, the DAG dedup, the fee gate and the mempool enqueue
+    /// (rpc.rs:1185). The pre-validation relay that used to live in the
+    /// receive arm is gone — see docs/AETHER_PHASE2_PRIVACY_PROPAGATION.md
+    /// §2.9.
+    ///
+    /// Three properties, each asserted by a test:
+    ///
+    /// * **once** — `take_propagation_slot` claims the single wave for this
+    ///   payload before anything is transmitted, so a second call (RPC and
+    ///   P2P racing, or a duplicate arriving) schedules nothing. Net effect
+    ///   per link: ONE transmission, down from two.
+    /// * **not back to the sender** — the peer recorded at ingress is
+    ///   excluded. The upstream node already has the payload; sending it back
+    ///   wastes a frame and tells the observer it was us.
+    /// * **bounded and spread** — at most `MAX_PROPAGATION_FANOUT` peers,
+    ///   chosen across network groups, sent from `tokio::spawn`ed tasks after
+    ///   `propagation_delay` each. Nothing blocks here: a slow or stalled
+    ///   peer cannot delay the caller or the other targets.
     pub async fn broadcast_transaction(&self, tx: Transaction) {
         let tx_bytes = match bincode::serialize(&tx) {
             Ok(bytes) => bytes,
@@ -4189,7 +4536,17 @@ impl P2PNetwork {
             }
         };
 
-        // Mark as seen with Local source before broadcasting to avoid rebroadcast loops
+        // 2E-D: scheduling dedup comes FIRST — before `insert_seen`, before
+        // any serialization, before a single frame is handed to a socket.
+        // `Some(source)` = this call owns the wave; `None` = an earlier call
+        // already scheduled it and this one must not add a second.
+        let source = match take_propagation_slot(&self.propagation_state, &tx_bytes).await {
+            Some(source) => source,
+            None => return,
+        };
+
+        // Keep the receipt-level mark too: it is what stops a copy of this
+        // payload coming back from a peer from being re-processed at all.
         insert_seen(&self.seen_transactions, tx_bytes.clone()).await;
 
         let msg = P2PMessage::Transaction(tx_bytes.clone());
@@ -4201,14 +4558,50 @@ impl P2PNetwork {
             }
         };
 
-        let peers = self.peers.read().await;
-        let peers: &std::collections::HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>> = &*peers;
-        for (addr, sender) in peers.iter() {
-            let sender: &mpsc::UnboundedSender<Vec<u8>> = sender;
-            if sender.send(msg_bytes.clone()).is_err() {
-                warn!("Failed to send transaction to {}: channel closed", addr);
-            }
+        // Select the targets and draw each peer's delay under ONE rng lock
+        // (short, never held across an `.await`), then drop every guard before
+        // spawning so no lock is live while tasks are created.
+        let wave: Vec<(mpsc::UnboundedSender<Vec<u8>>, Duration)> = {
+            let peers_guard = self.peers.read().await;
+            let addrs: Vec<SocketAddr> = peers_guard.keys().copied().collect();
+            let mut rng = self.propagation_rng.lock().unwrap_or_else(|e| e.into_inner());
+            let targets = propagation_targets(&addrs, source, MAX_PROPAGATION_FANOUT, &mut *rng);
+            targets
+                .into_iter()
+                .filter_map(|addr| {
+                    let sender = peers_guard.get(&addr)?.clone();
+                    let delay = propagation_delay(&mut *rng);
+                    Some((sender, delay))
+                })
+                .collect()
+        };
+
+        let inflight = Arc::clone(&self.propagation_inflight);
+        for (sender, delay) in wave {
+            let task_inflight = Arc::clone(&inflight);
+            let task_msg = msg_bytes.clone();
+            task_inflight.fetch_add(1, Ordering::Relaxed);
+            tokio::spawn(async move {
+                // The jitter IS the countermeasure: `relay_t - receive_t` is
+                // > 0 and differs per neighbour, so no two links show the same
+                // instant. It is not — and 2E-D does not claim it is — a
+                // defence against an observer holding both endpoints.
+                tokio::time::sleep(delay).await;
+                if sender.send(task_msg).is_err() {
+                    // LOG REVIEW (2E-D §11): no address, no hash, no relay
+                    // timestamp — a peer dropping out is not a correlation
+                    // event worth a line at the default level.
+                    tracing::trace!("relay peer channel closed");
+                }
+                task_inflight.fetch_sub(1, Ordering::Relaxed);
+            });
         }
+    }
+
+    /// 2E-D: relays currently waiting out their jitter. Returns to 0 once
+    /// every scheduled wave has been written out.
+    pub fn propagation_inflight(&self) -> usize {
+        self.propagation_inflight.load(Ordering::Relaxed)
     }
 
     /// Get the number of connected peers
@@ -9362,5 +9755,678 @@ mod tests {
         assert!(closure.iter().any(|h| h == &id_a.to_vec()));
         assert!(closure.iter().any(|h| h == &id_b.to_vec()));
         assert!(closure.iter().any(|h| h == &id_c.to_vec()));
+    }
+}
+
+/// Phase 2E-D — privacy-aware transaction propagation.
+///
+/// The step is judged on one number, `TRANSACTION_CORRELATION_RISK`
+/// (`HIGH` → `REDUCED`), decomposed into the five mechanisms it is built
+/// from: jitter, bounded fan-out, scheduling dedup, validation-before-relay
+/// and network-group diversity. Every assertion here maps to one of them,
+/// plus the two convergence/independence properties the step must NOT have
+/// broken (`MULTIHOP_CONVERGENCE`, `BOOTNODE_INDEPENDENCE`).
+///
+/// Nothing in this module starts a TCP connection or sleeps on a real
+/// schedule longer than `PROPAGATION_JITTER_MAX + 50 ms`.
+#[cfg(test)]
+mod phase2_privacy_propagation_tests {
+    use super::*;
+    use crate::transaction_processor::TransactionProcessor;
+    use crate::validation::ValidationMode;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// `groups` distinct /24s with `per_group` hosts in each. The group key
+    /// is `10.<g>.0.x`, so the host index never moves an address into a
+    /// different group — `peer_grid(4, 8)` really is 4 groups, not 32.
+    fn peer_grid(groups: usize, per_group: usize) -> Vec<SocketAddr> {
+        let mut v = Vec::with_capacity(groups * per_group);
+        for g in 0..groups {
+            for h in 0..per_group {
+                v.push(addr(&format!("10.{}.0.{}:9000", g, h + 1)));
+            }
+        }
+        v
+    }
+
+    fn rng(seed: u64) -> StdRng {
+        StdRng::seed_from_u64(seed)
+    }
+
+    fn make_tx(tag: u64) -> Transaction {
+        let mut sender = [0u8; 32];
+        sender[..8].copy_from_slice(&tag.to_le_bytes());
+        sender[8] = 0x5A;
+        Transaction::new(
+            [[0u8; 32]; 2],
+            sender,
+            [7u8; 32],
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 32],
+        )
+    }
+
+    /// A node with `addrs` already in its session table, each with a
+    /// live outbound channel. The receivers come back so a test can count
+    /// what actually went on the wire.
+    async fn network_with_peers(
+        addrs: &[SocketAddr],
+    ) -> (P2PNetwork, Vec<mpsc::UnboundedReceiver<Vec<u8>>>) {
+        let (tx_channel, _rx) = mpsc::unbounded_channel::<Transaction>();
+        let p2p = P2PNetwork::new(
+            P2PConfig::default(),
+            tx_channel,
+            Arc::new(|| vec![]),
+            Arc::new(|_| None),
+            Arc::new(|| vec![]),
+            Arc::new(crate::sync_stats::SyncContext::default()),
+            Arc::new(|_| false),
+        );
+        let mut rxs = Vec::with_capacity(addrs.len());
+        for a in addrs {
+            let (sx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            p2p.peers.write().await.insert(*a, sx);
+            rxs.push(rx);
+        }
+        (p2p, rxs)
+    }
+
+    /// Drain everything a peer received since the last call.
+    fn drain(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> usize {
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        n
+    }
+
+    // --- relay timing -------------------------------------------------------
+
+    /// JITTER: every draw sits inside the declared window, both ends of it
+    /// are actually reached (so nothing is clamped toward zero), and zero
+    /// itself is impossible — `relay_t == receive_t` cannot be constructed.
+    #[test]
+    fn test_relay_delay_bounds_and_spread() {
+        assert!(
+            PROPAGATION_JITTER_MIN > Duration::ZERO,
+            "a zero minimum would make `relay_t == receive_t` reachable"
+        );
+        assert!(PROPAGATION_JITTER_MAX > PROPAGATION_JITTER_MIN);
+
+        let mut r = rng(1);
+        let mut lo = Duration::MAX;
+        let mut hi = Duration::ZERO;
+        for _ in 0..10_000 {
+            let d = propagation_delay(&mut r);
+            assert!(
+                d >= PROPAGATION_JITTER_MIN && d <= PROPAGATION_JITTER_MAX,
+                "out of window: {:?}",
+                d
+            );
+            lo = lo.min(d);
+            hi = hi.max(d);
+        }
+        assert_eq!(lo, PROPAGATION_JITTER_MIN, "window floor never reached");
+        assert_eq!(hi, PROPAGATION_JITTER_MAX, "window ceiling never reached");
+    }
+
+    /// JITTER: the delay is a function of the RNG and of nothing else — same
+    /// seed replays, a different seed does not, and a single wave is never one
+    /// fixed offset. There is deliberately no content parameter to derive from,
+    /// so a transaction cannot imprint its own timing signature.
+    #[test]
+    fn test_relay_delay_depends_only_on_the_rng() {
+        let mut r1 = rng(7);
+        let mut r2 = rng(7);
+        let mut r3 = rng(8);
+        let a: Vec<Duration> = (0..16).map(|_| propagation_delay(&mut r1)).collect();
+        let b: Vec<Duration> = (0..16).map(|_| propagation_delay(&mut r2)).collect();
+        let c: Vec<Duration> = (0..16).map(|_| propagation_delay(&mut r3)).collect();
+
+        assert_eq!(a, b, "identical seeds must replay an identical wave");
+        assert_ne!(a, c, "a different seed must produce a different schedule");
+        assert!(
+            a.iter().any(|d| *d != a[0]),
+            "a wave must not collapse to one fixed offset (that is the leak 2E-D removes)"
+        );
+    }
+
+    // --- fan-out / peer selection ------------------------------------------
+
+    /// BOUNDED FANOUT: never more peers than the constant, never a duplicate
+    /// target, never empty while the table is populated — and the constant
+    /// itself stays at the reviewed value.
+    #[test]
+    fn test_fanout_is_bounded() {
+        assert_eq!(
+            MAX_PROPAGATION_FANOUT, 4,
+            "2E-D picks fan-out 4 (>= 3-5 is the standard gossip working point); \
+             changing it needs a fresh derivation, not a tweak"
+        );
+
+        let peers = peer_grid(1, 128);
+        for seed in 0..64 {
+            let t = propagation_targets(&peers, None, MAX_PROPAGATION_FANOUT, &mut rng(seed));
+            assert!(t.len() <= MAX_PROPAGATION_FANOUT, "seed {seed}: {}", t.len());
+            assert!(!t.is_empty());
+            let unique: HashSet<_> = t.iter().collect();
+            assert_eq!(unique.len(), t.len(), "seed {seed}: duplicate target");
+        }
+    }
+
+    /// NOT BACK TO THE SENDER: the upstream peer is always dropped, and the
+    /// wave still reaches its full size — excluding one peer must not shrink
+    /// coverage (it never was the peer's own turn).
+    #[test]
+    fn test_upstream_peer_is_excluded_without_shrinking_the_wave() {
+        let peers = peer_grid(4, 4);
+        let source = peers[7];
+        for seed in 0..64 {
+            let t = propagation_targets(&peers, Some(source), 4, &mut rng(seed));
+            assert!(!t.contains(&source), "seed {seed}: sent back to the sender");
+            assert_eq!(t.len(), 4, "seed {seed}: exclusion shrank the wave");
+        }
+    }
+
+    /// NETWORK DIVERSITY: with four groups and a fan-out of four, one group
+    /// may not own the wave. This is the reuse of the Phase 2C primitive that
+    /// makes the observing set span independent networks.
+    #[test]
+    fn test_fanout_spans_network_groups() {
+        let peers = peer_grid(4, 8);
+        for seed in 0..32 {
+            let t = propagation_targets(&peers, None, 4, &mut rng(seed));
+            let groups: HashSet<_> = t.iter().map(|a| network_group(*a)).collect();
+            assert_eq!(groups.len(), 4, "seed {seed}: only {:?} groups", groups);
+        }
+    }
+
+    /// DIVERSITY must not cost coverage: a node whose peers sit in two groups
+    /// still reaches `MAX_PROPAGATION_FANOUT`, because the quota is relaxed.
+    #[test]
+    fn test_topology_cannot_shrink_the_fanout() {
+        let mut peers = peer_grid(1, 4);
+        peers.push(addr("10.1.0.1:9000"));
+        for seed in 0..32 {
+            let t = propagation_targets(&peers, None, 4, &mut rng(seed));
+            assert_eq!(
+                t.len(),
+                4,
+                "seed {seed}: two-group topology must still reach the fan-out"
+            );
+        }
+    }
+
+    /// SELECTION is random, not the `HashMap` iteration order: the chosen set
+    /// varies across seeds rather than repeating one fixed ordering.
+    #[test]
+    fn test_fanout_selection_varies_by_seed() {
+        let peers = peer_grid(8, 4);
+        let mut seen: HashSet<Vec<SocketAddr>> = HashSet::new();
+        for seed in 0..64 {
+            seen.insert(propagation_targets(&peers, None, 4, &mut rng(seed)));
+        }
+        assert!(
+            seen.len() > 8,
+            "selection looks fixed: only {} distinct choices in 64 seeds",
+            seen.len()
+        );
+    }
+
+    /// BOOTNODE INDEPENDENCE: no address is systematically excluded (which
+    /// would mean a hard-coded allow-list) and none dominates the wave (which
+    /// would mean a privileged, named relay position). Every connected peer
+    /// is reachable, and the observed share stays near the fair `fanout/n`.
+    #[test]
+    fn test_no_privileged_relay_address() {
+        let peers = peer_grid(8, 4);
+        const ROUNDS: usize = 1024;
+        let mut hits: HashMap<SocketAddr, usize> = HashMap::new();
+        for seed in 0..ROUNDS as u64 {
+            for a in propagation_targets(&peers, None, 4, &mut rng(seed)) {
+                *hits.entry(a).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(
+            hits.len(),
+            peers.len(),
+            "some address is never selected — that is a privileged relay role"
+        );
+
+        let fair = 4.0 / peers.len() as f64;
+        let worst = hits.values().copied().max().unwrap() as f64 / ROUNDS as f64;
+        assert!(
+            worst < fair * 2.5,
+            "one address appears in {:.1}% of waves (fair share is {:.1}%)",
+            worst * 100.0,
+            fair * 100.0
+        );
+    }
+
+    // --- receive stage: no relay, ever -------------------------------------
+
+    /// VALIDATION BEFORE RELAY, structurally: receiving a payload records the
+    /// upstream peer and queues it for validation, but leaves `scheduled` at
+    /// false. The flag can only be set from `broadcast_transaction`, which is
+    /// downstream of `validate_pure` — so `scheduled == false` here IS the
+    /// proof that the receive stage transmits nothing.
+    #[tokio::test]
+    async fn test_receive_stage_schedules_no_relay() {
+        let seen: RwLock<HashMap<Vec<u8>, SeenTxEntry>> = RwLock::new(HashMap::new());
+        let state: RwLock<PropagationState> = RwLock::new(HashMap::new());
+        let (tx_channel, mut rx) = mpsc::unbounded_channel::<Transaction>();
+
+        let tx = make_tx(1);
+        let bytes = bincode::serialize(&tx).unwrap();
+        let source = addr("10.0.0.9:9000");
+
+        let accepted = accept_inbound_transaction(
+            bytes.clone(),
+            source,
+            &seen,
+            &state,
+            &tx_channel,
+        )
+        .await;
+        assert!(accepted, "a well-formed payload must reach the validator");
+        assert!(rx.try_recv().is_ok(), "and must be queued for validation");
+
+        let st = state.read().await;
+        let entry = st.get(&bytes).expect("ingress must record the payload");
+        assert_eq!(entry.source, Some(source), "upstream peer must be recorded");
+        assert!(
+            !entry.scheduled,
+            "receiving must not schedule a relay wave — that is the double relay, gone"
+        );
+    }
+
+    /// DEDUPLICATION: a payload already scheduled never schedules a second
+    /// wave, whether the duplicate arrives from the network or is re-submitted
+    /// locally. This is the check that takes the per-link copy count 2 -> 1.
+    #[tokio::test]
+    async fn test_a_payload_schedules_exactly_one_wave() {
+        let state: RwLock<PropagationState> = RwLock::new(HashMap::new());
+        let bytes = vec![9u8; 32];
+
+        assert!(
+            take_propagation_slot(&state, &bytes).await.is_some(),
+            "the first claim owns the wave"
+        );
+        assert!(
+            take_propagation_slot(&state, &bytes).await.is_none(),
+            "a duplicate must not open a second wave"
+        );
+        assert!(
+            take_propagation_slot(&state, &bytes).await.is_none(),
+            "…nor a third"
+        );
+        assert_eq!(state.read().await.len(), 1, "state stays payload-keyed");
+    }
+
+    /// First observation wins: a payload seen from A then from B is still
+    /// attributed to A, so the wave excludes A and not some other peer.
+    #[tokio::test]
+    async fn test_upstream_peer_is_first_observation() {
+        let state: RwLock<PropagationState> = RwLock::new(HashMap::new());
+        let bytes = vec![4u8; 32];
+        let a = addr("10.0.0.1:9000");
+        let b = addr("10.1.0.1:9000");
+
+        record_propagation_source(&state, &bytes, a).await;
+        record_propagation_source(&state, &bytes, b).await;
+
+        let claimed = take_propagation_slot(&state, &bytes)
+            .await
+            .expect("first claim owns the wave");
+        assert_eq!(claimed, Some(a), "first observation must be preserved");
+    }
+
+    /// A locally created payload (RPC, faucet, miner) has no upstream peer:
+    /// the wave must still open, with `None`, so a local submission is not
+    /// silently dropped from propagation.
+    #[tokio::test]
+    async fn test_local_payload_still_propagates() {
+        let state: RwLock<PropagationState> = RwLock::new(HashMap::new());
+        let bytes = vec![5u8; 32];
+        let claimed = take_propagation_slot(&state, &bytes)
+            .await
+            .expect("a local submission must schedule a wave");
+        assert_eq!(claimed, None, "…with no upstream peer to exclude");
+    }
+
+    // --- end to end ---------------------------------------------------------
+
+    /// DUPLICATION: every connected peer receives AT MOST ONE copy of a given
+    /// payload, and a second broadcast of the same payload delivers nothing at
+    /// all. (Before 2E-D the same link carried two — receive-relay plus
+    /// post-validation broadcast.)
+    #[tokio::test]
+    async fn test_each_peer_receives_at_most_one_copy() {
+        let peers = peer_grid(2, 4);
+        let (p2p, mut rxs) = network_with_peers(&peers).await;
+
+        let tx = make_tx(11);
+        p2p.broadcast_transaction(tx.clone()).await;
+        tokio::time::sleep(PROPAGATION_JITTER_MAX + Duration::from_millis(50)).await;
+
+        let first: Vec<usize> = rxs.iter_mut().map(drain).collect();
+        assert!(first.iter().sum::<usize>() >= 1, "the wave must reach someone");
+        assert!(
+            first.iter().all(|n| *n <= 1),
+            "a peer received more than one copy: {:?}",
+            first
+        );
+        assert!(
+            *first.iter().max().unwrap() <= MAX_PROPAGATION_FANOUT,
+            "fan-out exceeded"
+        );
+
+        // Re-broadcasting the same payload must schedule nothing.
+        p2p.broadcast_transaction(tx).await;
+        tokio::time::sleep(PROPAGATION_JITTER_MAX + Duration::from_millis(50)).await;
+        let second: usize = rxs.iter_mut().map(drain).sum();
+        assert_eq!(second, 0, "a duplicate opened a second wave");
+    }
+
+    /// NOT BACK TO THE SENDER, end to end: the peer the payload came from is
+    /// left out of the wave, and the wave is still fully sized.
+    #[tokio::test]
+    async fn test_upstream_peer_never_receives_the_relay() {
+        let peers = peer_grid(4, 4);
+        let source = peers[7];
+        let (p2p, mut rxs) = network_with_peers(&peers).await;
+
+        let tx = make_tx(21);
+        let bytes = bincode::serialize(&tx).unwrap();
+        record_propagation_source(&p2p.propagation_state, &bytes, source).await;
+
+        p2p.broadcast_transaction(tx).await;
+        tokio::time::sleep(PROPAGATION_JITTER_MAX + Duration::from_millis(50)).await;
+
+        let idx = peers.iter().position(|a| *a == source).unwrap();
+        assert_eq!(
+            drain(&mut rxs[idx]),
+            0,
+            "the upstream peer was told about a payload it already had"
+        );
+
+        let total: usize = rxs.iter_mut().map(drain).sum();
+        assert_eq!(
+            total,
+            MAX_PROPAGATION_FANOUT,
+            "exclusion must not shrink the wave"
+        );
+    }
+
+    /// The in-flight counter returns to zero: scheduled relays are tasks that
+    /// finish, not a queue that accumulates without bound.
+    #[tokio::test]
+    async fn test_inflight_relays_drain_to_zero() {
+        let peers = peer_grid(4, 4);
+        let (p2p, mut rxs) = network_with_peers(&peers).await;
+
+        for i in 0..32u64 {
+            p2p.broadcast_transaction(make_tx(100 + i)).await;
+            assert!(
+                p2p.propagation_inflight() <= 32 * MAX_PROPAGATION_FANOUT,
+                "in-flight must stay proportional to concurrent waves"
+            );
+        }
+
+        tokio::time::sleep(PROPAGATION_JITTER_MAX + Duration::from_millis(50)).await;
+        assert_eq!(
+            p2p.propagation_inflight(),
+            0,
+            "relays must complete rather than queue up"
+        );
+        let delivered: usize = rxs.iter_mut().map(drain).sum();
+        assert!(delivered <= 32 * MAX_PROPAGATION_FANOUT);
+    }
+
+    // --- validation ordering ------------------------------------------------
+
+    /// VALIDATION BEFORE RELAY: the relay call site sits strictly downstream
+    /// of the pure gate in `process_transaction`, and the receive arm holds
+    /// no peer-table access at all. A payload the gate rejects therefore never
+    /// reaches a socket, and there is no second, hidden relay path to fall
+    /// back on.
+    #[test]
+    fn test_relay_is_reachable_only_after_the_pure_gate() {
+        let rpc_src = include_str!("rpc.rs");
+        let gate = rpc_src
+            .find("processor.validate_pure")
+            .expect("the pure gate must exist in process_transaction");
+        let relay = rpc_src
+            .find("p2p_network.broadcast_transaction")
+            .expect("the relay call site must exist");
+        assert!(
+            gate < relay,
+            "relay moved upstream of validate_pure — invalid payloads would hit the wire"
+        );
+        assert_eq!(
+            rpc_src.matches("broadcast_transaction").count(),
+            1,
+            "exactly one relay call site; a second one would bypass the gate"
+        );
+
+        let p2p_src = include_str!("p2p.rs");
+        let header = "P2PMessage::Transaction(tx_bytes) => {";
+        let start = p2p_src
+            .find(header)
+            .expect("the receive arm must exist")
+            + header.len();
+        let end = p2p_src[start..]
+            .find("P2PMessage::Inventory")
+            .map(|i| i + start)
+            .expect("the following arm must exist");
+        let body = &p2p_src[start..end];
+        assert!(
+            !body.contains("peers.read()"),
+            "the receive arm touches the peer table — that is a relay"
+        );
+        assert!(
+            !body.contains("P2PMessage::Transaction("),
+            "the receive arm constructs a relay message"
+        );
+    }
+
+    /// A payload the pure gate rejects is never claimed for a wave: the gate
+    /// rejects it before `process_transaction` reaches the relay, so the
+    /// scheduling flag stays false exactly as it did at ingress.
+    #[tokio::test]
+    async fn test_invalid_transaction_is_never_scheduled_for_relay() {
+        // No PoW and a zeroed signature: `validate_pure` must refuse it.
+        let junk = Transaction::new(
+            [[0u8; 32]; 2],
+            [3u8; 32],
+            [4u8; 32],
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 32],
+        );
+        let processor = TransactionProcessor::new();
+        assert!(
+            processor
+                .validate_pure(&junk, ValidationMode::Historical)
+                .is_err(),
+            "the fixture must actually be invalid, or this test proves nothing"
+        );
+
+        // The receive stage is format-only by design, so the payload does
+        // enter the pipeline — but nothing downstream can have scheduled it.
+        let seen: RwLock<HashMap<Vec<u8>, SeenTxEntry>> = RwLock::new(HashMap::new());
+        let state: RwLock<PropagationState> = RwLock::new(HashMap::new());
+        let (tx_channel, _rx) = mpsc::unbounded_channel::<Transaction>();
+        let bytes = bincode::serialize(&junk).unwrap();
+        accept_inbound_transaction(
+            bytes.clone(),
+            addr("10.2.0.4:9000"),
+            &seen,
+            &state,
+            &tx_channel,
+        )
+        .await;
+
+        assert!(
+            !state.read().await.get(&bytes).unwrap().scheduled,
+            "a payload the pure gate rejects must never be marked for relay"
+        );
+    }
+
+    // --- convergence --------------------------------------------------------
+
+    /// MULTIHOP CONVERGENCE: the added delay of a full relay chain stays a
+    /// small fraction of both clocks that already bound propagation — the 10 s
+    /// inventory sync backstop and the 30 s `FRAME_TIMEOUT`. 2E-D must not
+    /// weaken either.
+    #[test]
+    fn test_multihop_convergence_stays_within_the_existing_bounds() {
+        const SYNC_BACKSTOP: Duration = Duration::from_secs(10);
+
+        // A 128-node table covered by fan-out 4 converges in 4 hops; allow 8.
+        for hops in 1..=8u32 {
+            let worst = PROPAGATION_JITTER_MAX * hops;
+            assert!(
+                worst < SYNC_BACKSTOP / 4,
+                "hops={hops}: worst-case chain {:?} eats into the sync backstop",
+                worst
+            );
+            assert!(
+                worst < FRAME_TIMEOUT / 4,
+                "hops={hops}: worst-case chain {:?} approaches FRAME_TIMEOUT",
+                worst
+            );
+        }
+
+        let expected_per_hop = (PROPAGATION_JITTER_MIN + PROPAGATION_JITTER_MAX) / 2;
+        assert!(
+            expected_per_hop * 8 < SYNC_BACKSTOP,
+            "the expected cost of an 8-hop chain must stay far below the backstop"
+        );
+    }
+
+    // --- measurement --------------------------------------------------------
+
+    /// Release-only measurement of the three numbers 2E-D is reported on.
+    ///
+    /// ```text
+    /// cargo test --release --lib bench_transaction_propagation -- --ignored --nocapture
+    /// ```
+    ///
+    /// * `TRANSACTION_PROPAGATION_OVERHEAD` — frames actually sent versus the
+    ///   pre-2E-D behaviour (every peer, twice).
+    /// * `TRANSACTION_PROPAGATION_LATENCY` — how far apart neighbours first
+    ///   see the payload. Pre-2E-D this was 0 ms by construction.
+    /// * `TRANSACTION_DUPLICATION_RATE` — copies delivered per link.
+    #[tokio::test]
+    #[ignore]
+    async fn bench_transaction_propagation() {
+        const N_PEERS: usize = 32;
+        const N_TX: usize = 1000;
+
+        let peers: Vec<SocketAddr> = (0..N_PEERS)
+            .map(|i| addr(&format!("10.9.{}.1:9000", i)))
+            .collect();
+        let (p2p, mut rxs) = network_with_peers(&peers).await;
+
+        // --- latency: one wave, spread between first and last neighbour ----
+        // Arrival times are polled rather than sampled after the fact: the
+        // tasks all complete during the wait, so reading the clock once at
+        // the end would report the wait itself and hide the spread.
+        let started = std::time::Instant::now();
+        p2p.broadcast_transaction(make_tx(0)).await;
+        let mut arrivals: Vec<Option<Duration>> = vec![None; N_PEERS];
+        let timeout = PROPAGATION_JITTER_MAX + Duration::from_millis(1000);
+        loop {
+            let mut got = 0usize;
+            for (i, rx) in rxs.iter_mut().enumerate() {
+                if arrivals[i].is_none() && rx.try_recv().is_ok() {
+                    arrivals[i] = Some(started.elapsed());
+                }
+                if arrivals[i].is_some() {
+                    got += 1;
+                }
+            }
+            if got >= MAX_PROPAGATION_FANOUT || started.elapsed() > timeout {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let times: Vec<Duration> = arrivals.into_iter().flatten().collect();
+        assert!(
+            !times.is_empty(),
+            "the wave must reach at least one neighbour"
+        );
+        let (first, last) = (*times.iter().min().unwrap(), *times.iter().max().unwrap());
+        let spread = last - first;
+        println!(
+            "TRANSACTION_PROPAGATION_LATENCY: first={:?} last={:?} spread={:?} recipients={}",
+            first,
+            last,
+            spread,
+            times.len()
+        );
+        assert!(
+            first >= PROPAGATION_JITTER_MIN,
+            "a neighbour saw the payload in the same instant it was scheduled"
+        );
+        assert!(
+            spread >= Duration::from_millis(1),
+            "all neighbours saw it together — that is the fixed-timing signal"
+        );
+
+        // --- overhead / duplication: a sustained stream ----------------------
+        for i in 1..=N_TX {
+            p2p.broadcast_transaction(make_tx(i as u64)).await;
+        }
+        tokio::time::sleep(PROPAGATION_JITTER_MAX + Duration::from_millis(50)).await;
+
+        let mut frames = 0usize;
+        for rx in rxs.iter_mut() {
+            frames += drain(rx);
+        }
+        // Pre-2E-D: every connected peer, every payload, twice.
+        let old_frames = N_TX * N_PEERS * 2;
+        let new_frames = frames;
+
+        let overhead = new_frames as f64 / old_frames as f64;
+        // Per LINK, not per wave: how many copies of a payload an average
+        // neighbour received. Pre-2E-D this was exactly 2.
+        let duplication = new_frames as f64 / (N_TX * N_PEERS) as f64;
+        println!(
+            "TRANSACTION_PROPAGATION_OVERHEAD: {} -> {} frames ({:.2} of the old cost)",
+            old_frames, new_frames, overhead
+        );
+        println!(
+            "TRANSACTION_DUPLICATION_RATE: {:.2} copies per link (was 2.00)",
+            duplication
+        );
+
+        assert!(
+            new_frames <= N_TX * MAX_PROPAGATION_FANOUT,
+            "fan-out exceeded: {} frames for {} payloads",
+            new_frames,
+            N_TX
+        );
+        assert!(
+            new_frames * 2 < old_frames,
+            "2E-D must strictly reduce wire copies"
+        );
+        assert!(
+            duplication <= 1.0001,
+            "some link still carries more than one copy"
+        );
     }
 }

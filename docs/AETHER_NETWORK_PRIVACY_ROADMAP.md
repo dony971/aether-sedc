@@ -1,21 +1,25 @@
 # AETHER — Roadmap confidentialité réseau (Phase 2E et au-delà)
 
 **Statut : `2E_ROADMAP = COMPLETE` (la roadmap est rédigée) ·
-`2E-A = IMPLEMENTED` · `2E-B … 2E-E = PROPOSED`**
+`2E-A = IMPLEMENTED` · `2E-D = IMPLEMENTED` · `2E-B … 2E-C = PROPOSED` ·
+`2E-E = NOT SCHEDULED`**
 
-> **Ce document reste un document de planification. Seule l'étape 2E-A a été
-> livrée, par un commit dédié (`phase2: harden network metadata privacy`).**
+> **Ce document reste un document de planification. Deux étapes ont été
+> livrées, chacune par un commit dédié : 2E-A
+> (`phase2: harden network metadata privacy`) et 2E-D
+> (`phase2: harden transaction propagation privacy`).**
 >
-> Les étapes 2E-B à 2E-E restent des **propositions**. Aucune n'est engagée,
+> Les étapes 2E-B à 2E-C restent des **propositions**. Aucune n'est engagée,
 > aucune n'a commencé, et le passage d'une étape à l'autre exige une décision
 > explicite — il ne se fait pas automatiquement.
 >
 > Détail et preuves de ce qui a réellement été codé (et de ce qui ne l'a pas
-> été) : `docs/AETHER_PHASE2_METADATA_HARDENING.md`.
+> été) : `docs/AETHER_PHASE2_METADATA_HARDENING.md` (2E-A) et
+> `docs/AETHER_PHASE2_PRIVACY_PROPAGATION.md` (2E-D).
 
-Branche : `dev/phase2-decentralized-network` · HEAD précédent `c9c44d0 phase2: add peer self-healing`
+Branche : `dev/phase2-decentralized-network` · HEAD précédent `b3f9839 phase2: harden network metadata privacy`
 RELEASE `v1.4.0-testnet` = `ad08e308ffbb96152f1ed6d4d7a2ea8e9ed54316` (inchangée)
-`2E_CODE_CHANGES = 2E-A ONLY` · `2E_COMMIT = phase2: harden network metadata privacy` · `DEPLOYMENT = NONE`
+`2E_CODE_CHANGES = 2E-A · 2E-D` · `2E_COMMITS = phase2: harden network metadata privacy (2E-A) · phase2: harden transaction propagation privacy (2E-D)` · `DEPLOYMENT = NONE`
 
 Entrées de cette roadmap :
 
@@ -30,15 +34,15 @@ L'exemple de séquence était `2E-A → 2E-B → 2E-C → 2E-D → 2E-E`. L'audi
 conduit à **un ordre différent** :
 
 ```
-2E-A  metadata hardening      ─┐
+2E-A  metadata hardening      ─┐ LIVRÉ (commit dédié)
                                ├─ indépendantes l'une de l'autre
-2E-D  privacy-aware propagation ┘
+2E-D  privacy-aware propagation ┘ LIVRÉ (commit dédié)
         │
         ▼
-2E-B  transport abstraction   ── prérequis obligatoire de 2E-C
+2E-B  transport abstraction   ── prérequis obligatoire de 2E-C   [PROPOSED]
         │
         ▼
-2E-C  optional Tor transport
+2E-C  optional Tor transport                                     [PROPOSED]
         │
         ▼
 2E-E  advanced anonymity      ── NON PLANIFIÉE (voir §2.E)
@@ -254,12 +258,24 @@ revendiquée aujourd'hui**).
 Réduire `TRANSACTION_CORRELATION_RISK` (actuellement `HIGH`) en rendant
 l'inférence de premier-vu et la corrélation de timing moins fiables.
 
+> **STATUT : D.1 + D.2 LIVRÉS**, ainsi que les deux changements non
+> optionnels qui les accompagnaient — suppression du relay **pré-validation**
+> et dédup de **planification** avant tout scheduling. Commit dédié
+> `phase2: harden transaction propagation privacy`. **D.3 et D.4 restent
+> PROPOSED.**
+>
+> `TRANSACTION_CORRELATION_RISK = HIGH → REDUCED`, justifié par la mesure
+> (`AETHER_PHASE2_PRIVACY_PROPAGATION.md` §9) : coût de trafic ×0,0625,
+> duplication 2,00 → 0,125 copies/lien, spread de relais 0 ms → 92,5-234,5 ms.
+> Le reste de cette section est le dossier de conception d'origine, conservé
+> pour D.3/D.4.
+
 **CHANGE** — candidates, par ordre de coût croissant :
 
 | Option | Changement | Bénéfice attendu |
 |---|---|---|
-| **D.1 — aléa de relais** | delay + jitter avant le relais de `P2PMessage::Transaction` (`p2p.rs:3249-3258`) et avant `broadcast_transaction` (`:3831`) | casse la synchronisation de rafale ; réduit le timing correlation |
-| **D.2 — fanout partiel** | relayer à un **sous-ensemble** aléatoire de voisins plutôt qu'à tous | réduit le nombre de points d'observation simultanés |
+| **D.1 — aléa de relais** | delay + jitter par peer avant chaque envoi — `propagation_delay` (`p2p.rs:619`), appelé dans `broadcast_transaction` (`p2p.rs:4530`) | casse la synchronisation de rafale ; réduit le timing correlation |
+| **D.2 — fanout partiel** | relayer à un **sous-ensemble** aléatoire de voisins plutôt qu'à tous — `propagation_targets` (`p2p.rs:646`), `MAX_PROPAGATION_FANOUT = 4` | réduit le nombre de points d'observation simultanés |
 | **D.3 — annonce par inventaire** | annoncer un hash (`Inventory`) puis servir en `GetData`, au lieu du push complet | masque la taille exacte de la transaction au premier saut |
 | **D.4 — stem / flare** | un seul relais discret (« stem ») puis diffusion large (« flare ») | l'approche Dandelion/Dandelion++, conçue exactement pour l'inférence de premier-vu |
 
@@ -333,7 +349,7 @@ roadmap dont on affirme explicitement qu'on ne sait pas ce qu'elle contient.
 
 ---
 
-## 3. Tests à prévoir (étape 14) — **7 des 8 tests 2E-A écrits ; les 10 autres non**
+## 3. Tests à prévoir (étape 14) — **7 des 8 tests 2E-A écrits ; les tests 2E-D n° 9, 11, 12 couverts ; n° 13 à 18 non**
 
 | # | Test | Étape | Ce qu'il vérifierait |
 |---|---|---|---|
@@ -370,24 +386,62 @@ roadmap dont on affirme explicitement qu'on ne sait pas ce qu'elle contient.
   ne change pas ;
 * hors tableau : `test_protocol_version_bump`, `test_handshake_magic_is_obfuscated`
   (ajouts non prévus) ;
-* n° **9 à 18** : **toujours non écrits** (2E-B, 2E-C, 2E-D).
+* n° **13 à 18** : **toujours non écrits** (2E-B, 2E-C).
+
+**Statut après 2E-D (étape 17) — module `p2p::phase2_privacy_propagation_tests`,
+19 tests dont 18 exécutés :**
+
+* n° **9** (`timing`) : **écrit** — `test_relay_delay_bounds_and_spread`
+  (bornes incluses, `MIN > 0`) et `test_relay_delay_depends_only_on_the_rng`
+  (pur dans le RNG, pas de décalage fixe) ;
+* n° **10** (`first_seen`) : **non écrit, écarté dûment justifié** — 2E-D ne
+  prétend pas résoudre le premier-vu : c'est la limite §12.2 de
+  `AETHER_PHASE2_PRIVACY_PROPAGATION.md`, à couvrir par **D.3/D.4**, hors
+  périmètre. Écrire ce test maintenant reviendrait à tester une garantie que
+  l'étape ne donne pas ;
+* n° **11** (`coverage`) : **écrit partiellement** —
+  `test_topology_cannot_shrink_the_fanout` (le fan-out ne se réduit jamais
+  pour cause de topologie) et `test_no_privileged_relay_address`
+  (aucune adresse privilégiée). La couverture du **graphe entier** n'est pas
+  simulée ici : elle est assurée par l'`Inventory` sync de 10 s, déjà couverte
+  par les tests de sync ;
+* n° **12** (`convergence`) : **écrit** —
+  `test_multihop_convergence_stays_within_the_existing_bounds` (8 hops ≤ 2 s
+  < backstop 10 s / 4 et < `FRAME_TIMEOUT` / 4) ;
+* hors tableau (14 tests + 1 bench) : `test_fanout_is_bounded`,
+  `test_upstream_peer_is_excluded_without_shrinking_the_wave`,
+  `test_fanout_spans_network_groups`, `test_fanout_selection_varies_by_seed`,
+  `test_receive_stage_schedules_no_relay`,
+  `test_a_payload_schedules_exactly_one_wave`,
+  `test_upstream_peer_is_first_observation`,
+  `test_local_payload_still_propagates`,
+  `test_each_peer_receives_at_most_one_copy`,
+  `test_upstream_peer_never_receives_the_relay`,
+  `test_inflight_relays_drain_to_zero`,
+  `test_relay_is_reachable_only_after_the_pure_gate`,
+  `test_invalid_transaction_is_never_scheduled_for_relay`, + le n° 11 ci-dessus ;
+  `#[ignore] bench_transaction_propagation` (release).
 
 **Gates de régression obligatoires pour chacun de ces tests, sans exception :**
 
 ```
-cargo test --lib p2p::                    # 131/131  (115 + 16)
+cargo test --lib p2p::                    # 149/149  (131 + 18)
+cargo test --lib phase2_                  # 92/92    (74 + 18)
 cargo test --lib phase2_decentralized_tests  # 26/26
 cargo test --lib phase2_eclipse_tests        # 15/15
 cargo test --lib phase2_self_healing_tests   # 17/17
 cargo test --lib bootstrap_phase1            # 19/19
 cargo test --lib p2p::phase2_privacy_tests   # 16/16
+cargo test --lib p2p::phase2_privacy_propagation_tests  # 18/18 + 1 ignored
 cargo test --lib log_privacy                 # 12/12
 cargo check --lib                            # 9 warnings, 0 nouveau
+cargo test --release --lib bench_transaction_propagation -- --ignored  # PASS
 ```
 
-**7 tests sur 18 sont codés (tous 2E-A, dont 2 renommés et 9 ajoutés hors
-tableau), 1 est écarté dûment justifié (n° 8), et les n° 9 à 18 restent
-spécifiés, pas codés.**
+**12 tests sur 18 du tableau sont codés (7 pour 2E-A dont 2 renommés et 9
+ajoutés hors tableau ; 2 pour 2E-D au sens strict, 1 partiellement), 2 sont
+écartés dûment justifiés (n° 8 et n° 10), et les n° 13 à 18 restent
+spécifiés, pas codés.** S'y ajoutent 15 tests 2E-D hors tableau (dont le bench).
 
 ---
 
@@ -405,7 +459,11 @@ cette roadmap**, y compris après livraison :
   qu'aucune fuite d'un autre canal n'existe**, et **tant qu'il est
   suffisamment peuplé**.
 * 2E-D ne rend pas « les transactions intraçables » : il réduit la fiabilité
-  d'attaque donnée, à mesurer.
+  d'attaque donnée. Mesuré en 2E-D (`AETHER_PHASE2_PRIVACY_PROPAGATION.md` §9)
+  : le coût de trafic passe à 0,0625 de l'ancien et la duplication de 2,00 à
+  0,125 copies par lien, mais un observateur voyant les deux extrémités reste
+  capable d'apparier les flux. Le seul résultat revendiqué est
+  `TRANSACTION_CORRELATION_RISK = REDUCED`.
 * 2E-E n'existe pas.
 
 Chaque étape ne devra communiquer que : *protection contre tel observateur*,
@@ -442,7 +500,7 @@ Chaque étape ne devra communiquer que : *protection contre tel observateur*,
 ## 6. Critère de sortie
 
 ```
-2E_ROADMAP                  = DOC COMPLETE, 1 ÉTAPE LIVRÉE SUR 5
+2E_ROADMAP                  = DOC COMPLETE, 2 ÉTAPES LIVRÉES SUR 5
 
 2E-A  METADATA HARDENING    = IMPLEMENTED  (A.1.a/b/c, A.2.i/ii/iii, A.3.a/b/c)
                               wire : P2P_PROTOCOL_VERSION 3 → 4
@@ -450,24 +508,31 @@ Chaque étape ne devra communiquer que : *protection contre tel observateur*,
                               METRICS_REVIEW = CLEAN (A.1.c : aucun changement)
 2E-B  TRANSPORT ABSTRACTION = PROPOSED  (prérequis obligatoire de 2E-C)
 2E-C  OPTIONAL TOR          = PROPOSED  (C.1 SOCKS sortant, C.2 onion bilatéral)
-2E-D  PRIVACY PROPAGATION   = PROPOSED  (D.1..D.4, ordre de coût croissant)
+2E-D  PRIVACY PROPAGATION   = IMPLEMENTED  (D.1 jitter + D.2 fanout borné/diversifié
+                              + dédup de planification + relay pré-validation supprimé
+                              + exclusion source)
+                              wire : aucun changement · PROTOCOL_CHANGE = NONE
+                              P2P_PROTOCOL_VERSION = 4 (inchangé depuis 2E-A)
 2E-E  ADVANCED ANONYMITY    = NOT SCHEDULED (aucune conception, aucune étude)
-SEQUENCE RECOMMANDÉE        = ~~2E-A~~ → 2E-D → 2E-B → 2E-C → 2E-E(non planifiée)
-                             (variante assumée : B et D interchangeables, au coût
-                              de TRANSACTION_CORRELATION_RISK = HIGH non traité)
+SEQUENCE RECOMMANDÉE        = ~~2E-A~~ → ~~2E-D~~ → 2E-B → 2E-C → 2E-E(non planifiée)
 
 METADATA_PRIVACY_CURRENT    = LOW → MEDIUM (borne, PAS suppression — cf.
                               AETHER_PHASE2_METADATA_HARDENING.md §4 et §5)
-IP_PRIVACY_CURRENT          = NONE (inchangé — hors périmètre de 2E-A)
+IP_PRIVACY_CURRENT          = NONE (inchangé — hors périmètre de 2E-A et 2E-D)
 ANONYMITY_CURRENT           = NONE (inchangé — aucun mécanisme implémenté)
-TRANSACTION_CORRELATION_RISK= HIGH (inchangé — 2E-D)
+TRANSACTION_CORRELATION_RISK= HIGH → REDUCED (2E-D — borne, PAS suppression — cf.
+                              AETHER_PHASE2_PRIVACY_PROPAGATION.md §12)
 
-2E_TESTS_SPECIFIED          = 18 · 7 IMPLEMENTED (2E-A) · 1 ÉCARTÉ JUSTIFIÉ (n° 8)
-                              · 10 RESTENT SPÉCIFIÉS, PAS CODÉS (n° 9..18)
-2E_TESTS_NEW                = 28 (p2p::phase2_privacy_tests 16 · log_privacy 12)
-2E_TEST_GATES               = p2p:: 131 · phase2_decentralized 26 · phase2_eclipse 15
-                              · phase2_self_healing 17 · bootstrap_phase1 19
-                              · phase2_privacy_tests 16 · log_privacy 12
+2E_TESTS_SPECIFIED          = 18 · 9 IMPLEMENTED (7 pour 2E-A, 2 pour 2E-D)
+                              · 1 PARTIEL (n° 11) · 2 ÉCARTÉS JUSTIFIÉS (n° 8, n° 10)
+                              · 6 RESTENT SPÉCIFIÉS, PAS CODÉS (n° 13..18)
+2E_TESTS_NEW                = 47 (p2p::phase2_privacy_tests 16 · log_privacy 12
+                              · p2p::phase2_privacy_propagation_tests 18 + 1 bench)
+2E_TEST_GATES               = p2p:: 149 · phase2_ 92 · bootstrap_phase1 19
+                              · phase2_decentralized 26 · phase2_eclipse 15
+                              · phase2_self_healing 17 · phase2_privacy_tests 16
+                              · phase2_privacy_propagation_tests 18 (+1 ignored)
+                              · log_privacy 12
                               · cargo check --lib 9 warnings / 0 nouveau
 
 METADATA_OVERHEAD           = mean 129.5 o · worst 257 o (sweep 4097 tailles)
@@ -477,8 +542,18 @@ THROUGHPUT_IMPACT           = ≈ −1 % (717.8 → 708.6 MB/s, best-of-6)
                               reproductible : cargo test --release --lib
                               p2p::phase2_privacy_tests::bench_2e_a_costs -- --ignored
 
-2E_CODE_CHANGES             = 2E-A ONLY
-2E_COMMIT                   = phase2: harden network metadata privacy
+TRANSACTION_PROPAGATION_OVERHEAD = 64 000 → 4 000 frames = 0,0625 de l'ancien
+                              (−93,75 %)
+TRANSACTION_DUPLICATION_RATE= 2,00 → 0,125 copies par lien
+TRANSACTION_PROPAGATION_LATENCY  = 0 ms → first 38,6..129,4 ms · last 189,0..275,9 ms
+                              · spread 92,5..234,5 ms (6 exécutions)
+                              reproductible : cargo test --release --lib
+                              p2p::phase2_privacy_propagation_tests::bench_transaction_propagation
+                              -- --ignored --nocapture
+
+2E_CODE_CHANGES             = 2E-A · 2E-D
+2E_COMMITS                  = phase2: harden network metadata privacy (2E-A)
+                              · phase2: harden transaction propagation privacy (2E-D)
 TRANSPORT_IMPLEMENTED       = NONE
 DEPLOYMENT                  = NONE
 V1.4.0_IMMUTABLE            = PASS   (ad08e308ffbb96152f1ed6d4d7a2ea8e9ed54316)
