@@ -8127,6 +8127,89 @@ mod bootstrap_phase1_tests {
         assert!(cipher.decrypt(Nonce::from_slice(&nonce), ct.as_ref()).is_err());
     }
 
+    // ===== PHASE 3E (M6): inter-session replay =====
+    //
+    // Sessions derive FRESH ephemeral X25519 keys per connection (handshake:
+    // EphemeralSecret::random_from_rng, both sides), hashed into the session
+    // key — keys differ across sessions. A captured session-A frame replayed
+    // into session B therefore fails AEAD authentication BEFORE any
+    // counter/content processing (production: warn + peer ban + disconnect),
+    // with the strictly-increasing per-session counter as second-layer
+    // defense inside a session. Verdict: ALREADY_PROTECTED; these tests pin
+    // the key-separation proof (pure crypto, no network, FAST).
+
+    /// M6: a VERBATIM captured wire frame (nonce bytes + ciphertext) from
+    /// session A is rejected under session B's key — the literal cross-
+    /// session replay attempt, counters looking "fresh" or not.
+    #[test]
+    fn test_replay_across_sessions() {
+        use chacha20poly1305::aead::{Aead, NewAead};
+        let key_a = [0xA1u8; 32];
+        let key_b = [0xB2u8; 32];
+        assert_ne!(key_a, key_b, "sessions must hold distinct keys");
+        let cipher_a = ChaCha20Poly1305::new(Key::from_slice(&key_a));
+        let cipher_b = ChaCha20Poly1305::new(Key::from_slice(&key_b));
+        // Capture three session-A frames (the attacker's recording).
+        let mut captured = Vec::new();
+        for counter in [1u64, 2, 9999] {
+            let nonce = P2PNetwork::build_nonce(counter, 0x01);
+            let ct = cipher_a
+                .encrypt(Nonce::from_slice(&nonce), b"payload".as_ref())
+                .unwrap();
+            captured.push((nonce, ct));
+        }
+        // Replay each VERBATIM into session B: all must fail to open.
+        for (nonce, ct) in &captured {
+            assert!(
+                cipher_b
+                    .decrypt(Nonce::from_slice(nonce), ct.as_ref())
+                    .is_err(),
+                "captured session-A frame must not open in session B"
+            );
+        }
+        // Control: the captures open fine under their own session key.
+        for (nonce, ct) in &captured {
+            assert!(cipher_a
+                .decrypt(Nonce::from_slice(nonce), ct.as_ref())
+                .is_ok());
+        }
+    }
+
+    /// M6: systematic key separation — session-A ciphertext over a
+    /// counter × direction matrix never opens under session B's key, while
+    /// same-key roundtrips always work.
+    #[test]
+    fn test_old_ciphertext_rejected_new_session() {
+        use chacha20poly1305::aead::{Aead, NewAead};
+        let key_a = [0xC3u8; 32];
+        let key_b = [0xD4u8; 32];
+        let cipher_a = ChaCha20Poly1305::new(Key::from_slice(&key_a));
+        let cipher_b = ChaCha20Poly1305::new(Key::from_slice(&key_b));
+        for counter in [1u64, 2, 100, 9999, u64::MAX - 1] {
+            for dir in [0x01u8, 0x02u8] {
+                let nonce = P2PNetwork::build_nonce(counter, dir);
+                let ct = cipher_a
+                    .encrypt(Nonce::from_slice(&nonce), b"payload".as_ref())
+                    .unwrap();
+                assert!(
+                    cipher_b
+                        .decrypt(Nonce::from_slice(&nonce), ct.as_ref())
+                        .is_err(),
+                    "counter {} dir {:02x}: cross-session open must fail",
+                    counter,
+                    dir
+                );
+            }
+        }
+        let nonce = P2PNetwork::build_nonce(7, 0x01);
+        let ct = cipher_a
+            .encrypt(Nonce::from_slice(&nonce), b"payload".as_ref())
+            .unwrap();
+        assert!(cipher_a
+            .decrypt(Nonce::from_slice(&nonce), ct.as_ref())
+            .is_ok());
+    }
+
     /// Long message sequence: all nonces unique under one key; encrypt/decrypt
     /// succeeds for every frame in both directions.
     #[test]

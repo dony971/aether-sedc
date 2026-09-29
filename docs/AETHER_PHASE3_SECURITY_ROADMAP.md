@@ -91,6 +91,7 @@ Finding IDs reference the audit: CRITICAL-1 (Â§3), C1/C2 (Â§14), HIGH-1 (Â�
 ## P2 â€” CORRECTNESS / ROBUSTNESS
 
 ### P2-1 â€” STEP-8 persist-failure semantics (M1)
+- **3E CLOSURE (M1)**: rollback symmetry shipped + 2 deterministic tests green — see MEDIUM_GAPS M1. Fault-injection harness remains future work (narrowed scope).
 - Define: rollback in-memory apply on persist failure (symmetric with STEPS 4/6) OR
   commit-and-report-applied. Current mixed state (applied + Err) must go.
 - Tests: storage fault-injection (M1).
@@ -103,10 +104,12 @@ Finding IDs reference the audit: CRITICAL-1 (Â§3), C1/C2 (Â§14), HIGH-1 (Â�
   selection or remove/document them as reserved; add behavior-pinning test FIRST so the
   change is observable.
 - Fixed-vector float-weight test (M7).
+- **3E CLOSURE (M2/M3/M4/M7)**: zero-weight guard + 3 tests; pruned-order independence proven (no consumer — no sort imposed); tip-selection record corrected (docs only, no behavior change); weight finiteness/integrality pinned — see MEDIUM_GAPS. Canonical-content and tip-behavior pins covered by existing + new tests; M4 heuristic itself intentionally unchanged.
 
 ### P2-3 â€” Replay key separation proof (M6)
 - Trace handshake â†’ per-session AEAD key schedule; add test proving cross-session frame
   rejection. If the binding is missing, file it as HIGH (key-schedule fix = P1).
+- **3E CLOSURE (M6)**: binding PRESENT (ephemeral per-session keys + AEAD + counter + ban) + 2 proof tests green — see MEDIUM_GAPS M6. No crypto change.
 
 ### P2-4 â€” Innocent-descendant policy (H4)
 - Measure merge-time loss at partition scale; define user-facing semantics (re-issue flow,

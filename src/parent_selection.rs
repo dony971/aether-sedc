@@ -55,16 +55,27 @@ impl Default for TipSet {
 }
 
 /// Parent Selection Algorithm based on cumulative weight and random walk.
+///
+/// PHASE 3E (M4) honesty note: parent choice shapes DAG TOPOLOGY only (which
+/// tips get referenced sooner). It is NOT consensus: the ledger applies every
+/// valid tx regardless of its parents, and conflict resolution ignores parent
+/// choice entirely (min-id rule). Two parameters below are RESERVED (accepted,
+/// never read); the freshness filter gates availability, not selection (see
+/// select_parents).
 #[derive(Debug)]
 pub struct ParentSelectionAlgorithm {
     /// Maximum age of a tip to be considered (in milliseconds)
     max_tip_age_ms: u64,
 
-    /// Minimum weight threshold for selection
+    /// Minimum weight threshold for selection.
+    /// PHASE 3E (M4): RESERVED — accepted by constructors, never read.
+    /// Changing it has no effect (kept for a future weighted filter).
     #[allow(dead_code)]
     min_weight: f64,
 
-    /// Diversity factor (0.0 to 1.0) - higher means more diverse parents
+    /// Diversity factor (0.0 to 1.0) - higher means more diverse parents.
+    /// PHASE 3E (M4): RESERVED — accepted by constructors, never read.
+    /// Changing it has no effect (kept for a future diversity heuristic).
     #[allow(dead_code)]
     diversity_factor: f64,
 
@@ -134,6 +145,17 @@ impl ParentSelectionAlgorithm {
 
             // Select child with probability proportional to weight
             let total_weight: u64 = weighted_children.iter().map(|(_, w)| w).sum();
+            // PHASE 3E (M2): explicit zero-weight guard. Unreachable given
+            // current weight invariants (children entries reference present
+            // txs, each maintained at weight >= 1.0; the clamp forbids
+            // negatives) — but a single invariant slip (future refactor,
+            // corrupted state) must degrade to early termination, never to a
+            // `gen_range(0..0)` panic (node crash = remote DoS primitive).
+            // Returning `current` is always safe: it is genesis or a DAG tx,
+            // both valid parent choices (roots are legal).
+            if total_weight == 0 {
+                return Ok(current);
+            }
             let mut random_weight = rng.gen_range(0..total_weight);
 
             for (child_id, weight) in weighted_children {
@@ -149,7 +171,16 @@ impl ParentSelectionAlgorithm {
     }
 
     /// Check if two tips are in conflict (double spend)
-    /// Returns true if they conflict
+    /// Returns true if they conflict.
+    ///
+    /// PHASE 3E (M4): deliberately CONSERVATIVE parent-diversity heuristic —
+    /// NOT the consensus double-spend rule. Flags same-sender (ANY nonce, so
+    /// mostly non-conflicting) pairs and pairs sharing ANY sender within
+    /// depth-10 ancestry. A `true` here only steers select_parents toward a
+    /// genesis fallback parent; it never rejects, prunes, or reorders ledger
+    /// state. The real double-spend rule is strictly (sender, account_nonce)
+    /// uniqueness, enforced in validate_dag / add_transaction_validated /
+    /// STEP 0. Do not cite this function as conflict evidence.
     fn check_double_spend_conflict(
         &self,
         tip1: TransactionId,
@@ -192,7 +223,15 @@ impl ParentSelectionAlgorithm {
         false
     }
 
-    /// Select two parent transactions from the tip set using random walk
+    /// Select two parent transactions from the tip set using random walk.
+    ///
+    /// PHASE 3E (M4): read this contract literally. The freshness filter
+    /// below is a LIVENESS pre-check only: if NO tip is fresh, selection
+    /// aborts with NoValidTips. When fresh tips exist, the actual parents
+    /// come from weight-proportional random walks from genesis — the
+    /// filtered list is NOT the selection pool (a misleading name otherwise).
+    /// Fallbacks (genesis second parent) keep selection total: any returned
+    /// pair is always DAG-valid, never consensus-relevant.
     pub fn select_parents(
         &self,
         tip_set: &TipSet,
@@ -2614,6 +2653,356 @@ mod tests {
                 "nonce mismatch for {:?}",
                 &addr[..2]
             );
+        }
+    }
+
+    // ===== PHASE 3E (M2): zero-weight walk guard =====
+    //
+    // The guard in random_walk (total_weight == 0 → return current) is
+    // unreachable given current weight invariants (children entries reference
+    // present txs maintained at weight >= 1.0; negatives clamped) — these
+    // tests CONSTRUCT the broken states directly (private field access from
+    // the child test module) to prove termination instead of panic. Analysis
+    // of reachability classes (production / malformed / pruned-history /
+    // empty-branch): impossible today in all four (add/remove/prune maintain
+    // the map; inject_raw writes no children entries at all); the guard is
+    // defense-in-depth against future invariant slips, with zero behavior
+    // change on the normal path (existing walk tests stay green).
+
+    /// M2: all-zero children weights terminate at genesis (no gen_range
+    /// panic). Genesis is a legal parent choice (roots exist by design).
+    #[test]
+    fn test_zero_weight_walk() {
+        let algo = ParentSelectionAlgorithm::default();
+        let mut dag = DAG::new();
+        let mut r = Transaction::new(
+            [[0u8; 32]; 2],
+            [0x60u8; 32],
+            [0x61u8; 32],
+            1,
+            1,
+            1234567890,
+            0,
+            0,
+            vec![0u8; 64],
+            vec![0u8; 32],
+        );
+        r.id = r.compute_hash();
+        dag.add_transaction_validated(r.clone()).unwrap();
+        // Simulate the invariant break: zero the maintained weight.
+        dag.transactions.get_mut(&r.id).unwrap().weight = 0.0;
+        let got = algo.random_walk(&dag).expect("must terminate, not panic");
+        assert_eq!(got, TransactionId::default(), "stay at genesis");
+    }
+
+    /// M2: terminates under repetition, and NEVER selects a zero-weight
+    /// child while a positive one exists (weighted choice degenerates to a
+    /// deterministic pick: sorted-desc first entry always wins when the
+    /// random draw is below its weight — always, since total == its weight).
+    #[test]
+    fn test_zero_weight_walk_terminates() {
+        let algo = ParentSelectionAlgorithm::default();
+        let mut dag = DAG::new();
+        let mk_root = |sender: [u8; 32]| {
+            let mut tx = Transaction::new(
+                [[0u8; 32]; 2],
+                sender,
+                [0x61u8; 32],
+                1,
+                1,
+                1234567890,
+                0,
+                0,
+                vec![0u8; 64],
+                vec![0u8; 32],
+            );
+            tx.id = tx.compute_hash();
+            tx
+        };
+        let z = mk_root([0x62u8; 32]);
+        let p = mk_root([0x63u8; 32]);
+        dag.add_transaction_validated(z.clone()).unwrap();
+        dag.add_transaction_validated(p.clone()).unwrap();
+        dag.transactions.get_mut(&z.id).unwrap().weight = 0.0;
+        for _ in 0..200 {
+            let got = algo.random_walk(&dag).expect("must terminate");
+            assert_eq!(got, p.id, "positive child always wins over zero");
+        }
+        // Pure-zero set: every walk stays at genesis.
+        dag.transactions.get_mut(&p.id).unwrap().weight = 0.0;
+        for _ in 0..200 {
+            let got = algo.random_walk(&dag).expect("must terminate");
+            assert_eq!(got, TransactionId::default());
+        }
+    }
+
+    /// M2: malformed children entries (stale id of an absent tx → weight 0
+    /// via the unwrap_or fallback) combined with a zeroed real tx also
+    /// terminate at genesis; the public selector surfaces its freshness
+    /// error (ancient fixture timestamps) instead of panicking.
+    #[test]
+    fn test_zero_weight_walk_malformed_state() {
+        let algo = ParentSelectionAlgorithm::default();
+        let mut dag = DAG::new();
+        let mut r = Transaction::new(
+            [[0u8; 32]; 2],
+            [0x64u8; 32],
+            [0x65u8; 32],
+            1,
+            1,
+            1234567890,
+            0,
+            0,
+            vec![0u8; 64],
+            vec![0u8; 32],
+        );
+        r.id = r.compute_hash();
+        dag.add_transaction_validated(r.clone()).unwrap();
+        dag.transactions.get_mut(&r.id).unwrap().weight = 0.0;
+        // Stale entry: present in children, absent from transactions.
+        let stale = [0xDEu8; 32];
+        dag.children
+            .insert(TransactionId::default(), vec![stale, r.id]);
+        let got = algo.random_walk(&dag).expect("must terminate");
+        assert_eq!(got, TransactionId::default());
+        // Public entry point: no panic either (freshness gate rejects the
+        // ancient fixture → deterministic NoValidTips, not a walk crash).
+        let mut tips = TipSet::new();
+        tips.add(r.clone());
+        assert!(algo.select_parents(&tips, &dag).is_err());
+    }
+
+    // ===== PHASE 3E (M3): pruned-list order independence =====
+    //
+    // Consumer audit (no functional order reader exists): STEP-0 pruned ids
+    // feed an order-insensitive batch purge + a cosmetic log sample;
+    // node.rs boot uses only pruned.len() + per-id deletes (set semantics);
+    // all in-repo assertions compare lengths or sorted sets. Pruned ORDER
+    // itself varies (BFS pop order over insertion-ordered children Vecs;
+    // HashSet order in canonical_resolve_conflicts; random Sled iteration
+    // order at boot) — and must not matter. This test proves two nodes with
+    // different arrival orders decide IDENTICALLY. No sorting is imposed: an
+    // arbitrary canonical order would be unjustified churn.
+
+    /// M3: same logical tx set in three input orders (sorted / reversed /
+    /// rotated — modeling random Sled iteration at boot) yields identical
+    /// survivor SETS, identical pruned SETS, and identical rebuild
+    /// fingerprints (balances, supply, nonces). Set = funding + winner +
+    /// loser (same key) + loser-child.
+    #[test]
+    fn test_pruned_list_order_independence() {
+        use crate::ledger::Ledger;
+        let sender = [0x70u8; 32];
+        let m1 = [0x71u8; 32];
+        let m2 = [0x72u8; 32];
+        let m3 = [0x73u8; 32];
+        let zero = [0u8; 32];
+        let faucet: [u8; 32] = hex::decode(crate::genesis::FAUCET_ADDRESS)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mk = |parents: [TransactionId; 2],
+                  s: [u8; 32],
+                  r: [u8; 32],
+                  amount: u64,
+                  fee: u64,
+                  nonce: u64| {
+            let mut tx = Transaction::new(
+                parents, s, r, amount, fee, 1234567890, 0, nonce,
+                vec![0u8; 64], vec![0u8; 32],
+            );
+            tx.id = tx.compute_hash();
+            tx
+        };
+        let f = mk([zero, zero], faucet, sender, 100_000, 100, 0);
+        let t1 = mk([zero, zero], sender, m1, 100, 10, 5);
+        let t2 = mk([zero, zero], sender, m2, 100, 10, 5);
+        assert_ne!(t1.id, t2.id);
+        let (w, l) = if t1.id < t2.id {
+            (t1.clone(), t2.clone())
+        } else {
+            (t2.clone(), t1.clone())
+        };
+        let d = mk([l.id, zero], m2, m3, 50, 5, 0);
+        // NOTE: D's sender is hardcoded m2; if L pays m1 instead (roles
+        // flipped), D is funded only when L applies — but L never applies
+        // (canonical loser in every order), so D never applies either way.
+        // The fingerprint comparison below is order-vs-order (identical
+        // inputs), hence exact regardless of roles.
+        let base = vec![f.clone(), w.clone(), l.clone(), d.clone()];
+        let mut orders: Vec<Vec<Transaction>> = Vec::new();
+        let mut sorted = base.clone();
+        sorted.sort_by_key(|t| t.id);
+        orders.push(sorted);
+        let mut reversed = base.clone();
+        reversed.reverse();
+        orders.push(reversed);
+        let mut rotated = base.clone();
+        rotated.rotate_left(2);
+        orders.push(rotated);
+
+        let mut fingerprints = Vec::new();
+        for input in &orders {
+            let mut set = input.clone();
+            let mut pruned = canonical_resolve_conflicts(&mut set);
+            pruned.sort();
+            let mut survivors: Vec<TransactionId> =
+                set.iter().map(|t| t.id).collect();
+            survivors.sort();
+            // Survivor set: funding + winner (loser + child dropped).
+            assert_eq!(survivors, {
+                let mut exp = vec![f.id, w.id];
+                exp.sort();
+                exp
+            });
+            assert_eq!(pruned.len(), 2, "loser + descendant drop in every order");
+            // Fingerprint via validated DAG + funded rebuild.
+            let mut dag = DAG::new();
+            for tx in &set {
+                dag.add_transaction_validated(tx.clone())
+                    .expect("survivors insert");
+            }
+            let mut ledger = Ledger::new();
+            ledger.rebuild_from_dag(&dag);
+            let mut bals: Vec<(String, u64)> = ledger
+                .get_all_balances()
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect();
+            bals.sort();
+            fingerprints.push((
+                survivors,
+                pruned,
+                bals,
+                ledger.total_supply(),
+                ledger.get_nonce(&sender),
+            ));
+        }
+        assert_eq!(fingerprints[0], fingerprints[1]);
+        assert_eq!(fingerprints[1], fingerprints[2]);
+
+        // prune_subtree return order: the SAME two child txs inserted in
+        // different orders (children Vec order differs) must yield identical
+        // removed SETS. (An earlier draft varied sender bytes per position,
+        // which builds DIFFERENT txs — correctly different prunes. The test
+        // must vary ORDER, not identity.)
+        let mk_child = |sender: [u8; 32], nonce: u64, root: TransactionId| {
+            let mut tx = Transaction::new(
+                [root, [0u8; 32]],
+                sender,
+                m3,
+                10,
+                1,
+                1234567890,
+                0,
+                nonce,
+                vec![0u8; 64],
+                vec![0u8; 32],
+            );
+            tx.id = tx.compute_hash();
+            tx
+        };
+        let build_two = |swap: bool| {
+            let mut dag = DAG::new();
+            let root = mk([zero, zero], sender, m1, 100, 10, 5);
+            dag.add_transaction_validated(root.clone()).unwrap();
+            let c1 = mk_child([0x81u8; 32], 0, root.id);
+            let c2 = mk_child([0x82u8; 32], 1, root.id);
+            // Identical txs, different insertion orders.
+            let (first, second) = if swap { (c2, c1) } else { (c1, c2) };
+            dag.add_transaction_validated(first).unwrap();
+            dag.add_transaction_validated(second).unwrap();
+            (dag, root.id)
+        };
+        let (mut da, ra) = build_two(false);
+        let (mut db, rb) = build_two(true);
+        let mut pa = da.prune_subtree(ra);
+        let mut pb = db.prune_subtree(rb);
+        pa.sort();
+        pb.sort();
+        assert_eq!(pa.len(), 3, "root + two children");
+        assert_eq!(pa, pb, "removed sets must match across insertion orders");
+    }
+
+    // ===== PHASE 3E (M7): floating-point determinism =====
+    //
+    // Triage (repo-wide f32/f64 audit): NO float reaches fork choice (min-id
+    // over integer ids), the ledger (u64 balances/nonces/fees), finality
+    // (no mechanism), or peer scoring (i32). Floats live in exactly three
+    // consensus-adjacent places, all deterministic IEEE-754 for identical
+    // inputs: (1) tx.weight f64 = subtree size, maintained by +1.0/-1.0 with
+    // a 0.0 clamp — integer-valued at all times, no division, no NaN source;
+    // consumed via exact `as u64` cast (tip walk) and a `>= 5.0` compare
+    // (Stable indicator, advisory); (2) fee-oracle/estimator f64 internals
+    // with u64 outputs (accept-time gates only; cross-node differences come
+    // from different local inputs, not from float nondeterminism); (3)
+    // timing/display/bench values (no consensus effect). Verdict below:
+    // NOT_RELEVANT for consensus safety; this test pins the exactness
+    // foundation the verdict rests on (integral, finite, bounded weights).
+
+    /// M7: weights stay integral, finite, non-negative and bounded by the DAG
+    /// size across random add/remove/prune sequences (deterministic LCG).
+    /// Any fractional/NaN/negative/overflowing weight would break the
+    /// exactness the tip-walk cast and the Stable threshold rely on.
+    #[test]
+    fn test_weight_finiteness_and_bounds() {
+        let mut rng_state: u64 = 0xF0E1_D2C3_B4A5_96A7;
+        let mut next = || {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng_state >> 33) as usize
+        };
+        let mut dag = DAG::new();
+        let mut serial: u64 = 0;
+        // Genesis-parented roots keep topology trivial; the exercise is the
+        // weight bookkeeping across interleaved mutations.
+        for _step in 0..200 {
+            match next() % 3 {
+                0 => {
+                    serial += 1;
+                    let mut sender = [0u8; 32];
+                    sender[..8].copy_from_slice(&serial.to_le_bytes());
+                    sender[8] = 0xB7;
+                    let mut tx = Transaction::new(
+                        [[0u8; 32]; 2],
+                        sender,
+                        [9u8; 32],
+                        1,
+                        1,
+                        1234567890,
+                        0,
+                        0,
+                        vec![0u8; 64],
+                        vec![0u8; 32],
+                    );
+                    tx.id = tx.compute_hash();
+                    dag.add_transaction_validated(tx).expect("fresh root");
+                }
+                1 => {
+                    let mut id = [0u8; 32];
+                    id[..8].copy_from_slice(&(next() as u64).to_le_bytes());
+                    dag.remove_transaction(&id);
+                }
+                _ => {
+                    let mut id = [0u8; 32];
+                    id[..8].copy_from_slice(&(next() as u64).to_le_bytes());
+                    dag.prune_subtree(id);
+                }
+            }
+            let count = dag.transaction_count() as f64;
+            for tx in dag.transactions().values() {
+                let w = tx.weight;
+                assert!(w.is_finite(), "weight must never be NaN/infinite");
+                assert!(w >= 0.0, "weights are clamped at zero");
+                assert_eq!(w.fract(), 0.0, "weights stay integral (+/-1.0 only)");
+                assert!(
+                    w <= count,
+                    "subtree size {} cannot exceed DAG size {}",
+                    w,
+                    count
+                );
+            }
         }
     }
 }

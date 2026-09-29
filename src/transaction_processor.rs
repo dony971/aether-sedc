@@ -20,7 +20,7 @@ use crate::ledger::Ledger;
 use crate::parent_selection::DAG;
 use crate::storage::BatchOperation;
 use crate::rpc::Mempool;
-use crate::transaction::Transaction;
+use crate::transaction::{Transaction, TransactionId};
 use crate::validation::{TransactionValidator, ValidationError, ValidationMode};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -399,10 +399,24 @@ impl TransactionProcessor {
         // transaction tree: if the ledger was saved for tx N, tx N is already
         // in the Sled transactions tree. The boot guard then knows the
         // persisted ledger never references history the DAG cannot rebuild.
+        //
+        // PHASE 3E (M1): either persist call can fail (disk full, I/O error,
+        // Sled transaction conflict). STEPS 4–7 already mutated memory, so a
+        // bare Err would leave memory AHEAD of disk while reporting failure.
+        // Roll back to the pre-apply snapshot (symmetric with the STEP 4/6
+        // failure paths) so Err means "nothing applied": the drainer's
+        // transient requeue then replays cleanly (the dup-gate precedes any
+        // mutation, so the retry can never double-apply), and a crash lands
+        // on consistent-older state in both windows (put-failed: tx absent
+        // everywhere; save-failed: tx row present, ledger rebuilt from it).
         if let Some(storage) = ledger.storage() {
             let storage_read = storage.read().await;
             if let Err(e) = storage_read.put_transaction(&tx) {
                 tracing::error!("❌ Failed to persist transaction to Sled: {}", e);
+                Self::rollback_apply(&mut dag, &mut ledger, &ledger_snapshot, &tx.id);
+                drop(ledger);
+                drop(dag);
+                drop(mempool);
                 return Err(ProcessingError::PersistenceError(format!(
                     "Transaction persist failed: {}",
                     e
@@ -420,6 +434,11 @@ impl TransactionProcessor {
         // (sender + receiver + burn address = O(3) writes vs O(N) full sweep).
         if let Err(e) = ledger.save_dirty().await {
             tracing::error!("❌ Persistence failed: {}", e);
+            // PHASE 3E (M1): same rollback as above (see comment at STEP 8).
+            Self::rollback_apply(&mut dag, &mut ledger, &ledger_snapshot, &tx.id);
+            drop(ledger);
+            drop(dag);
+            drop(mempool);
             return Err(ProcessingError::PersistenceError(format!(
                 "Save failed: {}",
                 e
@@ -431,6 +450,27 @@ impl TransactionProcessor {
             hex::encode(tx.id)
         );
         Ok(())
+    }
+
+    /// PHASE 3E (M1): undo STEPS 4–7 after a STEP-8 persistence failure so an
+    /// Err means "nothing applied" (symmetric with the STEP 4/6 failure
+    /// paths, which restore the same snapshot). The ledger is restored from
+    /// the pre-apply snapshot (balances, nonces, applied marks, burned fees —
+    /// `Ledger: Clone` captures all of it); the DAG entry added at STEP 6 is
+    /// removed (`remove_transaction` maintains tips/weights/index, and is a
+    /// safe no-op if a concurrent prune already took it). The mempool slot is
+    /// deliberately left to the caller: the drainer requeues on transient
+    /// errors (its retry then replays from a clean state — the dup-gate
+    /// precedes any mutation, so no double-apply), and a crash lands on
+    /// consistent-older state either way (see STEP 8 comment).
+    fn rollback_apply(
+        dag: &mut DAG,
+        ledger: &mut Ledger,
+        snapshot: &Ledger,
+        tx_id: &TransactionId,
+    ) {
+        dag.remove_transaction(tx_id);
+        *ledger = snapshot.clone();
     }
 
     /// INC-01 crash recovery: DAG-only insertion of a transaction whose
@@ -1541,5 +1581,154 @@ mod tests {
                 "pruned loser must be purged from storage"
             );
         }
+    }
+
+    /// PHASE 3E (M1): persist-failure rollback restores the pre-apply state.
+    /// White-box: dirty the DAG+ledger exactly as STEPS 4–7 do (transfer +
+    /// applied mark + nonce + DAG add), invoke rollback_apply, assert FULL
+    /// restoration (balances, nonce, applied marks, supply, DAG membership,
+    /// tips). Then prove clean replay: re-apply the same sequence (what the
+    /// drainer retry does) and assert the funded outcome. No fault injection
+    /// (Sled is reliable in-test): the trigger (persist Err → rollback at
+    /// both STEP-8 sites) is pinned by inspection, and retry convergence
+    /// rests on dup-gate-before-mutation (duplicate tests green). Sync, FAST.
+    #[test]
+    fn test_persist_error_after_apply() {
+        let sender = [0x51u8; 32];
+        let receiver = [0x52u8; 32];
+        let mut tx = Transaction::new(
+            [[0u8; 32]; 2],
+            sender,
+            receiver,
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 32],
+        );
+        tx.id = tx.compute_hash();
+        let mut dag = DAG::new();
+        let mut ledger = Ledger::new();
+        ledger.set_balance(&sender, 10_000);
+        let snapshot = ledger.clone();
+        // STEPS 4–7 shape.
+        ledger
+            .transfer_internal(&sender, &receiver, 100, 10)
+            .unwrap();
+        ledger.mark_applied(&tx.id);
+        ledger.set_nonce(&sender, 1);
+        dag.add_transaction_validated(tx.clone()).unwrap();
+        // Sanity: dirty.
+        assert_eq!(ledger.get_balance(&sender), 9890);
+        assert!(ledger.is_applied(&tx.id));
+        assert!(dag.transactions().contains_key(&tx.id));
+        // Rollback (what both STEP-8 failure paths now call).
+        TransactionProcessor::rollback_apply(&mut dag, &mut ledger, &snapshot, &tx.id);
+        // Restored.
+        assert_eq!(ledger.get_balance(&sender), 10_000);
+        assert_eq!(ledger.get_balance(&receiver), 0);
+        assert_eq!(ledger.get_nonce(&sender), 0);
+        assert!(!ledger.is_applied(&tx.id));
+        assert_eq!(ledger.total_supply(), snapshot.total_supply());
+        assert!(!dag.transactions().contains_key(&tx.id));
+        assert_eq!(dag.transaction_count(), 0);
+        assert_eq!(dag.tip_count(), 0);
+        // Clean replay converges (the drainer-retry shape).
+        ledger
+            .transfer_internal(&sender, &receiver, 100, 10)
+            .unwrap();
+        ledger.mark_applied(&tx.id);
+        ledger.set_nonce(&sender, 1);
+        dag.add_transaction_validated(tx.clone()).unwrap();
+        assert_eq!(ledger.get_balance(&sender), 9890);
+        assert_eq!(ledger.get_balance(&receiver), 100);
+        assert!(ledger.is_applied(&tx.id));
+        assert!(dag.transactions().contains_key(&tx.id));
+    }
+
+    /// PHASE 3E (M1): restart converges after either persist-failure window.
+    /// Funding flows through DAG txs (rebuild reseeds from genesis — manual
+    /// set_balance would be wiped, same lesson as 3C H4). Window A
+    /// (put-transaction failed: tx row absent): boot set = pre-apply →
+    /// rebuild equals the snapshot world. Window B (save-dirty failed: tx
+    /// row present, ledger stale): boot set includes tx → rebuild applies it
+    /// (heals FORWARD). Both consistent, never half-applied. Fingerprints:
+    /// balance maps, nonces, supply. Sync, FAST.
+    #[test]
+    fn test_restart_after_persist_failure() {
+        let sender = [0x53u8; 32];
+        let receiver = [0x54u8; 32];
+        let faucet: [u8; 32] = hex::decode(crate::genesis::FAUCET_ADDRESS)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mut funding = Transaction::new(
+            [[0u8; 32]; 2],
+            faucet,
+            sender,
+            100_000,
+            100,
+            1234567890,
+            0,
+            0,
+            vec![0u8; 64],
+            vec![0u8; 32],
+        );
+        funding.id = funding.compute_hash();
+        let mut tx = Transaction::new(
+            [[0u8; 32]; 2],
+            sender,
+            receiver,
+            100,
+            10,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 32],
+        );
+        tx.id = tx.compute_hash();
+        // Snapshot world: DAG {F}, ledger rebuilt (faucet is genesis-funded).
+        let mut snap_dag = DAG::new();
+        snap_dag
+            .add_transaction_validated(funding.clone())
+            .unwrap();
+        let mut snapshot = Ledger::new();
+        snapshot.rebuild_from_dag(&snap_dag);
+        assert_eq!(snapshot.get_balance(&sender), 100_000);
+
+        // Window A (put failed): persisted = {F} → rebuild == snapshot.
+        let mut dag_a = DAG::new();
+        dag_a
+            .add_transaction_validated(funding.clone())
+            .unwrap();
+        let mut ledger_a = Ledger::new();
+        ledger_a.rebuild_from_dag(&dag_a);
+        assert_eq!(ledger_a.get_all_balances(), snapshot.get_all_balances());
+        assert_eq!(ledger_a.total_supply(), snapshot.total_supply());
+        assert_eq!(ledger_a.get_nonce(&sender), snapshot.get_nonce(&sender));
+        assert!(!ledger_a.is_applied(&tx.id));
+
+        // Window B (save failed after put): persisted = {F, T} → rebuild
+        // applies T (heals forward, exactly once).
+        let mut dag_b = DAG::new();
+        dag_b
+            .add_transaction_validated(funding.clone())
+            .unwrap();
+        dag_b.add_transaction_validated(tx.clone()).unwrap();
+        let mut ledger_b = Ledger::new();
+        ledger_b.rebuild_from_dag(&dag_b);
+        assert_eq!(ledger_b.get_balance(&sender), 100_000 - 100 - 10);
+        assert_eq!(ledger_b.get_balance(&receiver), 100);
+        assert!(ledger_b.is_applied(&tx.id));
+        // Re-rebuild is idempotent (second boot after the same crash image).
+        let mut ledger_b2 = Ledger::new();
+        ledger_b2.rebuild_from_dag(&dag_b);
+        assert_eq!(
+            ledger_b2.get_all_balances(),
+            ledger_b.get_all_balances()
+        );
     }
 }

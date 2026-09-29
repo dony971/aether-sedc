@@ -4479,4 +4479,85 @@ mod tests {
         mp.dispose(&tx_hist.id, MempoolDisposition::Rejected);
         assert_eq!(mp.mode_of(&tx_hist.id), ValidationMode::Historical);
     }
+
+    // ===== PHASE 3E (M5): future timestamps via P2P =====
+    //
+    // A remote peer must not get a far-future tx accepted through a path
+    // with weaker policy than local submit. Post-3B both live paths (RPC and
+    // P2P relay) evaluate Fresh; sync backfill stays Historical BY DESIGN
+    // (genuine history must heal — the H1 contract). Garbage PoW suffices
+    // below: Fresh timestamp gates fire BEFORE PoW/signature checks, so these
+    // are FAST. Historical latitude for sync (incl. future-ts anomalies,
+    // self-limiting via parent-ordering) is documented, not re-tested here.
+
+    /// M5: far-future tx via the P2P LIVE path (Fresh) is rejected at the
+    /// accept gate (FutureTimestamp, not PoW) and never queued, DAGged, or
+    /// parked.
+    #[tokio::test]
+    async fn test_p2p_future_timestamp_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+        let tx = timestamp_probe_fixture(now_ms() + 2 * 3_600_000);
+        let r = rpc
+            .process_transaction(tx.clone(), "P2P", ValidationMode::Fresh)
+            .await;
+        let err = r.unwrap_err();
+        assert!(
+            err.0.contains("Future timestamp"),
+            "must fire the future gate, got: {}",
+            err.0
+        );
+        assert_eq!(rpc.mempool.read().await.size(), 0, "nothing queued");
+        assert!(
+            rpc.dag.read().await.get_transaction(tx.id).is_none(),
+            "nothing in DAG"
+        );
+        assert!(
+            rpc.orphans.read().await.is_empty(),
+            "future tx must never park as orphan"
+        );
+    }
+
+    /// M5: boundary wiring at the P2P live path. ts = now + MAX_FUTURE_MS
+    /// exactly: the timestamp gate PASSES (any error must be Invalid PoW —
+    /// the garbage fixture — proving gate passage, not timestamp rejection).
+    /// ts = now + MAX_FUTURE_MS + 5000: FutureTimestamp fires. The exact ±1 ms
+    /// edge is covered at validator level by existing mined tests; P2P level
+    /// pins the wiring with deterministic margins (the validator clock only
+    /// moves forward between ts-computation and validation, so equality can
+    /// never flip to a violation, and 5 s cannot be bridged by scheduling).
+    #[tokio::test]
+    async fn test_p2p_future_timestamp_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+        // Exact bound: timestamp gate passes → PoW gate fires instead.
+        let exact = timestamp_probe_fixture(now_ms() + Transaction::MAX_FUTURE_MS);
+        let r = rpc
+            .process_transaction(exact.clone(), "P2P", ValidationMode::Fresh)
+            .await;
+        let err = r.unwrap_err();
+        assert!(
+            err.0.contains("Invalid PoW"),
+            "exact bound must pass the timestamp gate, got: {}",
+            err.0
+        );
+        assert_eq!(rpc.mempool.read().await.size(), 0);
+        // Past bound: timestamp gate fires.
+        let past =
+            timestamp_probe_fixture(now_ms() + Transaction::MAX_FUTURE_MS + 5000);
+        let r = rpc
+            .process_transaction(past.clone(), "P2P", ValidationMode::Fresh)
+            .await;
+        let err = r.unwrap_err();
+        assert!(
+            err.0.contains("Future timestamp"),
+            "past-bound must fire the future gate, got: {}",
+            err.0
+        );
+        assert_eq!(rpc.mempool.read().await.size(), 0);
+        assert!(
+            rpc.dag.read().await.get_transaction(past.id).is_none(),
+            "nothing in DAG"
+        );
+    }
 }
