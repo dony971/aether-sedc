@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::sync_stats::{SyncContext, TOPO_ORDER_CAP};
+use crate::validation::ValidationMode;
 use crate::transport::{PeerAddr, TcpTransport, Transport, TransportListener, TransportStream};
 
 /// P2P handshake magic bytes ("AETH") — LOGICAL network identifier only.
@@ -3957,6 +3958,23 @@ impl P2PNetwork {
                             // Aether relays from `broadcast_transaction`
                             // instead: after validation, once, to a bounded
                             // fan-out, behind a per-peer jitter.
+                            //
+                            // PHASE 3B (H1): this arm is the LIVE gossip path
+                            // (single-tx relay of newly submitted txs). Record
+                            // Fresh provenance BEFORE queueing so the node
+                            // evaluates the tx under live policy end-to-end.
+                            // Sync backfill (SyncResponse batches below)
+                            // records Historical instead. First-delivery-wins:
+                            // a duplicate arriving via the other path keeps
+                            // the ORIGINAL mode. Insert-then-send ordering is
+                            // load-bearing (see note_ingress_mode).
+                            if let Ok(live_tx) =
+                                bincode::deserialize::<Transaction>(&tx_bytes)
+                            {
+                                sync_ctx
+                                    .note_ingress_mode(live_tx.id, ValidationMode::Fresh)
+                                    .await;
+                            }
                             if !accept_inbound_transaction(
                                 tx_bytes,
                                 addr,
@@ -4275,6 +4293,17 @@ impl P2PNetwork {
                                 // partition_batch confirmed this tx is deliverable.
                                 // Waiting txs (parents missing) are NOT marked, so the
                                 // next inventory diff re-requests them.
+                                //
+                                // PHASE 3B (H1): this is the SYNC backfill path
+                                // (inventory diffs, GetData closures, healing).
+                                // Record Historical provenance BEFORE queueing:
+                                // backfill carries genuinely-old txs that live
+                                // policy (Fresh) must not reject. Live gossip
+                                // singles record Fresh at the Transaction arm
+                                // above; first-delivery-wins on duplicates.
+                                sync_ctx
+                                    .note_ingress_mode(tx.id, ValidationMode::Historical)
+                                    .await;
                                 {
                                     let mut frontier = sync_ctx.frontier.write().await;
                                     frontier.mark_received(&tx.id);

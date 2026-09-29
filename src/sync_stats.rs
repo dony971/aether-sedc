@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use crate::validation::ValidationMode;
 
 /// B4: a missing parent is re-requested at most once per cooldown (see
 /// `PARENT_BACKOFF_STEPS`). Without this, every parked orphan re-requested its
@@ -224,6 +225,15 @@ pub struct SyncContext {
     pub topo_cache: Arc<RwLock<Option<(u64, Vec<Vec<u8>>)>>>,
     /// DEEP SYNC: monotone frontier tracker for sync progress.
     pub frontier: Arc<RwLock<SyncFrontier>>,
+    /// PHASE 3B (C1/H1): ingress provenance for validation-mode selection.
+    /// tx id -> (mode recorded at first delivery, record instant). Written by
+    /// the P2P ingress (live relay = Fresh, sync backfill = Historical;
+    /// first-delivery-wins), consumed (take) by the node P2P receiver, which
+    /// forwards the mode to process_transaction so the WHOLE pipeline (accept
+    /// gate, drainer, STEP 0, STEP 1) evaluates one tx under ONE policy.
+    /// Absent = Historical (timeless evaluation = pre-3B behavior; every live
+    /// path records explicitly).
+    pub ingress_mode: Arc<RwLock<HashMap<[u8; 32], (ValidationMode, Instant)>>>,
 }
 
 /// DEEP SYNC: maximum in-flight requests at any time.
@@ -237,6 +247,11 @@ pub const STALL_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// DEEP SYNC: maximum retry attempts per hash before marking as FAILED.
 pub const MAX_RETRY_ATTEMPTS: u32 = 3;
+
+/// PHASE 3B (C1/H1): bound for the ingress-provenance map (mirrors the
+/// frontier bound style). Steady-state size tracks the in-flight channel
+/// depth: every insert pairs with a channel send and every send with a take.
+pub const MAX_INGRESS_MODE_ENTRIES: usize = 100_000;
 
 // ===== Frontier types =====
 
@@ -650,7 +665,9 @@ impl SyncFrontier {
             pages_received: self.pages_received,
             pages_applied: self.pages_applied,
             pages_rejected: self.pages_rejected,
-            last_progress_secs_ago: self.last_progress.map(|t| now.duration_since(t).as_secs_f64()),
+            last_progress_secs_ago: self
+                .last_progress
+                .map(|t| now.duration_since(t).as_secs_f64()),
             state: self.sync_state,
             stall_count: self.stall_count,
             total_tracked: self.total_tracked() as u64,
@@ -694,6 +711,42 @@ impl SyncContext {
             .saturating_sub(1)
             .min(PARENT_BACKOFF_STEPS.len() as u32 - 1)) as usize;
         Duration::from_secs(PARENT_BACKOFF_STEPS[idx])
+    }
+
+    /// PHASE 3B (C1/H1): record ingress provenance. First-delivery-wins: a
+    /// re-delivery of an already-recorded tx keeps the ORIGINAL mode (the
+    /// queued instance came from the first delivery). MUST be called BEFORE
+    /// the channel send it annotates: the receiver takes on read, so
+    /// insert-then-send ordering is load-bearing (a miss defaults to
+    /// Historical). Oldest-evicted past the cap (self-healing: an evicted tx
+    /// re-records on re-delivery; a queued instance keeps its
+    /// mempool-recorded mode regardless).
+    pub async fn note_ingress_mode(&self, id: [u8; 32], mode: ValidationMode) {
+        let mut map = self.ingress_mode.write().await;
+        if !map.contains_key(&id) {
+            if map.len() >= MAX_INGRESS_MODE_ENTRIES {
+                if let Some(oldest) = map
+                    .iter()
+                    .min_by_key(|(_, (_, t))| *t)
+                    .map(|(k, _)| *k)
+                {
+                    map.remove(&oldest);
+                }
+            }
+            map.insert(id, (mode, Instant::now()));
+        }
+    }
+
+    /// PHASE 3B (C1/H1): consume ingress provenance. Absent (tests, races,
+    /// boot paths that never crossed the P2P ingress) defaults to Historical
+    /// = timeless evaluation = pre-3B behavior.
+    pub async fn take_ingress_mode(&self, id: [u8; 32]) -> ValidationMode {
+        self.ingress_mode
+            .write()
+            .await
+            .remove(&id)
+            .map(|(m, _)| m)
+            .unwrap_or(ValidationMode::Historical)
     }
 }
 
@@ -1017,5 +1070,67 @@ mod tests {
             f.add_pending(h);
         }
         assert!(f.total_tracked() <= MAX_FRONTIER_ENTRIES);
+    }
+
+    // ===== PHASE 3B (C1/H1): ingress-provenance helpers =====
+
+    /// Roundtrip + default: absent → Historical (pre-3B timeless behavior);
+    /// take consumes.
+    #[tokio::test]
+    async fn test_ingress_mode_roundtrip_and_default() {
+        let ctx = SyncContext::default();
+        let id = [0xABu8; 32];
+        assert_eq!(
+            ctx.take_ingress_mode(id).await,
+            ValidationMode::Historical,
+            "absent provenance must default to Historical"
+        );
+        ctx.note_ingress_mode(id, ValidationMode::Fresh).await;
+        assert_eq!(
+            ctx.take_ingress_mode(id).await,
+            ValidationMode::Fresh,
+            "recorded Fresh must roundtrip"
+        );
+        assert_eq!(
+            ctx.take_ingress_mode(id).await,
+            ValidationMode::Historical,
+            "take must consume"
+        );
+    }
+
+    /// First-delivery-wins: a duplicate arriving via the other ingress path
+    /// keeps the ORIGINAL mode (the queued instance came from the first
+    /// delivery).
+    #[tokio::test]
+    async fn test_ingress_mode_first_delivery_wins() {
+        let ctx = SyncContext::default();
+        let id = [0xCDu8; 32];
+        ctx
+            .note_ingress_mode(id, ValidationMode::Historical)
+            .await;
+        ctx.note_ingress_mode(id, ValidationMode::Fresh).await;
+        assert_eq!(
+            ctx.take_ingress_mode(id).await,
+            ValidationMode::Historical,
+            "re-delivery must not flip provenance"
+        );
+    }
+
+    /// Bounded: past the cap the oldest record is evicted (self-healing — an
+    /// evicted tx re-records on re-delivery; a queued instance keeps its
+    /// mempool-recorded mode regardless).
+    #[tokio::test]
+    async fn test_ingress_mode_bounded() {
+        let ctx = SyncContext::default();
+        for i in 0..(MAX_INGRESS_MODE_ENTRIES + 100) {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            id[8..16].copy_from_slice(&(i as u64).to_be_bytes());
+            ctx.note_ingress_mode(id, ValidationMode::Fresh).await;
+        }
+        assert!(
+            ctx.ingress_mode.read().await.len() <= MAX_INGRESS_MODE_ENTRIES,
+            "provenance map must stay bounded"
+        );
     }
 }

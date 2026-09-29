@@ -465,6 +465,13 @@ pub struct Mempool {
     /// Enqueue timestamp per tx id (TTL / expiry). Survives SELECT so a
     /// requeued tx keeps its ORIGINAL deadline — retries stay bounded.
     enqueued_at: HashMap<TransactionId, Instant>,
+    /// PHASE 3B (C1/H1): validation mode recorded at ACCEPT time, per tx id.
+    /// Mirrors the `enqueued_at` lifecycle exactly (inserted on successful
+    /// enqueue, removed on terminal dispose, untouched by requeue/remove):
+    /// the drainer evaluates each tx under the policy of ITS ingress path
+    /// (live submission = Fresh, sync backfill / reload = Historical), so
+    /// accept gate, drainer, STEP 0 and STEP 1 never disagree on one tx.
+    admit_mode: HashMap<TransactionId, ValidationMode>,
     /// Bounded LRU of permanently rejected tx ids (no infinite retries)
     recent_rejects: VecDeque<TransactionId>,
     recent_rejects_set: HashSet<TransactionId>,
@@ -483,6 +490,7 @@ impl Mempool {
             queue: VecDeque::with_capacity(max_size),
             in_flight: HashSet::new(),
             enqueued_at: HashMap::new(),
+            admit_mode: HashMap::new(),
             recent_rejects: VecDeque::new(),
             recent_rejects_set: HashSet::new(),
             max_size,
@@ -503,13 +511,31 @@ impl Mempool {
     }
 
     /// PHASE D: enqueue a transaction into the pending queue (QUEUE step).
-    /// Gate order: fee (economic) → permanent-reject cache → in-queue dedup
-    /// → capacity (backpressure, TRANSIENT: the drainer empties the queue).
-    /// The pure gate (PoW + signature) and the in-DAG dedup run in the accept
-    /// funnel BEFORE this (they need the DAG read lock). `min_fee` is the
-    /// accept-time oracle gate (spam control); the drainer later processes
-    /// without a fee gate because the fee was already paid at accept.
+    /// Same as `enqueue_with_mode` with `ValidationMode::Historical`
+    /// (timeless evaluation = pre-3B behavior). Used by the boot mempool
+    /// reload and by tests driving the queue directly; the production accept
+    /// funnel (`process_transaction`) records the caller mode instead.
     pub fn enqueue(&mut self, tx: Transaction, min_fee: u64) -> Result<(), RpcError> {
+        self.enqueue_with_mode(tx, min_fee, ValidationMode::Historical)
+    }
+
+    /// PHASE 3B (C1/H1): enqueue recording the accept-time validation mode.
+    /// The drainer later processes the tx under THIS mode, so a live
+    /// submission stays under live policy (Fresh) end-to-end while sync
+    /// backfill and reloads stay timeless (Historical).
+    pub fn enqueue_with_mode(
+        &mut self,
+        tx: Transaction,
+        min_fee: u64,
+        mode: ValidationMode,
+    ) -> Result<(), RpcError> {
+        // Gate order: fee (economic) → permanent-reject cache → in-queue
+        // dedup → capacity (backpressure, TRANSIENT: the drainer empties the
+        // queue). The pure gate (PoW + signature) and the in-DAG dedup run in
+        // the accept funnel BEFORE this (they need the DAG read lock).
+        // `min_fee` is the accept-time oracle gate (spam control); the
+        // drainer later processes without a fee gate because the fee was
+        // already paid at accept.
         // Economic validation: check minimum fee
         if tx.fee < min_fee {
             self.stats.rejected.fetch_add(1, Ordering::Relaxed);
@@ -542,8 +568,22 @@ impl Mempool {
 
         self.queue.push_back(tx.clone());
         self.enqueued_at.insert(tx.id, Instant::now());
+        // PHASE 3B: record the accept-time mode with the same lifecycle as
+        // the enqueue timestamp (removed on terminal dispose only).
+        self.admit_mode.insert(tx.id, mode);
         self.stats.added.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// PHASE 3B (C1/H1): validation mode recorded at accept for a queued tx.
+    /// Absent (legacy/test/reload entries pre-dating the record, or already
+    /// disposed) defaults to Historical = timeless evaluation = pre-3B
+    /// behavior.
+    pub fn mode_of(&self, tx_id: &TransactionId) -> ValidationMode {
+        self.admit_mode
+            .get(tx_id)
+            .copied()
+            .unwrap_or(ValidationMode::Historical)
     }
 
     /// PHASE D: deterministic SELECT (mandate §3). Returns up to `batch`
@@ -602,6 +642,10 @@ impl Mempool {
         let was_in_flight = self.in_flight.remove(tx_id);
         if was_queued || was_in_flight {
             self.enqueued_at.remove(tx_id);
+            // PHASE 3B: terminal disposition drops the recorded mode with the
+            // timestamp (mirrored lifecycle; `remove_transaction` leaves
+            // both in place exactly like `enqueued_at`).
+            self.admit_mode.remove(tx_id);
             self.stats.removed.fetch_add(1, Ordering::Relaxed);
             match outcome {
                 MempoolDisposition::Included => {
@@ -1172,7 +1216,14 @@ impl AetherRpcImpl {
             mempool_write.set_min_fee(min_fee);
         }
 
-        let enqueue_result = self.mempool.write().await.enqueue(tx.clone(), min_fee);
+        // PHASE 3B (C1/H1): record the caller mode with the queued tx so the
+        // drainer later evaluates it under ITS ingress policy (live = Fresh,
+        // sync/orphan/reload = Historical), never under a blanket mode.
+        let enqueue_result = self
+            .mempool
+            .write()
+            .await
+            .enqueue_with_mode(tx.clone(), min_fee, mode);
         if let Err(e) = enqueue_result {
             tracing::warn!("❌ Mempool enqueue rejected: {}", e);
             return Err(e);
@@ -1226,6 +1277,12 @@ impl AetherRpcImpl {
         }
         let processor = TransactionProcessor::new();
         for tx in batch {
+            // PHASE 3B (C1/H1): process under the mode recorded at ACCEPT
+            // time (live submission = Fresh, sync backfill / reload =
+            // Historical, legacy entries default Historical). The same mode
+            // flows into STEP 0 and STEP 1, so one tx can never be judged
+            // under two policies.
+            let admit_mode = self.mempool.read().await.mode_of(&tx.id);
             // Retry transient lock contention (the processor uses try_write;
             // a busy lock never drops a tx from the queue).
             let mut lock_attempts = 0;
@@ -1237,7 +1294,7 @@ impl AetherRpcImpl {
                         &self.ledger,
                         &self.mempool,
                         0,
-                        ValidationMode::Historical,
+                        admit_mode,
                     )
                     .await
                 {
@@ -4151,5 +4208,275 @@ mod tests {
             .unwrap();
         assert_eq!(bounded.total_count, 25, "total must stay exact");
         assert_eq!(bounded.transactions.len(), 5, "response must be capped");
+    }
+
+    // ===== PHASE 3B (C1/H1): validation-mode provenance =====
+
+    /// One PoW-valid pre-activation tx (20-bit), mined ONCE and shared:
+    /// policy-valid under Historical (genuine-history shape), policy-rejected
+    /// under Fresh (BackdatedTimestamp). Sharing one fixture keeps these
+    /// tests MEDIUM instead of HEAVY. Parallel tests each use a fresh
+    /// node state, so the shared bytes never collide.
+    fn backdated_20bit_fixture() -> Transaction {
+        use std::sync::OnceLock;
+        static FIX: OnceLock<Transaction> = OnceLock::new();
+        FIX.get_or_init(|| {
+            let wallet = Wallet::from_secret_key(
+                "6b0d2c3e4f5a60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef",
+            )
+            .expect("fixed test key");
+            let mut tx = Transaction::new(
+                [[0u8; 32]; 2],
+                wallet.address(),
+                [7u8; 32],
+                100,
+                1000,
+                Transaction::DIFFICULTY_MIGRATION_TS - 3_600_000,
+                0,
+                1,
+                vec![0u8; 64],
+                wallet.public_key_bytes(),
+            );
+            tx.nonce = tx.mine_nonce(20);
+            tx.signature = wallet.sign_transaction(&tx).expect("sign");
+            tx.id = tx.compute_hash();
+            assert!(tx.verify_pow(20));
+            assert!(Wallet::verify_transaction(&tx));
+            tx
+        })
+        .clone()
+    }
+
+    /// Garbage tx (no PoW, no signature) with a controlled timestamp for
+    /// FAST rejection-path tests: Fresh timestamp gates fire before PoW and
+    /// signature checks, so these fixtures never mine.
+    fn timestamp_probe_fixture(timestamp: u64) -> Transaction {
+        Transaction::new(
+            [[0u8; 32]; 2],
+            [8u8; 32],
+            [9u8; 32],
+            100,
+            10,
+            timestamp,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![0u8; 32],
+        )
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    /// PHASE 3B (H1): a LIVE submission must never be evaluated under the
+    /// Historical path. Backdated (PoW-valid), stale and future txs submitted
+    /// via RPC (Fresh) are rejected at the accept gate and never reach the
+    /// mempool, the DAG, or the orphan store.
+    #[tokio::test]
+    async fn test_live_post_activation_cannot_use_historical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+
+        // Backdated but PoW-valid: rejection must be POLICY, not PoW.
+        let backdated = backdated_20bit_fixture();
+        let r = rpc
+            .process_transaction(backdated.clone(), "RPC", ValidationMode::Fresh)
+            .await;
+        assert!(r.is_err(), "live backdated tx must be rejected: {:?}", r);
+
+        // Stale (> MAX_PAST_MS) and future (> MAX_FUTURE_MS) garbage: the
+        // Fresh timestamp gates fire before PoW/signature checks (FAST).
+        for ts in [now_ms().saturating_sub(2 * 3_600_000), now_ms() + 2 * 3_600_000] {
+            let probe = timestamp_probe_fixture(ts);
+            let r = rpc
+                .process_transaction(probe, "RPC", ValidationMode::Fresh)
+                .await;
+            assert!(r.is_err(), "live out-of-window tx must be rejected");
+        }
+
+        assert_eq!(rpc.mempool.read().await.size(), 0, "nothing queued");
+        assert!(
+            rpc.dag.read().await.get_transaction(backdated.id).is_none(),
+            "nothing in DAG"
+        );
+        assert!(
+            rpc.orphans.read().await.is_empty(),
+            "live-policy violators must never park as orphans"
+        );
+    }
+
+    /// PHASE 3B (H1): the P2P accept funnel honors the caller mode — the
+    /// node passes Fresh for live relay and Historical for sync backfill
+    /// (node.rs receiver). Same bytes: rejected live, admitted for sync.
+    #[tokio::test]
+    async fn test_p2p_post_activation_uses_live_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+        let tx = backdated_20bit_fixture();
+
+        // Live evaluation: rejected.
+        let r = rpc
+            .process_transaction(tx.clone(), "P2P", ValidationMode::Fresh)
+            .await;
+        assert!(r.is_err(), "P2P-live backdated tx must be rejected");
+        assert_eq!(rpc.mempool.read().await.size(), 0);
+
+        // Sync evaluation: queued (pure-valid history shape).
+        let r = rpc
+            .process_transaction(tx.clone(), "P2P", ValidationMode::Historical)
+            .await;
+        assert!(r.is_ok(), "P2P-sync backdated tx must queue: {:?}", r);
+        assert_eq!(rpc.mempool.read().await.size(), 1);
+        // ...and it drains into the DAG once funded (healing preserved).
+        rpc.ledger.write().await.set_balance(&tx.sender, 1_000_000);
+        drain_until_empty(&rpc).await;
+        assert!(
+            rpc.dag.read().await.get_transaction(tx.id).is_some(),
+            "sync-provenance tx must reach the DAG"
+        );
+    }
+
+    /// PHASE 3B (H1): orphans keep live policy. A live-backdated tx never
+    /// parks (rejected at the live accept gate); a sync-provenance orphan
+    /// with a missing parent still parks for later resolution (healing
+    /// preserved — the solver re-drives already-accepted txs, whose age is
+    /// bounded by ORPHAN_TTL + MEMPOOL_TTL, both far below staleness).
+    #[tokio::test]
+    async fn test_orphan_post_activation_uses_live_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+
+        // Live-backdated: rejected before any parking.
+        let r = rpc
+            .process_transaction(
+                backdated_20bit_fixture(),
+                "RPC",
+                ValidationMode::Fresh,
+            )
+            .await;
+        assert!(r.is_err());
+        rpc.drain_mempool().await;
+        assert!(
+            rpc.orphans.read().await.is_empty(),
+            "live-policy violator must never enter the orphan store"
+        );
+
+        // Sync-provenance orphan (missing parent, otherwise pure-valid):
+        // parks for resolution.
+        let wallet = Wallet::from_secret_key(
+            "6b0d2c3e4f5a60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef",
+        )
+        .expect("fixed test key");
+        let mut orphan = Transaction::new(
+            [[0x77u8; 32], [0u8; 32]],
+            wallet.address(),
+            [0x22u8; 32],
+            100,
+            1000,
+            Transaction::DIFFICULTY_MIGRATION_TS - 3_600_000,
+            0,
+            77,
+            vec![0u8; 64],
+            wallet.public_key_bytes(),
+        );
+        orphan.nonce = orphan.mine_nonce(20);
+        orphan.signature = wallet.sign_transaction(&orphan).expect("sign");
+        orphan.id = orphan.compute_hash();
+        let r = rpc
+            .process_transaction(orphan.clone(), "P2P", ValidationMode::Historical)
+            .await;
+        assert!(r.is_ok(), "sync orphan must queue: {:?}", r);
+        rpc.drain_mempool().await;
+        assert!(
+            rpc.orphans.read().await.contains_key(&orphan.id),
+            "sync-provenance orphan must park for later resolution"
+        );
+    }
+
+    /// PHASE 3B (H1): the drainer evaluates each tx under its recorded
+    /// accept-time mode. Same bytes: Fresh-recorded → rejected at the live
+    /// timestamp gate (transient: requeued TTL-bounded, DAG untouched);
+    /// Historical-recorded → drains into the DAG once funded.
+    #[tokio::test]
+    async fn test_drain_post_activation_uses_live_policy() {
+        // Fresh-recorded: one drain cycle rejects WITHOUT DAG admission; the
+        // tx is deferred (requeued, TTL-bounded), not lost and not admitted.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let rpc = test_rpc_impl(dir.path());
+            let tx = backdated_20bit_fixture();
+            rpc.mempool
+                .write()
+                .await
+                .enqueue_with_mode(tx.clone(), 1, ValidationMode::Fresh)
+                .expect("queue");
+            rpc.drain_mempool().await;
+            assert!(
+                rpc.dag.read().await.get_transaction(tx.id).is_none(),
+                "Fresh-recorded backdated tx must not reach the DAG"
+            );
+            assert_eq!(
+                rpc.mempool.read().await.size(),
+                1,
+                "live-policy violation defers (requeue), does not admit"
+            );
+            assert_eq!(rpc.mempool_stats().await.included, 0);
+        }
+        // Historical-recorded: drains into the DAG once funded.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let rpc = test_rpc_impl(dir.path());
+            let tx = backdated_20bit_fixture();
+            rpc.ledger.write().await.set_balance(&tx.sender, 1_000_000);
+            rpc.mempool
+                .write()
+                .await
+                .enqueue_with_mode(tx.clone(), 1, ValidationMode::Historical)
+                .expect("queue");
+            drain_until_empty(&rpc).await;
+            assert!(
+                rpc.dag.read().await.get_transaction(tx.id).is_some(),
+                "Historical-recorded tx must reach the DAG"
+            );
+            assert_eq!(rpc.mempool_stats().await.included, 1);
+        }
+    }
+
+    /// PHASE 3B (C1/H1): mempool mode-record lifecycle — recorded on
+    /// enqueue_with_mode, Historical by default on enqueue, readable via
+    /// mode_of, dropped on terminal dispose, preserved across requeue (which
+    /// never disposes). Pure unit test: no PoW, no I/O.
+    #[test]
+    fn test_mempool_admit_mode_recorded_and_cleared() {
+        let mut mp = Mempool::new(100, 10);
+        let tx_fresh = timestamp_probe_fixture(1234567890);
+        let mut tx_hist = timestamp_probe_fixture(1234567891);
+        tx_hist.id = [1u8; 32];
+
+        mp.enqueue(tx_hist.clone(), 1).expect("enqueue");
+        assert_eq!(
+            mp.mode_of(&tx_hist.id),
+            ValidationMode::Historical,
+            "legacy enqueue defaults to Historical (pre-3B behavior)"
+        );
+        mp.enqueue_with_mode(tx_fresh.clone(), 1, ValidationMode::Fresh)
+            .expect("enqueue_with_mode");
+        assert_eq!(mp.mode_of(&tx_fresh.id), ValidationMode::Fresh);
+
+        // Requeue preserves the record (no dispose involved).
+        let batch = mp.select_batch(10);
+        assert_eq!(batch.len(), 2);
+        mp.requeue(tx_fresh.clone());
+        assert_eq!(mp.mode_of(&tx_fresh.id), ValidationMode::Fresh);
+
+        // Terminal dispose drops the record with the timestamp.
+        mp.dispose(&tx_fresh.id, MempoolDisposition::Included);
+        assert_eq!(mp.mode_of(&tx_fresh.id), ValidationMode::Historical);
+        mp.dispose(&tx_hist.id, MempoolDisposition::Rejected);
+        assert_eq!(mp.mode_of(&tx_hist.id), ValidationMode::Historical);
     }
 }

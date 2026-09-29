@@ -8,7 +8,6 @@ use crate::{
     rpc::{start_rpc_server, AetherRpcImpl, Mempool},
     storage::Storage,
     transaction::{Address, Transaction},
-    validation::ValidationMode,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -618,6 +617,12 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     tokio::spawn(async move {
         tracing::info!("✅ P2P transaction receiver task spawned");
         while let Some(tx) = tx_receiver.recv().await {
+            // PHASE 3B (C1/H1): consume the ingress provenance recorded by
+            // the P2P layer (live relay = Fresh, sync backfill = Historical;
+            // absent = Historical = pre-3B behavior) and forward it as THE
+            // validation mode for the whole pipeline, so accept gate,
+            // drainer, STEP 0 and STEP 1 evaluate one tx under ONE policy.
+            let ingress_mode = sync_ctx_for_p2p.take_ingress_mode(tx.id).await;
             let rpc_impl = AetherRpcImpl::new(
                 dag_for_p2p.clone(),
                 ledger_for_p2p.clone(),
@@ -631,7 +636,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             );
 
             match rpc_impl
-                .process_transaction(tx, "P2P", ValidationMode::Historical)
+                .process_transaction(tx, "P2P", ingress_mode)
                 .await
             {
                 Ok(_) => {

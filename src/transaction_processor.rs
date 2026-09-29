@@ -168,7 +168,17 @@ impl TransactionProcessor {
                 // (PoW, signature, sender-key match) BEFORE we prune anything,
                 // otherwise a malformed tx could knock a valid tx out of the
                 // local DAG and diverge the node from the network.
-                self.validator.validate_pure(&tx, ValidationMode::Fresh)?;
+                //
+                // PHASE 3B (C1): evaluate the winner in the CALLER's mode, not
+                // a hardcoded Fresh. STEP 1 below uses `mode` too, so STEP 0
+                // and STEP 1 always agree on one tx: the same winner is
+                // accepted (or rejected) no matter which conflicting tx
+                // arrived first. A hardcoded mode here split nodes whenever
+                // the winner was timestamp-stale/future/backdated at delivery
+                // (Fresh rejected what Historical accepted). PoW, signature
+                // and sender-key checks run in EVERY mode, so the V-21
+                // protection is fully preserved.
+                self.validator.validate_pure(&tx, mode)?;
                 tracing::warn!(
                     "🔄 Resolving sender conflict in favor of {} (pruning {})",
                     hex::encode(&tx.id[..4]),
@@ -592,7 +602,12 @@ mod tests {
     #[tokio::test]
     async fn test_double_spend_order_invariance() {
         use crate::wallet::Wallet;
-        let processor = TransactionProcessor::with_difficulty(1); // trivial PoW
+        // PHASE 3B (C2): the validator `difficulty` knob is NOT read by
+        // validate_pure (timestamp-derived difficulty rules); mine at the
+        // policy-required 20 bits for these pre-activation fixtures so the
+        // test exercises conflict logic, not PoW rejection. Default processor
+        // = production configuration.
+        let processor = TransactionProcessor::new();
         let wallet = Wallet::from_secret_key(
             "6b0d2c3e4f5a60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef",
         )
@@ -613,10 +628,10 @@ mod tests {
                 vec![0u8; 64],
                 pk.clone(),
             );
-            tx.nonce = tx.mine_nonce(1);
+            tx.nonce = tx.mine_nonce(20);
             tx.signature = wallet.sign_transaction(&tx).expect("sign");
             tx.id = tx.compute_hash();
-            assert!(tx.verify_pow(1));
+            assert!(tx.verify_pow(20));
             assert!(Wallet::verify_transaction(&tx));
             tx
         };
@@ -667,12 +682,33 @@ mod tests {
                 drop(dag_read);
                 assert_eq!(ledger.read().await.get_balance(&sender), 1000);
 
+                // PHASE 3B (C2): Historical = the production DAG-entry mode
+                // (the drainer evaluates every tx timelessly; Fresh is an
+                // edge-submission policy enforced at RPC accept, and the 1970
+                // fixtures predate the migration timestamp policy). This test
+                // proves timeless DAG/ledger properties (order invariance),
+                // so it runs in the production configuration. Assertions
+                // below are unchanged.
                 processor_ref
-                    .process(first, &dag, &ledger, &mempool, 10, ValidationMode::Fresh)
+                    .process(
+                        first,
+                        &dag,
+                        &ledger,
+                        &mempool,
+                        10,
+                        ValidationMode::Historical,
+                    )
                     .await
                     .expect("first arrival is accepted");
                 let second_result = processor_ref
-                    .process(second, &dag, &ledger, &mempool, 10, ValidationMode::Fresh)
+                    .process(
+                        second,
+                        &dag,
+                        &ledger,
+                        &mempool,
+                        10,
+                        ValidationMode::Historical,
+                    )
                     .await;
                 if expect_second_ok {
                     assert!(
@@ -1049,7 +1085,11 @@ mod tests {
     #[tokio::test]
     async fn test_phantom_nonce_heals_transfer() {
         use crate::wallet::Wallet;
-        let processor = TransactionProcessor::with_difficulty(1);
+        // PHASE 3B (C2): see note on test_double_spend_order_invariance —
+        // timestamp-derived difficulty rules (validator knob unread); mine
+        // the policy-required 20 bits for this pre-activation fixture.
+        // Default processor = production configuration.
+        let processor = TransactionProcessor::new();
         let wallet = Wallet::from_secret_key(
             "6b0d2c3e4f5a60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef",
         )
@@ -1078,10 +1118,13 @@ mod tests {
             vec![0u8; 64],
             pk,
         );
-        tx.nonce = tx.mine_nonce(1);
+        tx.nonce = tx.mine_nonce(20);
         tx.signature = wallet.sign_transaction(&tx).expect("sign");
         tx.id = tx.compute_hash();
 
+        // PHASE 3B (C2): Historical = the production DAG-entry mode (see
+        // note on test_double_spend_order_invariance). Phantom-nonce healing
+        // is a timeless recovery property; assertions below are unchanged.
         processor
             .process(
                 tx.clone(),
@@ -1089,7 +1132,7 @@ mod tests {
                 &ledger,
                 &mempool,
                 10,
-                ValidationMode::Fresh,
+                ValidationMode::Historical,
             )
             .await
             .expect("phantom nonce must heal with full apply");
@@ -1108,7 +1151,11 @@ mod tests {
     #[tokio::test]
     async fn test_applied_true_duplicate_skips_replay() {
         use crate::wallet::Wallet;
-        let processor = TransactionProcessor::with_difficulty(1);
+        // PHASE 3B (C2): see note on test_double_spend_order_invariance —
+        // timestamp-derived difficulty rules (validator knob unread); mine
+        // the policy-required 20 bits for this pre-activation fixture.
+        // Default processor = production configuration.
+        let processor = TransactionProcessor::new();
         let wallet = Wallet::from_secret_key(
             "6b0d2c3e4f5a60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef",
         )
@@ -1135,7 +1182,7 @@ mod tests {
             vec![0u8; 64],
             pk,
         );
-        tx.nonce = tx.mine_nonce(1);
+        tx.nonce = tx.mine_nonce(20);
         tx.signature = wallet.sign_transaction(&tx).expect("sign");
         tx.id = tx.compute_hash();
 
@@ -1148,6 +1195,9 @@ mod tests {
         }
         assert_eq!(ledger.read().await.get_balance(&sender), 10000 - 110);
 
+        // PHASE 3B (C2): Historical = the production DAG-entry mode (see
+        // note on test_double_spend_order_invariance). DAG healing without
+        // replay is a timeless recovery property; assertions below unchanged.
         processor
             .process(
                 tx.clone(),
@@ -1155,7 +1205,7 @@ mod tests {
                 &ledger,
                 &mempool,
                 10,
-                ValidationMode::Fresh,
+                ValidationMode::Historical,
             )
             .await
             .expect("recovery must heal the DAG");
@@ -1163,5 +1213,167 @@ mod tests {
         assert_eq!(ledger.read().await.get_balance(&sender), 10000 - 110);
         assert_eq!(ledger.read().await.get_balance(&receiver), 100);
         assert!(dag.read().await.transactions().contains_key(&tx.id));
+    }
+
+    /// PHASE 3B (C1): STEP-0 / STEP-1 validation-mode consistency.
+    ///
+    /// Regression shape: a conflict winner whose timestamp is stale under
+    /// live policy (pre-activation here → BackdatedTimestamp in Fresh) must
+    /// be treated IDENTICALLY no matter which conflicting tx arrived first.
+    /// Pre-fix, STEP 0 hardcoded Fresh while STEP 1 used the caller mode, so
+    /// loser-first order kept the loser while winner-first order installed
+    /// the winner: a permanent split across a partition/reconnect. Post-fix
+    /// both steps use the caller mode:
+    /// - Historical: the winner installs in BOTH orders (healing works; no
+    ///   Fresh veto in the winner branch);
+    /// - Fresh: the winner is rejected in BOTH orders (loser kept in both;
+    ///   consistent rejection, still no split).
+    /// Cross-mode outcomes legitimately differ (policy, not inconsistency);
+    /// WITHIN one mode, arrival order must not matter. Compares DAG id sets,
+    /// balances and supply (fingerprint) across A-then-B vs B-then-A.
+    #[tokio::test]
+    async fn test_step0_validation_mode_consistency() {
+        use crate::wallet::Wallet;
+        let processor = TransactionProcessor::new();
+        let wallet = Wallet::from_secret_key(
+            "6b0d2c3e4f5a60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef",
+        )
+        .expect("fixed test key");
+        let sender = wallet.address();
+        let pk = wallet.public_key_bytes();
+
+        // Pre-activation timestamps → 20-bit PoW required. Mined once and
+        // reused across all four runs: policy-valid under Historical
+        // (genuine-history shape), policy-rejected under Fresh — exactly the
+        // C1 divergence shape. Default processor = production configuration
+        // (timestamp-derived difficulty; the validator knob is unread).
+        let pre_ts =
+            crate::transaction::Transaction::DIFFICULTY_MIGRATION_TS - 3_600_000;
+        let build = |receiver: [u8; 32], ts_off: u64| {
+            let mut tx = Transaction::new(
+                [[0u8; 32]; 2],
+                sender,
+                receiver,
+                100,
+                10,
+                pre_ts + ts_off,
+                0,
+                1,
+                vec![0u8; 64],
+                pk.clone(),
+            );
+            tx.nonce = tx.mine_nonce(20);
+            tx.signature = wallet.sign_transaction(&tx).expect("sign");
+            tx.id = tx.compute_hash();
+            assert!(tx.verify_pow(20));
+            tx
+        };
+        let tx_a = build([0xAAu8; 32], 0);
+        let tx_b = build([0xBBu8; 32], 1000);
+        assert_ne!(tx_a.id, tx_b.id);
+        let (winner, loser) = if tx_a.id <= tx_b.id {
+            (tx_a.clone(), tx_b.clone())
+        } else {
+            (tx_b.clone(), tx_a.clone())
+        };
+
+        let processor_ref = &processor;
+        let run = |first: Transaction,
+                   second: Transaction,
+                   mode: ValidationMode| {
+            let winner = winner.clone();
+            let loser = loser.clone();
+            async move {
+                let dag = Arc::new(RwLock::new(DAG::new()));
+                let ledger = Arc::new(RwLock::new(Ledger::new()));
+                let mempool = Arc::new(RwLock::new(Mempool::new(1000, 10)));
+
+                let faucet: [u8; 32] = hex::decode(crate::genesis::FAUCET_ADDRESS)
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                let funding = Transaction::new(
+                    [[0u8; 32]; 2],
+                    faucet,
+                    sender,
+                    1000,
+                    5,
+                    pre_ts,
+                    0,
+                    1,
+                    vec![0u8; 64],
+                    vec![1u8; 64],
+                );
+                dag.write()
+                    .await
+                    .add_transaction_validated(funding)
+                    .expect("funding inserts");
+                let dag_read = dag.read().await;
+                ledger.write().await.rebuild_from_dag(&dag_read);
+                drop(dag_read);
+
+                let _ = processor_ref
+                    .process(first, &dag, &ledger, &mempool, 10, mode)
+                    .await;
+                let _ = processor_ref
+                    .process(second, &dag, &ledger, &mempool, 10, mode)
+                    .await;
+
+                // Fingerprint: DAG id set + balances + supply.
+                let dag_guard = dag.read().await;
+                let mut ids: Vec<[u8; 32]> =
+                    dag_guard.transactions().keys().copied().collect();
+                ids.sort();
+                let winner_in = dag_guard.transactions().contains_key(&winner.id);
+                let loser_in = dag_guard.transactions().contains_key(&loser.id);
+                drop(dag_guard);
+                let ledger_guard = ledger.read().await;
+                let fp = (
+                    ids,
+                    ledger_guard.get_balance(&sender),
+                    ledger_guard.get_balance(&winner.receiver),
+                    ledger_guard.get_balance(&loser.receiver),
+                    ledger_guard.total_supply(),
+                );
+                drop(ledger_guard);
+                (fp, winner_in, loser_in)
+            }
+        };
+
+        // Historical: winner installs in BOTH orders (pre-fix this failed in
+        // loser-first order — STEP 0 vetoed under Fresh).
+        let (fp_hw, w_hw, l_hw) = run(
+            winner.clone(),
+            loser.clone(),
+            ValidationMode::Historical,
+        )
+        .await;
+        let (fp_hl, w_hl, l_hl) = run(
+            loser.clone(),
+            winner.clone(),
+            ValidationMode::Historical,
+        )
+        .await;
+        assert!(w_hw && w_hl, "Historical: winner must install in both orders");
+        assert!(!l_hw && !l_hl, "Historical: loser must drop in both orders");
+        assert_eq!(
+            fp_hw, fp_hl,
+            "Historical: fingerprint must be order-invariant"
+        );
+
+        // Fresh: winner rejected in BOTH orders (consistent rejection —
+        // still no split; only funding remains in both DAGs).
+        let (fp_fw, w_fw, l_fw) =
+            run(winner.clone(), loser.clone(), ValidationMode::Fresh).await;
+        let (fp_fl, w_fl, l_fl) =
+            run(loser.clone(), winner.clone(), ValidationMode::Fresh).await;
+        assert!(
+            !w_fw && !w_fl && !l_fw && !l_fl,
+            "Fresh: stale winner AND stale loser must both be rejected"
+        );
+        assert_eq!(
+            fp_fw, fp_fl,
+            "Fresh: fingerprint must be order-invariant"
+        );
     }
 }
