@@ -1,5 +1,12 @@
 # AETHER PHASE 3A â€” SECURITY ROADMAP (future work, no code in this audit)
 
+> PHASE 3B STATUS (commit `8ec482d`): P0-1, P0-2, P0-doc CLOSED — see
+> `docs/AETHER_PHASE3_CONSENSUS_HARDENING.md` (C1/C2/H1 = PASS).
+> PHASE 3C STATUS (this phase): P1-1 (H3), P1-2 (H2), P2-4 (H4) CLOSED — see
+> `docs/AETHER_PHASE3_CONSENSUS_ECONOMIC_HARDENING.md` (gates PASS with stated
+> residuals). REMAINS OPEN: P1-3, P1-4, P2-1, P2-2, P2-3, P3, backlog items
+> 3–10 below.
+
 Companion to `docs/AETHER_PHASE3_CONSENSUS_AUDIT.md`. Nothing here is implemented, committed,
 or scheduled by this document â€” it is a prioritized backlog for explicit follow-up phases.
 Scope guardrails inherited from the audit: no consensus-constant change without a migration
@@ -12,6 +19,7 @@ Finding IDs reference the audit: CRITICAL-1 (Â§3), C1/C2 (Â§14), HIGH-1 (Â�
 ## P0 â€” CONSENSUS-SAFETY BLOCKERS (must close before any adversarial exposure)
 
 ### P0-1 â€” Unify validation mode on the conflict path (CRITICAL-1, C1, C2)
+- **3B CLOSURE**: fixed (STEP 0 uses caller mode; provenance threading) + tests green — see CONSENSUS_HARDENING section 1.
 - **Problem**: STEP 0 re-validates the conflict winner with hardcoded `ValidationMode::Fresh`
   (`src/transaction_processor.rs:171`) while entry (STEP 1, `:206`) and the drainer
   (`src/rpc.rs:1240`) use the caller mode (Historical in production). Same tx, same content,
@@ -28,6 +36,7 @@ Finding IDs reference the audit: CRITICAL-1 (Â§3), C1/C2 (Â§14), HIGH-1 (Â�
   until then â€” documentation task, P0-doc below).
 
 ### P0-2 â€” Enforce timestamp/PoW-cost policy at DAG entry (HIGH-1, H1)
+- **3B CLOSURE**: fixed (provenance: live=Fresh, sync=Historical, drainer honors recorded mode) + 4 H1 tests green — see CONSENSUS_HARDENING section 3.
 - **Problem**: drainer + P2P + orphan paths always Historical â†’ backdated 20-bit PoW accepted,
   stale/future timestamps accepted at consensus entry; Fresh policy is perimeter-only.
 - **Direction**: separate RELAY data (untrusted, Fresh) from SYNC data (provenance-known
@@ -54,9 +63,11 @@ Finding IDs reference the audit: CRITICAL-1 (Â§3), C1/C2 (Â§14), HIGH-1 (Â�
   (possibly 20-bit backdated); defender cost = O(DAG).
 - Direction: per-sender conflict rate limit; incremental (non-full) rebuild after prune;
   cap + prioritize; measure first (H3 benchmark), then bound.
+- **3C CLOSURE**: measured + shipped (sender-nonce index, atomic batch purge, pruned logging) + 5 tests green — see ECONOMIC_HARDENING H3. Quadratic chain-prune + per-conflict rebuild documented with triggers.
 - Tests: H3 adversarial benchmark; regression bound test.
 
 ### P1-2 â€” Min-id grinding quantification (H2)
+- **3C CLOSURE**: quantified (1 PoW/attempt, mean ~2 vs typical rival, TOTAL influence proven) + 3 tests green + receiver guidance — see ECONOMIC_HARDENING H2. No compatible consensus fix exists; capability retained by design (stated residual).
 - Measure cost-per-id-improvement at 24-bit (and 20-bit) in the style of
   `test_w11_cost_measurement`; decide whether min-id needs a cost anchor (e.g. fee-weighted
   tiebreak is a CONSENSUS CHANGE â€” design only, not in audit scope).
@@ -100,6 +111,7 @@ Finding IDs reference the audit: CRITICAL-1 (Â§3), C1/C2 (Â§14), HIGH-1 (Â�
 ### P2-4 â€” Innocent-descendant policy (H4)
 - Measure merge-time loss at partition scale; define user-facing semantics (re-issue flow,
   mempool retention of pruned-but-valid txs for re-broadcast?). Design + tests.
+- **3C CLOSURE**: proven (exact {L,D} removal, funds intact, live==boot) + pruned logging shipped + 3 tests green — see ECONOMIC_HARDENING H4. H4_INNOCENT_DESCENDANT_LOSS = NO (funds).
 
 ---
 

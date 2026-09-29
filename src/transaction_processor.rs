@@ -18,6 +18,7 @@
 
 use crate::ledger::Ledger;
 use crate::parent_selection::DAG;
+use crate::storage::BatchOperation;
 use crate::rpc::Mempool;
 use crate::transaction::Transaction;
 use crate::validation::{TransactionValidator, ValidationError, ValidationMode};
@@ -195,15 +196,41 @@ impl TransactionProcessor {
                     }
                 };
                 let pruned = dag_w.prune_subtree(existing_id);
+                // PHASE 3C (H4): observability for the losing branch. The
+                // pruned set is EXACTLY the loser subtree (precision pinned by
+                // test_conflict_prunes_only_invalid_branch): innocent parties
+                // that built on the loser need this list to re-issue (their
+                // funds are intact — the rebuild below drops only effects, and
+                // hash-bound parents make in-DAG survival impossible). Log the
+                // count plus the first ids (bounded: subtrees can be large).
+                {
+                    let sample: Vec<String> = pruned
+                        .iter()
+                        .take(8)
+                        .map(|id| hex::encode(&id[..4]))
+                        .collect();
+                    tracing::warn!(
+                        "🗑️ Conflict prune: {} txs removed (loser subtree), sample [{}]",
+                        pruned.len(),
+                        sample.join(",")
+                    );
+                }
                 // V-21 FIX: purge the pruned transactions from persistent
                 // storage so they cannot resurrect at the next boot (the boot
                 // rebuild would otherwise become nondeterministic: whichever
                 // of the loser/winner it hits first would win).
+                //
+                // PHASE 3C (H3): one atomic batch_write instead of N
+                // per-id deletes — identical semantics (index + applied-mark
+                // purge per id, see batch_write DeleteTransaction) with one
+                // Sled transaction + one flush instead of N syscalls.
                 if let Some(storage) = ledger_w.storage() {
                     let storage_read = storage.read().await;
-                    for pruned_id in &pruned {
-                        let _ = storage_read.delete_transaction(*pruned_id);
-                    }
+                    let ops: Vec<BatchOperation> = pruned
+                        .iter()
+                        .map(|pruned_id| BatchOperation::DeleteTransaction(*pruned_id))
+                        .collect();
+                    let _ = storage_read.batch_write(ops);
                 }
                 ledger_w.rebuild_from_dag(&dag_w);
             }
@@ -1375,5 +1402,144 @@ mod tests {
             fp_fw, fp_fl,
             "Fresh: fingerprint must be order-invariant"
         );
+    }
+
+    /// PHASE 3C (H3): STEP-0 storage-purge wiring. A conflict resolved live
+    /// through process() with a storage-backed ledger must leave the winner
+    /// persisted and the pruned loser ABSENT from the store (no resurrection
+    /// at boot). Guards the per-id-delete → batch_write rewrite: identical
+    /// semantics (index + applied-mark purge) asserted end-to-end.
+    /// MEDIUM: two 20-bit mines (policy-valid pre-activation fixtures).
+    #[tokio::test]
+    async fn test_step0_prune_purges_loser_from_storage() {
+        use crate::ledger::Ledger;
+        use crate::storage::Storage;
+        use crate::wallet::Wallet;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = Storage::open(dir.path()).expect("open");
+        let storage_arc = Arc::new(RwLock::new(storage));
+        let processor = TransactionProcessor::new();
+        let wallet = Wallet::from_secret_key(
+            "6b0d2c3e4f5a60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef",
+        )
+        .expect("fixed test key");
+        let sender = wallet.address();
+        let pk = wallet.public_key_bytes();
+
+        let dag = Arc::new(RwLock::new(DAG::new()));
+        let ledger = Arc::new(RwLock::new(
+            Ledger::new_with_storage(storage_arc.clone())
+                .await
+                .expect("ledger with storage"),
+        ));
+        let mempool = Arc::new(RwLock::new(Mempool::new(1000, 10)));
+
+        // Fund the sender through the DAG (faucet -> sender).
+        let faucet: [u8; 32] = hex::decode(crate::genesis::FAUCET_ADDRESS)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let funding = Transaction::new(
+            [[0u8; 32]; 2],
+            faucet,
+            sender,
+            1000,
+            5,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+        dag.write()
+            .await
+            .add_transaction_validated(funding)
+            .expect("funding inserts");
+        {
+            let dag_read = dag.read().await;
+            ledger.write().await.rebuild_from_dag(&dag_read);
+        }
+
+        // Conflicting pair (pre-activation ts → 20-bit PoW required).
+        let pre_ts = crate::transaction::Transaction::DIFFICULTY_MIGRATION_TS
+            - 3_600_000;
+        let build = |receiver: [u8; 32]| {
+            let mut tx = Transaction::new(
+                [[0u8; 32]; 2],
+                sender,
+                receiver,
+                100,
+                10,
+                pre_ts,
+                0,
+                1,
+                vec![0u8; 64],
+                pk.clone(),
+            );
+            tx.nonce = tx.mine_nonce(20);
+            tx.signature = wallet.sign_transaction(&tx).expect("sign");
+            tx.id = tx.compute_hash();
+            assert!(tx.verify_pow(20));
+            tx
+        };
+        let tx_a = build([0xAAu8; 32]);
+        let tx_b = build([0xBBu8; 32]);
+        assert_ne!(tx_a.id, tx_b.id);
+        let (winner, loser) = if tx_a.id <= tx_b.id {
+            (tx_a.clone(), tx_b.clone())
+        } else {
+            (tx_b.clone(), tx_a.clone())
+        };
+
+        // Loser first (accepted + persisted), then winner (STEP-0 prune).
+        processor
+            .process(
+                loser.clone(),
+                &dag,
+                &ledger,
+                &mempool,
+                10,
+                ValidationMode::Historical,
+            )
+            .await
+            .expect("loser arrives first, no conflict yet");
+        {
+            let store = storage_arc.read().await;
+            assert!(
+                store.transaction_exists(loser.id).unwrap(),
+                "loser persisted at accept"
+            );
+        }
+        processor
+            .process(
+                winner.clone(),
+                &dag,
+                &ledger,
+                &mempool,
+                10,
+                ValidationMode::Historical,
+            )
+            .await
+            .expect("winner prunes the loser");
+        // DAG + ledger: winner installed, loser gone.
+        assert!(dag.read().await.transactions().contains_key(&winner.id));
+        assert!(!dag.read().await.transactions().contains_key(&loser.id));
+        assert_eq!(
+            ledger.read().await.get_balance(&winner.receiver),
+            100
+        );
+        assert_eq!(ledger.read().await.get_balance(&loser.receiver), 0);
+        // Store: winner present, loser purged (no boot resurrection).
+        {
+            let store = storage_arc.read().await;
+            assert!(
+                store.transaction_exists(winner.id).unwrap(),
+                "winner persisted"
+            );
+            assert!(
+                !store.transaction_exists(loser.id).unwrap(),
+                "pruned loser must be purged from storage"
+            );
+        }
     }
 }

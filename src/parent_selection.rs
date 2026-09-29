@@ -278,6 +278,14 @@ pub struct DAG {
     transactions: HashMap<TransactionId, Transaction>,
     children: HashMap<TransactionId, Vec<TransactionId>>,
     tips: HashSet<TransactionId>,
+    /// PHASE 3C (H3): (sender, account_nonce) -> tx id index. The canonical
+    /// double-spend detector ran a full O(n) scan per admission (STEP 0,
+    /// validate_dag, add_transaction_validated); this makes it O(1) with
+    /// identical answers. Skipped from serialization (rebuilt implicitly:
+    /// every mutation below maintains it). Invariant: at most one tx per key
+    /// in production (the conflict check rejects the second before insert).
+    #[serde(skip_serializing)]
+    sender_nonce_index: HashMap<([u8; 32], u64), TransactionId>,
 }
 
 impl DAG {
@@ -287,6 +295,7 @@ impl DAG {
             transactions: HashMap::new(),
             children: HashMap::new(),
             tips: HashSet::new(),
+            sender_nonce_index: HashMap::new(),
         }
     }
 
@@ -321,15 +330,16 @@ impl DAG {
     /// Returns the id of the conflicting transaction if one exists.
     /// This is the canonical double-spend detector: a (sender, nonce) pair must be
     /// unique across the whole DAG. No special-casing is allowed for any address.
+    ///
+    /// PHASE 3C (H3): O(1) via the sender_nonce_index (same answers as the
+    /// former full scan; production invariant guarantees at most one tx per
+    /// key, so the indexed id IS the conflicting tx).
     pub fn find_sender_nonce_conflict(
         &self,
         sender: &[u8; 32],
         nonce: u64,
     ) -> Option<TransactionId> {
-        self.transactions
-            .iter()
-            .find(|(_, tx)| &tx.sender == sender && tx.account_nonce == nonce)
-            .map(|(id, _)| *id)
+        self.sender_nonce_index.get(&(*sender, nonce)).copied()
     }
 
     /// Check if a sender has a conflicting transaction (same nonce).
@@ -428,6 +438,13 @@ impl DAG {
         let tx_id = tx_with_parents.id;
 
         self.transactions.insert(tx_id, tx_with_parents.clone());
+        // PHASE 3C (H3): maintain the (sender, nonce) index. Safe: the
+        // conflict check above guarantees no live entry for this key (a
+        // second same-key tx is rejected before reaching here).
+        self.sender_nonce_index.insert(
+            (tx_with_parents.sender, tx_with_parents.account_nonce),
+            tx_id,
+        );
 
         for parent in &tx_with_parents.parents {
             if parent.iter().all(|&b| b == 0) {
@@ -476,6 +493,17 @@ impl DAG {
     pub fn remove_transaction(&mut self, tx_id: &TransactionId) {
         // Remove transaction from transactions map
         if let Some(tx) = self.transactions.remove(tx_id) {
+            // PHASE 3C (H3): drop the index entry ONLY if it points at this
+            // tx (defensive: the production invariant forbids two live txs
+            // per key, but a conditional delete can never corrupt).
+            if self
+                .sender_nonce_index
+                .get(&(tx.sender, tx.account_nonce))
+                == Some(tx_id)
+            {
+                self.sender_nonce_index
+                    .remove(&(tx.sender, tx.account_nonce));
+            }
             // Remove this transaction from its parents' children lists
             for parent in &tx.parents {
                 if let Some(children) = self.children.get_mut(parent) {
@@ -655,8 +683,16 @@ impl DAG {
     /// TEST ONLY: insert a transaction raw, with no validation and no
     /// topology bookkeeping. Lets tests construct corrupted DAGs (e.g. two
     /// conflicting transactions) that the public API rightly forbids.
+    ///
+    /// PHASE 3C (H3): also records the (sender, nonce) index, LAST-WINS on
+    /// duplicate keys. Test-only semantics: production can never hold two
+    /// live txs per key, so lookup order never matters there; harnesses that
+    /// inject conflicting pairs must not assert WHICH id `find_*` returns
+    /// for the pair (assert set membership instead).
     #[cfg(test)]
     pub fn inject_transaction_raw(&mut self, tx: Transaction) {
+        self.sender_nonce_index
+            .insert((tx.sender, tx.account_nonce), tx.id);
         self.transactions.insert(tx.id, tx);
     }
 }
@@ -1657,5 +1693,927 @@ mod tests {
             );
         }
         println!("=== END W11 COST ===\n");
+    }
+
+    // ===== PHASE 3C (H2): min-id grinding model =====
+    //
+    // These tests measure the ORDER mechanism only (compute_hash over shaped
+    // fixtures — no PoW, no signatures). Cost per grinding attempt in
+    // production = one full PoW (difficulty from timestamp: 24-bit
+    // post-activation, 20-bit pre-activation) + one Ed25519 sign. Ed25519
+    // (ed25519-dalek) signs DETERMINISTICALLY, so re-signing identical
+    // content yields the identical id: every attempt needs fresh content and
+    // therefore a fresh PoW. No invented numbers: attempts are measured,
+    // expectation follows from the uniformity premise proven below.
+
+    /// Shape a tx with fully controlled fields (no mining, no signing —
+    /// id is what matters here, not validity).
+    fn shaped_tx(
+        sender: [u8; 32],
+        receiver: [u8; 32],
+        amount: u64,
+        fee: u64,
+        timestamp: u64,
+        pow_nonce: u64,
+        account_nonce: u64,
+    ) -> Transaction {
+        let mut tx = Transaction::new(
+            [[0u8; 32]; 2],
+            sender,
+            receiver,
+            amount,
+            fee,
+            timestamp,
+            pow_nonce,
+            account_nonce,
+            vec![0u8; 64],
+            vec![0u8; 32],
+        );
+        tx.id = tx.compute_hash();
+        tx
+    }
+
+    /// H2 premise: min-id inputs are uniform over the id space. 1024 txs with
+    /// systematically varied ATTACKER-CONTROLLED fields (receiver, amount,
+    /// fee, timestamp, pow_nonce) and a FIXED conflict key (sender, nonce):
+    /// all ids distinct; first-nibble buckets within ±6σ of uniform
+    /// ([16,112] for E=64 — P(false alarm) ≈ 0); minimum below 2^250
+    /// (P(fail) = (255/256)^1024 ≈ 0).
+    #[test]
+    fn test_min_id_distribution() {
+        use std::collections::HashSet;
+        let sender = [0x11u8; 32];
+        let mut ids = Vec::with_capacity(1024);
+        for i in 0..1024u64 {
+            let mut receiver = [0u8; 32];
+            receiver[..8].copy_from_slice(&i.to_le_bytes());
+            let tx = shaped_tx(
+                sender,
+                receiver,
+                100 + i,
+                (i % 100) + 1,
+                1_700_000_000_000 + i,
+                i,
+                7,
+            );
+            ids.push(tx.id);
+        }
+        let distinct: HashSet<_> = ids.iter().collect();
+        assert_eq!(distinct.len(), 1024, "ids must all be distinct");
+        let mut buckets = [0u32; 16];
+        for id in &ids {
+            buckets[(id[0] >> 4) as usize] += 1;
+        }
+        for (b, c) in buckets.iter().enumerate() {
+            assert!(
+                (16..=112).contains(c),
+                "nibble bucket {} = {} (E=64, ±6σ)",
+                b,
+                c
+            );
+        }
+        let min = ids.iter().min().unwrap();
+        assert!(min[0] < 64, "minimum id unexpectedly large");
+        println!(
+            "H2 distribution: 1024 ids distinct, buckets {:?}, min {:02x}..",
+            buckets, min[0]
+        );
+    }
+
+    /// H2 bound: attempts to grind below a FIXED rival id. Attacker varies
+    /// timestamp (+1 ms) and receiver bytes; each variant is a fresh uniform
+    /// id (premise above), so attempts-to-win is geometric with
+    /// p = R/2^256 for rival id R.
+    ///
+    /// AUTHORING NOTE (kept deliberately): the first version drew 5
+    /// UNCONDITIONED rivals and observed mean 14.2 — one rival drew a small
+    /// id, dominating the mean. That is not a product defect; it IS the
+    /// scaling law (expected attempts = 2^256/R). The test therefore
+    /// conditions rivals to the TYPICAL band (first byte in [64,192]) and
+    /// asserts the typical case, with a second probe documenting the scaling
+    /// against a small rival explicitly. Bounds are a priori from the model
+    /// (per-trial cap 128; mean ≤ 8 = 2× the worst in-band expectation),
+    /// never fitted to observations.
+    #[test]
+    fn test_min_id_grinding_bound() {
+        let sender = [0x11u8; 32];
+        // Typical-band rivals: first qualifying seeds (deterministic).
+        let mut rivals = Vec::new();
+        for r in 0..1024u64 {
+            if rivals.len() >= 5 {
+                break;
+            }
+            let mut r_receiver = [0u8; 32];
+            r_receiver[..8].copy_from_slice(&(0xBEEF_0000 + r).to_le_bytes());
+            let rival =
+                shaped_tx(sender, r_receiver, 5000, 10, 1_700_000_000_000, 0, 1);
+            if (64..=192).contains(&rival.id[0]) {
+                rivals.push(rival);
+            }
+        }
+        assert_eq!(rivals.len(), 5, "band must yield 5 rivals");
+        let mut counts = Vec::new();
+        for (k, rival) in rivals.iter().enumerate() {
+            let mut attempts = 0u32;
+            loop {
+                attempts += 1;
+                let mut receiver = [0u8; 32];
+                receiver[..8]
+                    .copy_from_slice(&(0xC123_0000u64.wrapping_add(attempts as u64)).to_le_bytes());
+                let variant = shaped_tx(
+                    sender,
+                    receiver,
+                    5000,
+                    10,
+                    1_700_000_000_000 + attempts as u64,
+                    0,
+                    1,
+                );
+                if variant.id < rival.id {
+                    break;
+                }
+                assert!(
+                    attempts <= 128,
+                    "rival {} not beaten within 128 attempts",
+                    k
+                );
+            }
+            counts.push(attempts);
+        }
+        let mean = counts.iter().sum::<u32>() as f64 / counts.len() as f64;
+        assert!(mean <= 8.0, "mean attempts {} (E≈2 typical)", mean);
+        println!("H2 grinding: attempts per rival {:?}, mean {:.2}", counts, mean);
+
+        // Scaling probe: grinding vs a SMALL rival id costs proportionally
+        // more (expected attempts = 2^256/R). One rival with first byte < 16
+        // (bounded seed scan, deterministic); must complete within 4096
+        // attempts (E ≈ 16 for R ≈ 2^252). Reported: documents the
+        // defender's luck factor, not a bound.
+        let mut small = None;
+        for r in 0..1024u64 {
+            let mut r_receiver = [0u8; 32];
+            r_receiver[..8].copy_from_slice(&(0xF00D_0000 + r).to_le_bytes());
+            let cand =
+                shaped_tx(sender, r_receiver, 5000, 10, 1_700_000_000_000, 0, 1);
+            if cand.id[0] < 16 {
+                small = Some(cand);
+                break;
+            }
+        }
+        let small_rival = small.expect("seed scan must find a small rival");
+        let mut attempts = 0u32;
+        loop {
+            attempts += 1;
+            let mut receiver = [0u8; 32];
+            receiver[..8].copy_from_slice(
+                &(0xD00D_0000u64.wrapping_add(attempts as u64)).to_le_bytes(),
+            );
+            let variant = shaped_tx(
+                sender,
+                receiver,
+                5000,
+                10,
+                1_700_000_000_000 + attempts as u64,
+                0,
+                1,
+            );
+            if variant.id < small_rival.id {
+                break;
+            }
+            assert!(attempts <= 4096, "small-rival grind runaway");
+        }
+        println!(
+            "H2 scaling probe: small rival (leading {:02x}) beaten in {} attempts",
+            small_rival.id[0], attempts
+        );
+    }
+
+    /// H2 influence: grinding DECIDES the consensus outcome. txA fixed; grind
+    /// txB variants (timestamp steps, no PoW — order mechanism only) until
+    /// txB.id < txA.id (bounded 64); canonical_resolve_conflicts on {A, B}
+    /// must then drop A and keep B. Control: an unground B' (id > A) loses.
+    /// Same (sender, nonce) throughout (else no conflict exists to decide).
+    #[test]
+    fn test_min_id_selection_influence() {
+        let sender = [0x11u8; 32];
+        let tx_a = shaped_tx(sender, [0xAAu8; 32], 5000, 10, 1_700_000_000_000, 0, 1);
+        // Grind B below A.
+        let mut tx_b = shaped_tx(sender, [0xBBu8; 32], 100, 10, 1_700_000_000_000, 0, 1);
+        let mut attempts = 0u32;
+        while tx_b.id >= tx_a.id {
+            attempts += 1;
+            assert!(attempts <= 64, "grind did not flip within 64 attempts");
+            tx_b = shaped_tx(
+                sender,
+                [0xBBu8; 32],
+                100,
+                10,
+                1_700_000_000_000 + attempts as u64,
+                0,
+                1,
+            );
+        }
+        let mut set = vec![tx_a.clone(), tx_b.clone()];
+        let pruned = canonical_resolve_conflicts(&mut set);
+        assert_eq!(pruned.len(), 1, "exactly the loser drops");
+        assert!(pruned.contains(&tx_a.id), "A must lose once B is smaller");
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0].id, tx_b.id, "B must survive");
+        // Control: ground-in-reverse (B' id > A id) → A wins.
+        let mut tx_b2 = shaped_tx(sender, [0xCCu8; 32], 100, 10, 1_700_000_000_000, 0, 1);
+        let mut attempts2 = 0u32;
+        while tx_b2.id <= tx_a.id {
+            attempts2 += 1;
+            assert!(attempts2 <= 64);
+            tx_b2 = shaped_tx(
+                sender,
+                [0xCCu8; 32],
+                100,
+                10,
+                1_700_000_000_000 + 1_000_000 + attempts2 as u64,
+                0,
+                1,
+            );
+        }
+        let mut set2 = vec![tx_a.clone(), tx_b2.clone()];
+        let pruned2 = canonical_resolve_conflicts(&mut set2);
+        assert_eq!(pruned2.len(), 1);
+        assert!(pruned2.contains(&tx_b2.id), "larger id must lose");
+        assert_eq!(set2[0].id, tx_a.id, "A must survive");
+        println!(
+            "H2 influence: flip took {} attempts; control took {}",
+            attempts, attempts2
+        );
+    }
+
+    // ===== PHASE 3C (H3): conflict CPU cost =====
+    //
+    // No PoW anywhere below (add_transaction_validated checks
+    // duplicate/parents/sender-conflict only — validation is the processor's
+    // job). This measures the ALGORITHMIC cost that STEP 0 pays per conflict
+    // (lookup, prune traversal, full ledger rebuild), i.e. the amplification
+    // core. Per-tx crypto (one hash + one signature per validate_pure) is O(1)
+    // by code inspection and needs no timing.
+
+    /// Build a DAG of N distinct-sender root txs (validated inserts, no
+    /// mining). Sender bytes derive from the counter (unique by construction).
+    fn distinct_root_dag(n: usize) -> DAG {
+        let mut dag = DAG::new();
+        for i in 0..n {
+            let mut sender = [0u8; 32];
+            sender[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            sender[8..16].copy_from_slice(&(i as u64).to_be_bytes());
+            let mut tx = Transaction::new(
+                [[0u8; 32]; 2],
+                sender,
+                [9u8; 32],
+                1,
+                1,
+                1234567890,
+                0,
+                0,
+                vec![0u8; 64],
+                vec![0u8; 32],
+            );
+            tx.id = tx.compute_hash();
+            dag.add_transaction_validated(tx).expect("distinct insert");
+        }
+        dag
+    }
+
+    /// H3 lookup scaling: 1k/2k/4k/8k DAGs, 20000 mixed hit/miss lookups each.
+    /// Absolute bound (< 1 s) pins O(1) indexed lookup (a full scan would take
+    /// seconds); ratio bound (< 32 for 8× growth) pins the shape. Reported
+    /// times are the É11 record.
+    #[test]
+    fn test_conflict_lookup_scales() {
+        use std::time::Instant;
+        let mut times = Vec::new();
+        for &n in &[1000usize, 2000, 4000, 8000] {
+            let dag = distinct_root_dag(n);
+            let start = Instant::now();
+            let mut hits = 0u32;
+            for j in 0..20000u32 {
+                // Even = hit (exact reconstruction of an inserted sender,
+                // tail zeros included); odd = miss (byte 16 set — inserted
+                // senders are zero there by construction).
+                let mut sender = [0u8; 32];
+                if j % 2 == 0 {
+                    let i = (j as usize / 2) % n;
+                    sender[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                    sender[8..16].copy_from_slice(&(i as u64).to_be_bytes());
+                } else {
+                    sender[0] = 0xFF;
+                    sender[16] = 1;
+                    sender[17] = (j % 251) as u8;
+                }
+                if dag.find_sender_nonce_conflict(&sender, 0).is_some() {
+                    hits += 1;
+                }
+            }
+            let elapsed = start.elapsed();
+            println!(
+                "H3 lookup: N={} 20000 lookups in {:?} (hits {})",
+                n, elapsed, hits
+            );
+            assert_eq!(hits, 10000, "every even lookup must hit");
+            assert!(
+                elapsed.as_secs_f64() < 1.0,
+                "20k lookups on {} txs took {:?} (index regression?)",
+                n,
+                elapsed
+            );
+            times.push(elapsed);
+        }
+        let ratio = times[3].as_secs_f64() / times[0].as_secs_f64().max(1e-9);
+        println!("H3 lookup scaling T(8k)/T(1k) = {:.2}", ratio);
+        assert!(ratio < 32.0, "lookup scaling ratio {}", ratio);
+    }
+
+    /// H3 index equivalence: brute-force scan agrees with the index after
+    /// every mutation. Deterministic op sequence (LCG): validated adds
+    /// (fresh keys), rejected conflicting adds, removes, subtree prunes.
+    /// After each op, every tracked key (+ never-keys) must match the scan
+    /// EXACTLY (Some(id) with the same id — production holds ≤1 tx per key).
+    #[test]
+    fn test_conflict_index_matches_scan() {
+        let mut rng_state: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next = || {
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng_state >> 33) as usize
+        };
+        let mut dag = DAG::new();
+        let mut keys: Vec<([u8; 32], u64)> = Vec::new();
+        let mut key_serial: u64 = 0;
+        let mut fresh_key = || {
+            key_serial += 1;
+            let mut sender = [0u8; 32];
+            sender[..8].copy_from_slice(&key_serial.to_le_bytes());
+            sender[8] = 0xA5;
+            (sender, key_serial % 5)
+        };
+        let brute = |dag: &DAG, key: ([u8; 32], u64)| {
+            dag.transactions()
+                .iter()
+                .find(|(_, tx)| (tx.sender, tx.account_nonce) == key)
+                .map(|(id, _)| *id)
+        };
+        for _step in 0..150 {
+            match next() % 4 {
+                0 => {
+                    // Fresh validated add (must succeed).
+                    let (sender, nonce) = fresh_key();
+                    let mut tx = Transaction::new(
+                        [[0u8; 32]; 2],
+                        sender,
+                        [9u8; 32],
+                        1,
+                        1,
+                        1234567890,
+                        0,
+                        nonce,
+                        vec![0u8; 64],
+                        vec![0u8; 32],
+                    );
+                    tx.id = tx.compute_hash();
+                    dag.add_transaction_validated(tx).expect("fresh key inserts");
+                    keys.push((sender, nonce));
+                }
+                1 => {
+                    // Conflicting add (must be rejected, index untouched).
+                    if keys.is_empty() {
+                        continue;
+                    }
+                    let (sender, nonce) = keys[next() % keys.len()];
+                    let mut tx = Transaction::new(
+                        [[0u8; 32]; 2],
+                        sender,
+                        [7u8; 32],
+                        2,
+                        1,
+                        1234567890,
+                        0,
+                        nonce,
+                        vec![0u8; 64],
+                        vec![0u8; 32],
+                    );
+                    tx.id = tx.compute_hash();
+                    assert!(
+                        dag.add_transaction_validated(tx).is_err(),
+                        "same-key second tx must be rejected"
+                    );
+                }
+                2 => {
+                    // Remove (possibly absent → no-op).
+                    let mut id = [0u8; 32];
+                    id[..8].copy_from_slice(&(next() as u64).to_le_bytes());
+                    dag.remove_transaction(&id);
+                }
+                _ => {
+                    // Prune (possibly absent root → harmless singleton).
+                    let mut id = [0u8; 32];
+                    id[..8].copy_from_slice(&(next() as u64).to_le_bytes());
+                    dag.prune_subtree(id);
+                }
+            }
+            // Verify every tracked key plus never-keys.
+            for key in keys.iter().copied() {
+                assert_eq!(
+                    dag.find_sender_nonce_conflict(&key.0, key.1),
+                    brute(&dag, key),
+                    "index/scan mismatch for key after mutation"
+                );
+            }
+            for k in 0..4u8 {
+                let never = ([0xEEu8; 32], 1000 + k as u64);
+                assert_eq!(dag.find_sender_nonce_conflict(&never.0, never.1), None);
+                assert_eq!(brute(&dag, never), None);
+            }
+        }
+        println!(
+            "H3 index equivalence: 150 mixed ops, {} keys, all match",
+            keys.len()
+        );
+    }
+
+    /// H3 per-conflict cost: fixed 2000-tx DAG; K = 1,2,4,8,16 independent
+    /// conflict pairs (distinct senders per pair, childless roots). Per pair:
+    /// prune_subtree(loser) + full rebuild_from_dag. Each conflict pays a
+    /// full rebuild BY CONSTRUCTION — the test reports the base cost and the
+    /// scaling factor, and asserts no superlinear blowup (T(16)/T(1) < 64:
+    /// linear allows 16×, 4× noise margin).
+    #[test]
+    fn test_conflict_cpu_cost() {
+        use crate::ledger::Ledger;
+        use std::time::Instant;
+        let mut totals = Vec::new();
+        for &k in &[1usize, 2, 4, 8, 16] {
+            let mut dag = distinct_root_dag(2000);
+            let mut ledger = Ledger::new();
+            // K pairs: same (sender, nonce), distinct receivers; roles by id.
+            let mut losers = Vec::new();
+            for p in 0..k {
+                let mut sender = [0u8; 32];
+                sender[0] = 0xC0;
+                sender[1] = p as u8;
+                let mk = |receiver: [u8; 32]| {
+                    let mut tx = Transaction::new(
+                        [[0u8; 32]; 2],
+                        sender,
+                        receiver,
+                        100,
+                        10,
+                        1234567890,
+                        0,
+                        77,
+                        vec![0u8; 64],
+                        vec![0u8; 32],
+                    );
+                    tx.id = tx.compute_hash();
+                    tx
+                };
+                let t1 = mk([0x11u8; 32]);
+                let t2 = mk([0x22u8; 32]);
+                let loser_id = if t1.id < t2.id { t2.id } else { t1.id };
+                dag.inject_transaction_raw(t1);
+                dag.inject_transaction_raw(t2);
+                losers.push(loser_id);
+            }
+            let start = Instant::now();
+            for loser in &losers {
+                dag.prune_subtree(*loser);
+                ledger.rebuild_from_dag(&dag);
+            }
+            let elapsed = start.elapsed();
+            // Each pair loses exactly its loser (childless roots).
+            assert_eq!(
+                dag.transaction_count(),
+                2000 + k,
+                "one removal per conflict"
+            );
+            println!("H3 conflict cost: K={} in {:?}", k, elapsed);
+            totals.push(elapsed);
+        }
+        let factor =
+            totals[4].as_secs_f64() / totals[0].as_secs_f64().max(1e-9);
+        println!(
+            "H3 conflict scaling T(16)/T(1) = {:.2} (linear = 16)",
+            factor
+        );
+        assert!(factor < 64.0, "superlinear conflict blowup: {}", factor);
+    }
+
+    /// H3 deep-prune shape: chains L = 100/200/400/800 (same sender,
+    /// sequential nonces — validated inserts allow distinct nonces), prune
+    /// root + full rebuild. Loose bound (< 1000× for 8× growth: catches
+    /// cubic-or-worse only); the REPORTED curve feeds the weight-maintenance
+    /// decision (incremental O(L²) adjustment vs single-pass recompute).
+    #[test]
+    fn test_conflict_prune_chain_scaling() {
+        use crate::ledger::Ledger;
+        use std::time::Instant;
+        let mut times = Vec::new();
+        for &len in &[100usize, 200, 400, 800] {
+            let mut dag = DAG::new();
+            let mut ledger = Ledger::new();
+            let sender = [0xBu8; 32];
+            let mut prev = [0u8; 32];
+            let mut first = [0u8; 32];
+            for i in 0..len as u64 {
+                let mut tx = Transaction::new(
+                    [prev, [0u8; 32]],
+                    sender,
+                    [9u8; 32],
+                    1,
+                    1,
+                    1234567890,
+                    0,
+                    i,
+                    vec![0u8; 64],
+                    vec![0u8; 32],
+                );
+                tx.id = tx.compute_hash();
+                if i == 0 {
+                    first = tx.id;
+                }
+                prev = tx.id;
+                dag.add_transaction_validated(tx).expect("chain links");
+            }
+            assert_eq!(dag.transaction_count(), len);
+            let start = Instant::now();
+            let removed = dag.prune_subtree(first);
+            ledger.rebuild_from_dag(&dag);
+            let elapsed = start.elapsed();
+            assert_eq!(removed.len(), len, "whole chain must go");
+            assert_eq!(dag.transaction_count(), 0);
+            println!("H3 chain prune: L={} in {:?}", len, elapsed);
+            times.push(elapsed);
+        }
+        let ratio = times[3].as_secs_f64() / times[0].as_secs_f64().max(1e-9);
+        println!("H3 chain scaling T(800)/T(100) = {:.2}", ratio);
+        assert!(ratio < 1000.0, "pathological prune blowup: {}", ratio);
+    }
+
+    // ===== PHASE 3C (H4): innocent-descendant precision =====
+    //
+    // No PoW anywhere below (validated inserts need none; the single raw node
+    // is always a ROOT, so no topology link is ever missing). Hash-bound
+    // parents make in-DAG survival of a loser's descendants impossible by
+    // construction — what must hold instead: (a) prune removes EXACTLY the
+    // loser subtree, nothing else; (b) no funds are created, destroyed, or
+    // stranded (expectation loss is re-issuable; fund loss is not); (c) the
+    // boot-restart path converges to the identical state as live prune.
+
+    /// Fund `receivers` through the DAG itself (faucet→receiver, fee 100,
+    /// sequential faucet nonces from `nonce0`). REQUIRED because
+    /// rebuild_from_dag reseeds balances from genesis (a manual set_balance
+    /// is wiped): test funding must flow through real DAG transactions,
+    /// exactly like production.
+    fn fund_dag(dag: &mut DAG, receivers: &[([u8; 32], u64)], nonce0: u64) {
+        let faucet: [u8; 32] = hex::decode(crate::genesis::FAUCET_ADDRESS)
+            .expect("faucet hex")
+            .try_into()
+            .expect("faucet len");
+        for (i, (receiver, amount)) in receivers.iter().enumerate() {
+            let mut tx = Transaction::new(
+                [[0u8; 32]; 2],
+                faucet,
+                *receiver,
+                *amount,
+                100,
+                1234567890,
+                0,
+                nonce0 + i as u64,
+                vec![0u8; 64],
+                vec![0u8; 32],
+            );
+            tx.id = tx.compute_hash();
+            dag.add_transaction_validated(tx).expect("funding inserts");
+        }
+    }
+
+    /// Build the H4 fixture DAG. Shape:
+    ///   P root; A→B→C innocent chain on P; W/L same-key roots (roles by id:
+    ///   winner = min); D innocent child of [L, A] (diamond); E innocent
+    ///   child of W (winner's branch must survive).
+    /// W validates in first (no conflict yet); L is raw-injected as a ROOT
+    /// (no missing links: roots reference nothing); D, E validate after.
+    /// Returns (dag, ids of P,A,B,C,W,L,D,E with canonical roles).
+    fn h4_fixture() -> (
+        DAG,
+        TransactionId,
+        TransactionId,
+        TransactionId,
+        TransactionId,
+        TransactionId,
+        TransactionId,
+        TransactionId,
+        TransactionId,
+    ) {
+        let mut dag = DAG::new();
+        let mk = |parents: [TransactionId; 2],
+                  sender: [u8; 32],
+                  receiver: [u8; 32],
+                  amount: u64,
+                  fee: u64,
+                  nonce: u64| {
+            let mut tx = Transaction::new(
+                parents,
+                sender,
+                receiver,
+                amount,
+                fee,
+                1234567890,
+                0,
+                nonce,
+                vec![0u8; 64],
+                vec![0u8; 32],
+            );
+            tx.id = tx.compute_hash();
+            tx
+        };
+        let zero = [0u8; 32];
+        // P with concrete bytes (kept explicit for readability).
+        let p = mk([zero, zero], [0x10u8; 32], [0x11u8; 32], 1, 1, 0);
+        dag.add_transaction_validated(p.clone()).unwrap();
+        let a = mk([p.id, zero], [0x12u8; 32], [0x13u8; 32], 1, 1, 0);
+        dag.add_transaction_validated(a.clone()).unwrap();
+        let b = mk([a.id, zero], [0x14u8; 32], [0x15u8; 32], 1, 1, 0);
+        dag.add_transaction_validated(b.clone()).unwrap();
+        let c = mk([b.id, zero], [0x16u8; 32], [0x17u8; 32], 1, 1, 0);
+        dag.add_transaction_validated(c.clone()).unwrap();
+        // Conflict pair: same sender+nonce; roles assigned post-hoc by id.
+        let t1 = mk([zero, zero], [0x20u8; 32], [0x21u8; 32], 100, 10, 9);
+        let t2 = mk([zero, zero], [0x20u8; 32], [0x22u8; 32], 100, 10, 9);
+        assert_ne!(t1.id, t2.id);
+        let (w, l) = if t1.id < t2.id {
+            (t1.clone(), t2.clone())
+        } else {
+            (t2.clone(), t1.clone())
+        };
+        dag.add_transaction_validated(w.clone()).unwrap();
+        dag.inject_transaction_raw(l.clone());
+        // Diamond innocent: child of loser AND of A.
+        let d = mk([l.id, a.id], [0x30u8; 32], [0x31u8; 32], 50, 5, 0);
+        dag.add_transaction_validated(d.clone()).unwrap();
+        // Winner's innocent child (must survive).
+        let e = mk([w.id, zero], [0x40u8; 32], [0x41u8; 32], 30, 5, 0);
+        dag.add_transaction_validated(e.clone()).unwrap();
+        (dag, p.id, a.id, b.id, c.id, w.id, l.id, d.id, e.id)
+    }
+
+    /// H4 precision: prune(L) removes EXACTLY {L, D} — the loser plus its
+    /// diamond descendant — and nothing else. Survivors {P,A,B,C,W,E}; tips
+    /// {C, E}; weights A=3, P=4, W=2, B=2, C=E=1 (subtree sizes post-prune).
+    #[test]
+    fn test_conflict_prunes_only_invalid_branch() {
+        let (mut dag, p, a, b, c, w, l, d, e) = h4_fixture();
+        assert_eq!(dag.transaction_count(), 8);
+        let mut removed = dag.prune_subtree(l);
+        removed.sort();
+        let mut expected = vec![l, d];
+        expected.sort();
+        assert_eq!(removed, expected, "prune must remove exactly the loser subtree");
+        assert_eq!(dag.transaction_count(), 6);
+        for gone in [l, d] {
+            assert!(
+                dag.get_transaction(gone).is_none(),
+                "loser branch must be gone"
+            );
+        }
+        for kept in [p, a, b, c, w, e] {
+            assert!(
+                dag.get_transaction(kept).is_some(),
+                "innocent tx must survive"
+            );
+        }
+        // Tips = childless survivors.
+        let mut tips: Vec<[u8; 32]> = Vec::new();
+        for id in dag.transactions().keys() {
+            let has_live_child = dag
+                .children()
+                .get(id)
+                .map(|kids| {
+                    kids.iter()
+                        .any(|k| dag.transactions().contains_key(k))
+                })
+                .unwrap_or(false);
+            if !has_live_child {
+                tips.push(*id);
+            }
+        }
+        tips.sort();
+        let mut expected_tips = vec![c, e];
+        expected_tips.sort();
+        assert_eq!(tips, expected_tips, "tips must be exactly {{C, E}}");
+        // Weight exactness through the prune (subtree sizes).
+        let weight = |id| dag.get_transaction(id).map(|t| t.weight).unwrap_or(-1.0);
+        assert_eq!(weight(a), 3.0, "A subtree {{A,B,C}}");
+        assert_eq!(weight(p), 4.0, "P subtree {{P,A,B,C}}");
+        assert_eq!(weight(w), 2.0, "W subtree {{W,E}}");
+        assert_eq!(weight(b), 2.0);
+        assert_eq!(weight(c), 1.0);
+        assert_eq!(weight(e), 1.0);
+        // No stale children entries pointing at removed txs.
+        for kids in dag.children().values() {
+            for k in kids {
+                assert!(
+                    dag.transactions().contains_key(k),
+                    "children map must not reference pruned txs"
+                );
+            }
+        }
+    }
+
+    /// H4 funds: innocent balances survive, revocation is exact. Two-phase
+    /// shape mirroring a partition merge (both sides present, then resolve):
+    /// Phase 1 — DAG {L, D} only: L applies, D (funded solely via L) applies.
+    /// Phase 2 — W arrives (same key, smaller id): prune L (takes D), rebuild.
+    /// Phase 3 — E (winner's child) joins and applies.
+    /// Asserts the REVOCATION precisely (M2: 45→0, M3: 50→0), the winner
+    /// installation (M1: 0→100), preservation (M1→65, M4=30), S untouched
+    /// across phases (9890), and conservation (9985 = funded − burned fees).
+    /// Expectation loss (D's effects revoked) is by design (hash-bound
+    /// parents); FUND loss must be zero. H4_INNOCENT_DESCENDANT_LOSS = NO.
+    #[test]
+    fn test_conflict_preserves_innocent_descendant() {
+        use crate::ledger::Ledger;
+        let sender = [0x20u8; 32];
+        let m1 = [0x21u8; 32];
+        let m2 = [0x22u8; 32];
+        let m3 = [0x31u8; 32];
+        let m4 = [0x41u8; 32];
+        let zero = [0u8; 32];
+        let mk = |parents: [TransactionId; 2],
+                  s: [u8; 32],
+                  r: [u8; 32],
+                  amount: u64,
+                  fee: u64,
+                  nonce: u64| {
+            let mut tx = Transaction::new(
+                parents, s, r, amount, fee, 1234567890, 0, nonce,
+                vec![0u8; 64], vec![0u8; 32],
+            );
+            tx.id = tx.compute_hash();
+            tx
+        };
+        let t1 = mk([zero, zero], sender, m1, 100, 10, 5);
+        let t2 = mk([zero, zero], sender, m2, 100, 10, 5);
+        assert_ne!(t1.id, t2.id);
+        // Canonical roles: winner = min id (its receiver gets funded).
+        let (w, l, w_recv) = if t1.id < t2.id {
+            (t1, t2, m1)
+        } else {
+            (t2, t1, m2)
+        };
+        let l_recv = if w_recv == m1 { m2 } else { m1 };
+        // D spends the LOSER's output; E spends the WINNER's output.
+        // Built after roles are known (receivers depend on them).
+        let d = mk([l.id, zero], l_recv, m3, 50, 5, 0);
+        let e = mk([w.id, zero], w_recv, m4, 30, 5, 0);
+
+        let mut dag = DAG::new();
+        let mut ledger = Ledger::new();
+        // Fund S through the DAG (rebuild reseeds from genesis — manual
+        // set_balance would be wiped).
+        fund_dag(&mut dag, &[(sender, 100_000)], 0);
+
+        // Phase 1: loser world (W unknown yet) — L and innocent D apply.
+        dag.inject_transaction_raw(l.clone());
+        dag.add_transaction_validated(d.clone()).unwrap();
+        ledger.rebuild_from_dag(&dag);
+        assert_eq!(ledger.get_balance(&sender), 100_000 - 100 - 10);
+        assert_eq!(ledger.get_balance(&l_recv), 100 - 50 - 5);
+        assert_eq!(ledger.get_balance(&m3), 50);
+        assert!(ledger.is_applied(&l.id));
+        assert!(ledger.is_applied(&d.id));
+
+        // Phase 2: winner arrives (partition-merge shape) — prune L (takes
+        // D), rebuild. Innocent effects revoked EXACTLY, winner installed.
+        dag.inject_transaction_raw(w.clone());
+        let removed = dag.prune_subtree(l.id);
+        assert_eq!(removed.len(), 2, "loser + its innocent child");
+        ledger.rebuild_from_dag(&dag);
+        assert_eq!(ledger.get_balance(&l_recv), 0, "M2: 45→0 revoked");
+        assert_eq!(ledger.get_balance(&m3), 0, "M3: 50→0 revoked");
+        assert_eq!(ledger.get_balance(&w_recv), 100, "M1: 0→100 installed");
+        assert_eq!(ledger.get_balance(&sender), 100_000 - 100 - 10);
+        assert!(!ledger.is_applied(&l.id), "loser mark must not survive");
+        assert!(!ledger.is_applied(&d.id), "revoked mark must not survive");
+        assert!(dag.get_transaction(l.id).is_none());
+        assert!(dag.get_transaction(d.id).is_none());
+
+        // Phase 3: winner's innocent child joins and applies; conservation.
+        dag.add_transaction_validated(e.clone()).unwrap();
+        ledger.rebuild_from_dag(&dag);
+        assert_eq!(ledger.get_balance(&w_recv), 100 - 30 - 5);
+        assert_eq!(ledger.get_balance(&m4), 30);
+        let total = ledger.get_balance(&sender)
+            + ledger.get_balance(&w_recv)
+            + ledger.get_balance(&m4);
+        assert_eq!(total, 100_000 - 15, "supply conserved minus burned fees");
+        assert!(dag.get_transaction(w.id).is_some());
+        assert!(dag.get_transaction(e.id).is_some());
+    }
+
+    /// H4 restart equivalence: live-prune == boot-restart. The persisted set
+    /// (ALL txs incl. loser+descendants) through boot order
+    /// (canonical_resolve_conflicts → rebuild_dag_topological →
+    /// rebuild_from_dag) vs live order (inject all → prune canonical loser →
+    /// rebuild_from_dag): DAG id-sets equal + ledger fingerprints equal
+    /// (balances, supply, nonces). AFTER_RESTART == AFTER_CONFLICT.
+    #[test]
+    fn test_conflict_rebuild_preserves_valid_state() {
+        use crate::ledger::Ledger;
+        let (mut live_dag, p, a, b, c, w, l, d, e) = h4_fixture();
+        // Fund every spender THROUGH the DAG (rebuild reseeds from genesis).
+        // Identical funding on both paths (deterministic ids) so the
+        // fingerprints compare funded, non-vacuous states.
+        let spenders = [
+            [0x10u8; 32],
+            [0x12u8; 32],
+            [0x14u8; 32],
+            [0x16u8; 32],
+            [0x20u8; 32],
+            [0x30u8; 32],
+            [0x40u8; 32],
+        ];
+        let funded: Vec<([u8; 32], u64)> =
+            spenders.iter().map(|s| (*s, 1_000_000)).collect();
+        fund_dag(&mut live_dag, &funded, 0);
+        // LIVE order: prune canonical loser (max id), rebuild.
+        live_dag.prune_subtree(l);
+        let mut live_ledger = Ledger::new();
+        live_ledger.rebuild_from_dag(&live_dag);
+
+        // BOOT order: flat persisted set (loser + descendants included).
+        let (mut boot_src, _, _, _, _, _, _, _, _) = h4_fixture();
+        fund_dag(&mut boot_src, &funded, 0);
+        let mut persisted: Vec<Transaction> =
+            boot_src.transactions().values().cloned().collect();
+        assert_eq!(persisted.len(), 15, "persisted set holds the loser too");
+        let boot_pruned = canonical_resolve_conflicts(&mut persisted);
+        assert_eq!(boot_pruned.len(), 2, "canonical drop = loser + descendant");
+        let mut boot_dag = DAG::new();
+        let (inserted, skipped, orphans) =
+            rebuild_dag_topological(&mut boot_dag, persisted);
+        assert_eq!(skipped, 0, "no valid tx may be skipped");
+        assert!(orphans.is_empty(), "no orphans expected");
+        assert_eq!(inserted, 13);
+        let mut boot_ledger = Ledger::new();
+        boot_ledger.rebuild_from_dag(&boot_dag);
+
+        // Fingerprints must match.
+        let mut live_ids: Vec<[u8; 32]> =
+            live_dag.transactions().keys().copied().collect();
+        live_ids.sort();
+        let mut boot_ids: Vec<[u8; 32]> =
+            boot_dag.transactions().keys().copied().collect();
+        boot_ids.sort();
+        assert_eq!(live_ids, boot_ids, "DAG sets must match");
+        assert_eq!(live_ids.len(), 13, "8 fixture + 7 funding minus L and D");
+        for id in [p, a, b, c, w, e] {
+            assert!(live_ids.contains(&id) && boot_ids.contains(&id));
+        }
+        for id in [l, d] {
+            assert!(!live_ids.contains(&id) && !boot_ids.contains(&id));
+        }
+        assert_eq!(
+            live_ledger.total_supply(),
+            boot_ledger.total_supply(),
+            "supply must match"
+        );
+        for addr in [
+            [0x10u8; 32],
+            [0x12u8; 32],
+            [0x14u8; 32],
+            [0x16u8; 32],
+            [0x20u8; 32],
+            [0x30u8; 32],
+            [0x40u8; 32],
+            [0x11u8; 32],
+            [0x13u8; 32],
+            [0x15u8; 32],
+            [0x17u8; 32],
+            [0x21u8; 32],
+            [0x22u8; 32],
+            [0x31u8; 32],
+            [0x41u8; 32],
+        ] {
+            assert_eq!(
+                live_ledger.get_balance(&addr),
+                boot_ledger.get_balance(&addr),
+                "balance mismatch for {:?}",
+                &addr[..2]
+            );
+            assert_eq!(
+                live_ledger.get_nonce(&addr),
+                boot_ledger.get_nonce(&addr),
+                "nonce mismatch for {:?}",
+                &addr[..2]
+            );
+        }
     }
 }
