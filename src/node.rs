@@ -4,7 +4,7 @@ use crate::{
     json_storage::{ensure_data_dir, load_dag_from_json, save_dag_to_json},
     ledger::Ledger,
     p2p::{P2PConfig, P2PNetwork},
-    parent_selection::{canonical_resolve_conflicts, rebuild_dag_topological, DAG},
+    parent_selection::{rebuild_dag_topological, DAG},
     rpc::{start_rpc_server, AetherRpcImpl, Mempool},
     storage::Storage,
     transaction::{Address, Transaction},
@@ -253,26 +253,16 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             }
         }
 
-        // V-21 FIX: canonical double-spend resolution BEFORE rebuilding the
-        // DAG. Persistent storage may contain a pruned loser (and the txs
-        // built on it) - e.g. a crash between the runtime prune and its Sled
-        // purge. Without this, the boot rebuild would be nondeterministic:
-        // whichever of the loser/winner Sled iterates first would win. The
-        // smallest id per (sender, nonce) always wins, losers + descendants
-        // are dropped and purged from Sled (same rule as the runtime prune).
-        {
-            let pruned = canonical_resolve_conflicts(&mut all_txs);
-            if !pruned.is_empty() {
-                tracing::warn!(
-                    "⚠️ Boot canonicalization: dropping {} conflicting/descendant transaction(s) (min-id wins)",
-                    pruned.len()
-                );
-                let storage_read = storage.read().await;
-                for pruned_id in &pruned {
-                    let _ = storage_read.delete_transaction(*pruned_id);
-                }
-            }
-        }
+        // PHASE 4B: loser retention — NO canonical pruning at boot. Every
+        // persisted tx (winners AND former losers alike) is a legitimate DAG
+        // resident: the conflict DECISION (CDW winner, min-id tiebreak,
+        // grandfathered) is recomputed deterministically by the ledger
+        // rebuild below, and re-resolution stays possible as the DAG grows
+        // (retention is load-bearing for convergence — deleting losers here
+        // would amputate future re-resolution the way the old runtime prune
+        // did). Pre-activation conflicts resolve by frozen min-id, so ancient
+        // history is untouched. Nothing is purged from Sled on this path
+        // anymore (V-21 purge belonged to the pruning era).
 
         let mut rebuild_skipped = 0u64;
         if !all_txs.is_empty() {

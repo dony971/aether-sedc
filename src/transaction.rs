@@ -234,7 +234,7 @@ impl Transaction {
         let read_slice = |start: usize, len: usize, field_name: &str| -> Result<&[u8], String> {
             let end = start + len;
             if end > bytes.len() {
-                return Err(format!("Erreur: Reçu {} octets, mais j'essaie de lire le champ {} à l'index {} (taille {})", bytes.len(), field_name, start, len));
+                return Err(format!("Error: Received {} bytes, trying to read field {} at index {} (length {})", bytes.len(), field_name, start, len));
             }
             Ok(&bytes[start..end])
         };
@@ -396,6 +396,42 @@ impl Transaction {
         true
     }
 
+    /// PHASE 4B: count leading zero BITS of a 32-byte hash. Pure, exact,
+    /// deterministic on every platform (byte walk + u8::leading_zeros —
+    /// no floats, no platform sniffing). factored separately from
+    /// work_credit so tests pin it with fixed vectors (no hash grinding).
+    pub fn leading_zero_bits(hash: &TransactionId) -> u32 {
+        let mut n = 0u32;
+        for b in hash.iter() {
+            if *b == 0 {
+                n += 8;
+            } else {
+                n += b.leading_zeros();
+                break;
+            }
+        }
+        n
+    }
+
+    /// PHASE 4B: work credit for n leading zero bits = 2^n expected hashes,
+    /// saturating at u64::MAX (n >= 64, unreachable magnitudes — saturation
+    /// is documented, never silent wrap). Exact integer arithmetic.
+    pub fn credit_for_bits(n: u32) -> u64 {
+        1u64.checked_shl(n).unwrap_or(u64::MAX)
+    }
+
+    /// PHASE 4B: actual-bits work credit of this transaction =
+    /// 2^(leading zero bits of its PoW hash) = expected hashes priced
+    /// exactly. Rewards over-mining; denomination-free (a 20-bit and a
+    /// 24-bit proof price exactly their expected cost — the H1xH2 compound
+    /// priced, not banned). Deterministic, integer-only, recomputable from
+    /// stored fields (no migration, no oracle). Drives Cumulative Descendant
+    /// Work fork choice; never touches validation (difficulty rules unchanged).
+    pub fn work_credit(&self) -> u64 {
+        let n = Self::leading_zero_bits(&self.calculate_pow_hash(self.nonce));
+        Self::credit_for_bits(n)
+    }
+
     /// Mine the nonce to meet the difficulty requirement
     /// Returns the nonce that satisfies the PoW requirement
     pub fn mine_nonce(&self, difficulty: u8) -> u64 {
@@ -473,6 +509,19 @@ impl Transaction {
     /// Transactions newer than this relative to system clock are rejected.
     /// This prevents future-dating attacks and clock manipulation.
     pub const MAX_FUTURE_MS: u64 = 3_600_000; // 1 hour
+
+    /// PHASE 4B: activation timestamp for Cumulative Descendant Work conflict
+    /// resolution (milliseconds). A conflict whose NEWEST member has
+    /// timestamp >= CDW_ACTIVATION_TS resolves by CDW + min-id tiebreak; a
+    /// conflict with ALL members older resolves by grandfathered min-id
+    /// (frozen legacy rule — pre-activation settled outcomes never change).
+    /// Separate constant from DIFFICULTY_MIGRATION_TS (separate policy;
+    /// shared era value): all live-network traffic post-dates it, all
+    /// historical fixtures pre-date it.
+    ///
+    /// CONSENSUS RULE: hardcoded, same on every node (like DIFFICULTY_-
+    /// MIGRATION_TS). Changing it re-resolves cross-boundary conflicts.
+    pub const CDW_ACTIVATION_TS: u64 = 1_758_000_000_000; // 2025-09-16T00:00:00Z
 
     /// Determine the required PoW difficulty for a transaction based on its
     /// timestamp relative to the difficulty migration activation timestamp.

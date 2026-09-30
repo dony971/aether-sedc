@@ -350,10 +350,13 @@ impl TransactionValidator {
             }
         }
 
-        // Check for sender conflict (canonical double-spend detector)
-        if dag.has_sender_conflict(&tx.sender, tx.account_nonce) {
-            return Err(ValidationError::SenderConflict);
-        }
+        // PHASE 4B: NO sender-conflict rejection (loser retention). Same-key
+        // pairs COEXIST in the DAG (both validated, stored, gossiped); the
+        // conflict DECISION (CDW winner, min-id tiebreak, grandfathered)
+        // lives in resolve_conflict_key, enforced at ledger-application time
+        // (rebuild winners) and on the STEP 0 conflict path — never as a
+        // DAG-admission error. (The SenderConflict error variant is retained
+        // for API stability but no longer produced on this path.)
 
         Ok(())
     }

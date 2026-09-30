@@ -1515,7 +1515,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // later on a padded frame — the same strategy v2→v3 used.
 /// Wire format version of the P2P handshake.
 // OBSERVABILITY-ONLY visibility: `pub` so the boot banner can log it.
-pub const P2P_PROTOCOL_VERSION: u8 = 4;
+pub const P2P_PROTOCOL_VERSION: u8 = 5;
 /// Handshake frame: magic(4) | version(1) | genesis hash(32) | ephemeral key(32)
 const HANDSHAKE_FRAME_LEN: usize = 4 + 1 + 32 + 32;
 
@@ -8457,13 +8457,15 @@ mod phase2_privacy_tests {
 
     // --- A.3 protocol version / handshake metadata -------------------------
 
-    /// A.3: exactly ONE bump for this wire change, and an old peer is
-    /// refused at the handshake (magic first, then version).
+    /// Phase 4B: exactly ONE bump for this consensus change, and an old peer
+    /// is refused at the handshake (magic first, then version).
     #[test]
     fn test_protocol_version_bump() {
         assert_eq!(
-            P2P_PROTOCOL_VERSION, 4,
-            "2E-A bumps the wire version exactly once (3 -> 4)"
+            P2P_PROTOCOL_VERSION, 5,
+            "4B bumps the wire version exactly once (4 -> 5) for the CDW
+             consensus break: mixed-version nodes would resolve the same
+             conflicts differently, so they must split loudly, never silently"
         );
 
         // v3 peer: literal ASCII magic → refused by the magic check.

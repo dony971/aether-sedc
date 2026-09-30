@@ -317,14 +317,15 @@ pub struct DAG {
     transactions: HashMap<TransactionId, Transaction>,
     children: HashMap<TransactionId, Vec<TransactionId>>,
     tips: HashSet<TransactionId>,
-    /// PHASE 3C (H3): (sender, account_nonce) -> tx id index. The canonical
-    /// double-spend detector ran a full O(n) scan per admission (STEP 0,
-    /// validate_dag, add_transaction_validated); this makes it O(1) with
-    /// identical answers. Skipped from serialization (rebuilt implicitly:
-    /// every mutation below maintains it). Invariant: at most one tx per key
-    /// in production (the conflict check rejects the second before insert).
+    /// PHASE 3C (H3): (sender, account_nonce) -> tx ids index. O(1) conflict
+    /// lookup with identical answers to the former full scan.
+    /// Skipped from serialization (rebuilt implicitly: every mutation below
+    /// maintains it).
+    /// PHASE 4B: multi-member — conflicting pairs COEXIST (loser retention),
+    /// so one key maps to a LIST. Invariant: no duplicate ids in a list
+    /// (duplicate tx ids are rejected before insert).
     #[serde(skip_serializing)]
-    sender_nonce_index: HashMap<([u8; 32], u64), TransactionId>,
+    sender_nonce_index: HashMap<([u8; 32], u64), Vec<TransactionId>>,
 }
 
 impl DAG {
@@ -365,27 +366,131 @@ impl DAG {
             .any(|tx| &tx.sender == sender && tx.account_nonce == nonce)
     }
 
-    /// Check if a sender already has a transaction with a specific nonce in the DAG.
-    /// Returns the id of the conflicting transaction if one exists.
-    /// This is the canonical double-spend detector: a (sender, nonce) pair must be
-    /// unique across the whole DAG. No special-casing is allowed for any address.
+    /// Check if a sender already has transactions with a specific nonce.
+    /// Returns ALL resident ids sharing the (sender, nonce) key (insertion
+    /// order). Empty = no conflict. Length >= 2 = live conflict set.
     ///
-    /// PHASE 3C (H3): O(1) via the sender_nonce_index (same answers as the
-    /// former full scan; production invariant guarantees at most one tx per
-    /// key, so the indexed id IS the conflicting tx).
-    pub fn find_sender_nonce_conflict(
+    /// PHASE 4B: multi-member (loser retention) — replaces the unique-id
+    /// lookup. Callers needing the conflict DECISION use
+    /// resolve_conflict_key (CDW + tiebreak, grandfather-aware), never raw
+    /// order or length alone.
+    pub fn find_sender_nonce_conflicts(
+        &self,
+        sender: &[u8; 32],
+        nonce: u64,
+    ) -> Vec<TransactionId> {
+        self.sender_nonce_index
+            .get(&(*sender, nonce))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// PHASE 4B: resolve a conflict key to its winner id. Grandfathering: if
+    /// ALL members predate CDW_ACTIVATION_TS, min-id wins (frozen legacy
+    /// rule — pre-activation settled outcomes never change). Otherwise the
+    /// max-subtree-work member wins, min-id tiebreak (deterministic total
+    /// order). Returns None when fewer than 2 members (no conflict).
+    /// Pure function of the DAG set (deterministic across nodes, orders,
+    /// restarts, syncs). Missing members (index/store skew, should not
+    /// happen) count as pre-activation (safe min-id fallback, never panic).
+    pub fn resolve_conflict_key(
         &self,
         sender: &[u8; 32],
         nonce: u64,
     ) -> Option<TransactionId> {
-        self.sender_nonce_index.get(&(*sender, nonce)).copied()
+        let members = self.find_sender_nonce_conflicts(sender, nonce);
+        if members.len() < 2 {
+            return None;
+        }
+        let pre_activation = members.iter().all(|id| {
+            self.transactions
+                .get(id)
+                .map(|t| t.timestamp < Transaction::CDW_ACTIVATION_TS)
+                .unwrap_or(true)
+        });
+        if pre_activation {
+            return members.into_iter().min();
+        }
+        // CDW: highest subtree work wins; min-id breaks exact ties.
+        // Sort is explicit (never rely on index/insertion/HashMap order).
+        let mut scored: Vec<(u64, TransactionId)> = members
+            .iter()
+            .map(|id| (self.subtree_work(*id), *id))
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        scored.into_iter().next().map(|(_, id)| id)
     }
 
-    /// Check if a sender has a conflicting transaction (same nonce).
-    /// Returns true if there's a conflict.
-    pub fn has_sender_conflict(&self, sender: &[u8; 32], nonce: u64) -> bool {
-        self.find_sender_nonce_conflict(sender, nonce).is_some()
+    /// PHASE 4B: conflict keys (>= 2 members) in the ancestry of `parents`
+    /// (genesis roots skipped). A new tx can only shift scores of conflicts
+    /// it descends from (work flows upward), so re-resolution triggers walk
+    /// ancestors, never the whole DAG. Sorted/deduped for determinism.
+    /// Cost O(ancestors); single-member keys excluded (their winner is
+    /// trivially themselves — nothing to flip).
+    pub fn affected_conflict_keys(
+        &self,
+        parents: &[TransactionId; 2],
+    ) -> Vec<([u8; 32], u64)> {
+        let mut out = Vec::new();
+        let mut seen_ids = HashSet::new();
+        let mut seen_keys = HashSet::new();
+        let mut queue: Vec<TransactionId> = parents.to_vec();
+        while let Some(id) = queue.pop() {
+            if !seen_ids.insert(id) {
+                continue;
+            }
+            if id.iter().all(|&b| b == 0) {
+                continue;
+            }
+            if let Some(tx) = self.transactions.get(&id) {
+                let key = (tx.sender, tx.account_nonce);
+                if seen_keys.insert(key)
+                    && self
+                        .sender_nonce_index
+                        .get(&key)
+                        .map(|v| v.len())
+                        .unwrap_or(0)
+                        >= 2
+                {
+                    out.push(key);
+                }
+                queue.extend(tx.parents.iter().copied());
+            }
+        }
+        out.sort();
+        out
     }
+
+    /// PHASE 4B: subtree work = sum of work credits over the UNIQUE
+    /// descendant closure (self included). Saturating u64 addition
+    /// (u64::MAX cap, documented; unreachable magnitudes). Deterministic:
+    /// addition commutes and the visited set makes traversal order
+    /// irrelevant. Stale ids contribute 0 (absent tx) but traversal
+    /// continues through live children entries.
+    pub fn subtree_work(&self, root: TransactionId) -> u64 {
+        let mut total = 0u64;
+        let mut seen = HashSet::new();
+        let mut queue = vec![root];
+        while let Some(id) = queue.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(tx) = self.transactions.get(&id) {
+                total = total.saturating_add(tx.work_credit());
+            }
+            if let Some(children) = self.children.get(&id) {
+                queue.extend(children.iter().copied());
+            }
+        }
+        total
+    }
+
+    /// PHASE 4B: REMOVED `has_sender_conflict` (single-id unique-pair check).
+    /// Conflicting pairs now COEXIST (loser retention); the conflict DECISION
+    /// lives in resolve_conflict_key (CDW + tiebreak, grandfather-aware),
+    /// enforced at ledger-application time (rebuild winners), not at DAG
+    /// admission. Uniqueness callers migrated: STEP 0 (CDW resolve),
+    /// validate_dag (check dropped), add_transaction_validated (check dropped).
 
     /// Prune a transaction and its entire descendant subtree from the DAG
     /// (cascade removal). Used to deterministically resolve a double-spend
@@ -450,16 +555,16 @@ impl DAG {
             }
         }
 
-        // Check for sender conflict (canonical double-spend detector).
-        // Note: duplicate *parent pair* is intentionally NOT treated as a
-        // double-spend: two different senders may legitimately build on the
-        // same two tips. Real double-spends are caught by the (sender, nonce)
-        // uniqueness check below.
-        if self.has_sender_conflict(&tx.sender, tx.account_nonce) {
-            return Err(
-                "Sender conflict: only one pending transaction per sender allowed".to_string(),
-            );
-        }
+        // PHASE 4B: NO sender-conflict rejection (loser retention). Same-key
+        // pairs COEXIST in the DAG (both validated, both stored, both
+        // gossiped); the conflict DECISION (CDW winner, min-id tiebreak,
+        // grandfathered for all-pre-activation keys) is enforced at
+        // ledger-application time by rebuild winners + STEP 0. Duplicate
+        // *parent pair* remains allowed as before (independent rule).
+        //
+        // Convergence note: retention is symmetric (losing newcomers are
+        // INSERTED, never dropped), so arrival order cannot split nodes —
+        // sets converge via gossip and winners are pure functions of sets.
 
         // All validations passed - add transaction
         // 🔧 FIX: Root transactions (parents [0,0]) keep their parents unchanged.
@@ -477,13 +582,12 @@ impl DAG {
         let tx_id = tx_with_parents.id;
 
         self.transactions.insert(tx_id, tx_with_parents.clone());
-        // PHASE 3C (H3): maintain the (sender, nonce) index. Safe: the
-        // conflict check above guarantees no live entry for this key (a
-        // second same-key tx is rejected before reaching here).
-        self.sender_nonce_index.insert(
-            (tx_with_parents.sender, tx_with_parents.account_nonce),
-            tx_id,
-        );
+        // PHASE 3C (H3) index, PHASE 4B multi-member: append (duplicate tx
+        // ids are rejected above, so no id appears twice in one list).
+        self.sender_nonce_index
+            .entry((tx_with_parents.sender, tx_with_parents.account_nonce))
+            .or_default()
+            .push(tx_id);
 
         for parent in &tx_with_parents.parents {
             if parent.iter().all(|&b| b == 0) {
@@ -532,16 +636,14 @@ impl DAG {
     pub fn remove_transaction(&mut self, tx_id: &TransactionId) {
         // Remove transaction from transactions map
         if let Some(tx) = self.transactions.remove(tx_id) {
-            // PHASE 3C (H3): drop the index entry ONLY if it points at this
-            // tx (defensive: the production invariant forbids two live txs
-            // per key, but a conditional delete can never corrupt).
-            if self
-                .sender_nonce_index
-                .get(&(tx.sender, tx.account_nonce))
-                == Some(tx_id)
-            {
-                self.sender_nonce_index
-                    .remove(&(tx.sender, tx.account_nonce));
+            // PHASE 4B multi-member: retain all OTHER ids for this key;
+            // drop the key when its list empties.
+            let key = (tx.sender, tx.account_nonce);
+            if let Some(ids) = self.sender_nonce_index.get_mut(&key) {
+                ids.retain(|id| id != tx_id);
+                if ids.is_empty() {
+                    self.sender_nonce_index.remove(&key);
+                }
             }
             // Remove this transaction from its parents' children lists
             for parent in &tx.parents {
@@ -723,15 +825,16 @@ impl DAG {
     /// topology bookkeeping. Lets tests construct corrupted DAGs (e.g. two
     /// conflicting transactions) that the public API rightly forbids.
     ///
-    /// PHASE 3C (H3): also records the (sender, nonce) index, LAST-WINS on
-    /// duplicate keys. Test-only semantics: production can never hold two
-    /// live txs per key, so lookup order never matters there; harnesses that
-    /// inject conflicting pairs must not assert WHICH id `find_*` returns
-    /// for the pair (assert set membership instead).
+    /// PHASE 3C (H3): also records the (sender, nonce) index.
+    /// PHASE 4B: multi-member append (test harnesses inject conflicting
+    /// pairs; order within a key list is insertion order and must never be
+    /// read as a decision — resolve_conflict_key sorts explicitly).
     #[cfg(test)]
     pub fn inject_transaction_raw(&mut self, tx: Transaction) {
         self.sender_nonce_index
-            .insert((tx.sender, tx.account_nonce), tx.id);
+            .entry((tx.sender, tx.account_nonce))
+            .or_default()
+            .push(tx.id);
         self.transactions.insert(tx.id, tx);
     }
 }
@@ -2046,7 +2149,7 @@ mod tests {
                     sender[16] = 1;
                     sender[17] = (j % 251) as u8;
                 }
-                if dag.find_sender_nonce_conflict(&sender, 0).is_some() {
+                if !dag.find_sender_nonce_conflicts(&sender, 0).is_empty() {
                     hits += 1;
                 }
             }
@@ -2094,12 +2197,19 @@ mod tests {
             (sender, key_serial % 5)
         };
         let brute = |dag: &DAG, key: ([u8; 32], u64)| {
-            dag.transactions()
+            // PHASE 4B: plural comparison (sorted both sides: scan order is
+            // HashMap-random, index order is insertion order — neither is
+            // contractual; SET equality is).
+            let mut found: Vec<TransactionId> = dag
+                .transactions()
                 .iter()
-                .find(|(_, tx)| (tx.sender, tx.account_nonce) == key)
+                .filter(|(_, tx)| (tx.sender, tx.account_nonce) == key)
                 .map(|(id, _)| *id)
+                .collect();
+            found.sort();
+            found
         };
-        for _step in 0..150 {
+        for step in 0..150 {
             match next() % 4 {
                 0 => {
                     // Fresh validated add (must succeed).
@@ -2121,7 +2231,8 @@ mod tests {
                     keys.push((sender, nonce));
                 }
                 1 => {
-                    // Conflicting add (must be rejected, index untouched).
+                    // Conflicting add (PHASE 4B: RETAINED, not rejected —
+                    // loser retention; the key simply gains a member).
                     if keys.is_empty() {
                         continue;
                     }
@@ -2130,7 +2241,9 @@ mod tests {
                         [[0u8; 32]; 2],
                         sender,
                         [7u8; 32],
-                        2,
+                        // Unique per step (else a repeat pick would be an
+                        // exact-id duplicate, rejected for the wrong reason).
+                        2 + step as u64,
                         1,
                         1234567890,
                         0,
@@ -2139,10 +2252,8 @@ mod tests {
                         vec![0u8; 32],
                     );
                     tx.id = tx.compute_hash();
-                    assert!(
-                        dag.add_transaction_validated(tx).is_err(),
-                        "same-key second tx must be rejected"
-                    );
+                    dag.add_transaction_validated(tx)
+                        .expect("conflict pair coexists");
                 }
                 2 => {
                     // Remove (possibly absent → no-op).
@@ -2159,16 +2270,20 @@ mod tests {
             }
             // Verify every tracked key plus never-keys.
             for key in keys.iter().copied() {
+                let mut indexed = dag.find_sender_nonce_conflicts(&key.0, key.1);
+                indexed.sort();
                 assert_eq!(
-                    dag.find_sender_nonce_conflict(&key.0, key.1),
+                    indexed,
                     brute(&dag, key),
                     "index/scan mismatch for key after mutation"
                 );
             }
             for k in 0..4u8 {
                 let never = ([0xEEu8; 32], 1000 + k as u64);
-                assert_eq!(dag.find_sender_nonce_conflict(&never.0, never.1), None);
-                assert_eq!(brute(&dag, never), None);
+                assert!(dag
+                    .find_sender_nonce_conflicts(&never.0, never.1)
+                    .is_empty());
+                assert!(brute(&dag, never).is_empty());
             }
         }
         println!(

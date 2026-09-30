@@ -18,7 +18,6 @@
 
 use crate::ledger::Ledger;
 use crate::parent_selection::DAG;
-use crate::storage::BatchOperation;
 use crate::rpc::Mempool;
 use crate::transaction::{Transaction, TransactionId};
 use crate::validation::{TransactionValidator, ValidationError, ValidationMode};
@@ -141,98 +140,27 @@ impl TransactionProcessor {
         // own WARN/ERROR lines at their sites.
         tracing::debug!("🔍 Processing transaction: {}", hex::encode(tx.id));
 
-        // STEP 0: DETERMINISTIC DOUBLE-SPEND RESOLUTION (NV-09)
-        // If another transaction exists for the same (sender, nonce), the one
-        // with the lexicographically SMALLEST id wins (this is the same rule on
-        // every node, so all nodes converge). If we win, we prune the losing
-        // subtree and rebuild the ledger from the remaining DAG. If we lose,
-        // we reject deterministically. No special-casing for any address.
+        // STEP 0: CONFLICT DETECTION (PHASE 4B: CDW + loser retention).
+        // If resident txs share the newcomer's (sender, nonce), the newcomer
+        // joins them as a retained conflict member — winner or loser — via
+        // the conflict path below. It is NEVER pruned and NEVER rejected for
+        // conflicting (loser retention: both sides must coexist everywhere so
+        // arrival order cannot split nodes). Winner selection (CDW +
+        // min-id tiebreak, grandfathered for all-pre-activation keys),
+        // ledger application, and re-resolution triggers live there.
+        // Fast path (no residents): fall through to the normal pipeline,
+        // which carries its own re-resolution trigger for conflict-descendant
+        // insertions (see STEP 1c + STEP 6b).
         {
-            let dag_read = dag.read().await;
-            if let Some(existing_id) =
-                dag_read.find_sender_nonce_conflict(&tx.sender, tx.account_nonce)
-            {
-                if existing_id <= tx.id {
-                    tracing::warn!(
-                        "⚠️ Sender conflict rejected (existing id {} <= new id {}): {}",
-                        hex::encode(&existing_id[..4]),
-                        hex::encode(&tx.id[..4]),
-                        hex::encode(tx.sender)
-                    );
-                    return Err(ProcessingError::ValidationFailed(
-                        ValidationError::SenderConflict,
-                    ));
-                }
-                drop(dag_read);
-                // V-21 FIX: never destroy a valid transaction for an INVALID
-                // winner. The incoming tx must at least pass pure validation
-                // (PoW, signature, sender-key match) BEFORE we prune anything,
-                // otherwise a malformed tx could knock a valid tx out of the
-                // local DAG and diverge the node from the network.
-                //
-                // PHASE 3B (C1): evaluate the winner in the CALLER's mode, not
-                // a hardcoded Fresh. STEP 1 below uses `mode` too, so STEP 0
-                // and STEP 1 always agree on one tx: the same winner is
-                // accepted (or rejected) no matter which conflicting tx
-                // arrived first. A hardcoded mode here split nodes whenever
-                // the winner was timestamp-stale/future/backdated at delivery
-                // (Fresh rejected what Historical accepted). PoW, signature
-                // and sender-key checks run in EVERY mode, so the V-21
-                // protection is fully preserved.
-                self.validator.validate_pure(&tx, mode)?;
-                tracing::warn!(
-                    "🔄 Resolving sender conflict in favor of {} (pruning {})",
-                    hex::encode(&tx.id[..4]),
-                    hex::encode(&existing_id[..4])
-                );
-                let mut dag_w = match dag.try_write() {
-                    Ok(l) => l,
-                    Err(e) => return Err(ProcessingError::LockError(format!("DAG lock: {}", e))),
-                };
-                let mut ledger_w = match ledger.try_write() {
-                    Ok(l) => l,
-                    Err(e) => {
-                        return Err(ProcessingError::LockError(format!("Ledger lock: {}", e)))
-                    }
-                };
-                let pruned = dag_w.prune_subtree(existing_id);
-                // PHASE 3C (H4): observability for the losing branch. The
-                // pruned set is EXACTLY the loser subtree (precision pinned by
-                // test_conflict_prunes_only_invalid_branch): innocent parties
-                // that built on the loser need this list to re-issue (their
-                // funds are intact — the rebuild below drops only effects, and
-                // hash-bound parents make in-DAG survival impossible). Log the
-                // count plus the first ids (bounded: subtrees can be large).
-                {
-                    let sample: Vec<String> = pruned
-                        .iter()
-                        .take(8)
-                        .map(|id| hex::encode(&id[..4]))
-                        .collect();
-                    tracing::warn!(
-                        "🗑️ Conflict prune: {} txs removed (loser subtree), sample [{}]",
-                        pruned.len(),
-                        sample.join(",")
-                    );
-                }
-                // V-21 FIX: purge the pruned transactions from persistent
-                // storage so they cannot resurrect at the next boot (the boot
-                // rebuild would otherwise become nondeterministic: whichever
-                // of the loser/winner it hits first would win).
-                //
-                // PHASE 3C (H3): one atomic batch_write instead of N
-                // per-id deletes — identical semantics (index + applied-mark
-                // purge per id, see batch_write DeleteTransaction) with one
-                // Sled transaction + one flush instead of N syscalls.
-                if let Some(storage) = ledger_w.storage() {
-                    let storage_read = storage.read().await;
-                    let ops: Vec<BatchOperation> = pruned
-                        .iter()
-                        .map(|pruned_id| BatchOperation::DeleteTransaction(*pruned_id))
-                        .collect();
-                    let _ = storage_read.batch_write(ops);
-                }
-                ledger_w.rebuild_from_dag(&dag_w);
+            let has_conflict = !dag
+                .read()
+                .await
+                .find_sender_nonce_conflicts(&tx.sender, tx.account_nonce)
+                .is_empty();
+            if has_conflict {
+                return self
+                    .process_conflict(tx, dag, ledger, mempool, mode)
+                    .await;
             }
         }
 
@@ -312,6 +240,13 @@ impl TransactionProcessor {
             }
         }
         self.validator.validate_ledger(&tx, &ledger_read, min_fee)?;
+        // PHASE 4B: re-resolution trigger bookkeeping. The newcomer may
+        // descend from tracked conflicts (its work accrues to their
+        // subtrees): record affected keys + their pre-insert winners now
+        // (read locks held); STEP 6b recomputes post-insert and rebuilds
+        // iff any winner flipped. Read-only, no state touched.
+        let trigger_keys = dag_read.affected_conflict_keys(&tx.parents);
+        let trigger_pre = Self::conflict_winners_for(&dag_read, &trigger_keys);
         drop(dag_read);
         drop(ledger_read);
 
@@ -383,6 +318,24 @@ impl TransactionProcessor {
             return Err(ProcessingError::DagError(format!("DAG add failed: {}", e)));
         }
 
+        // STEP 6b: RE-RESOLUTION TRIGGER (PHASE 4B). The newcomer's work
+        // accrues to its ancestors' subtrees: if any tracked conflict key was
+        // affected (trigger_keys from STEP 1c), recompute and rebuild iff a
+        // winner flipped. With no flip the STEP-4 live state stands (it is
+        // rebuild-equivalent by the same live≈rebuild trust as the base
+        // protocol — winners unchanged, newcomer applied). With a flip the
+        // full replay re-derives the flipped world (the newcomer's STEP-4
+        // transfer included or correctly dropped by the replay).
+        if !trigger_keys.is_empty() {
+            let trigger_post = Self::conflict_winners_for(&dag, &trigger_keys);
+            if trigger_post != trigger_pre {
+                tracing::info!(
+                    "🔄 Descendant arrival flipped conflict winner(s); rebuilding"
+                );
+                ledger.rebuild_from_dag(&dag);
+            }
+        }
+
         // STEP 7: REMOVE FROM MEMPOOL (PHASE D — the mempool is a PENDING
         // queue, not a dead-end window). The drainer SELECTed this tx; once it
         // reaches the DAG it leaves the queue. Previously this step ADDED the
@@ -450,6 +403,171 @@ impl TransactionProcessor {
             hex::encode(tx.id)
         );
         Ok(())
+    }
+
+    /// PHASE 4B: conflict-path acceptance (CDW + loser retention).
+    ///
+    /// Entry: STEP 0 detected resident txs sharing the newcomer's
+    /// (sender, nonce). The newcomer is validated (pure + DAG, orphan gate
+    /// included) and INSERTED — winner or loser, never pruned, never rejected
+    /// for conflicting. Ledger effects apply ONLY via rebuild, and only when
+    /// some tracked winner flipped (newcomer effects included); otherwise the
+    /// ledger stands (newcomer sits unapplied as residue).
+    ///
+    /// Deliberate deviations from the normal path, all argued:
+    /// - NO validate_ledger gate: a would-be winner is routinely unfundable
+    ///   in the incumbent loser's world; funding is evaluated at rebuild time
+    ///   in winner-world (where the winner IS fundable if legitimately funded
+    ///   at all). Gating here would veto valid winners (the exact bug this
+    ///   redesign removes).
+    /// - NO live transfer (no STEP-4 equivalent): effects flow exclusively
+    ///   through rebuild_from_dag, so a flip can never half-apply.
+    /// - Fee policy unchanged: the accept funnel fee-gates before the mempool;
+    ///   min_fee is therefore not re-checked here.
+    /// V-21 preserved: pure validation precedes ANY mutation, in the caller
+    /// mode (3B consistency).
+    async fn process_conflict(
+        &self,
+        tx: Transaction,
+        dag: &Arc<RwLock<DAG>>,
+        ledger: &Arc<RwLock<Ledger>>,
+        mempool: &Arc<RwLock<Mempool>>,
+        mode: ValidationMode,
+    ) -> Result<(), ProcessingError> {
+        self.validator.validate_pure(&tx, mode)?;
+        // Orphan gate (same shape as STEP 1b): missing parents park, they
+        // must never be inserted without their ancestry.
+        {
+            let dag_read = dag.read().await;
+            let missing_parents: Vec<[u8; 32]> = tx
+                .parents
+                .iter()
+                .filter(|p| **p != [0u8; 32] && !dag_read.transactions().contains_key(*p))
+                .copied()
+                .collect();
+            if !missing_parents.is_empty() {
+                drop(dag_read);
+                return Err(ProcessingError::Orphan(missing_parents));
+            }
+            // Full DAG checks (duplicate id, parents present, parent-ts
+            // monotonicity). No sender-conflict rejection (retention).
+            self.validator.validate_dag(&tx, &dag_read)?;
+        }
+        // Write locks (same order/discipline as the normal path).
+        let mut dag = match dag.try_write() {
+            Ok(l) => l,
+            Err(e) => return Err(ProcessingError::LockError(format!("DAG lock: {}", e))),
+        };
+        let mut ledger = match ledger.try_write() {
+            Ok(l) => l,
+            Err(e) => {
+                drop(dag);
+                return Err(ProcessingError::LockError(format!("Ledger lock: {}", e)));
+            }
+        };
+        let mut mempool = match mempool.try_write() {
+            Ok(l) => l,
+            Err(e) => {
+                drop(ledger);
+                drop(dag);
+                return Err(ProcessingError::LockError(format!("Mempool lock: {}", e)));
+            }
+        };
+        // Snapshot for M1 rollback.
+        let ledger_snapshot = ledger.clone();
+        // Pre-insert winners: own key (trivial if sole resident) + ancestor
+        // keys the newcomer descends from (its work accrues to their subtrees).
+        let mut keys = dag.affected_conflict_keys(&tx.parents);
+        keys.push((tx.sender, tx.account_nonce));
+        keys.sort();
+        keys.dedup();
+        let pre = Self::conflict_winners_for(&dag, &keys);
+        // Insert (retained win or lose — never pruned, never rejected).
+        if let Err(e) = dag.add_transaction_validated(tx.clone()) {
+            tracing::error!("❌ Conflict DAG add failed: {}", e);
+            *ledger = ledger_snapshot;
+            drop(ledger);
+            drop(dag);
+            drop(mempool);
+            return Err(ProcessingError::DagError(format!("DAG add failed: {}", e)));
+        }
+        // Re-resolve; rebuild iff any winner flipped (newcomer effects apply
+        // ONLY through the rebuild — never live-transferred on this path).
+        let post = Self::conflict_winners_for(&dag, &keys);
+        if post != pre {
+            tracing::info!(
+                "🔄 Conflict re-resolved (CDW flip): {:?} -> {:?}",
+                pre.iter()
+                    .map(|(_, id)| hex::encode(&id[..4]))
+                    .collect::<Vec<_>>(),
+                post.iter()
+                    .map(|(_, id)| hex::encode(&id[..4]))
+                    .collect::<Vec<_>>(),
+            );
+            ledger.rebuild_from_dag(&dag);
+        }
+        // Terminal disposition (DAG-held, winner or retained loser alike).
+        mempool.remove_transaction(&tx.id);
+        // Persistence (mirror STEP 8, M1 rollback on either failure).
+        if let Some(storage) = ledger.storage() {
+            let storage_read = storage.read().await;
+            if let Err(e) = storage_read.put_transaction(&tx) {
+                tracing::error!("❌ Failed to persist conflict tx to Sled: {}", e);
+                Self::rollback_apply(&mut dag, &mut ledger, &ledger_snapshot, &tx.id);
+                drop(ledger);
+                drop(dag);
+                drop(mempool);
+                return Err(ProcessingError::PersistenceError(format!(
+                    "Transaction persist failed: {}",
+                    e
+                )));
+            }
+        }
+        if let Err(e) = ledger.save_dirty().await {
+            tracing::error!("❌ Conflict persistence failed: {}", e);
+            Self::rollback_apply(&mut dag, &mut ledger, &ledger_snapshot, &tx.id);
+            drop(ledger);
+            drop(dag);
+            drop(mempool);
+            return Err(ProcessingError::PersistenceError(format!(
+                "Save failed: {}",
+                e
+            )));
+        }
+        tracing::info!(
+            "✅ Conflict tx processed (retained): {}",
+            hex::encode(tx.id)
+        );
+        Ok(())
+    }
+
+    /// PHASE 4B: winners for `keys` against `dag`, in input order.
+    /// Single-member keys resolve trivially to their sole member (no score
+    /// needed); multi-member keys via resolve_conflict_key (CDW + tiebreak,
+    /// grandfathered). Empty member lists are skipped (cannot happen in
+    /// production — maintained index — but never panic on skew). Pure,
+    /// deterministic; the flip detector compares pre/post vectors.
+    fn conflict_winners_for(
+        dag: &DAG,
+        keys: &[([u8; 32], u64)],
+    ) -> Vec<(([u8; 32], u64), TransactionId)> {
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let members = dag.find_sender_nonce_conflicts(&key.0, key.1);
+            if members.is_empty() {
+                continue;
+            }
+            let winner = if members.len() == 1 {
+                members[0]
+            } else {
+                match dag.resolve_conflict_key(&key.0, key.1) {
+                    Some(id) => id,
+                    None => continue,
+                }
+            };
+            out.push((*key, winner));
+        }
+        out
     }
 
     /// PHASE 3E (M1): undo STEPS 4–7 after a STEP-8 persistence failure so an
@@ -719,8 +837,13 @@ mod tests {
         // Borrow the processor once: the closure + async blocks capture this
         // shared reference (Copy), keeping the closure Fn for both runs.
         let processor_ref = &processor;
-        let run = |first: Transaction, second: Transaction, second_is_loser: bool| {
-            let expect_second_ok = !second_is_loser;
+        // PHASE 4B: both arrivals accepted (loser retention) — the run
+        // closure no longer takes a loser flag and expects Ok twice. The
+        // ORDER-INVARIANCE property under test is unchanged (identical DAG
+        // sets, identical ledgers, identical fingerprints in both orders);
+        // only the expected SET grew (loser retained, decided at ledger via
+        // CDW/min-id — grandfathered min-id here, same winner as before).
+        let run = |first: Transaction, second: Transaction| {
             async move {
                 let dag = Arc::new(RwLock::new(DAG::new()));
                 let ledger = Arc::new(RwLock::new(Ledger::new()));
@@ -767,7 +890,7 @@ mod tests {
                     )
                     .await
                     .expect("first arrival is accepted");
-                let second_result = processor_ref
+                processor_ref
                     .process(
                         second,
                         &dag,
@@ -776,50 +899,41 @@ mod tests {
                         10,
                         ValidationMode::Historical,
                     )
-                    .await;
-                if expect_second_ok {
-                    assert!(
-                        second_result.is_ok(),
-                        "the winning transaction must be accepted, got {:?}",
-                        second_result
-                    );
-                } else {
-                    assert!(
-                        second_result.is_err(),
-                        "the losing transaction must be rejected, got {:?}",
-                        second_result
-                    );
-                }
+                    .await
+                    .expect("second arrival is retained (PHASE 4B)");
                 (dag, ledger)
             }
         };
 
-        let (dag_wl, ledger_wl) = run(winner.clone(), loser.clone(), true).await;
-        let (dag_lw, ledger_lw) = run(loser.clone(), winner.clone(), false).await;
+        let (dag_wl, ledger_wl) = run(winner.clone(), loser.clone()).await;
+        let (dag_lw, ledger_lw) = run(loser.clone(), winner.clone()).await;
 
-        // Identical DAG outcome: funding + exactly the winner, in both orders.
+        // Identical DAG outcome: funding + winner + retained loser, both orders.
         {
             let dag_wl_guard = dag_wl.read().await;
             let dag_lw_guard = dag_lw.read().await;
             assert_eq!(
                 dag_wl_guard.transaction_count(),
-                2,
-                "order 1: funding + winner"
+                3,
+                "order 1: funding + winner + retained loser"
             );
             assert_eq!(
                 dag_lw_guard.transaction_count(),
-                2,
-                "order 2: funding + winner"
+                3,
+                "order 2: funding + winner + retained loser"
             );
             assert!(dag_wl_guard.transactions().contains_key(&winner.id));
             assert!(dag_lw_guard.transactions().contains_key(&winner.id));
-            assert!(!dag_wl_guard.transactions().contains_key(&loser.id));
-            assert!(!dag_lw_guard.transactions().contains_key(&loser.id));
+            assert!(dag_wl_guard.transactions().contains_key(&loser.id));
+            assert!(dag_lw_guard.transactions().contains_key(&loser.id));
             // WEIGHT: identical in both orders too — the DAG maintains it the
-            // same way whichever transaction arrives first. Both roots (winner
-            // and funding have genesis parents) → each subtree = {itself} = 1.
+            // same way whichever transaction arrives first. All three roots
+            // (winner, retained loser, funding — genesis parents each) →
+            // each subtree = {itself} = 1.
             assert_eq!(dag_wl_guard.get_transaction(winner.id).unwrap().weight, 1.0);
             assert_eq!(dag_lw_guard.get_transaction(winner.id).unwrap().weight, 1.0);
+            assert_eq!(dag_wl_guard.get_transaction(loser.id).unwrap().weight, 1.0);
+            assert_eq!(dag_lw_guard.get_transaction(loser.id).unwrap().weight, 1.0);
             for (label, guard) in [("order 1", &dag_wl_guard), ("order 2", &dag_lw_guard)] {
                 let funding_weight = guard
                     .transactions()
@@ -856,14 +970,16 @@ mod tests {
             .unwrap()
     }
 
-    /// S11 reinforcement (restart/resync dimension): a crash that leaves BOTH
-    /// double-spend candidates — plus a descendant built on the loser — in
-    /// persistent storage must still converge to the same canonical winner at
-    /// boot. The boot path (node.rs) runs `canonical_resolve_conflicts` BEFORE
-    /// the topological rebuild (V-21), then rebuilds the ledger from the
-    /// surviving DAG. This test replays exactly that sequence on a simulated
-    /// crash residue and asserts the outcome is identical to the live
-    /// resolution (winner only, same balances).
+    /// S11 reinforcement (restart/resync dimension), PHASE 4B note: this test
+    /// replays the LEGACY boot sequence explicitly (canonical_resolve prunes
+    /// losers, then topological rebuild) on a simulated crash residue and
+    /// asserts winner-only convergence with identical balances. The live node
+    /// boot path (node.rs) no longer prunes (loser retention — both sides are
+    /// legitimate DAG residents, decided at ledger via CDW/min-id); the
+    /// canonical helper itself is unchanged (pure min-id, still correct for
+    /// pre-activation data), so this test pins the legacy helper, not current
+    /// boot behavior. See test_conflict_rebuild_preserves_valid_state for the
+    /// retention-era boot equivalence proof.
     #[tokio::test]
     async fn test_boot_rebuild_converges_after_crash_residue() {
         use crate::parent_selection::canonical_resolve_conflicts;
@@ -1282,19 +1398,17 @@ mod tests {
         assert!(dag.read().await.transactions().contains_key(&tx.id));
     }
 
-    /// PHASE 3B (C1): STEP-0 / STEP-1 validation-mode consistency.
+    /// PHASE 3B (C1) + PHASE 4B (retention): STEP-0 / STEP-1 validation-mode
+    /// consistency under loser retention.
     ///
     /// Regression shape: a conflict winner whose timestamp is stale under
     /// live policy (pre-activation here → BackdatedTimestamp in Fresh) must
     /// be treated IDENTICALLY no matter which conflicting tx arrived first.
-    /// Pre-fix, STEP 0 hardcoded Fresh while STEP 1 used the caller mode, so
-    /// loser-first order kept the loser while winner-first order installed
-    /// the winner: a permanent split across a partition/reconnect. Post-fix
-    /// both steps use the caller mode:
-    /// - Historical: the winner installs in BOTH orders (healing works; no
-    ///   Fresh veto in the winner branch);
-    /// - Fresh: the winner is rejected in BOTH orders (loser kept in both;
-    ///   consistent rejection, still no split).
+    /// Post-fix both steps use the caller mode:
+    /// - Historical: the winner installs AND the loser is retained in BOTH
+    ///   orders (healing works; no Fresh veto in the winner branch);
+    /// - Fresh: neither installs in BOTH orders (consistent rejection at the
+    ///   pure gate — still no split; only funding remains in both DAGs).
     /// Cross-mode outcomes legitimately differ (policy, not inconsistency);
     /// WITHIN one mode, arrival order must not matter. Compares DAG id sets,
     /// balances and supply (fingerprint) across A-then-B vs B-then-A.
@@ -1407,8 +1521,11 @@ mod tests {
             }
         };
 
-        // Historical: winner installs in BOTH orders (pre-fix this failed in
-        // loser-first order — STEP 0 vetoed under Fresh).
+        // PHASE 4B: retention — Historical installs the winner AND retains
+        // the loser in BOTH orders (no prune anywhere on this path). The
+        // C1 property under test is unchanged (same treatment regardless of
+        // arrival order); only the expected SET grew (loser retained,
+        // decided at ledger via CDW/min-id — grandfathered min-id here).
         let (fp_hw, w_hw, l_hw) = run(
             winner.clone(),
             loser.clone(),
@@ -1422,7 +1539,7 @@ mod tests {
         )
         .await;
         assert!(w_hw && w_hl, "Historical: winner must install in both orders");
-        assert!(!l_hw && !l_hl, "Historical: loser must drop in both orders");
+        assert!(l_hw && l_hl, "Historical: loser must be retained in both orders");
         assert_eq!(
             fp_hw, fp_hl,
             "Historical: fingerprint must be order-invariant"
@@ -1444,14 +1561,18 @@ mod tests {
         );
     }
 
-    /// PHASE 3C (H3): STEP-0 storage-purge wiring. A conflict resolved live
-    /// through process() with a storage-backed ledger must leave the winner
-    /// persisted and the pruned loser ABSENT from the store (no resurrection
-    /// at boot). Guards the per-id-delete → batch_write rewrite: identical
-    /// semantics (index + applied-mark purge) asserted end-to-end.
-    /// MEDIUM: two 20-bit mines (policy-valid pre-activation fixtures).
+    /// PHASE 4B (retention): STEP-0 loser retention end-to-end. A conflict
+    /// resolved live through process() with a storage-backed ledger must
+    /// leave BOTH sides persisted (winner installs, loser retained — no
+    /// prune, no purge). Guards the batch_write call site (still exercised
+    /// for other paths) and pins the retention invariant where the old
+    /// prune+purge behavior lived: the store must hold the loser (future
+    /// re-resolution needs it), the ledger must apply only the winner.
+    /// (Pre-4B this test pinned prune+purge; the divergence is the specified
+    /// CONSENSUS_BREAK — retention replaces deletion. MEDIUM: two 20-bit
+    /// mines, policy-valid pre-activation fixtures, grandfathered min-id.)
     #[tokio::test]
-    async fn test_step0_prune_purges_loser_from_storage() {
+    async fn test_step0_retains_loser_everywhere() {
         use crate::ledger::Ledger;
         use crate::storage::Storage;
         use crate::wallet::Wallet;
@@ -1531,7 +1652,7 @@ mod tests {
             (tx_b.clone(), tx_a.clone())
         };
 
-        // Loser first (accepted + persisted), then winner (STEP-0 prune).
+        // Loser first (accepted + persisted), then winner (retained pair).
         processor
             .process(
                 loser.clone(),
@@ -1560,16 +1681,16 @@ mod tests {
                 ValidationMode::Historical,
             )
             .await
-            .expect("winner prunes the loser");
-        // DAG + ledger: winner installed, loser gone.
+            .expect("winner joins the retained pair");
+        // DAG + ledger: winner installed, loser RETAINED (not pruned).
         assert!(dag.read().await.transactions().contains_key(&winner.id));
-        assert!(!dag.read().await.transactions().contains_key(&loser.id));
+        assert!(dag.read().await.transactions().contains_key(&loser.id));
         assert_eq!(
             ledger.read().await.get_balance(&winner.receiver),
             100
         );
         assert_eq!(ledger.read().await.get_balance(&loser.receiver), 0);
-        // Store: winner present, loser purged (no boot resurrection).
+        // Store: BOTH present (retention — re-resolution needs the loser).
         {
             let store = storage_arc.read().await;
             assert!(
@@ -1577,8 +1698,8 @@ mod tests {
                 "winner persisted"
             );
             assert!(
-                !store.transaction_exists(loser.id).unwrap(),
-                "pruned loser must be purged from storage"
+                store.transaction_exists(loser.id).unwrap(),
+                "retained loser must stay in storage"
             );
         }
     }

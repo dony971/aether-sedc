@@ -898,6 +898,11 @@ fn test_malicious_flood_within_bounds() {
 }
 
 /// Malicious peer scenario H: réponse contradictoire (different data for same hash).
+/// PHASE 4B: contradictory same-key txs now COEXIST (loser retention) instead
+/// of being rejected at admission — equivocation is resolved at
+/// ledger-application time (CDW winner, min-id tiebreak, grandfathered here:
+/// pre-activation fixtures), never by DAG rejection. The divergence from the
+/// old rejection behavior is the specified CONSENSUS_BREAK (intended).
 #[test]
 fn test_malicious_contradictory_response() {
     // Two different txs with the same sender/nonce (conflict)
@@ -928,11 +933,23 @@ fn test_malicious_contradictory_response() {
     );
     let (mut dag, _b, _o, _m) = initialize_genesis(GenesisConfig::default());
     let _ = dag.add_transaction_validated(tx_a.clone());
+    // PHASE 4B: retained pair (both admitted); decision deferred to resolve.
     let result = dag.add_transaction_validated(tx_b.clone());
     assert!(
-        result.is_err(),
-        "conflicting tx must be rejected (sender nonce)"
+        result.is_ok(),
+        "conflicting tx must be retained, not rejected: {:?}",
+        result
     );
+    let members = dag.find_sender_nonce_conflicts(&sender, 1);
+    assert_eq!(members.len(), 2, "both sides must coexist");
+    assert!(members.contains(&tx_a.id));
+    assert!(members.contains(&tx_b.id));
+    // Grandfathered fixtures (pre-activation ts): min-id decides, deterministically.
+    let winner = dag
+        .resolve_conflict_key(&sender, 1)
+        .expect("pair must resolve");
+    let expect_min = tx_a.id.min(tx_b.id);
+    assert_eq!(winner, expect_min, "grandfathered pair resolves min-id");
 }
 
 // ===== ÉTAPE 9: Convergence Invariants =====

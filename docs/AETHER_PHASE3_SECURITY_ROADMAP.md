@@ -1,5 +1,30 @@
 # AETHER PHASE 3A â€” SECURITY ROADMAP (future work, no code in this audit)
 
+> PHASE 3F STATUS (study only, no code, no commit): H2 = REQUIRES_PROTOCOL_CHANGE.
+> Options A-F analyzed on 10 dimensions + 9-attack matrix + protocol-consequence
+> table + Bitcoin principle comparison in docs/AETHER_PHASE3_H2_GRINDING_ANALYSIS.md.
+> Only family C (cumulative work) is effective + determinism-preserving, and it
+> forks conflict outcomes (version bump + migration required). No effective
+> compatible fix exists. Phase-4 outline recorded, NOT started. Receiver
+> confirmation policy remains the only operative mitigation.
+
+> PHASE 4A STATUS (design only, no code, no commit): fork-choice redesign
+> study complete. PRIMARY = Cumulative Descendant Work + min-id tiebreak +
+> loser retention with re-resolution (convergent, priced). BACKUP =
+> work-gated min-id replacement window (minimal, residual boundary splits).
+> See docs/AETHER_PHASE4_CONSENSUS_WEIGHT_DESIGN.md (properties, options A-F
+> x22 dims, attack matrix, DAG examples, decision, test plan) and
+> docs/AETHER_PHASE4_MIGRATION_PLAN.md (break inventory, grandfathering,
+> activation, rollback). H2 stays OPEN_RESIDUAL pending Phase-4
+> implementation. Phase 4B NOT started.
+
+> PHASE 4B STATUS (implemented, unreleased, uncommitted): PRIMARY design
+> shipped (CDW actual-bits + min-id tiebreak + loser retention +
+> re-resolution triggers + activation/grandfathering + P2P v5). 18 phase4
+> tests green (17 debug + 1 release) + full regression gates green. H2 moves
+> to RESOLVED contingent on release/activation (see IMPLEMENTATION doc).
+> Commit pending exit review.
+
 > PHASE 3B STATUS (commit `8ec482d`): P0-1, P0-2, P0-doc CLOSED — see
 > `docs/AETHER_PHASE3_CONSENSUS_HARDENING.md` (C1/C2/H1 = PASS).
 > PHASE 3C STATUS (this phase): P1-1 (H3), P1-2 (H2), P2-4 (H4) CLOSED — see

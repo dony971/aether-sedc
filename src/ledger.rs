@@ -508,21 +508,35 @@ impl Ledger {
         // explicitly forbidden (it differs across nodes and runs).
         let mut pending: Vec<Transaction> = dag.transactions().values().cloned().collect();
 
-        // Canonical double-spend winners: the SMALLEST id per (sender,
-        // account_nonce) pair, computed up front as a pure function of the
-        // DAG. A tx that is not the canonical winner of its key can NEVER
-        // apply, no matter when the replay meets it (this also covers the
-        // pathological case where the loser is fundable before the winner).
+        // PHASE 4B: canonical winners per (sender, account_nonce) key,
+        // delegated to DAG conflict resolution (CDW + min-id tiebreak,
+        // grandfathered for all-pre-activation keys). Single-member keys
+        // resolve trivially to themselves. A tx that is not the canonical
+        // winner of its key can NEVER apply, no matter when the replay meets
+        // it (this also covers the pathological case where the loser is
+        // fundable before the winner). Pure function of the DAG set:
+        // deterministic across nodes, orders, restarts, syncs.
         let mut canonical_winners: std::collections::HashMap<(Address, u64), TransactionId> =
             std::collections::HashMap::new();
-        for tx in &pending {
-            let key = (tx.sender, tx.account_nonce);
-            let better = match canonical_winners.get(&key) {
-                Some(existing) => tx.id < *existing,
-                None => true,
-            };
-            if better {
-                canonical_winners.insert(key, tx.id);
+        {
+            use std::collections::HashSet;
+            let mut keys: HashSet<(Address, u64)> = HashSet::new();
+            for tx in &pending {
+                keys.insert((tx.sender, tx.account_nonce));
+            }
+            for (sender, nonce) in keys {
+                let members = dag.find_sender_nonce_conflicts(&sender, nonce);
+                if members.len() < 2 {
+                    if let Some(only) = members.into_iter().next() {
+                        canonical_winners.insert((sender, nonce), only);
+                    }
+                    continue;
+                }
+                // Multi-member: authoritative resolution (never None here —
+                // defensive fallback is the sole member, unreachable).
+                if let Some(winner) = dag.resolve_conflict_key(&sender, nonce) {
+                    canonical_winners.insert((sender, nonce), winner);
+                }
             }
         }
         pending.sort_unstable_by_key(|tx| tx.id);

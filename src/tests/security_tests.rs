@@ -166,8 +166,11 @@ mod replay_attack_tests {
         let result = validator.validate_dag(&tx1, &dag);
         assert!(result.is_err());
 
-        // A DIFFERENT transaction reusing the same (sender, nonce) pair must
-        // be rejected by the canonical double-spend detector.
+        // A DIFFERENT transaction reusing the same (sender, nonce) pair is NO
+        // LONGER rejected at DAG admission (PHASE 4B loser retention): both
+        // sides coexist and the conflict is decided at ledger-application
+        // time (CDW winner, min-id tiebreak, grandfathered). Exact-id replay
+        // above is still rejected — replay protection is intact.
         let tx2 = Transaction::new(
             [[0u8; 32]; 2],
             addr,
@@ -181,7 +184,7 @@ mod replay_attack_tests {
             vec![1u8; 64],
         );
         let result = validator.validate_dag(&tx2, &dag);
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     /// Out-of-order nonces must NOT be rejected at the ledger level: the
@@ -225,9 +228,14 @@ mod double_spend_tests {
 
     /// A (sender, nonce) pair must be unique in the DAG (canonical double-spend
     /// detector). A second transaction from the same sender with the same nonce
-    /// is rejected, regardless of its parents.
+    /// PHASE 4B: same sender + same nonce is ADMITTED (loser retention),
+    /// decided at ledger-application time — no longer rejected at admission,
+    /// regardless of parents. (Old rule rejected here; the divergence is the
+    /// specified CONSENSUS_BREAK, proven intended by the phase4 comparative
+    /// tests. Exact-id replays are still rejected — see
+    /// test_replay_attack_prevention.)
     #[tokio::test]
-    async fn test_sender_nonce_conflict_rejected() {
+    async fn test_sender_nonce_conflict_retained() {
         let mut dag = DAG::new();
         let addr = [1u8; 32];
 
@@ -245,7 +253,7 @@ mod double_spend_tests {
         );
         dag.add_transaction_validated(tx1.clone()).unwrap();
 
-        // Same sender, same nonce -> double spend -> rejected.
+        // Same sender, same nonce -> retained conflict pair (PHASE 4B).
         let tx2 = Transaction::new(
             [[0u8; 32]; 2],
             addr,
@@ -258,8 +266,13 @@ mod double_spend_tests {
             vec![0u8; 64],
             vec![1u8; 64],
         );
-        let result = dag.add_transaction_validated(tx2);
-        assert!(result.is_err());
+        let result = dag.add_transaction_validated(tx2.clone());
+        assert!(result.is_ok(), "conflict pair must coexist: {:?}", result);
+        // Both members resident; decision deferred to resolve_conflict_key.
+        let members = dag.find_sender_nonce_conflicts(&addr, 1);
+        assert_eq!(members.len(), 2);
+        assert!(members.contains(&tx1.id));
+        assert!(members.contains(&tx2.id));
     }
 
     /// find_sender_nonce_conflict must locate the existing conflicting tx so the
@@ -283,10 +296,10 @@ mod double_spend_tests {
         );
         dag.add_transaction_validated(tx1.clone()).unwrap();
 
-        let found = dag.find_sender_nonce_conflict(&addr, 1);
-        assert_eq!(found, Some(tx1.id));
+        let found = dag.find_sender_nonce_conflicts(&addr, 1);
+        assert_eq!(found, vec![tx1.id]);
         // A different nonce has no conflict.
-        assert!(dag.find_sender_nonce_conflict(&addr, 2).is_none());
+        assert!(dag.find_sender_nonce_conflicts(&addr, 2).is_empty());
     }
 
     /// Distinct nonces from the same sender are NOT a conflict (valid chains

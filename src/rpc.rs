@@ -1355,8 +1355,11 @@ impl AetherRpcImpl {
                         .await;
                 }
                 Err(ProcessingError::ValidationFailed(
-                    ValidationError::SenderConflict
-                    | ValidationError::InvalidPoW { .. }
+                    // PHASE 4B: SenderConflict REMOVED from this arm — same-key
+                    // conflicts are retained in the DAG now (loser retention),
+                    // never rejected, so the variant is no longer produced on
+                    // any path (kept defined for API stability).
+                    ValidationError::InvalidPoW { .. }
                     | ValidationError::InvalidSignature
                     | ValidationError::SenderPublicKeyMismatch
                     | ValidationError::DoubleSpend
