@@ -3,6 +3,7 @@
 //! Implements tip selection based on cumulative weight and random walk.
 //! Uses IOTA-style tip selection with cumulative weight calculation.
 
+use crate::stake::StakeRegistry;
 use crate::transaction::{Transaction, TransactionId};
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
@@ -419,6 +420,106 @@ impl DAG {
             .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         scored.into_iter().next().map(|(_, id)| id)
+    }
+
+  /// PHASE 4G: v6 stake-weighted fork choice for a conflict key.
+  /// Era-routed by NEWEST member timestamp (same predicate family as the
+  /// CDW grandfathering above, one era further): newest member predating
+  /// V6_ACTIVATION_TS delegates to the frozen legacy `resolve_conflict_key`
+  /// (CDW/min-id paths intact  -  pre-activation settled outcomes never
+  /// change). Post-activation keys resolve FINALIZED-first, then by live
+  /// stake support (plurality  -  quorum is a FINALITY property, not a
+  /// preference property), min-id tiebreak. NO PoW/mining/nonce/difficulty/
+  /// work-credit anywhere on this path (POW_IN_CONSENSUS = NO).
+  /// `at_epoch`: stake evaluation epoch (caller: current or vote epoch;
+  /// deterministic input). Returns None when fewer than 2 members.
+  /// Pure function of (DAG set, registry views)  -  deterministic across
+  /// nodes, orders, restarts, syncs.
+  pub fn resolve_conflict_key_v6(
+        &self,
+  sender: &[u8; 32],
+  nonce: u64,
+  registry: &StakeRegistry,
+  at_epoch: u64,
+  ) -> Option<TransactionId> {
+  let members = self.find_sender_nonce_conflicts(sender, nonce);
+  if members.len() < 2 {
+  return None;
+            }
+  // Era gate: newest member decides the rule (a conflict touching
+  // post-activation data lives under stake finality, even if some
+  // members predate it). Missing members count as pre-activation
+  // (safe legacy fallback, never panic  -  same convention as above).
+  let newest_post_v6 = members.iter().any(|id| {
+  self.transactions
+                .get(id)
+  .map(|t| Transaction::is_v6_active_at(t.timestamp))
+  .unwrap_or(false)
+            });
+  if !newest_post_v6 {
+  return self.resolve_conflict_key(sender, nonce);
+            }
+  let key = (*sender, nonce);
+  // FINALIZED first: a valid finality decision is absolute (never
+  // overturned by later votes  -  stickiness lives in try_finalize).
+  if let Some(winner) = registry.finalized_winner(&key) {
+  if members.contains(&winner) {
+  return Some(winner);
+                }
+  // Finalized id not resident (store skew, should not happen):
+  // fall through to stake support (never panic, never invent).
+            }
+  // Stake support plurality, min-id tiebreak. Sorted member order so
+  // ties resolve to the smallest id without a second pass.
+  let mut ordered = members.clone();
+  ordered.sort();
+  let mut best: Option<(TransactionId, u64)> = None;
+  for m in &ordered {
+  let s = registry.support_for(key, m, at_epoch, |txid: &[u8; 32]| {
+  self.is_strict_descendant(m, txid)
+  });
+  let better = match best {
+            None => true,
+  Some((_, bs)) => s > bs,
+            };
+        if better {
+  best = Some((*m, s));
+        }
+    }
+  best.map(|(id, _)| id)
+            }
+
+  /// PHASE 4G: strict DAG descent (txid descends from `ancestor`, excluding
+  /// `ancestor` itself). Walks parents upward with a visited set (bounded
+  /// by DAG size, terminates on cycles  -  DAG is acyclic by admission but
+  /// this never loops regardless). Genesis ids are never descendants.
+  /// Powers the vote-closure test in resolve_conflict_key_v6 (votes may
+  /// point at descendants of a member, not just the member itself).
+  pub fn is_strict_descendant(
+  &self,
+  ancestor: &[u8; 32],
+  txid: &[u8; 32],
+  ) -> bool {
+  if txid == ancestor || txid.iter().all(|&b| b == 0) {
+  return false;
+            }
+        let mut seen = HashSet::new();
+  let mut queue = vec![*txid];
+        while let Some(id) = queue.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+  if id == *ancestor {
+                return true;
+        }
+            if id.iter().all(|&b| b == 0) {
+                continue;
+    }
+            if let Some(tx) = self.transactions.get(&id) {
+                queue.extend(tx.parents.iter().copied());
+            }
+            }
+        false
     }
 
     /// PHASE 4B: conflict keys (>= 2 members) in the ancestry of `parents`

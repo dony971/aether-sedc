@@ -3,11 +3,13 @@ use crate::{
     genesis::{initialize_genesis, GenesisConfig},
     json_storage::{ensure_data_dir, load_dag_from_json, save_dag_to_json},
     ledger::Ledger,
-    p2p::{P2PConfig, P2PNetwork},
+  p2p::{P2PConfig, P2PNetwork, StakePayload},
     parent_selection::{rebuild_dag_topological, DAG},
     rpc::{start_rpc_server, AetherRpcImpl, Mempool},
+  stake::StakeRegistry,
     storage::Storage,
     transaction::{Address, Transaction},
+  transaction_processor::TransactionProcessor,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -84,7 +86,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
         tracing::info!("RPC Bind: {}", rpc_bind);
         if !loopback {
             tracing::warn!(
-                "⚠️ WARNING RPC exposed on non-loopback address {} — anyone who can reach it can query balances, request faucet funds (if enabled) and submit transactions. Bind 127.0.0.1 unless you operate a firewall.",
+  "⚠️ WARNING RPC exposed on non-loopback address {}  -  anyone who can reach it can query balances, request faucet funds (if enabled) and submit transactions. Bind 127.0.0.1 unless you operate a firewall.",
                 rpc_bind
             );
         }
@@ -392,7 +394,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             } else {
                 drop(dag_read);
                 tracing::error!(
-                    "⛔ INC-01: store looks complete but derived supply {} > persisted {} — the persisted ledger has MORE applied history (truncated store with no orphans); KEEPING persisted ledger, recovery required",
+  "⛔ INC-01: store looks complete but derived supply {} > persisted {}  -  the persisted ledger has MORE applied history (truncated store with no orphans); KEEPING persisted ledger, recovery required",
                     derived_supply,
                     persisted_supply
                 );
@@ -401,7 +403,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
         } else {
             drop(dag_read);
             tracing::error!(
-                "⛔ INC-01: local store INCOMPLETE ({} orphans, {} skipped) — KEEPING persisted ledger (supply {}), NOT overwriting; recovery via orphan solver + sync required",
+  "⛔ INC-01: local store INCOMPLETE ({} orphans, {} skipped)  -  KEEPING persisted ledger (supply {}), NOT overwriting; recovery via orphan solver + sync required",
                 orphans.read().await.len(),
                 rebuild_skipped,
                 ledger.total_supply()
@@ -484,9 +486,46 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     }
     tracing::info!("✓ Mempool initialized");
 
+  // PHASE 4G: stake registry boot-load (validators / votes / finalized /
+  // evidence from the Sled stake trees, manifest-verified). Fresh data
+  // dir (no manifest) starts empty. A manifest mismatch (counts or hash)
+  // means a partial save  -  boot REFUSES rather than run consensus on
+  // partial stake state (fail closed; operator restores or resyncs).
+  tracing::info!("🗳️ Loading stake registry...");
+  let stake_registry: Arc<RwLock<StakeRegistry>> = {
+  let storage_read = storage.read().await;
+  match storage_read.load_registry() {
+  Ok(Some(reg)) => {
+  let snap = reg.snapshot();
+                tracing::info!(
+  "  Stake registry restored: {} validators, {} votes, {} finalized, {} evidence",
+  snap.validators.len(),
+  snap.votes.len(),
+  snap.finalized.len(),
+  snap.evidence.len()
+            );
+  Arc::new(RwLock::new(reg))
+        }
+  Ok(None) => {
+  tracing::info!("  No stake state (fresh node)  -  starting empty");
+  Arc::new(RwLock::new(StakeRegistry::new()))
+        }
+                Err(e) => {
+  return Err(format!(
+  "Refusing boot: stake registry failed to load ({}). Restore the data dir or resync  -  never run on partial stake state.",
+  e
+        )
+  .into());
+                }
+            }
+            };
+
     tracing::info!("📡 Creating P2P channel...");
     let (tx_channel, mut tx_receiver) = tokio::sync::mpsc::unbounded_channel::<Transaction>();
     tracing::info!("✓ P2P channel created");
+  // PHASE 4G: stake gossip channel (P2P Vote/Bond/Unbond ingress).
+  let (stake_channel, mut stake_receiver) =
+  tokio::sync::mpsc::unbounded_channel::<StakePayload>();
 
     let p2p_dag_for_tips = dag.clone();
     let get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(move || {
@@ -585,6 +624,22 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     ));
     tracing::info!("✅ P2P network initialized");
 
+  // PHASE 4G: wire stake gossip. The vote-serving lookup reads the Sled
+  // vote tree with try_read (GetData retries cover contention  -  serving
+  // never blocks consensus locks).
+  p2p_network.set_stake_channel(stake_channel);
+            {
+  let storage_for_votes = storage.clone();
+  p2p_network.set_vote_lookup(Arc::new(move |id: &[u8]| {
+  let arr: [u8; 32] = id.try_into().ok()?;
+  let guard = storage_for_votes.try_read().ok()?;
+  match guard.get_vote(&arr) {
+  Ok(Some(v)) => Some(v.encode()),
+  _ => None,
+            }
+  }));
+        }
+
     let p2p_network_clone = p2p_network.clone();
     tracing::info!("🔄 Spawning P2P Network task...");
     tokio::spawn(async move {
@@ -603,6 +658,8 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     let storage_for_p2p = storage.clone();
     let orphans_for_p2p = orphans.clone();
     let sync_ctx_for_p2p = sync_ctx.clone();
+  let stake_for_p2p = stake_registry.clone();
+  let p2p_for_stake = p2p_network.clone();
 
     tokio::spawn(async move {
         tracing::info!("✅ P2P transaction receiver task spawned");
@@ -613,7 +670,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             // validation mode for the whole pipeline, so accept gate,
             // drainer, STEP 0 and STEP 1 evaluate one tx under ONE policy.
             let ingress_mode = sync_ctx_for_p2p.take_ingress_mode(tx.id).await;
-            let rpc_impl = AetherRpcImpl::new(
+  let mut rpc_impl = AetherRpcImpl::new(
                 dag_for_p2p.clone(),
                 ledger_for_p2p.clone(),
                 storage_for_p2p.clone(),
@@ -624,6 +681,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                 orphans_for_p2p.clone(),
                 sync_ctx_for_p2p.clone(),
             );
+  rpc_impl.set_stake_registry(stake_for_p2p.clone());
 
             match rpc_impl
                 .process_transaction(tx, "P2P", ingress_mode)
@@ -661,6 +719,74 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
         }
     });
 
+  // PHASE 4G: STAKE RECEIVER  -  P2P Vote/Bond/Unbond gossip admission.
+  // Each payload goes through TransactionProcessor (single entry:
+  // validate -> insert/slash -> persist -> re-resolve -> conditional
+  // rebuild) and, once accepted, is relayed onward (validation-before-
+  // relay: broadcast_stake re-verifies; Duplicates are NOT re-relayed  - 
+  // they flew once). No provenance modes (Fresh/Historical is
+  // tx-sync-specific); admission owns rejection.
+  let dag_for_stake = dag.clone();
+  let ledger_for_stake = ledger.clone();
+  let stake_for_stake = stake_registry.clone();
+    tokio::spawn(async move {
+  tracing::info!("✅ P2P stake receiver task spawned");
+  let mut processor = TransactionProcessor::new();
+  processor.set_stake_registry(stake_for_stake.clone());
+  while let Some(payload) = stake_receiver.recv().await {
+  match payload {
+  StakePayload::Vote(vote) => {
+  let id = vote.id();
+  match processor
+  .process_vote(vote.clone(), &dag_for_stake, &ledger_for_stake)
+        .await
+            {
+  Ok(outcome) => {
+                tracing::info!(
+  "✅ P2P vote admitted {} ({:?})",
+  hex::encode(&id[..4]),
+  outcome
+                );
+  if outcome != crate::stake::VoteInsertOutcome::Duplicate {
+  p2p_for_stake.broadcast_stake(StakePayload::Vote(vote)).await;
+            }
+                }
+  Err(e) => {
+  tracing::warn!("❌ P2P vote rejected: {}", e);
+            }
+        }
+        }
+  StakePayload::Bond(bond) => {
+  match processor.process_bond(bond.clone(), &ledger_for_stake).await {
+  Ok(()) => {
+  tracing::info!("✅ P2P bond admitted");
+  p2p_for_stake.broadcast_stake(StakePayload::Bond(bond)).await;
+                    }
+  Err(e) => {
+  tracing::warn!("❌ P2P bond rejected: {}", e);
+                }
+        }
+                }
+  StakePayload::Unbond(unbond) => {
+  match processor
+  .process_unbond(unbond.clone(), &dag_for_stake, &ledger_for_stake)
+  .await
+        {
+  Ok(()) => {
+  tracing::info!("✅ P2P unbond admitted");
+  p2p_for_stake
+  .broadcast_stake(StakePayload::Unbond(unbond))
+  .await;
+        }
+  Err(e) => {
+  tracing::warn!("❌ P2P unbond rejected: {}", e);
+                }
+        }
+        }
+    }
+}
+    });
+
     // PHASE D: MEMPOOL DRAINER — the mempool lifecycle loop
     // (ACCEPT → QUEUE → SELECT → PROCESS → INCLUDE → REMOVE). Spawned
     // unconditionally so it runs on every node type (miner, validator,
@@ -677,10 +803,11 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     let p2p_for_drain = p2p_network.clone();
     let orphans_for_drain = orphans.clone();
     let sync_ctx_for_drain = sync_ctx.clone();
+  let stake_for_drain = stake_registry.clone();
 
     tokio::spawn(async move {
         tracing::info!("✅ Mempool drainer task spawned");
-        let rpc_impl = AetherRpcImpl::new(
+  let mut rpc_impl = AetherRpcImpl::new(
             dag_for_drain,
             ledger_for_drain,
             storage_for_drain,
@@ -691,6 +818,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             orphans_for_drain,
             sync_ctx_for_drain,
         );
+  rpc_impl.set_stake_registry(stake_for_drain);
         let mut last_log = std::time::Instant::now();
         let mut last_removed: u64 = 0;
         loop {
@@ -752,6 +880,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     let dag_save_periodic = dag.clone();
     let dag_store_path_save_periodic = dag_store_path.clone();
     let sync_ctx_periodic = sync_ctx.clone();
+  let stake_periodic = stake_registry.clone();
     let last_stats_snapshot = Arc::new(std::sync::Mutex::new(
         crate::sync_stats::SyncStatsSnapshot::default(),
     ));
@@ -779,7 +908,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                 let _ = storage_lock.flush();
             }
 
-            let rpc_impl = AetherRpcImpl::new(
+  let mut rpc_impl = AetherRpcImpl::new(
                 dag_periodic.clone(),
                 ledger_periodic.clone(),
                 storage_periodic.clone(),
@@ -790,6 +919,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                 orphans_periodic.clone(),
                 sync_ctx_periodic.clone(),
             );
+  rpc_impl.set_stake_registry(stake_periodic.clone());
 
             rpc_impl.process_orphans().await;
 
@@ -843,6 +973,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     let mining_enabled_rpc = mining_enabled.clone();
     let rpc_orphans = orphans.clone();
     let sync_ctx_rpc = sync_ctx.clone();
+  let stake_rpc = stake_registry.clone();
 
     tracing::info!("🔄 Spawning RPC Server task...");
     tokio::spawn(async move {
@@ -858,6 +989,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             mining_enabled_rpc,
             rpc_orphans,
             sync_ctx_rpc,
+  Some(stake_rpc),
         )
         .await
         {

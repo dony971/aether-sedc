@@ -8,8 +8,10 @@
 
 use crate::ledger::Ledger;
 use crate::parent_selection::DAG;
-use crate::transaction::Transaction;
+use crate::stake::{StakeRegistry, ValidatorState, EPOCH_GRACE, MIN_STAKE};
+use crate::transaction::{Bond, Transaction, Unbond, Vote};
 use crate::transaction::TransactionId;
+use crate::transaction::{BOND_FORMAT_VERSION, VOTE_FORMAT_VERSION};
 
 /// Validation result with detailed error information
 #[derive(Debug, Clone, PartialEq)]
@@ -59,6 +61,26 @@ pub enum ValidationError {
         parent_index: usize,
         parent_ts: u64,
     },
+  // -- PHASE 4G stake-finality errors (additive; existing arms untouched) --
+  /// Vote signature does not verify against the validator address
+  InvalidVoteSignature,
+  /// Bond/unbond signature does not verify against the validator address
+  InvalidBondSignature,
+  /// Vote/bond/unbond from an address with no registry record
+  UnknownValidator { validator: [u8; 32] },
+  /// Proven equivocator (permanent flag): may never vote or re-bond
+  SlashedValidator,
+  /// Known validator not currently eligible (immature bond, unbonding,
+  /// unbonded). Slashed has its own variant above; unknown its own.
+  IneligibleValidator { validator: [u8; 32] },
+  /// Bond amount below the admission floor
+  InsufficientStake { required: u64, provided: u64 },
+  /// Vote/bond/unbond epoch outside the acceptance window
+  /// (votes: at_epoch +/- EPOCH_GRACE; bonds/unbonds: not from the future
+  /// beyond grace  -  past replays are idempotent via id dedup downstream)
+  EpochOutOfWindow { epoch: u64, at_epoch: u64 },
+  /// Unknown vote/bond wire format version (fail closed, never ignore)
+  InvalidStakeVersion { version: u8 },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -172,6 +194,42 @@ impl std::fmt::Display for ValidationError {
                     "Parent timestamp violation: child ts {} < parent[{}] ts {}",
                     child_ts, parent_index, parent_ts
                 )
+            }
+  ValidationError::InvalidVoteSignature => {
+  write!(f, "Invalid vote signature")
+        }
+  ValidationError::InvalidBondSignature => {
+  write!(f, "Invalid bond/unbond signature")
+    }
+  ValidationError::UnknownValidator { validator } => {
+  write!(f, "Unknown validator: {}", hex::encode(validator))
+}
+  ValidationError::SlashedValidator => {
+  write!(f, "Validator is slashed (permanent)")
+}
+  ValidationError::IneligibleValidator { validator } => {
+  write!(
+  f,
+  "Validator not eligible (immature, unbonding or unbonded): {}",
+  hex::encode(validator)
+  )
+}
+  ValidationError::InsufficientStake { required, provided } => {
+  write!(
+  f,
+  "Insufficient stake: {} < minimum {}",
+  provided, required
+  )
+        }
+  ValidationError::EpochOutOfWindow { epoch, at_epoch } => {
+  write!(
+  f,
+  "Epoch {} outside acceptance window at epoch {}",
+  epoch, at_epoch
+  )
+    }
+  ValidationError::InvalidStakeVersion { version } => {
+  write!(f, "Unknown stake wire version: {}", version)
             }
         }
     }
@@ -287,8 +345,17 @@ impl TransactionValidator {
         // The tx was valid when originally created.
         // Parent timestamp ordering (validate_dag) prevents structural abuse.
 
-        // PoW verification (always — using difficulty derived from timestamp)
-        if !tx.verify_pow(required_difficulty) {
+  // PoW verification (pre-V6 timestamps ONLY  -  using difficulty derived
+  // from timestamp).
+  //
+  // PHASE 4G: post-V6-activation timestamps SKIP the PoW gate
+  // (fee-only admission  -  POW_IN_CONSENSUS = NO after activation).
+  // Historical PoW fields are still parsed (no brutal deletion) but
+  // carry no consensus weight. Pre-activation timestamps keep the
+  // exact legacy gate (grandfathered, frozen).
+  if !Transaction::is_v6_active_at(tx.timestamp)
+  && !tx.verify_pow(required_difficulty)
+  {
             return Err(ValidationError::InvalidPoW {
                 difficulty: required_difficulty,
             });
@@ -419,6 +486,187 @@ impl TransactionValidator {
         self.validate_pure(tx, mode)?;
         self.validate_dag(tx, dag)?;
         self.validate_ledger(tx, ledger, min_fee)?;
+        Ok(())
+    }
+
+  // ====================================================================
+  // PHASE 4G: stake-finality validation (votes / bonds / unbonds).
+  // Discipline mirrors transaction validation: pure checks first
+  // (version, signature, epoch window), then registry/ledger reads.
+  // DELIBERATELY ABSENT: any duplicate/equivocation rejection. A second
+  // side for the same (validator, epoch, key) is EVIDENCE (slash +
+  // proof preservation at insert), never an admission error  -  rejecting
+  // it here would let the first-seen vote censor the proof of its own
+  // author's equivocation.
+  // ====================================================================
+
+  /// Validate a finality vote against the live registry.
+  /// `at_epoch`: evaluation epoch (caller: current epoch; deterministic
+  /// input  -  same rule as consensus fns taking explicit epochs).
+  pub fn validate_vote(
+  &self,
+  vote: &Vote,
+  registry: &StakeRegistry,
+  at_epoch: u64,
+  ) -> Result<(), ValidationError> {
+  // Wire version (fail closed).
+  if vote.format_version != VOTE_FORMAT_VERSION {
+  return Err(ValidationError::InvalidStakeVersion {
+  version: vote.format_version,
+  });
+    }
+  // Signature binds ALL vote fields to the validator address
+  // (= the ed25519 verifying key).
+  if !vote.verify_signature() {
+  return Err(ValidationError::InvalidVoteSignature);
+    }
+  // Epoch window: current +/- EPOCH_GRACE (skew tolerance). Older or
+  // newer votes are stale (dropped, never slashed  -  staleness is not
+  // equivocation). Saturating: epoch 0 band underflows cleanly.
+  if vote.epoch.saturating_add(EPOCH_GRACE) < at_epoch
+  || vote.epoch > at_epoch.saturating_add(EPOCH_GRACE)
+  {
+  return Err(ValidationError::EpochOutOfWindow {
+  epoch: vote.epoch,
+  at_epoch,
+  });
+    }
+  // Registry standing: unknown / slashed / ineligible are distinct
+  // errors (callers log and count them separately).
+  match registry.validator_state(&vote.validator) {
+  None => {
+  return Err(ValidationError::UnknownValidator {
+  validator: vote.validator,
+  })
+    }
+  Some(ValidatorState::Slashed) => {
+  return Err(ValidationError::SlashedValidator)
+    }
+  Some(ValidatorState::Bonded) => {}
+  Some(_) => {
+  return Err(ValidationError::IneligibleValidator {
+  validator: vote.validator,
+  })
+    }
+        }
+  // Maturation + liveness: Bonded on record is not enough (immature
+  // bonds must wait out BOND_MATURATION_EPOCHS  -  flash-entry guard).
+  if !registry.is_eligible(&vote.validator, at_epoch) {
+  return Err(ValidationError::IneligibleValidator {
+  validator: vote.validator,
+  });
+    }
+  // NOTE: asserted stake_amount/stake_epoch context is intentionally
+  // NOT cross-checked (a partitioned voter's view may lag
+  // legitimately); weight always reads live from the registry.
+  // NOTE: vote parents are intentionally NOT existence-checked
+  // (DAG-embedding context only  -  partitions must not veto votes).
+  Ok(())
+    }
+
+  /// Validate a bond intent (lock funds into voting weight).
+  /// Admission checks here; fund locking happens at application
+  /// (ledger integration  -  validated amount is what gets locked).
+  pub fn validate_bond(
+  &self,
+  bond: &Bond,
+  ledger: &Ledger,
+  registry: &StakeRegistry,
+  at_epoch: u64,
+  ) -> Result<(), ValidationError> {
+  if bond.format_version != BOND_FORMAT_VERSION {
+  return Err(ValidationError::InvalidStakeVersion {
+  version: bond.format_version,
+  });
+    }
+  if !bond.verify_signature() {
+  return Err(ValidationError::InvalidBondSignature);
+        }
+  if bond.amount < MIN_STAKE {
+  return Err(ValidationError::InsufficientStake {
+  required: MIN_STAKE,
+  provided: bond.amount,
+  });
+    }
+  // Slashed addresses may never re-bond (permanent flag).
+  if registry.validator_state(&bond.validator) == Some(ValidatorState::Slashed) {
+  return Err(ValidationError::SlashedValidator);
+        }
+  // Funds must exist (ledger is the source of truth for balances;
+  // the registry only tracks bonded weight  -  no circularity: this
+  // reads the LEDGER, never the registry, for funds).
+  let balance = ledger.get_balance(&bond.validator);
+  if balance < bond.amount {
+  return Err(ValidationError::InsufficientBalance {
+  required: bond.amount,
+  available: balance,
+  });
+    }
+  // Bond epoch MUST be near-current (+/- EPOCH_GRACE, same window as
+  // votes). Rationale: maturation is measured from the SIGNED
+  // creation epoch (deterministic across nodes  -  arrival times
+  // differ, so arrival-epoch maturation would DIVERGE eligibility).
+  // An unbounded past would let an attacker backdate fresh bonds to
+  // epoch 0 for INSTANT maturity (flash-entry bypass of the
+  // BOND_MATURATION guard). Delayed gossip beyond one epoch is
+  // rejected  -  the operator re-signs with a fresh epoch (bonds are
+  // not time-critical; maturation is 2 epochs regardless).
+  if bond.epoch.saturating_add(EPOCH_GRACE) < at_epoch
+  || bond.epoch > at_epoch.saturating_add(EPOCH_GRACE)
+  {
+  return Err(ValidationError::EpochOutOfWindow {
+  epoch: bond.epoch,
+  at_epoch,
+  });
+        }
+  Ok(())
+    }
+
+  /// Validate an unbond intent (begin exit; voting ends at acceptance).
+  pub fn validate_unbond(
+  &self,
+  unbond: &Unbond,
+  registry: &StakeRegistry,
+  at_epoch: u64,
+  ) -> Result<(), ValidationError> {
+  if unbond.format_version != BOND_FORMAT_VERSION {
+  return Err(ValidationError::InvalidStakeVersion {
+  version: unbond.format_version,
+  });
+        }
+  if !unbond.verify_signature() {
+  return Err(ValidationError::InvalidBondSignature);
+    }
+  match registry.validator_state(&unbond.validator) {
+  None => {
+  return Err(ValidationError::UnknownValidator {
+  validator: unbond.validator,
+  })
+        }
+  Some(ValidatorState::Slashed) => {
+  return Err(ValidationError::SlashedValidator)
+    }
+  // Only an actively-bonded validator can begin an exit
+  // (already-exiting is a no-op at apply time, but a fresh
+  // intent for a non-bonded address is rejected fail-closed).
+  Some(ValidatorState::Bonded) => {}
+  Some(_) => {
+  return Err(ValidationError::IneligibleValidator {
+  validator: unbond.validator,
+  })
+        }
+    }
+  // Same near-current window as bonds (same determinism argument:
+  // release is measured from the SIGNED epoch; unbounded backdating
+  // would grant early exits).
+  if unbond.epoch.saturating_add(EPOCH_GRACE) < at_epoch
+  || unbond.epoch > at_epoch.saturating_add(EPOCH_GRACE)
+  {
+  return Err(ValidationError::EpochOutOfWindow {
+  epoch: unbond.epoch,
+  at_epoch,
+  });
+        }
         Ok(())
     }
 }

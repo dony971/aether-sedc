@@ -17,6 +17,7 @@ pub mod node_logging;
 pub mod p2p;
 pub mod parent_selection;
 pub mod rpc;
+pub mod stake;
 pub mod storage;
 pub mod sync_stats;
 pub mod transaction;
@@ -32,7 +33,7 @@ pub use genesis::{
     genesis_hash, initialize_genesis, GenesisBlock, GenesisConfig, GENESIS_HASH, GENESIS_MESSAGE,
 };
 pub use ledger::Ledger;
-pub use p2p::{P2PConfig, P2PMessage, P2PNetwork};
+pub use p2p::{P2PConfig, P2PMessage, P2PNetwork, StakeHooks, StakePayload, StakeVoteLookup};
 pub use parent_selection::{ParentSelectionAlgorithm, TipSet, DAG};
 pub use rpc::{
     start_rpc_server, AetherRpcImpl, BalanceResponse, DagEdge as RpcDagEdge, DagGraphResponse,

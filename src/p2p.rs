@@ -5,6 +5,7 @@
 //! Supports DNS-based peer discovery and peer exchange (PEX).
 
 use crate::transaction::Transaction;
+use crate::transaction::{Bond, Unbond, Vote};
 use chacha20poly1305::aead::{Aead, NewAead};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand::rngs::{OsRng, StdRng};
@@ -24,7 +25,7 @@ use crate::sync_stats::{SyncContext, TOPO_ORDER_CAP};
 use crate::validation::ValidationMode;
 use crate::transport::{PeerAddr, TcpTransport, Transport, TransportListener, TransportStream};
 
-/// P2P handshake magic bytes ("AETH") — LOGICAL network identifier only.
+/// P2P handshake magic bytes ("AETH")  -  LOGICAL network identifier only.
 ///
 /// 2E-A (A.3): the literal ASCII signature is never put on the wire. The
 /// handshake transmits `handshake_wire_magic()` (this constant XOR
@@ -45,7 +46,7 @@ const HANDSHAKE_MAGIC_MASK: [u8; 4] = [0x3F, 0x71, 0xA5, 0x1C];
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
-// Phase 2E-A (A.3) — frame length padding ("paliers de padding sur total_len").
+// Phase 2E-A (A.3)  -  frame length padding ("paliers de padding sur total_len").
 //
 // Threat addressed: the clear `u32 total_len` prefix tells any passive
 // observer the EXACT size of every message, which sizes the DAG inventory
@@ -183,7 +184,7 @@ const RECENT_SUCCESS_BONUS: i32 = PEER_SCORE_INITIAL / 4;
 /// Rank penalty applied once per live session already held in the same network
 /// group. Four sessions in one group cost 80, making an over-represented group
 /// roughly five times less likely to be picked than an empty one of equal
-/// quality — which is what turns "diversity" into a selection property rather
+/// quality  -  which is what turns "diversity" into a selection property rather
 /// than a post-hoc admission check.
 const GROUP_OVERREPRESENTATION_PENALTY: i32 = PEER_SCORE_INITIAL / 5;
 
@@ -1643,6 +1644,59 @@ async fn accept_inbound_transaction(
     tx_channel.send(tx).is_ok()
 }
 
+/// PHASE 4G: the receive stage for one inbound stake payload (vote / bond /
+/// unbond gossip). Same contract as accept_inbound_transaction: dedup →
+/// strict-decode → record receipt + upstream peer → queue, NO relay of any
+/// kind (relay happens exactly once, later, in broadcast_stake, reachable
+/// only after validation + admission). Signature verification is an
+/// ADMISSION check (process_vote/validate_*), not a receive check  -  the
+/// receive stage is format-only by design (same as transactions, where
+/// validate_pure owns the signature gate).
+/// Crate-visible for the phase4G integration tests (ingress contract).
+async fn accept_inbound_stake(
+  kind: &'static str,
+  payload_bytes: Vec<u8>,
+  source: SocketAddr,
+  seen: &RwLock<HashMap<Vec<u8>, SeenTxEntry>>,
+  propagation_state: &RwLock<PropagationState>,
+  stake_channel: &mpsc::UnboundedSender<StakePayload>,
+) -> bool {
+  // DEDUPE, ahead of anything that could schedule a relay.
+  if seen.read().await.contains_key(&payload_bytes) {
+                                        return false;
+}
+
+  let payload = match kind {
+  "vote" => match Vote::decode(&payload_bytes) {
+  Ok(v) => StakePayload::Vote(v),
+            Err(_) => {
+  warn!("Failed to decode vote from {}", source);
+                                        return false;
+        }
+    },
+  "bond" => match Bond::decode(&payload_bytes) {
+  Ok(b) => StakePayload::Bond(b),
+  Err(_) => {
+  warn!("Failed to decode bond from {}", source);
+  return false;
+    }
+                },
+  "unbond" => match Unbond::decode(&payload_bytes) {
+  Ok(u) => StakePayload::Unbond(u),
+  Err(_) => {
+  warn!("Failed to decode unbond from {}", source);
+  return false;
+}
+                },
+  _ => return false,
+            };
+
+  insert_seen(seen, payload_bytes.clone()).await;
+  record_propagation_source(propagation_state, &payload_bytes, source).await;
+  tracing::trace!("received {} from {}", kind, source);
+  stake_channel.send(payload).is_ok()
+}
+
 /// P2P network configuration
 #[derive(Clone)]
 pub struct P2PConfig {
@@ -1822,7 +1876,7 @@ impl AddressEntry {
 /// Outcome of a capacity-aware admission attempt (D8).
 ///
 /// `ingress_address` needs to distinguish "already known" (true, just refresh
-/// the clock) from "refused" (false) — a bare `Option<SocketAddr>` conflated
+/// the clock) from "refused" (false)  -  a bare `Option<SocketAddr>` conflated
 /// both with "made room", which is exactly the ambiguity that made the old
 /// caller's `accepted` flag easy to get wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2275,7 +2329,50 @@ pub enum P2PMessage {
     Pong,
     /// Peer exchange - list of known peer addresses
     Peers(Vec<SocketAddr>),
+  // -- PHASE 4G stake-finality gossip (additive ENUM TAIL: existing
+  // variants keep their bincode indices, so old binaries decode every
+  // pre-4G message identically; a pre-4G peer receiving these fails
+  // deserialization and error-disconnects per existing discipline).
+  // Payloads are the CANONICAL encodings (Vote 257B / Bond 113B /
+  // Unbond 105B  -  strict-decoded on receipt, never trusted).
+  /// Finality vote gossip (canonical vote encoding)
+  Vote(Vec<u8>),
+  /// Bond intent gossip (canonical bond encoding)
+  Bond(Vec<u8>),
+  /// Unbond intent gossip (canonical unbond encoding)
+  Unbond(Vec<u8>),
 }
+
+/// PHASE 4G: decoded stake payload handed from the P2P receive stage to
+/// the node (mirrors how Transaction objects cross tx_channel  -  the node
+/// admits them via TransactionProcessor::process_vote/bond/unbond).
+#[derive(Debug, Clone)]
+pub enum StakePayload {
+  Vote(Vote),
+  Bond(Bond),
+  Unbond(Unbond),
+}
+
+/// PHASE 4G: node-supplied stake hooks for the P2P layer. Both behind
+/// set-once Arcs so P2PNetwork::new (15 call sites) keeps its signature:
+/// the node wires these after construction via the setters below.
+/// Unwired (None) = stake gossip is dropped at ingress and GetData serves
+/// transactions only (pre-v6 behavior, no crash, no silent mis-handle).
+#[derive(Clone, Default)]
+pub struct StakeHooks {
+  /// Admit decoded stake payloads (node vote/bond receiver task).
+  pub stake_channel: std::sync::Arc<
+  std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<StakePayload>>>,
+  >,
+  /// Serve vote encodings by vote id (GetData fallback; backed by the
+  /// stake_votes storage tree). None = tx-only serving (as before).
+  pub get_vote_by_id:
+  std::sync::Arc<std::sync::Mutex<Option<StakeVoteLookup>>>,
+}
+
+/// PHASE 4G: vote serving lookup (id -> canonical encoding).
+pub type StakeVoteLookup =
+  std::sync::Arc<dyn Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync>;
 
 /// Seen transaction entry with timestamp for LRU eviction
 #[derive(Clone)]
@@ -2354,7 +2451,7 @@ pub struct P2PNetwork {
     /// Session *direction* lives with the sessions, not with the address book:
     /// an address's `PeerSource` records how we first learned it and is
     /// deliberately never relabelled, so it cannot answer "is this live session
-    /// ours?". Exactly two writers — the dial path inserts, the task wrapping
+  /// ours?". Exactly two writers  -  the dial path inserts, the task wrapping
     /// `handle_peer` removes — so it cannot drift from `peers` without `peers`
     /// drifting too. Never held together with `peers` or `addresses`.
     outbound_sessions: Arc<RwLock<HashSet<SocketAddr>>>,
@@ -2378,8 +2475,10 @@ pub struct P2PNetwork {
     get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
     get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
     get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
+  // PHASE 4G stake hooks (set-once; see StakeHooks).
+  stake_hooks: StakeHooks,
     seen_transactions: Arc<RwLock<HashMap<Vec<u8>, SeenTxEntry>>>,
-    /// 2E-D: scheduling state for relays — upstream peer + "already
+  /// 2E-D: scheduling state for relays  -  upstream peer + "already
     /// scheduled". Read strictly before a relay wave is started, so a
     /// payload can never be transmitted twice per link. Separate from
     /// `seen_transactions` (receipt dedup); see `PropagationEntry`.
@@ -2432,6 +2531,23 @@ impl P2PNetwork {
             propagation_rng: Arc::new(std::sync::Mutex::new(StdRng::from_entropy())),
             sync_ctx,
             is_orphan,
+  stake_hooks: StakeHooks::default(),
+        }
+    }
+
+  /// PHASE 4G: wire the node stake receiver (called once at boot, before
+  /// or after start  -  the hooks are resolved per message, never cached).
+  pub fn set_stake_channel(&self, tx: mpsc::UnboundedSender<StakePayload>) {
+  if let Ok(mut guard) = self.stake_hooks.stake_channel.lock() {
+  *guard = Some(tx);
+            }
+                }
+
+  /// PHASE 4G: wire vote-by-id serving for GetData fallback (node
+  /// storage accessor). Unwired = transactions only (as before).
+  pub fn set_vote_lookup(&self, lookup: StakeVoteLookup) {
+  if let Ok(mut guard) = self.stake_hooks.get_vote_by_id.lock() {
+  *guard = Some(lookup);
         }
     }
 
@@ -2457,6 +2573,7 @@ impl P2PNetwork {
         let propagation_state = Arc::clone(&self.propagation_state);
         let sync_ctx = Arc::clone(&self.sync_ctx);
         let is_orphan = Arc::clone(&self.is_orphan);
+  let stake_hooks = self.stake_hooks.clone();
         let local_addr = self.config.listen_addr;
         let addresses = self.addresses.clone();
         let (peer_discovery_tx, mut peer_discovery_rx) = mpsc::unbounded_channel::<SocketAddr>();
@@ -2486,6 +2603,7 @@ impl P2PNetwork {
                 peer_discovery_tx,
                 sync_ctx,
                 is_orphan,
+  stake_hooks,
             )
             .await;
         });
@@ -2994,7 +3112,7 @@ impl P2PNetwork {
             let known = mgr.addresses();
             let ordered = Self::redial_candidates(&known, &seeds, local);
             // Everything `redial_candidates` appended sits behind the known
-            // half; that exact tail — not "is this a configured seed" — is what
+  // half; that exact tail  -  not "is this a configured seed"  -  is what
             // phase 2 of the selection preserves.
             let known_len = known.iter().filter(|a| **a != local).count();
             let seed_tail: HashSet<SocketAddr> =
@@ -3281,6 +3399,7 @@ impl P2PNetwork {
         peer_discovery_tx: mpsc::UnboundedSender<SocketAddr>,
         sync_ctx: Arc<SyncContext>,
         is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
+  stake_hooks: StakeHooks,
     ) {
         loop {
             match listener.accept().await {
@@ -3375,6 +3494,7 @@ impl P2PNetwork {
                     let addresses = addresses.clone();
                     let sync_ctx = Arc::clone(&sync_ctx);
                     let is_orphan = Arc::clone(&is_orphan);
+  let stake_hooks = stake_hooks.clone();
                     tokio::spawn(async move {
                         Self::handle_peer(
                             stream,
@@ -3393,6 +3513,7 @@ impl P2PNetwork {
                             peer_discovery_tx,
                             sync_ctx,
                             is_orphan,
+  stake_hooks,
                         )
                         .await;
                     });
@@ -3467,10 +3588,10 @@ impl P2PNetwork {
             return Err("Short P2P handshake frame");
         }
         if incoming[..4] != Self::handshake_wire_magic() {
-            return Err("Invalid P2P handshake magic — not an Aether node");
+  return Err("Invalid P2P handshake magic  -  not an Aether node");
         }
         if incoming[4] != P2P_PROTOCOL_VERSION {
-            return Err("Incompatible P2P protocol version — upgrade the node");
+  return Err("Incompatible P2P protocol version  -  upgrade the node");
         }
         if incoming[5..37] != crate::genesis::GENESIS_HASH {
             return Err("Network mismatch: peer genesis hash differs from ours");
@@ -3666,6 +3787,7 @@ impl P2PNetwork {
         peer_discovery_tx: mpsc::UnboundedSender<SocketAddr>,
         sync_ctx: Arc<SyncContext>,
         is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
+  stake_hooks: StakeHooks,
     ) {
         // Split stream into read and write halves (both owned, so the write
         // half can be moved into the send task below).
@@ -3947,7 +4069,7 @@ impl P2PNetwork {
                 Ok(msg) => {
                     match msg {
                         P2PMessage::Transaction(tx_bytes) => {
-                            // 2E-D (§2.9): this arm is now receive → dedup →
+  // 2E-D (sec.2.9): this arm is now receive → dedup →
                             // record upstream peer → queue, and NOTHING else.
                             //
                             // The relay that used to live here ran *before*
@@ -4124,6 +4246,33 @@ impl P2PNetwork {
                             }
                         }
                         P2PMessage::GetData(hashes) => {
+  // PHASE 4G: vote fallback. Vote ids and tx ids
+  // share the 32-byte space but never collide in
+  // practice (both are BLAKE3 content addresses
+  // over disjoint encodings  -  grinding a tx id to
+  // equal a vote id is a 2nd-preimage attack on
+  // 256 bits). A requested hash with no transaction
+  // is therefore served from the vote store when
+  // present (one Vote message per hit, bounded like
+  // tx pages); misses stay silent (peer retries via
+  // gossip, same as unknown txs today).
+  let vote_lookup = match stake_hooks.get_vote_by_id.lock() {
+  Ok(guard) => guard.clone(),
+  Err(_) => None,
+                            };
+  if let Some(lookup) = vote_lookup {
+  for hash in hashes.iter().take(MAX_SYNC_PAGE) {
+  if get_transaction_by_hash(hash).is_none() {
+  if let Some(enc) = lookup(hash) {
+  if let Ok(vote_msg) = bincode::serialize(
+  &P2PMessage::Vote(enc),
+        ) {
+  let _ = msg_sender.send(vote_msg);
+                                    }
+                                }
+                            }
+                            }
+                                }
                             // DEEP SYNC: serve requested transactions with FULL
                             // ancestor closure, split into multiple topologically
                             // sorted pages. Each page is ancestor-closed so the
@@ -4390,6 +4539,93 @@ impl P2PNetwork {
                                 let _ = peer_discovery_tx.send(peer_addr);
                             }
                         }
+  // -- PHASE 4G stake gossip arms (enum tail: these sit
+  // AFTER Peers so the Transaction..Inventory source
+  // span asserted by the relay-gate test is untouched).
+  // Format-only receive (strict decode + dedup), then
+  // queue for the node vote/bond tasks. No provenance
+  // modes (Fresh/Historical is tx-sync-specific);
+  // admission (signature/epoch/stake checks) owns
+  // rejection downstream. Unwired stake channel =
+  // drop at ingress (pre-v6 nodes).
+  P2PMessage::Vote(payload_bytes) => {
+  let stake_tx = match stake_hooks
+  .stake_channel
+  .lock()
+                    {
+  Ok(guard) => guard.clone(),
+  Err(_) => None,
+        };
+  match stake_tx {
+                None => continue,
+  Some(tx) => {
+  if !accept_inbound_stake(
+  "vote",
+  payload_bytes,
+                    addr,
+  &seen_transactions,
+  &propagation_state,
+  &tx,
+                )
+            .await
+        {
+                continue;
+        }
+            }
+            }
+        }
+  P2PMessage::Bond(payload_bytes) => {
+  let stake_tx = match stake_hooks
+  .stake_channel
+  .lock()
+        {
+  Ok(guard) => guard.clone(),
+  Err(_) => None,
+        };
+  match stake_tx {
+                None => continue,
+  Some(tx) => {
+  if !accept_inbound_stake(
+  "bond",
+  payload_bytes,
+                        addr,
+  &seen_transactions,
+  &propagation_state,
+  &tx,
+                    )
+            .await
+        {
+                    continue;
+                }
+                }
+            }
+            }
+  P2PMessage::Unbond(payload_bytes) => {
+  let stake_tx = match stake_hooks
+  .stake_channel
+  .lock()
+        {
+  Ok(guard) => guard.clone(),
+  Err(_) => None,
+        };
+  match stake_tx {
+  None => continue,
+  Some(tx) => {
+  if !accept_inbound_stake(
+  "unbond",
+  payload_bytes,
+  addr,
+  &seen_transactions,
+  &propagation_state,
+  &tx,
+        )
+            .await
+        {
+                    continue;
+            }
+        }
+    }
+    }
                     }
                 }
                 Err(e) => {
@@ -4536,6 +4772,7 @@ impl P2PNetwork {
                 let propagation_state = Arc::clone(&self.propagation_state);
                 let sync_ctx = Arc::clone(&self.sync_ctx);
                 let is_orphan = Arc::clone(&self.is_orphan);
+  let stake_hooks = self.stake_hooks.clone();
                 let peer_discovery_tx = {
                     let guard = self.peer_discovery_tx.lock().await;
                     guard.clone().unwrap_or_else(|| {
@@ -4562,6 +4799,7 @@ impl P2PNetwork {
                         peer_discovery_tx,
                         sync_ctx,
                         is_orphan,
+  stake_hooks,
                     )
                     .await;
                     // Phase 2C: release the reservation only once the session
@@ -4688,6 +4926,92 @@ impl P2PNetwork {
     /// every scheduled wave has been written out.
     pub fn propagation_inflight(&self) -> usize {
         self.propagation_inflight.load(Ordering::Relaxed)
+        }
+
+  /// PHASE 4G: relay one admitted stake payload (vote / bond / unbond).
+  /// Validation-before-send (canonical re-encode + version + signature  - 
+  /// NOTHING the node rejected reaches the wire), scheduling dedup first
+  /// (same take_propagation_slot discipline as transactions: one wave
+  /// per payload, upstream peer excluded, bounded fan-out + jitter).
+  /// Called by the node AFTER process_vote/bond/unbond accepts (and by
+  /// RPC submission paths post-admission)  -  never by the receive stage.
+  /// NOTE on "sends gated pre-activation": the gate on WHAT gets produced
+  /// lives at the node vote task (it only votes post-V6 keys); the relay
+  /// itself is content-agnostic by 2E-D design (it never interprets
+  /// payloads)  -  its gates are validation + dedup + fan-out caps.
+  pub async fn broadcast_stake(&self, payload: StakePayload) {
+  let (payload_bytes, msg) = match &payload {
+  StakePayload::Vote(v) => {
+  if v.format_version != crate::transaction::VOTE_FORMAT_VERSION
+  || !v.verify_signature()
+            {
+                    return;
+                    }
+  let bytes = v.encode();
+  (bytes.clone(), P2PMessage::Vote(bytes))
+                    }
+  StakePayload::Bond(b) => {
+  if b.format_version != crate::transaction::BOND_FORMAT_VERSION
+  || !b.verify_signature()
+        {
+                return;
+                }
+  let bytes = b.encode();
+  (bytes.clone(), P2PMessage::Bond(bytes))
+            }
+  StakePayload::Unbond(u) => {
+  if u.format_version != crate::transaction::BOND_FORMAT_VERSION
+  || !u.verify_signature()
+        {
+                return;
+        }
+  let bytes = u.encode();
+  (bytes.clone(), P2PMessage::Unbond(bytes))
+                    }
+        };
+
+  let source = match take_propagation_slot(&self.propagation_state, &payload_bytes).await {
+  Some(source) => source,
+  None => return,
+        };
+  insert_seen(&self.seen_transactions, payload_bytes.clone()).await;
+
+        let msg_bytes = match bincode::serialize(&msg) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+  error!("Failed to serialize P2P stake message: {}", e);
+  return;
+                }
+        };
+
+  let wave: Vec<(mpsc::UnboundedSender<Vec<u8>>, Duration)> = {
+  let peers_guard = self.peers.read().await;
+  let addrs: Vec<SocketAddr> = peers_guard.keys().copied().collect();
+  let mut rng = self.propagation_rng.lock().unwrap_or_else(|e| e.into_inner());
+  let targets = propagation_targets(&addrs, source, MAX_PROPAGATION_FANOUT, &mut *rng);
+  targets
+            .into_iter()
+  .filter_map(|addr| {
+  let sender = peers_guard.get(&addr)?.clone();
+  let delay = propagation_delay(&mut *rng);
+  Some((sender, delay))
+        })
+            .collect()
+        };
+
+  let inflight = Arc::clone(&self.propagation_inflight);
+  for (sender, delay) in wave {
+  let task_inflight = Arc::clone(&inflight);
+  let task_msg = msg_bytes.clone();
+  task_inflight.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+  tokio::time::sleep(delay).await;
+  if sender.send(task_msg).is_err() {
+  tracing::trace!("relay peer channel closed");
+            }
+  task_inflight.fetch_sub(1, Ordering::Relaxed);
+                        });
+        }
     }
 
     /// Get the number of connected peers
@@ -6442,7 +6766,7 @@ mod phase2_eclipse_tests {
         for (i, w) in rounds.windows(2).enumerate() {
             assert_ne!(
                 w[0], w[1],
-                "round {i} and round {} drew the same order — the RNG is not re-seeded",
+  "round {i} and round {} drew the same order  -  the RNG is not re-seeded",
                 i + 1
             );
         }
@@ -6631,7 +6955,7 @@ mod phase2_eclipse_tests {
         );
         assert!(
             mgr.scores.contains_key(&banned),
-            "a ban always survives the sweep — that is why scores are a separate map"
+  "a ban always survives the sweep  -  that is why scores are a separate map"
         );
         assert_eq!(
             mgr.len(),
@@ -8784,7 +9108,7 @@ mod phase2_privacy_tests {
         assert_eq!(
             w1.len(),
             w2.len(),
-            "frame size must not track DAG size — that is the leak"
+  "frame size must not track DAG size  -  that is the leak"
         );
 
         // Rotation: five consecutive windows are disjoint and cover the DAG,
@@ -9094,6 +9418,55 @@ mod tests {
             assert_eq!(seen_read.len(), 1);
         }
     }
+
+  /// PHASE 4G: stake ingress is format-only (strict decode + dedup),
+  /// mirroring accept_inbound_transaction. A well-formed vote with a
+  /// BOGUS signature is still queued here (signatures are admission's
+  /// job); garbage, wrong-kind bytes and replays are dropped.
+    #[tokio::test]
+  async fn test_stake_ingress_format_only_dedup() {
+  use crate::transaction::VOTE_FORMAT_VERSION;
+        let seen = Arc::new(RwLock::new(HashMap::new()));
+  let prop = Arc::new(RwLock::new(HashMap::new()));
+  let (tx, mut rx) = mpsc::unbounded_channel::<StakePayload>();
+  let source: SocketAddr = "127.0.0.1:30333".parse().unwrap();
+
+  let vote = Vote {
+  format_version: VOTE_FORMAT_VERSION,
+  validator: [0x11u8; 32],
+  epoch: 600_000,
+  conflict_sender: [0x22u8; 32],
+  conflict_nonce: 5,
+  side: [0x33u8; 32],
+  stake_epoch: 600_000,
+  stake_amount: 200,
+  parents: [[0u8; 32]; 2],
+  // Bogus signature ON PURPOSE: ingress must not check it.
+  signature: [0xABu8; 64],
+  };
+  let bytes = vote.encode();
+  assert!(accept_inbound_stake("vote", bytes.clone(), source, &seen, &prop, &tx).await);
+  // Queued (decoded, round-trips byte-identical).
+  match rx.try_recv().expect("vote queued") {
+  StakePayload::Vote(v) => assert_eq!(v.encode(), bytes),
+  other => panic!("expected vote, got {:?}", other),
+            }
+  // Replay dropped (dedup ahead of everything).
+  assert!(!accept_inbound_stake("vote", bytes, source, &seen, &prop, &tx).await);
+  // Garbage dropped.
+  assert!(!accept_inbound_stake("vote", vec![0u8; 10], source, &seen, &prop, &tx).await);
+  // Wrong-kind bytes dropped (bond encoding as vote).
+  let bond = Bond {
+  format_version: crate::transaction::BOND_FORMAT_VERSION,
+  validator: [0x11u8; 32],
+  amount: 30_000_000,
+  epoch: 1,
+  signature: [0u8; 64],
+  };
+  assert!(!accept_inbound_stake("vote", bond.encode(), source, &seen, &prop, &tx).await);
+  // Unknown kind dropped.
+  assert!(!accept_inbound_stake("nope", vec![1u8; 257], source, &seen, &prop, &tx).await);
+        }
 
     /// H2: read_exact_timeout must fail with ErrorKind::TimedOut when the peer
     /// sends nothing, and succeed when the bytes arrive. A stalled peer can no
@@ -10169,7 +10542,7 @@ mod phase2_privacy_propagation_tests {
         assert_eq!(
             hits.len(),
             peers.len(),
-            "some address is never selected — that is a privileged relay role"
+  "some address is never selected  -  that is a privileged relay role"
         );
 
         let fair = 4.0 / peers.len() as f64;
@@ -10215,7 +10588,7 @@ mod phase2_privacy_propagation_tests {
         assert_eq!(entry.source, Some(source), "upstream peer must be recorded");
         assert!(
             !entry.scheduled,
-            "receiving must not schedule a relay wave — that is the double relay, gone"
+  "receiving must not schedule a relay wave  -  that is the double relay, gone"
         );
     }
 
@@ -10380,7 +10753,7 @@ mod phase2_privacy_propagation_tests {
             .expect("the relay call site must exist");
         assert!(
             gate < relay,
-            "relay moved upstream of validate_pure — invalid payloads would hit the wire"
+  "relay moved upstream of validate_pure  -  invalid payloads would hit the wire"
         );
         assert_eq!(
             rpc_src.matches("broadcast_transaction").count(),
@@ -10401,7 +10774,7 @@ mod phase2_privacy_propagation_tests {
         let body = &p2p_src[start..end];
         assert!(
             !body.contains("peers.read()"),
-            "the receive arm touches the peer table — that is a relay"
+  "the receive arm touches the peer table  -  that is a relay"
         );
         assert!(
             !body.contains("P2PMessage::Transaction("),
@@ -10555,7 +10928,7 @@ mod phase2_privacy_propagation_tests {
         );
         assert!(
             spread >= Duration::from_millis(1),
-            "all neighbours saw it together — that is the fixed-timing signal"
+  "all neighbours saw it together  -  that is the fixed-timing signal"
         );
 
         // --- overhead / duplication: a sustained stream ----------------------

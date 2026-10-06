@@ -19,7 +19,8 @@
 use crate::ledger::Ledger;
 use crate::parent_selection::DAG;
 use crate::rpc::Mempool;
-use crate::transaction::{Transaction, TransactionId};
+use crate::stake::{current_epoch, StakeRegistry, VoteInsertOutcome};
+use crate::transaction::{Bond, Transaction, TransactionId, Unbond, Vote};
 use crate::validation::{TransactionValidator, ValidationError, ValidationMode};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -77,6 +78,12 @@ impl From<ValidationError> for ProcessingError {
 /// All RPC, P2P, and test code MUST use this processor
 pub struct TransactionProcessor {
     validator: TransactionValidator,
+  /// PHASE 4G: live stake-finality registry (None = pre-v6 wiring:
+  /// every path behaves EXACTLY as before  -  legacy CDW/min-id
+  /// everywhere). Set by the node after boot-loading the registry from
+  /// storage. When present, conflict winners are era-routed (v6 for
+  /// post-activation keys) and vote/bond/unbond admission is enabled.
+  stake_registry: Option<Arc<RwLock<StakeRegistry>>>,
 }
 
 impl TransactionProcessor {
@@ -84,6 +91,7 @@ impl TransactionProcessor {
     pub fn new() -> Self {
         Self {
             validator: TransactionValidator::new(),
+  stake_registry: None,
         }
     }
 
@@ -91,7 +99,14 @@ impl TransactionProcessor {
     pub fn with_difficulty(difficulty: u8) -> Self {
         Self {
             validator: TransactionValidator::with_difficulty(difficulty),
+  stake_registry: None,
         }
+    }
+
+  /// PHASE 4G: attach the live stake registry (node boot path, after
+  /// storage load). Idempotent (re-attaching replaces the handle).
+  pub fn set_stake_registry(&mut self, registry: Arc<RwLock<StakeRegistry>>) {
+  self.stake_registry = Some(registry);
     }
 
     /// PHASE D: expose the pure gate (PoW + signature) to the mempool ACCEPT
@@ -246,7 +261,7 @@ impl TransactionProcessor {
         // (read locks held); STEP 6b recomputes post-insert and rebuilds
         // iff any winner flipped. Read-only, no state touched.
         let trigger_keys = dag_read.affected_conflict_keys(&tx.parents);
-        let trigger_pre = Self::conflict_winners_for(&dag_read, &trigger_keys);
+  let trigger_pre = self.conflict_winners_for(&dag_read, &trigger_keys);
         drop(dag_read);
         drop(ledger_read);
 
@@ -327,12 +342,12 @@ impl TransactionProcessor {
         // full replay re-derives the flipped world (the newcomer's STEP-4
         // transfer included or correctly dropped by the replay).
         if !trigger_keys.is_empty() {
-            let trigger_post = Self::conflict_winners_for(&dag, &trigger_keys);
+  let trigger_post = self.conflict_winners_for(&dag, &trigger_keys);
             if trigger_post != trigger_pre {
                 tracing::info!(
                     "🔄 Descendant arrival flipped conflict winner(s); rebuilding"
                 );
-                ledger.rebuild_from_dag(&dag);
+  self.rebuild_for_era(&dag, &mut ledger);
             }
         }
 
@@ -481,7 +496,7 @@ impl TransactionProcessor {
         keys.push((tx.sender, tx.account_nonce));
         keys.sort();
         keys.dedup();
-        let pre = Self::conflict_winners_for(&dag, &keys);
+  let pre = self.conflict_winners_for(&dag, &keys);
         // Insert (retained win or lose — never pruned, never rejected).
         if let Err(e) = dag.add_transaction_validated(tx.clone()) {
             tracing::error!("❌ Conflict DAG add failed: {}", e);
@@ -493,10 +508,10 @@ impl TransactionProcessor {
         }
         // Re-resolve; rebuild iff any winner flipped (newcomer effects apply
         // ONLY through the rebuild — never live-transferred on this path).
-        let post = Self::conflict_winners_for(&dag, &keys);
+  let post = self.conflict_winners_for(&dag, &keys);
         if post != pre {
             tracing::info!(
-                "🔄 Conflict re-resolved (CDW flip): {:?} -> {:?}",
+  "🔄 Conflict re-resolved (flip): {:?} -> {:?}",
                 pre.iter()
                     .map(|(_, id)| hex::encode(&id[..4]))
                     .collect::<Vec<_>>(),
@@ -504,7 +519,7 @@ impl TransactionProcessor {
                     .map(|(_, id)| hex::encode(&id[..4]))
                     .collect::<Vec<_>>(),
             );
-            ledger.rebuild_from_dag(&dag);
+  self.rebuild_for_era(&dag, &mut ledger);
         }
         // Terminal disposition (DAG-held, winner or retained loser alike).
         mempool.remove_transaction(&tx.id);
@@ -541,16 +556,308 @@ impl TransactionProcessor {
         Ok(())
     }
 
-    /// PHASE 4B: winners for `keys` against `dag`, in input order.
-    /// Single-member keys resolve trivially to their sole member (no score
-    /// needed); multi-member keys via resolve_conflict_key (CDW + tiebreak,
-    /// grandfathered). Empty member lists are skipped (cannot happen in
-    /// production — maintained index — but never panic on skew). Pure,
-    /// deterministic; the flip detector compares pre/post vectors.
+  // ====================================================================
+  // PHASE 4G: stake admission entries (vote / bond / unbond). Shared by
+  // RPC, P2P and node vote tasks  -  the ONLY way stake objects enter the
+  // registry (same single-entry discipline as process() for txs).
+  //
+  // LOCK ORDER (global): dag -> registry -> ledger -> mempool, with
+  // standalone single-lock phases allowed anywhere. Concretely: no path
+  // ever holds the registry while acquiring dag (phases below take dag
+  // first, or take the registry alone); the tx conflict paths take the
+  // registry LAST via try_read (fail-fast, never waits). try_* failures
+  // map to LockError (transient requeue, same discipline as dag/ledger).
+  //
+  // PERSISTENCE: every mutation persists via storage.save_registry
+  // (authoritative rewrite + manifest; a crash before the manifest write
+  // fails closed at next boot). INTERIM cost: O(registry) per event  - 
+  // votes/bonds are validator-scale (not tx-scale); batched checkpointing
+  // is a perf TODO, not a correctness gap. Votes lost to a crash before
+  // persist are re-gossipable (producers re-emit per epoch).
+  // ====================================================================
+
+  /// PHASE 4G: admit a finality vote. Returns the insert disposition:
+  /// Accepted (new weight), Duplicate (idempotent replay, no-op),
+  /// Equivocated (slash applied + evidence; triggers full re-resolution).
+  /// Re-resolution: the vote's key is re-decided (finalize attempt +
+  /// quorum-loss invalidation check); the ledger rebuilds iff a decision
+  /// is created/voided or the winner may have flipped toward the new
+  /// vote (post-winner == vote side). Equivocation ALWAYS rebuilds (a
+  /// slash zeroes weight on every key the slasher voted on) after a
+  /// finalized-key quorum sweep on the vote's key.
+  pub async fn process_vote(
+        &self,
+  vote: Vote,
+        dag: &Arc<RwLock<DAG>>,
+        ledger: &Arc<RwLock<Ledger>>,
+  ) -> Result<VoteInsertOutcome, ProcessingError> {
+  let registry = match &self.stake_registry {
+  None => {
+  return Err(ProcessingError::DagError(
+  "stake registry not attached".to_string(),
+  ))
+                }
+  Some(r) => r.clone(),
+            };
+  // Storage handle first (standalone phase  -  no locks held).
+  let storage_opt = ledger.read().await.storage();
+  let at_epoch = current_epoch();
+  let key = (vote.conflict_sender, vote.conflict_nonce);
+  let vote_side = vote.side;
+
+  // Phase A: validate + insert (registry alone).
+  let outcome = {
+  let mut reg = registry.write().await;
+  if let Err(e) = self.validator.validate_vote(&vote, &reg, at_epoch) {
+  return Err(ProcessingError::ValidationFailed(e));
+        }
+  let outcome = reg.insert_vote(vote);
+  if matches!(
+  outcome,
+  VoteInsertOutcome::Accepted | VoteInsertOutcome::Equivocated { .. }
+    ) {
+  Self::persist_registry(&reg, &storage_opt).await?;
+    }
+  outcome
+            };
+  if outcome == VoteInsertOutcome::Duplicate {
+  return Ok(outcome);
+    }
+
+  // Phase B/C: re-resolve the vote's key (dag read, then registry
+  // write  -  dag -> registry order) with finalize + invalidation.
+  let mut need_rebuild = matches!(outcome, VoteInsertOutcome::Equivocated { .. });
+        {
+                let dag_guard = dag.read().await;
+  let mut reg = registry.write().await;
+  let members = dag_guard.find_sender_nonce_conflicts(&key.0, key.1);
+  if members.len() >= 2 {
+  // Finalize attempt (sticky: existing decisions returned as-is).
+  let finalized_before = reg.finalized_winner(&key);
+  let finalized_now = reg.try_finalize(key, &members, at_epoch, |m, txid| {
+  dag_guard.is_strict_descendant(m, txid)
+  });
+  if finalized_now.is_some() && finalized_before.is_none() {
+  need_rebuild = true;
+            }
+  // Quorum-loss invalidation: a valid finality whose support
+  // fell below quorum (slash/unbond since finalizing) is
+  // DELETED so later re-resolution starts clean.
+  if let Some(winner) = reg.finalized_winner(&key) {
+  let support = reg.support_for(key, &winner, at_epoch, |txid| {
+  dag_guard.is_strict_descendant(&winner, txid)
+  });
+  let total = reg.eligible_stake_total(at_epoch);
+  if !StakeRegistry::quorum_met(support, total) {
+  reg.invalidate_finality(&key);
+  need_rebuild = true;
+            }
+        }
+  // Plurality flip toward the new vote (Accepted only;
+  // Equivocated already forces a rebuild above).
+  if !need_rebuild {
+  if let Some(winner) =
+  dag_guard.resolve_conflict_key_v6(&key.0, key.1, &reg, at_epoch)
+        {
+  if winner == vote_side {
+  need_rebuild = true;
+            }
+        }
+    }
+}
+  if need_rebuild {
+  // Persist decision changes before replaying them.
+  Self::persist_registry(&reg, &storage_opt).await?;
+    }
+  drop(reg);
+                drop(dag_guard);
+}
+
+  // Phase D: global replay under v6 winners + ledger persist.
+  if need_rebuild {
+  let dag_guard = dag.read().await;
+  let reg = registry.read().await;
+  let mut ledger_guard = ledger.write().await;
+  ledger_guard.rebuild_from_dag_v6(&dag_guard, &reg, at_epoch);
+  if let Err(e) = ledger_guard.save_dirty().await {
+  return Err(ProcessingError::PersistenceError(format!(
+  "Save failed: {}",
+  e
+  )));
+    }
+    }
+  Ok(outcome)
+    }
+
+  /// PHASE 4G: admit a bond intent (lock funds into voting weight).
+  /// Maturation is measured from the SIGNED creation epoch (deterministic
+  /// across nodes  -  arrival times differ; validation windows it to
+  /// near-current so backdating cannot grant instant maturity). New bonds
+  /// are immature for BOND_MATURATION_EPOCHS, hence ineligible
+  /// immediately  -  no winner can flip, no rebuild. (Top-ups likewise
+  /// reset maturation; see StakeRegistry::apply_bond.) Replays of the
+  /// same bond id are idempotent Ok (no double top-up  -  each top-up
+  /// needs a FRESH signature, i.e. a new id).
+  pub async fn process_bond(
+  &self,
+  bond: Bond,
+  ledger: &Arc<RwLock<Ledger>>,
+    ) -> Result<(), ProcessingError> {
+  let registry = match &self.stake_registry {
+  None => {
+  return Err(ProcessingError::DagError(
+  "stake registry not attached".to_string(),
+  ))
+            }
+  Some(r) => r.clone(),
+        };
+  let at_epoch = current_epoch();
+  // Ledger read standalone (funds check needs no other lock).
+                let ledger_guard = ledger.read().await;
+  let storage_opt = ledger_guard.storage();
+  let validation = {
+  let reg = registry.read().await;
+  self.validator
+  .validate_bond(&bond, &ledger_guard, &reg, at_epoch)
+        };
+                drop(ledger_guard);
+  if let Err(e) = validation {
+  return Err(ProcessingError::ValidationFailed(e));
+        }
+  let mut reg = registry.write().await;
+  if !reg.note_bond_seen(bond.id()) {
+                return Ok(());
+    }
+  reg.apply_bond(bond.validator, bond.amount, bond.epoch)
+  .map_err(ProcessingError::DagError)?;
+  Self::persist_registry(&reg, &storage_opt).await?;
+        Ok(())
+            }
+
+  /// PHASE 4G: admit an unbond intent (begin exit; voting ends at
+  /// acceptance  -  clean cutover). Release is measured from the SIGNED
+  /// epoch (deterministic across nodes; validation windows it to
+  /// near-current so backdating cannot grant early exits). Support drops
+  /// immediately, so winners may flip on any key the validator backed:
+  /// unconditional global rebuild + finalized-key quorum sweep (same
+  /// invalidation rule as votes), then persist.
+  pub async fn process_unbond(
+  &self,
+  unbond: Unbond,
+  dag: &Arc<RwLock<DAG>>,
+  ledger: &Arc<RwLock<Ledger>>,
+  ) -> Result<(), ProcessingError> {
+  let registry = match &self.stake_registry {
+  None => {
+  return Err(ProcessingError::DagError(
+  "stake registry not attached".to_string(),
+  ))
+            }
+  Some(r) => r.clone(),
+        };
+  let storage_opt = ledger.read().await.storage();
+  let at_epoch = current_epoch();
+            {
+  let mut reg = registry.write().await;
+  if let Err(e) = self.validator.validate_unbond(&unbond, &reg, at_epoch) {
+  return Err(ProcessingError::ValidationFailed(e));
+        }
+  reg.apply_unbond(unbond.validator, unbond.epoch)
+  .map_err(ProcessingError::DagError)?;
+  Self::persist_registry(&reg, &storage_opt).await?;
+    }
+  // Quorum sweep over finalized keys (dag read, then registry write).
+                {
+  let dag_guard = dag.read().await;
+  let mut reg = registry.write().await;
+  let mut voided = false;
+  for fkey in reg.finalized_keys() {
+  if let Some(winner) = reg.finalized_winner(&fkey) {
+  let support = reg.support_for(fkey, &winner, at_epoch, |txid| {
+  dag_guard.is_strict_descendant(&winner, txid)
+  });
+  let total = reg.eligible_stake_total(at_epoch);
+  if !StakeRegistry::quorum_met(support, total) {
+  reg.invalidate_finality(&fkey);
+  voided = true;
+    }
+        }
+    }
+  if voided {
+  Self::persist_registry(&reg, &storage_opt).await?;
+        }
+  drop(reg);
+  drop(dag_guard);
+        }
+  // Unconditional replay (support dropped on live keys too).
+        {
+  let dag_guard = dag.read().await;
+  let reg = registry.read().await;
+  let mut ledger_guard = ledger.write().await;
+  ledger_guard.rebuild_from_dag_v6(&dag_guard, &reg, at_epoch);
+  if let Err(e) = ledger_guard.save_dirty().await {
+  return Err(ProcessingError::PersistenceError(format!(
+  "Save failed: {}",
+  e
+  )));
+        }
+        }
+  Ok(())
+            }
+
+  /// PHASE 4G: persist helper  -  authoritative registry rewrite (no-op
+  /// without storage, e.g. pure in-memory tests). save_registry fails
+  /// closed on I/O (Err => caller reports PersistenceError, memory state
+  /// stands  -  the next event re-saves; boot never reads partial state
+  /// thanks to the manifest).
+  async fn persist_registry(
+  reg: &StakeRegistry,
+  storage_opt: &Option<Arc<RwLock<crate::storage::Storage>>>,
+  ) -> Result<(), ProcessingError> {
+  if let Some(storage) = storage_opt {
+  let storage_guard = storage.read().await;
+  if let Err(e) = storage_guard.save_registry(reg) {
+  return Err(ProcessingError::PersistenceError(format!(
+  "Stake persist failed: {}",
+  e
+  )));
+        }
+                }
+  Ok(())
+            }
+
+  /// PHASE 4B winners for `keys` against `dag`, in input order, with
+  /// PHASE 4G era routing when a registry is attached: single-member keys
+  /// resolve trivially to their sole member (no score needed); multi-member
+  /// keys via resolve_conflict_key_v6 (finalized-first, then stake
+  /// plurality, min-id tiebreak; pre-V6 keys delegate to the frozen legacy
+  /// resolve_conflict_key). WITHOUT a registry: exact legacy behavior
+  /// (resolve_conflict_key everywhere). Empty member lists are skipped
+  /// (cannot happen in production  -  maintained index  -  but never panic on
+  /// skew). Pure, deterministic; the flip detector compares pre/post
+  /// vectors.
+    ///
+  /// LOCK DISCIPLINE: takes the registry as try_read (fail-fast LockError
+  /// discipline like the dag/ledger/mempool guards here  -  a contended
+  /// registry means a vote/bond mutation is in flight RIGHT NOW, and that
+  /// mutation's own trigger re-resolves the same keys after committing, so
+  /// a transient legacy answer here can never stick). Global order is
+  /// dag -> registry -> ledger -> mempool (registry always AFTER dag,
+  /// never before, never held while acquiring dag).
     fn conflict_winners_for(
+  &self,
         dag: &DAG,
         keys: &[([u8; 32], u64)],
     ) -> Vec<(([u8; 32], u64), TransactionId)> {
+  // Registry view (fail-fast): None/absent => pure legacy path.
+  let reg_guard = match &self.stake_registry {
+  None => None,
+  Some(reg) => match reg.try_read() {
+  Ok(g) => Some(g),
+  Err(_) => None,
+  },
+        };
+  let at_epoch = current_epoch();
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
             let members = dag.find_sender_nonce_conflicts(&key.0, key.1);
@@ -560,7 +867,11 @@ impl TransactionProcessor {
             let winner = if members.len() == 1 {
                 members[0]
             } else {
-                match dag.resolve_conflict_key(&key.0, key.1) {
+  let resolved = match &reg_guard {
+  Some(reg) => dag.resolve_conflict_key_v6(&key.0, key.1, reg, at_epoch),
+  None => dag.resolve_conflict_key(&key.0, key.1),
+        };
+  match resolved {
                     Some(id) => id,
                     None => continue,
                 }
@@ -568,6 +879,24 @@ impl TransactionProcessor {
             out.push((*key, winner));
         }
         out
+        }
+
+  /// PHASE 4G: era-branched ledger replay for the conflict paths. With an
+  /// attached registry the replay consumes v6 winners (finalized-first);
+  /// without, the frozen legacy replay. Callers hold dag+ledger already
+  /// (write) and pass the registry view implicitly via self (try_read  - 
+  /// same transient-legacy discipline as conflict_winners_for).
+  fn rebuild_for_era(&self, dag: &DAG, ledger: &mut Ledger) {
+  match &self.stake_registry {
+  None => ledger.rebuild_from_dag(dag),
+  Some(reg) => match reg.try_read() {
+  Ok(view) => {
+  let at_epoch = current_epoch();
+  ledger.rebuild_from_dag_v6(dag, &view, at_epoch);
+    }
+  Err(_) => ledger.rebuild_from_dag(dag),
+  },
+            }
     }
 
     /// PHASE 3E (M1): undo STEPS 4–7 after a STEP-8 persistence failure so an

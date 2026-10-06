@@ -6,6 +6,8 @@ pub mod inc01_fix_tests;
 pub mod migration_multinode;
 pub mod multiprocess_crash;
 pub mod phase4_consensus_weight_tests;
+pub mod phase4c_adversarial_audit_tests;
+pub mod phase4g_stake_finality_tests;
 pub mod pow_economics;
 pub mod scalability;
 pub mod security_tests;

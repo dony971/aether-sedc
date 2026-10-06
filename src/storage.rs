@@ -3,7 +3,11 @@
 //! Implements Sled persistence for transactions, DAG state, and wallet balances.
 //! Includes atomic writes, separate trees for balances and transactions, and migration from JSON.
 
-use crate::transaction::{Address, Transaction, TransactionId};
+use crate::stake::{
+  ConflictKey, EquivocationEvidence, FinalizedRecord, RegistrySnapshot, StakeRegistry,
+  ValidatorRecord,
+                };
+use crate::transaction::{Address, Transaction, TransactionId, Vote};
 use sled::{Db, Transactional, Tree};
 use std::collections::HashMap;
 use std::path::Path;
@@ -50,6 +54,11 @@ pub enum TreeName {
     Orphans,      // Orphan transactions waiting for parents
     Mempool,      // Persistent mempool queue
     AppliedTx,    // C2 P3: ids of transactions whose ledger effects were applied
+  // PHASE 4G: stake-finality trees (additive only  -  existing trees untouched)
+  Validators,  // validator address (32B) -> bincode(ValidatorRecord)
+  Votes,  // vote id (32B) -> canonical vote encoding (257B)
+  Finalized,  // sender (32B) ++ nonce LE (8B) -> bincode(FinalizedRecord)
+  Evidence,  // evidence id (32B) -> bincode(EquivocationEvidence)
 }
 
 impl TreeName {
@@ -63,6 +72,10 @@ impl TreeName {
             TreeName::Orphans => "orphans",
             TreeName::Mempool => "mempool",
             TreeName::AppliedTx => "applied_tx",
+  TreeName::Validators => "stake_validators",
+  TreeName::Votes => "stake_votes",
+  TreeName::Finalized => "stake_finalized",
+  TreeName::Evidence => "stake_evidence",
         }
     }
 }
@@ -79,6 +92,11 @@ pub struct Storage {
     orphans: Tree,
     mempool: Tree,
     applied_tx: Tree,
+  // PHASE 4G stake-finality trees.
+  validators: Tree,
+  votes: Tree,
+  finalized: Tree,
+  evidence: Tree,
 }
 
 impl Storage {
@@ -95,6 +113,10 @@ impl Storage {
         let orphans = db.open_tree(TreeName::Orphans.name())?;
         let mempool = db.open_tree(TreeName::Mempool.name())?;
         let applied_tx = db.open_tree(TreeName::AppliedTx.name())?;
+  let validators = db.open_tree(TreeName::Validators.name())?;
+  let votes = db.open_tree(TreeName::Votes.name())?;
+  let finalized = db.open_tree(TreeName::Finalized.name())?;
+  let evidence = db.open_tree(TreeName::Evidence.name())?;
 
         Ok(Self {
             db,
@@ -106,6 +128,10 @@ impl Storage {
             orphans,
             mempool,
             applied_tx,
+  validators,
+  votes,
+  finalized,
+  evidence,
         })
     }
 
@@ -120,6 +146,10 @@ impl Storage {
             TreeName::Orphans => &self.orphans,
             TreeName::Mempool => &self.mempool,
             TreeName::AppliedTx => &self.applied_tx,
+  TreeName::Validators => &self.validators,
+  TreeName::Votes => &self.votes,
+  TreeName::Finalized => &self.finalized,
+  TreeName::Evidence => &self.evidence,
         }
     }
 
@@ -654,6 +684,263 @@ impl Storage {
 
         Ok(nonces)
     }
+
+  // ====================================================================
+  // PHASE 4G: stake-finality persistence (validators / votes / finalized
+  // decisions / equivocation evidence). Additive only  -  every existing
+  // accessor above is untouched. Records are NEVER deleted except via
+  // save_registry (authoritative rewrite) and remove_finalized (slash-
+  // triggered invalidation path): Unbonded/Slashed validator records are
+  // RETAINED for audit (weight zero, enforced in the registry).
+  // ====================================================================
+
+  /// Manifest key (Metadata tree): bincode((u64 counts x4, blake3 hash,
+  /// seen bond ids)). Written LAST on save; verified FIRST on load  -  a
+  /// crash between the record writes and the manifest write fails closed
+  /// (counts/hash mismatch) instead of restoring a silently partial
+  /// registry. The admitted-bond-id set rides in the manifest (no fifth
+  /// tree): it is validator-scale and covered by the same hash.
+  const STAKE_MANIFEST_KEY: &'static str = "stake_registry_manifest_v1";
+
+  /// 40-byte finalized key: sender (32B) ++ nonce LE (8B).
+  fn finalized_key(key: &ConflictKey) -> Vec<u8> {
+  let mut out = Vec::with_capacity(40);
+  out.extend_from_slice(&key.0);
+  out.extend_from_slice(&key.1.to_le_bytes());
+  out
+}
+
+  fn parse_finalized_key(raw: &[u8]) -> Result<ConflictKey, StorageError> {
+  if raw.len() != 40 {
+  return Err(StorageError::DatabaseError(
+  "Invalid finalized key length".to_string(),
+  ));
+}
+  let mut sender = [0u8; 32];
+  sender.copy_from_slice(&raw[..32]);
+  let mut nonce_bytes = [0u8; 8];
+  nonce_bytes.copy_from_slice(&raw[32..40]);
+  Ok((sender, u64::from_le_bytes(nonce_bytes)))
+    }
+
+  /// Store one validator record (keyed by address).
+  pub fn put_validator_record(&self, rec: &ValidatorRecord) -> Result<(), StorageError> {
+  let value = bincode::serialize(rec)?;
+  self.tree(TreeName::Validators).insert(rec.address, value)?;
+  Ok(())
+    }
+
+  /// Load one validator record (None = unknown address).
+  pub fn get_validator_record(
+  &self,
+  validator: &[u8; 32],
+  ) -> Result<Option<ValidatorRecord>, StorageError> {
+  match self.tree(TreeName::Validators).get(validator)? {
+  None => Ok(None),
+  Some(value) => {
+  let rec: ValidatorRecord = bincode::deserialize(&value)?;
+  Ok(Some(rec))
+    }
+    }
+    }
+
+  /// Store one vote (keyed by vote id, canonical 257B encoding).
+  pub fn put_vote(&self, vote: &Vote) -> Result<(), StorageError> {
+  self.tree(TreeName::Votes).insert(vote.id(), vote.encode())?;
+  Ok(())
+    }
+
+  /// Vote id presence (P2P GetData serving, dedup checks).
+  pub fn has_vote(&self, id: &[u8; 32]) -> Result<bool, StorageError> {
+  Ok(self.tree(TreeName::Votes).get(id)?.is_some())
+    }
+
+  /// Load one vote by id (None = unknown). Strict-decodes on read
+  /// (corrupt bytes are Err, never a silent skip  -  callers decide).
+  pub fn get_vote(&self, id: &[u8; 32]) -> Result<Option<Vote>, StorageError> {
+  match self.tree(TreeName::Votes).get(id)? {
+  None => Ok(None),
+  Some(value) => {
+  let vote = Vote::decode(&value).map_err(StorageError::DatabaseError)?;
+  Ok(Some(vote))
+    }
+    }
+    }
+
+  /// Store one finalized record (keyed by conflict key).
+  pub fn put_finalized(
+  &self,
+  key: &ConflictKey,
+  rec: &FinalizedRecord,
+  ) -> Result<(), StorageError> {
+  let value = bincode::serialize(rec)?;
+  self.tree(TreeName::Finalized)
+  .insert(Self::finalized_key(key), value)?;
+  Ok(())
+    }
+
+  /// Load one finalized record (None = no decision for this key).
+  pub fn get_finalized(
+  &self,
+  key: &ConflictKey,
+  ) -> Result<Option<FinalizedRecord>, StorageError> {
+  match self.tree(TreeName::Finalized).get(Self::finalized_key(key))? {
+  None => Ok(None),
+  Some(value) => {
+  let rec: FinalizedRecord = bincode::deserialize(&value)?;
+  Ok(Some(rec))
+    }
+    }
+}
+
+  /// Delete a finalized record (slash-triggered invalidation ONLY  - 
+  /// mirrors StakeRegistry::invalidate_finality; never called on any
+  /// fork-choice or re-resolution path).
+  pub fn remove_finalized(&self, key: &ConflictKey) -> Result<bool, StorageError> {
+  Ok(self
+  .tree(TreeName::Finalized)
+  .remove(Self::finalized_key(key))?
+  .is_some())
+  }
+
+  /// Store one evidence record (keyed by evidence id, both votes inside).
+  pub fn put_evidence(&self, ev: &EquivocationEvidence) -> Result<(), StorageError> {
+  let value = bincode::serialize(ev)?;
+  self.tree(TreeName::Evidence).insert(ev.id, value)?;
+  Ok(())
+  }
+
+  /// Evidence id presence.
+  pub fn has_evidence(&self, id: &[u8; 32]) -> Result<bool, StorageError> {
+  Ok(self.tree(TreeName::Evidence).get(id)?.is_some())
+  }
+
+  /// Authoritative registry save: clears the four stake trees, writes the
+  /// snapshot parts per-record, then writes the manifest LAST. A crash
+  /// before the manifest write loads as manifest-mismatch (fail closed).
+  pub fn save_registry(&self, registry: &StakeRegistry) -> Result<(), StorageError> {
+  let snap = registry.snapshot();
+  self.tree(TreeName::Validators).clear()?;
+  self.tree(TreeName::Votes).clear()?;
+  self.tree(TreeName::Finalized).clear()?;
+  self.tree(TreeName::Evidence).clear()?;
+  for rec in &snap.validators {
+  self.put_validator_record(rec)?;
+  }
+  for bytes in &snap.votes {
+  let vote = Vote::decode(bytes).map_err(StorageError::DatabaseError)?;
+  self.put_vote(&vote)?;
+  }
+  for (key, rec) in &snap.finalized {
+  self.put_finalized(key, rec)?;
+  }
+  for ev in &snap.evidence {
+  self.put_evidence(ev)?;
+  }
+  // Manifest: counts + blake3 over the canonical snapshot bytes.
+  let snap_bytes = bincode::serialize(&snap)?;
+  let mut hasher = blake3::Hasher::new();
+  hasher.update(&snap_bytes);
+  let hash: [u8; 32] = hasher.finalize().into();
+  let manifest = (
+  snap.validators.len() as u64,
+  snap.votes.len() as u64,
+  snap.finalized.len() as u64,
+  snap.evidence.len() as u64,
+  hash,
+  snap.seen_bonds.clone(),
+        );
+  let manifest_bytes = bincode::serialize(&manifest)?;
+  self.put_metadata(Self::STAKE_MANIFEST_KEY, &manifest_bytes)?;
+  Ok(())
+  }
+
+  /// Registry load (boot path): reads the four trees, checks counts and
+  /// hash against the manifest, restores through StakeRegistry::restore
+  /// (equivocation re-detection re-fires deterministically). Returns
+  /// Ok(None) when no manifest exists (fresh node  -  caller starts empty).
+  /// Any mismatch or corruption is Err (fail closed, never partial).
+  pub fn load_registry(&self) -> Result<Option<StakeRegistry>, StorageError> {
+  let manifest_bytes = match self.get_metadata(Self::STAKE_MANIFEST_KEY) {
+  Ok(b) => b,
+  // No manifest = fresh node that never saved stake state.
+  Err(StorageError::KeyNotFound) => return Ok(None),
+  Err(e) => return Err(e),
+  };
+  let (n_val, n_votes, n_fin, n_ev, hash, seen_bonds): (
+  u64,
+  u64,
+  u64,
+  u64,
+  [u8; 32],
+  Vec<[u8; 32]>,
+  ) = bincode::deserialize(&manifest_bytes)?;
+  let mut validators = Vec::new();
+  for item in self.tree(TreeName::Validators).iter() {
+  let (_, value) = item.map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+  let rec: ValidatorRecord = bincode::deserialize(&value)?;
+  validators.push(rec);
+  }
+  let mut votes = Vec::new();
+  for item in self.tree(TreeName::Votes).iter() {
+  let (_, value) = item.map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+  // Strict decode now (corrupt bytes fail here, not later).
+  let vote = Vote::decode(&value).map_err(StorageError::DatabaseError)?;
+  votes.push(vote.encode());
+  }
+  let mut finalized = Vec::new();
+  for item in self.tree(TreeName::Finalized).iter() {
+  let (key, value) = item.map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+  let ck = Self::parse_finalized_key(key.as_ref())?;
+  let rec: FinalizedRecord = bincode::deserialize(&value)?;
+  finalized.push((ck, rec));
+  }
+  let mut evidence = Vec::new();
+  for item in self.tree(TreeName::Evidence).iter() {
+  let (_, value) = item.map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+  let ev: EquivocationEvidence = bincode::deserialize(&value)?;
+  // Fail closed on corrupt embedded votes (proof must verify).
+  let _ = ev.votes().map_err(StorageError::DatabaseError)?;
+  evidence.push(ev);
+  }
+  // Deterministic order (same as snapshot()).
+  validators.sort_by(|a: &ValidatorRecord, b: &ValidatorRecord| a.address.cmp(&b.address));
+  votes.sort();
+  finalized.sort_by(
+  |(a, _): &(ConflictKey, FinalizedRecord), (b, _): &(ConflictKey, FinalizedRecord)| {
+  a.cmp(b)
+  },
+        );
+  evidence.sort_by(|a: &EquivocationEvidence, b: &EquivocationEvidence| a.id.cmp(&b.id));
+  if validators.len() as u64 != n_val
+  || votes.len() as u64 != n_votes
+  || finalized.len() as u64 != n_fin
+  || evidence.len() as u64 != n_ev
+  {
+  return Err(StorageError::DatabaseError(
+  "stake manifest count mismatch (partial save?)".to_string(),
+  ));
+  }
+  let snap = RegistrySnapshot {
+  validators,
+  votes,
+  finalized,
+  evidence,
+  seen_bonds,
+  };
+  let snap_bytes = bincode::serialize(&snap)?;
+  let mut hasher = blake3::Hasher::new();
+  hasher.update(&snap_bytes);
+  let recomputed: [u8; 32] = hasher.finalize().into();
+  if recomputed != hash {
+  return Err(StorageError::DatabaseError(
+  "stake manifest hash mismatch (partial save?)".to_string(),
+  ));
+  }
+  let registry =
+  StakeRegistry::restore(snap).map_err(StorageError::DatabaseError)?;
+  Ok(Some(registry))
+  }
 }
 
 /// Batch operation for atomic writes

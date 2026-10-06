@@ -568,6 +568,28 @@ impl Transaction {
         }
     }
 
+    // ========================================================================
+    // PHASE 4G: v6 stake-finality primitives (NO PoW anywhere in this section).
+    // ========================================================================
+    //
+    // V6_ACTIVATION_TS gates the stake-finality rule the same way
+    // DIFFICULTY_MIGRATION_TS gates difficulty: conflicts whose newest member
+    // predates it resolve under legacy rules (min-id / CDW, frozen);
+    // conflicts touching post-activation data resolve by stake finality.
+    // INTERIM VALUE (release-management flag-day pending - see migration
+    // plan): far-future placeholder so the v6 rule is DORMANT by default and
+    // can never activate accidentally. All v6 paths are fully exercised with
+    // post-activation fixtures regardless of wall-clock time.
+    pub const V6_ACTIVATION_TS: u64 = 1_893_456_000_000; // 2030-01-01T00:00:00Z
+
+    /// True iff the v6 stake-finality rule governs an object carrying this
+    /// timestamp (post-activation). Pure, deterministic, same on every node.
+    /// Grandfathering (pre-activation data keeps legacy rules) flows from this
+    /// single predicate - never from peer versions or local flags.
+    pub fn is_v6_active_at(timestamp_ms: u64) -> bool {
+        timestamp_ms >= Self::V6_ACTIVATION_TS
+    }
+
     /// Benchmark PoW timing at a given difficulty level.
     /// Returns (average_ns, median_ns, p95_ns, hashes_per_second) over `iterations` mines.
     #[cfg(test)]
@@ -621,6 +643,290 @@ impl Transaction {
 
         let derived_address: [u8; 32] = self.public_key[..32].try_into().unwrap_or([0u8; 32]);
         self.sender == derived_address
+}
+}
+
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+/// PHASE 4G: vote wire format version (first byte of every canonical vote
+/// encoding). Unknown versions are rejected fail-closed; extensions ship as
+/// new versions, never silent tail fields.
+pub const VOTE_FORMAT_VERSION: u8 = 1;
+/// Bond/unbond wire format version (same discipline as votes).
+pub const BOND_FORMAT_VERSION: u8 = 1;
+
+/// PHASE 4G: a stake-weighted finality vote (P6 exact fields).
+///
+/// Wire layout is FIXED (field order below, integers little-endian, no
+/// floats, no maps, no variable-length vectors - fixed arrays only):
+/// version u8 | validator [u8;32] | epoch u64 | conflict_sender [u8;32] |
+/// conflict_nonce u64 | side [u8;32] | stake_epoch u64 | stake_amount u64 |
+/// parents [[u8;32];2] | signature [u8;64] = 1+32+8+32+8+32+8+8+64+64 = 257 B.
+/// Validator address IS the ed25519 verifying key (same convention as
+/// transaction sender/public-key binding), so no pubkey field is needed.
+/// `parents` is DAG-embedding CONTEXT only (auditability, fork causality
+/// display): never a validity condition (existence-checking votes against
+/// sync state would let partitions veto valid votes - liveness harm).
+/// `stake_amount`/`stake_epoch` are ASSERTED context: validity checks bond
+/// state live in the registry; mismatches are logged, never rejected (a
+/// partitioned voter's view may lag legitimately).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Vote {
+    pub format_version: u8,
+    pub validator: [u8; 32],
+    pub epoch: u64,
+    pub conflict_sender: [u8; 32],
+    pub conflict_nonce: u64,
+    pub side: [u8; 32],
+    pub stake_epoch: u64,
+    pub stake_amount: u64,
+    pub parents: [[u8; 32]; 2],
+    pub signature: [u8; 64],
+        }
+
+/// Canonical vote id = BLAKE3 over the canonical encoding INCLUDING the
+/// signature (same id philosophy as transactions: content-addressed,
+/// dedup-safe, replay-inert).
+pub type VoteId = [u8; 32];
+
+impl Vote {
+    /// Canonical bytes WITHOUT the signature (what gets signed).
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(193);
+        out.push(self.format_version);
+        out.extend_from_slice(&self.validator);
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        out.extend_from_slice(&self.conflict_sender);
+        out.extend_from_slice(&self.conflict_nonce.to_le_bytes());
+        out.extend_from_slice(&self.side);
+        out.extend_from_slice(&self.stake_epoch.to_le_bytes());
+        out.extend_from_slice(&self.stake_amount.to_le_bytes());
+        out.extend_from_slice(&self.parents[0]);
+        out.extend_from_slice(&self.parents[1]);
+        out
+    }
+
+    /// Full canonical encoding (signing bytes + signature). Deterministic.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = self.signing_bytes();
+        out.extend_from_slice(&self.signature);
+        out
+        }
+
+    /// Strict decode: exact length (193 + 64 = 257), exact version, else Err.
+    /// Fails closed on truncation, extension, or version mismatch.
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() != 257 {
+            return Err(format!("bad vote length: {}", bytes.len()));
+    }
+        if bytes[0] != VOTE_FORMAT_VERSION {
+            return Err(format!("unknown vote version: {}", bytes[0]));
+        }
+        let mut validator = [0u8; 32];
+        validator.copy_from_slice(&bytes[1..33]);
+        let mut u8buf = [0u8; 8];
+        u8buf.copy_from_slice(&bytes[33..41]);
+        let epoch = u64::from_le_bytes(u8buf);
+        let mut conflict_sender = [0u8; 32];
+        conflict_sender.copy_from_slice(&bytes[41..73]);
+        u8buf.copy_from_slice(&bytes[73..81]);
+        let conflict_nonce = u64::from_le_bytes(u8buf);
+        let mut side = [0u8; 32];
+        side.copy_from_slice(&bytes[81..113]);
+        u8buf.copy_from_slice(&bytes[113..121]);
+        let stake_epoch = u64::from_le_bytes(u8buf);
+        u8buf.copy_from_slice(&bytes[121..129]);
+        let stake_amount = u64::from_le_bytes(u8buf);
+        let mut p0 = [0u8; 32];
+        p0.copy_from_slice(&bytes[129..161]);
+        let mut p1 = [0u8; 32];
+        p1.copy_from_slice(&bytes[161..193]);
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&bytes[193..257]);
+        Ok(Self {
+            format_version: VOTE_FORMAT_VERSION,
+            validator,
+            epoch,
+            conflict_sender,
+            conflict_nonce,
+            side,
+            stake_epoch,
+            stake_amount,
+            parents: [p0, p1],
+            signature,
+        })
+    }
+
+    /// Vote id (content address, includes signature).
+    pub fn id(&self) -> VoteId {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.encode());
+        hasher.finalize().into()
+    }
+
+    /// Verify the Ed25519 signature against the validator address (= the
+    /// verifying key, same convention as transaction senders).
+    pub fn verify_signature(&self) -> bool {
+        let key = match VerifyingKey::try_from(self.validator.as_slice()) {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+        let sig = match Signature::try_from(self.signature.as_slice()) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        key.verify(&self.signing_bytes(), &sig).is_ok()
+    }
+}
+
+/// PHASE 4G: bond intent (lock funds into voting weight).
+/// Canonical layout: version u8 | validator [u8;32] | amount u64 LE |
+/// epoch u64 LE | signature [u8;64] = 1+32+8+8+64 = 113 B.
+/// `epoch` records creation epoch (auditability; effectiveness is immediate
+/// by design decision - documented, no maturation delay).
+/// No fee field (spam posture: per-peer rate limits + validation-before-
+/// relay + id dedup + MIN_STAKE admission gate; documented residual).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Bond {
+    pub format_version: u8,
+    pub validator: [u8; 32],
+    pub amount: u64,
+    pub epoch: u64,
+    pub signature: [u8; 64],
+    }
+
+/// Bond id (content address, includes signature).
+pub type BondId = [u8; 32];
+
+impl Bond {
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(49);
+        out.push(self.format_version);
+        out.extend_from_slice(&self.validator);
+        out.extend_from_slice(&self.amount.to_le_bytes());
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        out
+}
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = self.signing_bytes();
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() != 113 {
+            return Err(format!("bad bond length: {}", bytes.len()));
+    }
+        if bytes[0] != BOND_FORMAT_VERSION {
+            return Err(format!("unknown bond version: {}", bytes[0]));
+    }
+        let mut validator = [0u8; 32];
+        validator.copy_from_slice(&bytes[1..33]);
+        let mut u8buf = [0u8; 8];
+        u8buf.copy_from_slice(&bytes[33..41]);
+        let amount = u64::from_le_bytes(u8buf);
+        u8buf.copy_from_slice(&bytes[41..49]);
+        let epoch = u64::from_le_bytes(u8buf);
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&bytes[49..113]);
+        Ok(Self {
+            format_version: BOND_FORMAT_VERSION,
+            validator,
+            amount,
+            epoch,
+            signature,
+        })
+    }
+
+    pub fn id(&self) -> BondId {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.encode());
+        hasher.finalize().into()
+    }
+
+    pub fn verify_signature(&self) -> bool {
+        let key = match VerifyingKey::try_from(self.validator.as_slice()) {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+        let sig = match Signature::try_from(self.signature.as_slice()) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        key.verify(&self.signing_bytes(), &sig).is_ok()
+    }
+    }
+
+/// PHASE 4G: unbond intent (begin exit; funds release after UNBONDING_EPOCHS).
+/// Canonical layout: version u8 | validator [u8;32] | epoch u64 LE (request
+/// epoch; release at request + UNBONDING_EPOCHS) | signature [u8;64] =
+/// 1+32+8+64 = 105 B. Voting eligibility ends at request acceptance
+/// (clean cutover, no exit-timing games).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Unbond {
+    pub format_version: u8,
+    pub validator: [u8; 32],
+    pub epoch: u64,
+    pub signature: [u8; 64],
+    }
+
+/// Unbond id (content address, includes signature).
+pub type UnbondId = [u8; 32];
+
+impl Unbond {
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(41);
+        out.push(self.format_version);
+        out.extend_from_slice(&self.validator);
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        out
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = self.signing_bytes();
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() != 105 {
+            return Err(format!("bad unbond length: {}", bytes.len()));
+    }
+        if bytes[0] != BOND_FORMAT_VERSION {
+            return Err(format!("unknown unbond version: {}", bytes[0]));
+    }
+        let mut validator = [0u8; 32];
+        validator.copy_from_slice(&bytes[1..33]);
+        let mut u8buf = [0u8; 8];
+        u8buf.copy_from_slice(&bytes[33..41]);
+        let epoch = u64::from_le_bytes(u8buf);
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&bytes[41..105]);
+        Ok(Self {
+            format_version: BOND_FORMAT_VERSION,
+            validator,
+            epoch,
+            signature,
+        })
+    }
+
+    pub fn id(&self) -> UnbondId {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.encode());
+        hasher.finalize().into()
+    }
+
+    pub fn verify_signature(&self) -> bool {
+        let key = match VerifyingKey::try_from(self.validator.as_slice()) {
+            Ok(k) => k,
+            Err(_) => return false,
+        };
+        let sig = match Signature::try_from(self.signature.as_slice()) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        key.verify(&self.signing_bytes(), &sig).is_ok()
     }
 }
 

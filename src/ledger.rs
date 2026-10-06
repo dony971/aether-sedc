@@ -492,6 +492,36 @@ impl Ledger {
     /// contains two transactions with the same (sender, account_nonce), only
     /// the smallest id applies (canonical double-spend rule).
     pub fn rebuild_from_dag(&mut self, dag: &DAG) {
+  let pending = self.rebuild_prelude(dag);
+  let canonical_winners = Self::canonical_winners_legacy(dag, &pending);
+  self.apply_rebuild(pending, canonical_winners);
+        }
+
+  /// PHASE 4G: stake-aware rebuild. Identical pipeline to
+  /// rebuild_from_dag except multi-member conflicts resolve via
+  /// resolve_conflict_key_v6 (finalized-first, then stake plurality,
+  /// min-id tiebreak; pre-V6 keys delegate to the frozen legacy rule, so
+  /// grandfathered outcomes NEVER change). Slash needs NO separate
+  /// replay step: slashing zeroes registry weight at READ time, and this
+  /// rebuild consumes those live weights  -  a slashed validator's sides
+  /// lose support automatically on the next rebuild after the slash.
+  /// (Fund-burn semantics are deferred per charter: no tokenomics
+  /// invented; no ledger surgery, hence no rebuild-divergence class.)
+  pub fn rebuild_from_dag_v6(
+  &mut self,
+  dag: &DAG,
+  registry: &crate::stake::StakeRegistry,
+  at_epoch: u64,
+  ) {
+  let pending = self.rebuild_prelude(dag);
+  let canonical_winners = Self::canonical_winners_v6(dag, registry, at_epoch, &pending);
+  self.apply_rebuild(pending, canonical_winners);
+            }
+
+  /// Shared rebuild prelude: reset state, reseed genesis, collect the
+  /// canonical-order candidate set (ascending id  -  HashMap iteration
+  /// order explicitly forbidden).
+  fn rebuild_prelude(&mut self, dag: &DAG) -> Vec<Transaction> {
         self.balances.clear();
         self.nonces.clear();
         self.total_fees_burned = 0;
@@ -506,22 +536,57 @@ impl Ledger {
 
         // Canonical order: ascending id. HashMap iteration order is
         // explicitly forbidden (it differs across nodes and runs).
-        let mut pending: Vec<Transaction> = dag.transactions().values().cloned().collect();
+  dag.transactions().values().cloned().collect()
+                }
 
-        // PHASE 4B: canonical winners per (sender, account_nonce) key,
-        // delegated to DAG conflict resolution (CDW + min-id tiebreak,
-        // grandfathered for all-pre-activation keys). Single-member keys
-        // resolve trivially to themselves. A tx that is not the canonical
-        // winner of its key can NEVER apply, no matter when the replay meets
-        // it (this also covers the pathological case where the loser is
-        // fundable before the winner). Pure function of the DAG set:
-        // deterministic across nodes, orders, restarts, syncs.
+  /// PHASE 4B winners (legacy, frozen): single-member keys resolve to
+  /// themselves; multi-member via resolve_conflict_key (CDW + min-id,
+  /// grandfathered). Pure function of the DAG set.
+  fn canonical_winners_legacy(
+  dag: &DAG,
+  pending: &[Transaction],
+  ) -> std::collections::HashMap<(Address, u64), TransactionId> {
+  Self::canonical_winners_with(dag, pending, |d, sender, nonce| {
+  d.resolve_conflict_key(sender, nonce)
+  })
+                }
+
+  /// PHASE 4G winners: same key scan; multi-member via
+  /// resolve_conflict_key_v6 (finalized-first, then stake plurality,
+  /// min-id tiebreak; pre-V6 keys delegate to the frozen legacy rule).
+  /// Pure function of (DAG set, registry views).
+  fn canonical_winners_v6(
+  dag: &DAG,
+  registry: &crate::stake::StakeRegistry,
+  at_epoch: u64,
+  pending: &[Transaction],
+  ) -> std::collections::HashMap<(Address, u64), TransactionId> {
+  Self::canonical_winners_with(dag, pending, |d, sender, nonce| {
+  d.resolve_conflict_key_v6(sender, nonce, registry, at_epoch)
+  })
+            }
+
+  /// Shared key scan: single-member keys resolve trivially; multi-member
+  /// via the injected resolver. A tx that is not the canonical winner of
+  /// its key can NEVER apply, no matter when the replay meets it (this
+  /// also covers the pathological case where the loser is fundable
+  /// before the winner). Deterministic across nodes, orders, restarts,
+  /// syncs. (Refactored 4G without behavior change: the legacy call
+  /// passes the exact pre-4G resolver.)
+  fn canonical_winners_with<F>(
+  dag: &DAG,
+  pending: &[Transaction],
+  resolve: F,
+  ) -> std::collections::HashMap<(Address, u64), TransactionId>
+  where
+  F: Fn(&DAG, &[u8; 32], u64) -> Option<TransactionId>,
+        {
         let mut canonical_winners: std::collections::HashMap<(Address, u64), TransactionId> =
             std::collections::HashMap::new();
         {
             use std::collections::HashSet;
             let mut keys: HashSet<(Address, u64)> = HashSet::new();
-            for tx in &pending {
+            for tx in pending {
                 keys.insert((tx.sender, tx.account_nonce));
             }
             for (sender, nonce) in keys {
@@ -534,11 +599,22 @@ impl Ledger {
                 }
                 // Multi-member: authoritative resolution (never None here —
                 // defensive fallback is the sole member, unreachable).
-                if let Some(winner) = dag.resolve_conflict_key(&sender, nonce) {
+  if let Some(winner) = resolve(dag, &sender, nonce) {
                     canonical_winners.insert((sender, nonce), winner);
                 }
             }
         }
+  canonical_winners
+                }
+
+  /// Shared rebuild application: ascending-id replay, residue skipping
+  /// (non-winners never debit), funding relaxation, eviction, dirty
+  /// marking. Identical for legacy and v6  -  only the winners map differs.
+  fn apply_rebuild(
+  &mut self,
+  mut pending: Vec<Transaction>,
+  canonical_winners: std::collections::HashMap<(Address, u64), TransactionId>,
+  ) {
         pending.sort_unstable_by_key(|tx| tx.id);
 
         let mut applied: std::collections::HashSet<TransactionId> =
@@ -1668,7 +1744,7 @@ mod tests {
         ledger.commit_nonce(&faucet, 1);
         ledger.save_dirty().await.unwrap();
 
-        // "Crash" — reload from Sled
+  // "Crash"  -  reload from Sled
         let ledger2 = Ledger::new_with_storage(storage_arc.clone()).await.unwrap();
         assert_eq!(ledger2.get_balance(&user), 1000);
         assert_eq!(

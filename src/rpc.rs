@@ -4,7 +4,9 @@
 
 use crate::ledger::Ledger;
 use crate::parent_selection::DAG;
-use crate::transaction::{Address, Transaction, TransactionId};
+use crate::p2p::StakePayload;
+use crate::stake::{StakeRegistry, VoteInsertOutcome};
+use crate::transaction::{Address, Bond, Transaction, TransactionId, Unbond, Vote};
 use crate::transaction_processor::{ProcessingError, TransactionProcessor};
 use crate::validation::{ValidationError, ValidationMode};
 use axum::{
@@ -846,6 +848,10 @@ pub struct AetherRpcImpl {
     start_time: std::time::Instant,
     /// B4: shared bootstrap state (counters, parent-request dedup, orphan TTL)
     sync_ctx: Arc<crate::sync_stats::SyncContext>,
+  /// PHASE 4G: live stake registry (None = unwired: stake endpoints fail
+  /// closed). Set by the node after boot-loading from storage (5 new()
+  /// call sites untouched  -  the handle arrives via the setter).
+  stake_registry: Option<Arc<RwLock<StakeRegistry>>>,
 }
 
 struct FeeOracle {
@@ -914,7 +920,13 @@ impl AetherRpcImpl {
             rate_limiter_per_ip: RateLimiter::new(40, 10), // 40 requests per 10s per client IP
             start_time: std::time::Instant::now(),
             sync_ctx,
+  stake_registry: None,
         }
+    }
+
+  /// PHASE 4G: attach the live stake registry (node boot path).
+  pub fn set_stake_registry(&mut self, registry: Arc<RwLock<StakeRegistry>>) {
+  self.stake_registry = Some(registry);
     }
 
     /// Load the faucet signing key from `data_dir/faucet.key` (a 64-char hex
@@ -1261,6 +1273,199 @@ impl AetherRpcImpl {
     /// are bounded (TTL + reject cache + finite queue), and the queue can
     /// never block DAG growth or bootstrap (Phase C root cause fixed).
     /// Runs on every node type via the node drainer task (~150 ms tick).
+  // ====================================================================
+  // PHASE 4G stake endpoints (minimal surface: submit + queries).
+  // Admission runs through TransactionProcessor (single entry  -  same
+  // discipline as txs); gossip follows ONLY on accept (validation
+    // before relay, same as the transaction relay path). Params are hex of the
+  // CANONICAL encodings (vote 257B / bond 113B / unbond 105B).
+  // ====================================================================
+
+  /// Shared stake processor (registry-attached) or fail-closed RpcError.
+  fn stake_processor(&self) -> Result<TransactionProcessor, RpcError> {
+  match &self.stake_registry {
+  None => Err(RpcError("Stake registry not attached".to_string())),
+  Some(reg) => {
+  let mut processor = TransactionProcessor::new();
+  processor.set_stake_registry(reg.clone());
+  Ok(processor)
+        }
+                    }
+                }
+
+  /// Hex param helper (single hex string, array-or-bare like txs).
+  fn stake_bytes_param(params: serde_json::Value) -> Result<Vec<u8>, RpcError> {
+  let hex_str: String = match params {
+  serde_json::Value::Array(arr) if arr.len() == 1 => match &arr[0] {
+  serde_json::Value::String(s) => s.clone(),
+  _ => return Err(RpcError("Invalid params: expected string in array".to_string())),
+            },
+  serde_json::Value::String(s) => s.clone(),
+  _ => return Err(RpcError("Invalid params: expected array with string or string".to_string())),
+        };
+  hex::decode(&hex_str).map_err(|e| RpcError(format!("Invalid hex data: {}", e)))
+                }
+
+  /// aether_submitVote: admit a finality vote (hex of canonical 257B).
+  pub async fn submit_vote(
+        &self,
+  params: serde_json::Value,
+  ) -> Result<TransactionResponse, RpcError> {
+  let bytes = Self::stake_bytes_param(params)?;
+  let vote = Vote::decode(&bytes).map_err(RpcError)?;
+  let vote_id = vote.id();
+  let outcome = self
+  .stake_processor()?
+  .process_vote(vote.clone(), &self.dag, &self.ledger)
+                    .await
+  .map_err(|e| RpcError(e.to_string()))?;
+  let (status, message) = match &outcome {
+  VoteInsertOutcome::Accepted => (
+  "accepted".to_string(),
+  "Vote accepted (weight live)".to_string(),
+            ),
+  VoteInsertOutcome::Duplicate => (
+  "duplicate".to_string(),
+  "Vote already known (idempotent)".to_string(),
+                    ),
+  VoteInsertOutcome::Equivocated { evidence_id } => (
+  "equivocated".to_string(),
+    format!(
+  "Equivocation recorded, evidence {}",
+  hex::encode(evidence_id)
+  ),
+  ),
+            };
+  // Gossip new weight/proof (Duplicates already flew once).
+  if !matches!(outcome, VoteInsertOutcome::Duplicate) {
+                    self.p2p_network
+  .broadcast_stake(StakePayload::Vote(vote))
+                        .await;
+                    }
+  Ok(TransactionResponse {
+  tx_id: vote_id,
+  status,
+  message,
+        })
+                }
+
+  /// aether_submitBond: admit a bond intent (hex of canonical 113B).
+  pub async fn submit_bond(
+        &self,
+  params: serde_json::Value,
+  ) -> Result<TransactionResponse, RpcError> {
+  let bytes = Self::stake_bytes_param(params)?;
+  let bond = Bond::decode(&bytes).map_err(RpcError)?;
+  let bond_id = bond.id();
+  self.stake_processor()?
+  .process_bond(bond.clone(), &self.ledger)
+                    .await
+  .map_err(|e| RpcError(e.to_string()))?;
+  self.p2p_network
+  .broadcast_stake(StakePayload::Bond(bond))
+                        .await;
+  Ok(TransactionResponse {
+  tx_id: bond_id,
+  status: "accepted".to_string(),
+  message: "Bond accepted (matures for voting)".to_string(),
+        })
+                    }
+
+  /// aether_submitUnbond: admit an unbond intent (hex of canonical 105B).
+  pub async fn submit_unbond(
+        &self,
+  params: serde_json::Value,
+  ) -> Result<TransactionResponse, RpcError> {
+  let bytes = Self::stake_bytes_param(params)?;
+  let unbond = Unbond::decode(&bytes).map_err(RpcError)?;
+  let unbond_id = unbond.id();
+  self.stake_processor()?
+  .process_unbond(unbond.clone(), &self.dag, &self.ledger)
+                    .await
+  .map_err(|e| RpcError(e.to_string()))?;
+  self.p2p_network
+  .broadcast_stake(StakePayload::Unbond(unbond))
+                            .await;
+  Ok(TransactionResponse {
+  tx_id: unbond_id,
+  status: "accepted".to_string(),
+  message: "Unbond accepted (voting ends now)".to_string(),
+            })
+                }
+
+  /// aether_getFinality: finalized decision for (sender_hex, nonce)
+  /// or null (no decision). Reads the live registry (no locks beyond
+  /// the registry read  -  pure query).
+  pub async fn get_finality(
+        &self,
+  params: serde_json::Value,
+  ) -> Result<serde_json::Value, RpcError> {
+  let arr = params.as_array().ok_or_else(|| RpcError("Invalid params".to_string()))?;
+  let sender_hex = arr.first().and_then(|v| v.as_str()).ok_or_else(|| RpcError("Missing sender".to_string()))?;
+  let nonce = arr.get(1).and_then(|v| v.as_u64()).ok_or_else(|| RpcError("Missing nonce".to_string()))?;
+  let sender_bytes = hex::decode(sender_hex).map_err(|_| RpcError("Invalid hex sender".to_string()))?;
+  let sender: [u8; 32] = sender_bytes.try_into().map_err(|_| RpcError("Invalid sender".to_string()))?;
+  let reg = match &self.stake_registry {
+  None => return Err(RpcError("Stake registry not attached".to_string())),
+  Some(r) => r.clone(),
+            };
+  let key = (sender, nonce);
+  let dag_guard = self.dag.read().await;
+  let members = dag_guard.find_sender_nonce_conflicts(&sender, nonce);
+  drop(dag_guard);
+  let reg_guard = reg.read().await;
+  // Winner + supporting weight recomputed live (same inputs as
+  // fork choice  -  the query mirrors consensus, never a cache).
+  let at_epoch = crate::stake::current_epoch();
+  let decided = reg_guard.finalized_winner(&key);
+  let out = match decided {
+  None => serde_json::json!({ "winner": null, "members": members.len() }),
+  Some(winner) => {
+  let total = reg_guard.eligible_stake_total(at_epoch);
+  serde_json::json!({
+  "winner": hex::encode(winner),
+  "eligible_total": total,
+  "members": members.len(),
+        })
+                }
+                        };
+  Ok(out)
+                }
+
+  /// aether_getValidators: bonded set snapshot (bounded: 500, sorted by
+  /// address  -  deterministic pagination-free page one; more is an
+  /// explorer concern, not consensus).
+  pub async fn get_validators(&self) -> Result<serde_json::Value, RpcError> {
+  let reg = match &self.stake_registry {
+  None => return Err(RpcError("Stake registry not attached".to_string())),
+  Some(r) => r.clone(),
+            };
+  let at_epoch = crate::stake::current_epoch();
+  let reg_guard = reg.read().await;
+  let snap = reg_guard.snapshot();
+  let total = reg_guard.eligible_stake_total(at_epoch);
+  let mut validators: Vec<serde_json::Value> = snap
+  .validators
+                    .iter()
+  .take(500)
+  .map(|rec| {
+  serde_json::json!({
+  "address": hex::encode(rec.address),
+  "bonded_amount": rec.bonded_amount,
+  "state": format!("{:?}", rec.state),
+  "bonded_epoch": rec.bonded_epoch,
+            })
+        })
+            .collect();
+  validators.sort_by(|a, b| a["address"].as_str().cmp(&b["address"].as_str()));
+  Ok(serde_json::json!({
+  "validators": validators,
+  "returned": validators.len(),
+  "eligible_total": total,
+  "at_epoch": at_epoch,
+  }))
+                }
+
     pub async fn drain_mempool(&self) {
         // 1) TTL expiry (bounded retries).
         {
@@ -1275,7 +1480,14 @@ impl AetherRpcImpl {
         if batch.is_empty() {
             return;
         }
-        let processor = TransactionProcessor::new();
+  // PHASE 4G: the drainer resolves conflicts through the same
+  // era-routed winners as the vote path (v6 when wired, legacy
+  // otherwise)  -  a drainer on legacy rules while votes finalize v6
+  // would apply divergent winners.
+  let mut processor = TransactionProcessor::new();
+  if let Some(reg) = &self.stake_registry {
+  processor.set_stake_registry(reg.clone());
+            }
         for tx in batch {
             // PHASE 3B (C1/H1): process under the mode recorded at ACCEPT
             // time (live submission = Fresh, sync backfill / reload =
@@ -2339,8 +2551,10 @@ pub async fn start_rpc_server(
     mining_enabled: Arc<RwLock<bool>>,
     orphans: Arc<RwLock<std::collections::HashMap<[u8; 32], Transaction>>>,
     sync_ctx: Arc<crate::sync_stats::SyncContext>,
+  // PHASE 4G: live stake registry (None = stake endpoints fail closed).
+  stake_registry: Option<Arc<RwLock<StakeRegistry>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let rpc_impl = Arc::new(AetherRpcImpl::new(
+  let mut impl_inner = AetherRpcImpl::new(
         dag,
         ledger,
         storage,
@@ -2350,7 +2564,11 @@ pub async fn start_rpc_server(
         mining_enabled,
         orphans,
         sync_ctx,
-    ));
+    );
+  if let Some(reg) = stake_registry {
+  impl_inner.set_stake_registry(reg);
+        }
+  let rpc_impl = Arc::new(impl_inner);
 
     // Log mempool config
     let mempool_config = {
@@ -2404,7 +2622,7 @@ pub async fn start_rpc_server(
     } else {
         // Non-loopback: restrictive CORS for security
         tracing::warn!(
-            "RPC bound to non-loopback address {} — CORS restricted",
+  "RPC bound to non-loopback address {}  -  CORS restricted",
             addr
         );
         tower_http::cors::CorsLayer::new()
@@ -2507,6 +2725,51 @@ async fn handle_rpc(
                 Err(e) => Err(e),
             }
         }
+  // PHASE 4G stake surface (rate-limited like every method above).
+  "aether_submitVote" => {
+  let params = payload
+  .get("params")
+  .cloned()
+  .unwrap_or(serde_json::Value::Array(vec![]));
+  match rpc_impl.submit_vote(params).await {
+            Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
+            Err(e) => Err(e),
+            }
+        }
+  "aether_submitBond" => {
+  let params = payload
+  .get("params")
+  .cloned()
+  .unwrap_or(serde_json::Value::Array(vec![]));
+  match rpc_impl.submit_bond(params).await {
+            Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
+            Err(e) => Err(e),
+                            }
+                        }
+  "aether_submitUnbond" => {
+  let params = payload
+  .get("params")
+  .cloned()
+  .unwrap_or(serde_json::Value::Array(vec![]));
+  match rpc_impl.submit_unbond(params).await {
+                Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
+                            Err(e) => Err(e),
+                    }
+            }
+  "aether_getFinality" => {
+  let params = payload
+  .get("params")
+  .cloned()
+  .unwrap_or(serde_json::Value::Array(vec![]));
+  match rpc_impl.get_finality(params).await {
+  Ok(response) => Ok(response),
+                Err(e) => Err(e),
+        }
+    }
+  "aether_getValidators" => match rpc_impl.get_validators().await {
+  Ok(response) => Ok(response),
+                        Err(e) => Err(e),
+        },
         "aether_getDagStats" => match rpc_impl.get_dag_stats().await {
             Ok(response) => serde_json::to_value(response).map_err(|e| RpcError(e.to_string())),
             Err(e) => Err(e),
@@ -2761,7 +3024,7 @@ td {{ padding:0.5rem; border-bottom:1px solid #21262d; }}
 </div>
 
 </div>
-<div class="footer">AETHER SEDC v1.0.1 — 0 unsafe — VQV Consensus</div>
+<div class="footer">AETHER SEDC v1.0.1  -  0 unsafe  -  VQV Consensus</div>
 
 <script>
 const STATS = {stats_json};
@@ -3909,7 +4172,7 @@ mod tests {
         assert_eq!(status.consensus_status, ConsensusStatus::Stable);
         assert!(
             status.practically_final,
-            "practically_final = Stable|Finalized — Stable is now reachable"
+  "practically_final = Stable|Finalized  -  Stable is now reachable"
         );
         {
             let dag = rpc.dag.read().await;
