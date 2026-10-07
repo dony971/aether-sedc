@@ -1416,19 +1416,26 @@ impl AetherRpcImpl {
   let reg_guard = reg.read().await;
   // Winner + supporting weight recomputed live (same inputs as
   // fork choice  -  the query mirrors consensus, never a cache).
+  // F-D4: the pinned certificate (quorum vote ids + denominator)
+  // is included so clients can re-verify and re-gossip finality
+  // without the live registry.
   let at_epoch = crate::stake::current_epoch();
-  let decided = reg_guard.finalized_winner(&key);
+  let decided = reg_guard.finalized_record(&key);
   let out = match decided {
   None => serde_json::json!({ "winner": null, "members": members.len() }),
-  Some(winner) => {
+  Some(rec) => {
   let total = reg_guard.eligible_stake_total(at_epoch);
+  let cert: Vec<String> = rec.supporting_votes.iter().map(hex::encode).collect();
   serde_json::json!({
-  "winner": hex::encode(winner),
+  "winner": hex::encode(rec.winner),
   "eligible_total": total,
   "members": members.len(),
+  "epoch": rec.epoch,
+  "supporting_weight": rec.supporting_weight,
+  "certificate": cert,
         })
-                }
-                        };
+            }
+                    };
   Ok(out)
                 }
 

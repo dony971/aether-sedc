@@ -1,5 +1,15 @@
 # AETHER PHASE 3A â€” SECURITY ROADMAP (future work, no code in this audit)
 
+> PHASE 4F STATUS (design only, no code, no commit): V6 stake-finality
+> parameters resolved -- MIN_STAKE band+maximin (INTERIM ceiling),
+> EPOCH 3600s, UNBONDING 72 epochs, SLASH 100% + WAL mandate, incentives
+> minimum-viable (no-reward now), explicit canonical vote format (~280B),
+> weak-subjectivity combo, timestamp+v6-gate activation. Sybil/quorum models
+> complete (deterministic sims). TOKENOMICS_DEPENDENCY = PRESENT (distribution
+> schedule, valuation context, emission schedule, fee dynamics).
+> READY_FOR_PHASE4G = YES. See
+> docs/AETHER_PHASE4F_STAKE_FINALITY_PARAMETERS.md (21 sections).
+
 > PHASE 3F STATUS (study only, no code, no commit): H2 = REQUIRES_PROTOCOL_CHANGE.
 > Options A-F analyzed on 10 dimensions + 9-attack matrix + protocol-consequence
 > table + Bitcoin principle comparison in docs/AETHER_PHASE3_H2_GRINDING_ANALYSIS.md.
@@ -17,6 +27,17 @@
 > docs/AETHER_PHASE4_MIGRATION_PLAN.md (break inventory, grandfathering,
 > activation, rollback). H2 stays OPEN_RESIDUAL pending Phase-4
 > implementation. Phase 4B NOT started.
+
+> PHASE 4D STATUS (design only, no code, no commit): no-mining DAG consensus
+> study complete. RECOMMENDED_CONSENSUS = Stake-Weighted DAG Finality
+> (bonded-stake quorum over DAG-embedded votes; min-id tiebreak only).
+> SYBIL_RESISTANCE = slashable bonded stake + quorum math (identity counting
+> explicitly rejected). FINALITY = explicit supermajority quorum (ladder:
+> received/validated/confirmed/selected/irreversible/final).
+> PERMISSIONLESS = CONDITIONAL (transact/validate open; voting needs bonded
+> stake). v6 migration strategy recorded (genesis untouched, ad08e30
+> untouched). H2 stays OPEN_RESIDUAL pending implementation. No Phase-4B
+> code modified. Phase 4B-implementation NOT started.
 
 > PHASE 4B STATUS (implemented, unreleased, uncommitted): PRIMARY design
 > shipped (CDW actual-bits + min-id tiebreak + loser retention +

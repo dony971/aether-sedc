@@ -353,6 +353,42 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     let dag: Arc<RwLock<DAG>> = Arc::new(RwLock::new(dag));
     let _balances: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(balances));
 
+    // PHASE 4G: stake registry boot-load, hoisted BEFORE the boot ledger
+    // rebuild so the rebuild can be era-aware (F-D1). Storage-only
+    // dependency (no DAG/ledger/mempool input), so position here is safe.
+    // Fresh data dir (no manifest) starts empty. A manifest mismatch
+    // (counts or hash) means a partial save - boot REFUSES rather than
+    // run consensus on partial stake state (fail closed; operator
+    // restores or resyncs).
+    tracing::info!("🗳️ Loading stake registry...");
+    let stake_registry: Arc<RwLock<StakeRegistry>> = {
+        let storage_read = storage.read().await;
+        match storage_read.load_registry() {
+            Ok(Some(reg)) => {
+                let snap = reg.snapshot();
+                tracing::info!(
+                    "  Stake registry restored: {} validators, {} votes, {} finalized, {} evidence",
+                    snap.validators.len(),
+                    snap.votes.len(),
+                    snap.finalized.len(),
+                    snap.evidence.len()
+                );
+                Arc::new(RwLock::new(reg))
+            }
+            Ok(None) => {
+                tracing::info!("  No stake state (fresh node) - starting empty");
+                Arc::new(RwLock::new(StakeRegistry::new()))
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Refusing boot: stake registry failed to load ({}). Restore the data dir or resync - never run on partial stake state.",
+                    e
+                )
+                .into());
+            }
+        }
+    };
+
     // INC-01 GUARD: the DAG is the source of truth ONLY when the local store
     // is complete. A crash can truncate the transaction tree (observed in the
     // incident: 10004 -> 20 persisted txs). Deriving the ledger from a partial
@@ -373,7 +409,21 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
         drop(orphans_read);
         if store_complete {
             let mut derived = ledger.clone();
-            derived.rebuild_from_dag(&dag_read);
+            // PHASE 4I (F-D1): era-aware boot rebuild. The registry is
+            // loaded above, so the v6 replay is available: for all-pre-V6
+            // DAGs it decides BIT-IDENTICALLY to legacy (per-key
+            // delegation inside resolve_conflict_key_v6 - proven g24),
+            // while post-V6 keys follow stake/finality instead of being
+            // silently rolled back to CDW/min-id on every restart.
+            // Locks ride along untouched (rebuild preserves them).
+            {
+                let reg = stake_registry.read().await;
+                derived.rebuild_from_dag_v6(
+                    &dag_read,
+                    &reg,
+                    crate::stake::current_epoch(),
+                );
+            }
             let derived_supply = derived.total_supply();
             let persisted_supply = ledger.total_supply();
             // Fresh node: persisted ledger is empty (0) because Sled has no
@@ -485,40 +535,6 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
         }
     }
     tracing::info!("✓ Mempool initialized");
-
-  // PHASE 4G: stake registry boot-load (validators / votes / finalized /
-  // evidence from the Sled stake trees, manifest-verified). Fresh data
-  // dir (no manifest) starts empty. A manifest mismatch (counts or hash)
-  // means a partial save  -  boot REFUSES rather than run consensus on
-  // partial stake state (fail closed; operator restores or resyncs).
-  tracing::info!("🗳️ Loading stake registry...");
-  let stake_registry: Arc<RwLock<StakeRegistry>> = {
-  let storage_read = storage.read().await;
-  match storage_read.load_registry() {
-  Ok(Some(reg)) => {
-  let snap = reg.snapshot();
-                tracing::info!(
-  "  Stake registry restored: {} validators, {} votes, {} finalized, {} evidence",
-  snap.validators.len(),
-  snap.votes.len(),
-  snap.finalized.len(),
-  snap.evidence.len()
-            );
-  Arc::new(RwLock::new(reg))
-        }
-  Ok(None) => {
-  tracing::info!("  No stake state (fresh node)  -  starting empty");
-  Arc::new(RwLock::new(StakeRegistry::new()))
-        }
-                Err(e) => {
-  return Err(format!(
-  "Refusing boot: stake registry failed to load ({}). Restore the data dir or resync  -  never run on partial stake state.",
-  e
-        )
-  .into());
-                }
-            }
-            };
 
     tracing::info!("📡 Creating P2P channel...");
     let (tx_channel, mut tx_receiver) = tokio::sync::mpsc::unbounded_channel::<Transaction>();
@@ -710,7 +726,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                             .sync_frontier
                             .fetch_max(total_now, std::sync::atomic::Ordering::Relaxed);
                     }
-                    rpc_impl.process_orphans().await;
+            rpc_impl.process_orphans().await;
                 }
                 Err(e) => {
                     tracing::warn!("❌ P2P transaction rejected: {}", e);
@@ -923,6 +939,20 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
 
             rpc_impl.process_orphans().await;
 
+            // PHASE 4I (F-L1): matured-unbond fund release backstop (stake
+            // admission paths sweep on every event; this covers nodes with
+            // no stake traffic). Epoch-pure + idempotent; errors logged,
+            // never fatal (next cycle retries).
+            if let Err(e) =
+                crate::transaction_processor::TransactionProcessor::sweep_matured(
+                    &stake_periodic,
+                    &ledger_periodic,
+                )
+                .await
+            {
+                tracing::warn!("⚠️ Periodic stake sweep failed: {}", e);
+            }
+
             // B4: log the sync counters when they changed (bootstrap/join
             // observability; the RPC endpoint exposes them on demand).
             {
@@ -958,6 +988,28 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             // DAG and fetch what is missing, until all nodes converge on the
             // same transaction set.
             p2p_periodic.request_full_sync().await;
+            // PHASE 4I (F-D3): vote-inventory twin of the above. Sync
+            // carries transactions only, so a node that missed votes
+            // (offline, late join, restart gap) would resolve post-V6
+            // conflicts by min-id forever while live nodes use stake.
+            // Every cycle we announce our known vote ids; peers fetch
+            // what they lack via GetVotes (idempotent admission), until
+            // all nodes converge on the same vote set (and hence the
+            // same support/finality/ledger).
+            {
+                let reg = stake_periodic.read().await;
+                let snap = reg.snapshot();
+                drop(reg);
+                let mut ids: Vec<Vec<u8>> = Vec::with_capacity(snap.votes.len());
+                for bytes in &snap.votes {
+                    if let Ok(vote) = crate::transaction::Vote::decode(bytes) {
+                        ids.push(vote.id().to_vec());
+                    }
+                }
+                if !ids.is_empty() {
+                    p2p_periodic.announce_vote_inventory(ids).await;
+                }
+            }
         }
     });
 

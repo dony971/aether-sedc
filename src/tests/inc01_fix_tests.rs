@@ -27,6 +27,7 @@ use crate::ledger::Ledger;
 use crate::parent_selection::{rebuild_dag_topological, DAG};
 use crate::storage::Storage;
 use crate::transaction::Transaction;
+use crate::validation::ValidationMode;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -319,7 +320,14 @@ async fn test_inc01_recovery_insert_ledger_ahead() {
     }
 
     let result = processor
-        .process(tx.clone(), &dag, &ledger, &mempool, 1000)
+        .process(
+            tx.clone(),
+            &dag,
+            &ledger,
+            &mempool,
+            1000,
+            ValidationMode::Fresh,
+        )
         .await;
     assert!(result.is_ok(), "recovery insert must succeed: {:?}", result);
 
@@ -338,7 +346,14 @@ async fn test_inc01_recovery_insert_ledger_ahead() {
 
     // Idempotence: a second delivery is a no-op (duplicate in DAG).
     let again = processor
-        .process(tx.clone(), &dag, &ledger, &mempool, 1000)
+        .process(
+            tx.clone(),
+            &dag,
+            &ledger,
+            &mempool,
+            1000,
+            ValidationMode::Fresh,
+        )
         .await;
     assert!(again.is_err(), "duplicate must be rejected");
     assert_eq!(dag.read().await.transaction_count(), 3);

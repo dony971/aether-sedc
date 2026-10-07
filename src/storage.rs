@@ -55,10 +55,12 @@ pub enum TreeName {
     Mempool,      // Persistent mempool queue
     AppliedTx,    // C2 P3: ids of transactions whose ledger effects were applied
   // PHASE 4G: stake-finality trees (additive only  -  existing trees untouched)
-  Validators,  // validator address (32B) -> bincode(ValidatorRecord)
-  Votes,  // vote id (32B) -> canonical vote encoding (257B)
-  Finalized,  // sender (32B) ++ nonce LE (8B) -> bincode(FinalizedRecord)
-  Evidence,  // evidence id (32B) -> bincode(EquivocationEvidence)
+    Validators,   // validator address (32B) -> bincode(ValidatorRecord)
+    Votes,        // vote id (32B) -> canonical vote encoding (257B)
+    Finalized,    // sender (32B) ++ nonce LE (8B) -> bincode(FinalizedRecord)
+    Evidence,     // evidence id (32B) -> bincode(EquivocationEvidence)
+    // PHASE 4I (F-L1): bonded-stake locks, address (32B) -> amount u64 LE.
+    LockedBalances,
 }
 
 impl TreeName {
@@ -72,10 +74,11 @@ impl TreeName {
             TreeName::Orphans => "orphans",
             TreeName::Mempool => "mempool",
             TreeName::AppliedTx => "applied_tx",
-  TreeName::Validators => "stake_validators",
-  TreeName::Votes => "stake_votes",
-  TreeName::Finalized => "stake_finalized",
-  TreeName::Evidence => "stake_evidence",
+            TreeName::Validators => "stake_validators",
+            TreeName::Votes => "stake_votes",
+            TreeName::Finalized => "stake_finalized",
+            TreeName::Evidence => "stake_evidence",
+            TreeName::LockedBalances => "locked_balances",
         }
     }
 }
@@ -92,11 +95,13 @@ pub struct Storage {
     orphans: Tree,
     mempool: Tree,
     applied_tx: Tree,
-  // PHASE 4G stake-finality trees.
-  validators: Tree,
-  votes: Tree,
-  finalized: Tree,
-  evidence: Tree,
+    // PHASE 4G stake-finality trees.
+    validators: Tree,
+    votes: Tree,
+    finalized: Tree,
+    evidence: Tree,
+    // PHASE 4I (F-L1) bonded-stake locks.
+    locked_balances: Tree,
 }
 
 impl Storage {
@@ -117,6 +122,7 @@ impl Storage {
   let votes = db.open_tree(TreeName::Votes.name())?;
   let finalized = db.open_tree(TreeName::Finalized.name())?;
   let evidence = db.open_tree(TreeName::Evidence.name())?;
+  let locked_balances = db.open_tree(TreeName::LockedBalances.name())?;
 
         Ok(Self {
             db,
@@ -132,6 +138,7 @@ impl Storage {
   votes,
   finalized,
   evidence,
+  locked_balances,
         })
     }
 
@@ -150,6 +157,7 @@ impl Storage {
   TreeName::Votes => &self.votes,
   TreeName::Finalized => &self.finalized,
   TreeName::Evidence => &self.evidence,
+  TreeName::LockedBalances => &self.locked_balances,
         }
     }
 
@@ -333,6 +341,35 @@ impl Storage {
         }
 
         Ok(balances)
+    }
+
+    /// PHASE 4I (F-L1): store a bonded-stake lock (address -> amount).
+    /// Zero amounts are stored explicitly (tombstone clarity: locked 0
+    /// differs from absent only for audit scans; spendable() treats both
+    /// as zero).
+    pub fn put_locked(&self, address: Address, amount: u64) -> Result<(), StorageError> {
+        let tree = self.tree(TreeName::LockedBalances);
+        tree.insert(address, amount.to_le_bytes().to_vec())?;
+        Ok(())
+    }
+
+    /// Get all bonded-stake locks. Corrupt values fail closed (same
+    /// discipline as balances: never silently drop stake state).
+    pub fn get_all_locked(&self) -> Result<HashMap<Address, u64>, StorageError> {
+        let tree = self.tree(TreeName::LockedBalances);
+        let mut out = HashMap::new();
+        for item in tree.iter() {
+            let (key, value) = item.map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+            let address: Address = key
+                .as_ref()
+                .try_into()
+                .map_err(|_| StorageError::DatabaseError("Invalid locked-key length".to_string()))?;
+            let amount = u64::from_le_bytes(value.as_ref().try_into().map_err(|_| {
+                StorageError::DatabaseError("Invalid locked value length".to_string())
+            })?);
+            out.insert(address, amount);
+        }
+        Ok(out)
     }
 
     /// Store metadata
@@ -695,7 +732,7 @@ impl Storage {
   // ====================================================================
 
   /// Manifest key (Metadata tree): bincode((u64 counts x4, blake3 hash,
-  /// seen bond ids)). Written LAST on save; verified FIRST on load  -  a
+  /// seen bond ids, pending unbond intents)). Written LAST on save; verified FIRST on load  -  a
   /// crash between the record writes and the manifest write fails closed
   /// (counts/hash mismatch) instead of restoring a silently partial
   /// registry. The admitted-bond-id set rides in the manifest (no fifth
@@ -838,6 +875,8 @@ impl Storage {
   self.put_evidence(ev)?;
   }
   // Manifest: counts + blake3 over the canonical snapshot bytes.
+  // seen_bonds AND pending_unbonds ride in the manifest (validator-scale
+  // sets covered by the same hash; no extra trees).
   let snap_bytes = bincode::serialize(&snap)?;
   let mut hasher = blake3::Hasher::new();
   hasher.update(&snap_bytes);
@@ -849,6 +888,7 @@ impl Storage {
   snap.evidence.len() as u64,
   hash,
   snap.seen_bonds.clone(),
+  snap.pending_unbonds.clone(),
         );
   let manifest_bytes = bincode::serialize(&manifest)?;
   self.put_metadata(Self::STAKE_MANIFEST_KEY, &manifest_bytes)?;
@@ -867,13 +907,14 @@ impl Storage {
   Err(StorageError::KeyNotFound) => return Ok(None),
   Err(e) => return Err(e),
   };
-  let (n_val, n_votes, n_fin, n_ev, hash, seen_bonds): (
+  let (n_val, n_votes, n_fin, n_ev, hash, seen_bonds, pending_unbonds): (
   u64,
   u64,
   u64,
   u64,
   [u8; 32],
   Vec<[u8; 32]>,
+  Vec<([u8; 32], u64)>,
   ) = bincode::deserialize(&manifest_bytes)?;
   let mut validators = Vec::new();
   for item in self.tree(TreeName::Validators).iter() {
@@ -927,6 +968,7 @@ impl Storage {
   finalized,
   evidence,
   seen_bonds,
+  pending_unbonds,
   };
   let snap_bytes = bincode::serialize(&snap)?;
   let mut hasher = blake3::Hasher::new();

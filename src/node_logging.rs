@@ -186,7 +186,8 @@ impl std::io::Write for RollingGuard<'_> {
         Ok(buf.len())
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {        // Already flushed per append; nothing buffered here.
+    fn flush(&mut self) -> std::io::Result<()> {
+        // Already flushed per append; nothing buffered here.
         Ok(())
     }
 }

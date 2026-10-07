@@ -709,11 +709,13 @@ fn g22_validate_unbond_accept_and_rejections() {
         val.validate_unbond(&signed_unbond(&wa, at), &reg, at),
         Ok(())
     );
-    // Unknown validator.
-    assert!(matches!(
+    // Unknown validator: admitted as intent (4I order independence:
+    // unbond-before-bond converges with bond-before-unbond via the
+    // pending-intent path; intents are signature-bound + windowed).
+    assert_eq!(
         val.validate_unbond(&signed_unbond(&wb, at), &reg, at),
-        Err(ValidationError::UnknownValidator { .. })
-    ));
+        Ok(())
+    );
     // After exit requested: fresh intent for exiting address rejected.
     reg.apply_unbond(wa.address(), at).expect("unbond");
     assert!(matches!(
@@ -749,8 +751,12 @@ fn g22_validate_unbond_accept_and_rejections() {
 fn g23_v6_pow_gate_skipped_post_activation_only() {
     let val = TransactionValidator::new();
     let w = wallet_a();
-    // Post-activation tx with INVALID PoW: Historical pure validation
-    // passes (fee-only admission  -  POW_IN_CONSENSUS = NO).
+    // Post-activation tx with INVALID PoW: POW_IN_CONSENSUS = NO still
+    // holds (the gate is skipped), BUT while the wall clock is still
+    // pre-activation the F-D2 era gate rejects future-era objects on
+    // every mode first (4I intended behavior change: nothing
+    // post-V6-dated enters pre-activation stores). Post-wall-activation
+    // the same object passes (covered by the D2 pure-fn matrix).
     let post = unsigned_pow_tx_at(&wallet_a(), Transaction::V6_ACTIVATION_TS + 1000);
     assert!(
         post.timestamp >= Transaction::V6_ACTIVATION_TS,
@@ -758,8 +764,11 @@ fn g23_v6_pow_gate_skipped_post_activation_only() {
     );
     assert_eq!(
         val.validate_pure(&post, ValidationMode::Historical),
-        Ok(()),
-        "post-V6 timestamps skip the PoW gate"
+        Err(ValidationError::FutureEraTransaction {
+            tx_ts: post.timestamp,
+            activation_ts: Transaction::V6_ACTIVATION_TS,
+        }),
+        "post-V6 timestamps rejected while wall-clock pre-activation (F-D2)"
     );
     // Pre-activation tx with INVALID PoW: gate still enforced (frozen).
     let pre = unsigned_pow_tx_at(&w, Transaction::DIFFICULTY_MIGRATION_TS + 1000);

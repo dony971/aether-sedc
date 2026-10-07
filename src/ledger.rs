@@ -42,6 +42,21 @@ pub struct Ledger {
     /// P4-incremental: tx ids removed from applied since last save.
     #[serde(skip)]
     dirty_applied_removed: HashSet<TransactionId>,
+    /// PHASE 4I (F-L1): bonded-stake locks. address (hex) -> locked amount.
+    /// Lock semantics (no new economics: uses only 4F-specified values):
+    /// - bond admission locks `amount` (spendable = balance - locked);
+    /// - unbond keeps funds locked for UNBONDING_EPOCHS (voting ends at
+    ///   request; the delay is the fraud window for post-exit slashing);
+    /// - matured exits release via sweep (deterministic, epoch-pure);
+    /// - slash NEVER releases (weight zeroed in registry AND funds frozen
+    ///   permanently: slash = full economic loss without inventing a burn
+    ///   destination or touching zero-emission supply accounting).
+    /// Locks are stake-state, NOT DAG-derived: rebuilds preserve them
+    /// verbatim (see rebuild_prelude); persistence via the locked tree.
+    pub locked: HashMap<String, u64>,
+    /// P4-incremental: accounts whose locks changed since last save.
+    #[serde(skip)]
+    dirty_locked: HashSet<String>,
 }
 
 /// Fee burn address (all fees are sent here and effectively burned)
@@ -67,6 +82,8 @@ impl Ledger {
             dirty_nonces: HashSet::new(),
             dirty_applied_added: HashSet::new(),
             dirty_applied_removed: HashSet::new(),
+            locked: HashMap::new(),
+            dirty_locked: HashSet::new(),
         }
     }
 
@@ -85,6 +102,8 @@ impl Ledger {
             dirty_nonces: HashSet::new(),
             dirty_applied_added: HashSet::new(),
             dirty_applied_removed: HashSet::new(),
+            locked: HashMap::new(),
+            dirty_locked: HashSet::new(),
         };
 
         // Load balances from Sled
@@ -104,6 +123,13 @@ impl Ledger {
         // C2 P3: load the applied-tx set (empty on pre-tracking upgrades;
         // the STEP-1c rule treats store-membership as backstop precision).
         ledger.applied = storage_read.get_all_applied().unwrap_or_default();
+
+        // PHASE 4I (F-L1): load bonded-stake locks (empty on pre-lock
+        // upgrades: no locks existed, so nothing is locked - fail-closed
+        // on corrupt values like every other loader here).
+        for (addr, amount) in storage_read.get_all_locked()? {
+            ledger.locked.insert(hex::encode(addr), amount);
+        }
 
         drop(storage_read);
 
@@ -142,6 +168,16 @@ impl Ledger {
                     .try_into()
                     .map_err(|e| format!("Invalid address length: {}", e))?;
                 storage_read.put_nonce(address, *nonce)?;
+            }
+            // PHASE 4I (F-L1): save bonded-stake locks (full rewrite,
+            // same authoritativeness as balances/nonces above).
+            for (addr_hex, locked) in &self.locked {
+                let addr_bytes = hex::decode(addr_hex)?;
+                let address: Address = addr_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|e| format!("Invalid address length: {}", e))?;
+                storage_read.put_locked(address, *locked)?;
             }
             // C2 P3: persist the applied-tx set AUTHORITATIVELY (stale ids
             // removed first so pruned losers drop out even if a delete path
@@ -198,6 +234,18 @@ impl Ledger {
                 storage_read.put_nonce(address, nonce)?;
             }
 
+            // --- Locks: write only dirty entries (O(K)) ---
+            let dirty_lock = std::mem::take(&mut self.dirty_locked);
+            for addr_hex in &dirty_lock {
+                let addr_bytes = hex::decode(addr_hex)?;
+                let address: Address = addr_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|e| format!("Invalid address length: {}", e))?;
+                let locked = *self.locked.get(addr_hex).unwrap_or(&0);
+                storage_read.put_locked(address, locked)?;
+            }
+
             // --- Applied set: incremental (O(delta)) ---
             let added = std::mem::take(&mut self.dirty_applied_added);
             let removed = std::mem::take(&mut self.dirty_applied_removed);
@@ -209,11 +257,12 @@ impl Ledger {
             }
 
             tracing::debug!(
-                "💾 Ledger delta saved ({} bal, {} non, {} app+ {} app-)",
+                "💾 Ledger delta saved ({} bal, {} non, {} app+ {} app-, {} lock)",
                 dirty_bal.len(),
                 dirty_non.len(),
                 added.len(),
-                removed.len()
+                removed.len(),
+                dirty_lock.len()
             );
         }
         Ok(())
@@ -287,6 +336,70 @@ impl Ledger {
         Ok(())
     }
 
+    // ====================================================================
+    // PHASE 4I (F-L1): bonded-stake locks. Locked funds stay IN balances
+    // (supply accounting untouched: locked is a reservation overlay, not
+    // a movement) and are subtracted only for SPENDABILITY decisions.
+    // Invariants: locked(addr) <= balance(addr) is NOT required globally
+    // (fees burned from a bonded account reduce balance below locked;
+    // spendable saturates at zero - the lock still gates); every mutation
+    // marks dirty_locked for persistence.
+    // ====================================================================
+
+    /// Locked amount for an address (0 if absent).
+    pub fn get_locked(&self, address: &Address) -> u64 {
+        let addr_hex = hex::encode(address);
+        *self.locked.get(&addr_hex).unwrap_or(&0)
+    }
+
+    /// All locked entries (hex address, amount), sorted by address.
+    /// Sweep/reconciliation read path (F-L1 orphan cleanup).
+    pub fn locked_entries(&self) -> Vec<(String, u64)> {
+        let mut out: Vec<(String, u64)> = self
+            .locked
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Spendable amount = balance minus locked (saturating).
+    /// Every funding decision (validate_ledger, transfer_internal,
+    /// validate_bond) MUST use this, never raw balance.
+    pub fn spendable(&self, address: &Address) -> u64 {
+        self.get_balance(address)
+            .saturating_sub(self.get_locked(address))
+    }
+
+    /// Lock `amount` more (bond admission / top-up). Overflow-safe
+    /// (checked; astronomically unreachable, fail-closed regardless).
+    pub fn bond_lock(&mut self, address: &Address, amount: u64) -> Result<(), String> {
+        let addr_hex = hex::encode(address);
+        let current = *self.locked.get(&addr_hex).unwrap_or(&0);
+        let next = current
+            .checked_add(amount)
+            .ok_or_else(|| format!("Lock overflow: {} + {}", current, amount))?;
+        self.dirty_locked.insert(addr_hex.clone());
+        self.locked.insert(addr_hex, next);
+        Ok(())
+    }
+
+    /// Release `amount` (matured unbond sweep ONLY - never on slash:
+    /// slashed funds stay locked permanently = full economic loss with
+    /// zero supply/tokenomics invention). Saturating floor (releasing
+    /// more than locked clamps to zero; callers release exact tracked
+    /// amounts, so clamping only fires on logic bugs - safe direction).
+    pub fn bond_release(&mut self, address: &Address, amount: u64) {
+        let addr_hex = hex::encode(address);
+        let current = *self.locked.get(&addr_hex).unwrap_or(&0);
+        let next = current.saturating_sub(amount);
+        if next != current {
+            self.dirty_locked.insert(addr_hex.clone());
+            self.locked.insert(addr_hex, next);
+        }
+    }
+
     /// Transfer balance from one address to another with fee deduction (INTERNAL USE ONLY)
     /// 🔒 ZERO TRUST: This method is private. Use TransactionProcessor for all transfers.
     /// Atomic: either all changes apply or none apply
@@ -307,14 +420,22 @@ impl Ledger {
         let to_balance = *self.balances.get(&to_hex).unwrap_or(&0);
         let burn_balance = *self.balances.get(&burn_hex).unwrap_or(&0);
 
-        // Check sender has enough for amount + fee
+        // Check sender has enough SPENDABLE for amount + fee (F-L1: bonded
+        // locks gate every debit path, including rebuild replays - a
+        // locked validator cannot move bonded funds through any tx).
         let total_deduction = amount
             .checked_add(fee)
             .ok_or_else(|| format!("Overflow: amount + fee = {} + {}", amount, fee))?;
-        if from_balance < total_deduction {
+        let spendable = from_balance.saturating_sub(*self.locked.get(&from_hex).unwrap_or(&0));
+        if spendable < total_deduction {
             return Err(format!(
-                "Insufficient balance: {} < {} (amount: {}, fee: {})",
-                from_balance, total_deduction, amount, fee
+                "Insufficient spendable balance: {} < {} (balance: {}, locked: {}, amount: {}, fee: {})",
+                spendable,
+                total_deduction,
+                from_balance,
+                self.locked.get(&from_hex).unwrap_or(&0),
+                amount,
+                fee
             ));
         }
 
@@ -528,6 +649,11 @@ impl Ledger {
         // C2 P3: the applied set is re-derived purely, like everything
         // else (pruned losers drop out; no stale marks survive).
         self.applied.clear();
+        // PHASE 4I (F-L1): LOCKS ARE NOT CLEARED. Locks are stake-state
+        // (registry-derived), not DAG-derived: no replay can recompute
+        // them, so wiping them here would silently unlock every bonded
+        // validator on each rebuild. They persist verbatim across replays
+        // (and across restarts via the locked tree).
 
         // Apply genesis distribution (fixed supply).
         for (addr_hex, balance) in crate::genesis::GENESIS_LEDGER {

@@ -1644,6 +1644,31 @@ async fn accept_inbound_transaction(
     tx_channel.send(tx).is_ok()
 }
 
+/// PHASE 4I (F-D3): pure vote-inventory diff used by the VoteInventory
+/// arm: advertised ids minus locally known ids, deduplicated, bounded.
+/// Deterministic (order-preserving over the first-seen advertised order).
+/// Cap bounds a single response; re-announcement converges the remainder.
+pub fn vote_inventory_missing(
+    advertised: &[Vec<u8>],
+    is_known: &dyn Fn(&[u8]) -> bool,
+    cap: usize,
+) -> Vec<Vec<u8>> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<&[u8]> = HashSet::new();
+    let mut out = Vec::new();
+    for id in advertised.iter().take(cap) {
+        if out.len() >= cap {
+            break;
+        }
+        if !seen.insert(id.as_slice()) {
+            continue;
+        }
+        if !is_known(id) {
+            out.push(id.clone());
+        }
+    }
+    out
+}
 /// PHASE 4G: the receive stage for one inbound stake payload (vote / bond /
 /// unbond gossip). Same contract as accept_inbound_transaction: dedup →
 /// strict-decode → record receipt + upstream peer → queue, NO relay of any
@@ -2339,8 +2364,20 @@ pub enum P2PMessage {
   Vote(Vec<u8>),
   /// Bond intent gossip (canonical bond encoding)
   Bond(Vec<u8>),
-  /// Unbond intent gossip (canonical unbond encoding)
-  Unbond(Vec<u8>),
+    /// Unbond intent gossip (canonical unbond encoding)
+    Unbond(Vec<u8>),
+    // -- PHASE 4I (F-D3) vote backfill (additive ENUM TAIL, same compat
+    // rule as the 4G kinds: indices 12, 13; old peers error-disconnect).
+    // Sync carries transactions only, so joining nodes rebuild EMPTY
+    // registries and resolve post-V6 keys by min-id while live nodes use
+    // stake/finality (permanent divergence for settled keys). These two
+    // control messages close the gap: peers announce known vote ids,
+    // joiners fetch the unknown encodings, admission stays idempotent
+    // (process_vote Duplicate) so backfill can never fork state.
+    /// Vote inventory announcement (vote ids known to the sender)
+    VoteInventory(Vec<Vec<u8>>),
+    /// Vote fetch request (vote ids wanted by the sender)
+    GetVotes(Vec<Vec<u8>>),
 }
 
 /// PHASE 4G: decoded stake payload handed from the P2P receive stage to
@@ -4626,6 +4663,46 @@ impl P2PNetwork {
         }
     }
     }
+  // -- PHASE 4I (F-D3) vote-backfill arms (enum tail: after Unbond so
+  // the Transaction..Inventory source span asserted by the relay-gate
+  // test is untouched).
+  P2PMessage::VoteInventory(ids) => {
+  // Diff advertised ids against our vote store; fetch what we lack
+  // (bounded, deduplicated pure helper). Unwired lookup (tx-only
+  // node) = ignore.
+  let lookup = match stake_hooks.get_vote_by_id.lock() {
+  Ok(guard) => guard.clone(),
+  Err(_) => None,
+        };
+  if let Some(lookup) = lookup {
+  let missing =
+  vote_inventory_missing(&ids, &|id| lookup(id).is_some(), MAX_INV_ITEMS);
+  if !missing.is_empty() {
+  // Re-cap to page size for the request itself.
+  let page: Vec<Vec<u8>> = missing.into_iter().take(MAX_SYNC_PAGE).collect();
+  if let Ok(req) = bincode::serialize(&P2PMessage::GetVotes(page)) {
+  let _ = msg_sender.send(req);
+                    }
+                }
+            }
+        }
+  P2PMessage::GetVotes(ids) => {
+  // Serve known vote encodings (bounded). Unknown ids stay silent
+  // (requester retries via gossip, same as unknown txs today).
+  let lookup = match stake_hooks.get_vote_by_id.lock() {
+  Ok(guard) => guard.clone(),
+  Err(_) => None,
+        };
+  if let Some(lookup) = lookup {
+  for id in ids.into_iter().take(MAX_SYNC_PAGE) {
+  if let Some(enc) = lookup(&id) {
+  if let Ok(vote_msg) = bincode::serialize(&P2PMessage::Vote(enc)) {
+  let _ = msg_sender.send(vote_msg);
+                            }
+                        }
+                    }
+                }
+            }
                     }
                 }
                 Err(e) => {
@@ -5367,6 +5444,31 @@ impl P2PNetwork {
             debug!("[Sync] Requesting full inventory from {}", addr);
             if sender.send(msg.clone()).is_err() {
                 warn!("Failed to send SyncRequest to {}: channel closed", addr);
+            }
+        }
+    }
+
+    /// PHASE 4I (F-D3): announce known vote ids to every connected peer
+    /// (bounded at MAX_INV_ITEMS: validator-scale, no rotation needed -
+    /// callers pass the full sorted set and it fits; oversized sets are
+    /// truncated deterministically by sort order... callers sort first).
+    /// Peers answer GetVotes for the ids they lack; admission is
+    /// idempotent, so announcements are safe to repeat every sync cycle.
+    pub async fn announce_vote_inventory(&self, mut vote_ids: Vec<Vec<u8>>) {
+        vote_ids.sort();
+        vote_ids.truncate(MAX_INV_ITEMS);
+        let msg = match bincode::serialize(&P2PMessage::VoteInventory(vote_ids)) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to serialize VoteInventory: {}", e);
+                return;
+            }
+        };
+        let peers = self.peers.read().await;
+        for (addr, sender) in peers.iter() {
+            debug!("[Sync] Announcing vote inventory to {}", addr);
+            if sender.send(msg.clone()).is_err() {
+                warn!("Failed to send VoteInventory to {}: channel closed", addr);
             }
         }
     }

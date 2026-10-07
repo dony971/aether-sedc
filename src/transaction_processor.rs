@@ -563,10 +563,13 @@ impl TransactionProcessor {
   //
   // LOCK ORDER (global): dag -> registry -> ledger -> mempool, with
   // standalone single-lock phases allowed anywhere. Concretely: no path
-  // ever holds the registry while acquiring dag (phases below take dag
-  // first, or take the registry alone); the tx conflict paths take the
+  // ever holds the ledger while acquiring registry, and no path ever
+  // holds the registry while acquiring dag (vote phases take dag first,
+  // or take the registry alone); the tx conflict paths take the
   // registry LAST via try_read (fail-fast, never waits). try_* failures
   // map to LockError (transient requeue, same discipline as dag/ledger).
+  // sweep_matured is phase-separated (one guard at a time) and therefore
+  // order-exempt by construction.
   //
   // PERSISTENCE: every mutation persists via storage.save_registry
   // (authoritative rewrite + manifest; a crash before the manifest write
@@ -604,6 +607,9 @@ impl TransactionProcessor {
   let at_epoch = current_epoch();
   let key = (vote.conflict_sender, vote.conflict_nonce);
   let vote_side = vote.side;
+  // F-L1: release matured exits first (frees funds validation may need;
+  // deterministic, epoch-pure; see sweep_matured).
+  Self::sweep_matured(&registry, ledger).await?;
 
   // Phase A: validate + insert (registry alone).
   let outcome = {
@@ -631,7 +637,22 @@ impl TransactionProcessor {
                 let dag_guard = dag.read().await;
   let mut reg = registry.write().await;
   let members = dag_guard.find_sender_nonce_conflicts(&key.0, key.1);
-  if members.len() >= 2 {
+  // F-V1 era gate: the finality machinery below (finalize attempt,
+  // quorum-loss invalidation, plurality trigger) runs ONLY for
+  // post-V6 keys (newest member decides, same predicate as fork
+  // choice). Votes for pre-V6 keys stay ADMITTED (Phase A idempotent
+  // insert keeps vote sets convergent across nodes) but can never
+  // create, void, or trigger on a decision there: pre-V6 conflicts
+  // resolve by the frozen legacy rule, which reads no registry state.
+  // (Deliberately not a rejection: admitting keeps gossip sets
+  // convergent; finalizing would create dead records.)
+  let post_v6 = members.iter().any(|id| {
+  dag_guard
+  .get_transaction(*id)
+  .map(|t| Transaction::is_v6_active_at(t.timestamp))
+  .unwrap_or(false)
+  });
+  if members.len() >= 2 && post_v6 {
   // Finalize attempt (sticky: existing decisions returned as-is).
   let finalized_before = reg.finalized_winner(&key);
   let finalized_now = reg.try_finalize(key, &members, at_epoch, |m, txid| {
@@ -712,6 +733,10 @@ impl TransactionProcessor {
   Some(r) => r.clone(),
         };
   let at_epoch = current_epoch();
+  // F-L1: sweep matured exits (frees funds the bond check may need)
+  // before validation, then reconcile orphaned locks (crash window
+  // between fund-lock save and registry persist, sec. sweep_matured).
+  Self::sweep_matured(&registry, ledger).await?;
   // Ledger read standalone (funds check needs no other lock).
                 let ledger_guard = ledger.read().await;
   let storage_opt = ledger_guard.storage();
@@ -731,6 +756,32 @@ impl TransactionProcessor {
   reg.apply_bond(bond.validator, bond.amount, bond.epoch)
   .map_err(ProcessingError::DagError)?;
   Self::persist_registry(&reg, &storage_opt).await?;
+  drop(reg);
+  // F-L1: lock the bonded funds AFTER the registry record exists
+  // (lock-without-record orphans self-heal in sweep_matured; record-
+  // without-lock cannot persist because any failure below is Err).
+  // Re-checked under the write guard: spendable may have moved since
+  // the validation read (single-node interleaving).
+  {
+  let mut ledger_guard = ledger.write().await;
+  if ledger_guard.spendable(&bond.validator) < bond.amount {
+  return Err(ProcessingError::ValidationFailed(
+  ValidationError::InsufficientBalance {
+  required: bond.amount,
+  available: ledger_guard.spendable(&bond.validator),
+  },
+  ));
+        }
+  ledger_guard
+  .bond_lock(&bond.validator, bond.amount)
+  .map_err(ProcessingError::LedgerError)?;
+  if let Err(e) = ledger_guard.save_dirty().await {
+  return Err(ProcessingError::PersistenceError(format!(
+  "Save failed: {}",
+  e
+  )));
+        }
+  }
         Ok(())
             }
 
@@ -757,6 +808,9 @@ impl TransactionProcessor {
         };
   let storage_opt = ledger.read().await.storage();
   let at_epoch = current_epoch();
+  // F-L1: sweep matured exits before validation (same rationale as
+  // process_vote/process_bond).
+  Self::sweep_matured(&registry, ledger).await?;
             {
   let mut reg = registry.write().await;
   if let Err(e) = self.validator.validate_unbond(&unbond, &reg, at_epoch) {
@@ -805,7 +859,104 @@ impl TransactionProcessor {
   Ok(())
             }
 
-  /// PHASE 4G: persist helper  -  authoritative registry rewrite (no-op
+    /// PHASE 4I (F-L1): release matured unbondings (registry state +
+    /// ledger funds), called at the head of every stake admission and by
+    /// the node periodic task. Epoch-pure and idempotent: releasable iff
+    /// now_epoch >= release_epoch (monotone: once releasable, always
+    /// releasable). Late-releasing nodes stay CONSERVATIVE (more locked =
+    /// reject spends others accept; drainer requeues transiently, rebuild
+    /// holds pending) and converge without intervention. Slashed funds
+    /// are NEVER released (release_matured only transitions Unbonding;
+    /// slash is permanent economic loss with zero supply invention).
+    /// Also reconciles orphaned locks (locked funds with NO registry
+    /// record: only producible by a crash between fund-lock save and
+    /// registry persist): released back to spendable, since no position
+    /// backs them.
+    /// LOCKING: deliberately phase-separated (never two guards at once),
+    /// so no lock-ordering hazard exists by construction. Returns the
+    /// released addresses (empty = no-op).
+    pub async fn sweep_matured(
+        registry: &Arc<RwLock<StakeRegistry>>,
+        ledger: &Arc<RwLock<Ledger>>,
+    ) -> Result<Vec<[u8; 32]>, ProcessingError> {
+        let at_epoch = current_epoch();
+        // Storage handle first (standalone phase - no locks held).
+        let storage_opt = ledger.read().await.storage();
+        // Phase 1: registry state transitions (alone).
+        let released: Vec<([u8; 32], u64)> = {
+            let mut reg = registry.write().await;
+            let addrs = reg.release_matured(at_epoch);
+            if addrs.is_empty() {
+                Vec::new()
+            } else {
+                let amounts = addrs
+                    .iter()
+                    .map(|a| (*a, reg.bonded_amount(a)))
+                    .collect::<Vec<_>>();
+                Self::persist_registry(&reg, &storage_opt).await?;
+                amounts
+            }
+        };
+        // Phase 2: ledger fund releases (alone).
+        let mut out: Vec<[u8; 32]> = Vec::with_capacity(released.len());
+        if !released.is_empty() {
+            let mut ledger_guard = ledger.write().await;
+            for (addr, amount) in &released {
+                ledger_guard.bond_release(addr, *amount);
+                out.push(*addr);
+            }
+            if let Err(e) = ledger_guard.save_dirty().await {
+                return Err(ProcessingError::PersistenceError(format!(
+                    "Save failed: {}",
+                    e
+                )));
+            }
+        }
+        // Phase 3: orphan reconciliation (each guard alone, sequentially).
+        // Candidates snapshot first; registry membership next; releases
+        // last. A lock with no backing record is crash debris by
+        // construction (locks are only ever created alongside a bond
+        // admission whose registry record precedes them in code order).
+        let candidates: Vec<([u8; 32], u64)> = {
+            let ledger_guard = ledger.read().await;
+            let mut found = Vec::new();
+            for (addr_hex, locked) in ledger_guard.locked_entries() {
+                if locked == 0 {
+                    continue;
+                }
+                if let Ok(bytes) = hex::decode(&addr_hex) {
+                    if let Ok(addr) = <[u8; 32]>::try_from(bytes) {
+                        found.push((addr, locked));
+                    }
+                }
+            }
+            found
+        };
+        if !candidates.is_empty() {
+            let reg = registry.read().await;
+            let orphans: Vec<([u8; 32], u64)> = candidates
+                .into_iter()
+                .filter(|(addr, _)| reg.validator_state(addr).is_none())
+                .collect();
+            drop(reg);
+            if !orphans.is_empty() {
+                let mut ledger_guard = ledger.write().await;
+                for (addr, locked) in &orphans {
+                    ledger_guard.bond_release(addr, *locked);
+                    out.push(*addr);
+                }
+                if let Err(e) = ledger_guard.save_dirty().await {
+                    return Err(ProcessingError::PersistenceError(format!(
+                        "Save failed: {}",
+                        e
+                    )));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// PHASE 4G: persist helper - authoritative registry rewrite (no-op
   /// without storage, e.g. pure in-memory tests). save_registry fails
   /// closed on I/O (Err => caller reports PersistenceError, memory state
   /// stands  -  the next event re-saves; boot never reads partial state

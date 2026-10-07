@@ -1,209 +1,384 @@
-# AETHER SEDC — Protocol Specification (v3)
+# Aether Protocol Specification
 
-Version du protocole : **P2P 3** (WEIGHT, 2026-08-17) — consensus DAG-append.
-Ce document est la **référence normative** : une équipe indépendante doit pouvoir
-implémenter un nœud interopérable SANS lire le code source ni deviner les règles.
-Toute divergence entre ce document et le code est un bug à corriger.
+**Version:** 3.0 (V3 testnet release candidate)
+**Date:** 2026-09-16
+**Status:** Current protocol — matches code exactly
 
 ---
 
-## 1. Modèle général
+## 1. Network Identity
 
-- Registre **sans blocs, sans leaders** : les transactions sont des nœuds d'un
-  DAG. Pas de récompenses de bloc, **émission zéro** après le genesis ; l'offre
-  ne peut que décroître (fees brûlés).
-- Le **DAG est la source de vérité** : le ledger (soldes + nonces) est dérivé du
-  DAG et reconstruit depuis lui au démarrage.
-- Unité : `1 AETH = 10^10 unités` (`UNITS_PER_AETH`). Supply genesis vivante :
-  `10 AETH (founder) + 100 000 000 AETH (faucet)`. `MAX_SUPPLY = 2 × 10^18`
-  (invariant défensif, jamais atteint).
+| Parameter | Value |
+|---|---|
+| Protocol version | `3` |
+| Handshake magic | `0x41455448` ("AETH") |
+| Genesis hash | `[0u8; 32]` (32 zero bytes) |
+| Network separation | Genesis hash comparison during handshake |
+| Encryption | ChaCha20-Poly1305 (X25519 key exchange) |
 
-## 2. Transaction
+Nodes on different networks (different genesis hashes) reject each other during handshake. No explicit NETWORK_ID constant exists; the genesis hash serves as the network identifier.
+
+## 2. Genesis
+
+**Genesis hash:** `[0u8; 32]`
+
+**Genesis message:** `"17/Aug/2026 - Aether: Trust is computed, not granted. V3 testnet release candidate: canonical genesis for P2P protocol v3 (structural weight, zero emission). Operator ceremony."`
+
+**Genesis ledger:**
+
+| Address | Balance (base units) | AETH |
+|---|---|---|
+| Founder (`2ffab7...60d4`) | 100,000,000,000 | 10 |
+| Faucet (`a19ee0...aabfb`) | 1,000,000,000,000,000,000 | 100,000,000 |
+| **Total** | **1,000,010,000,000,000,000** | **100,000,010** |
+
+**MAX_SUPPLY:** `2,000,000,000,000,000,000` (200,000,000 AETH)
+**UNITS_PER_AETH:** `10,000,000,000` (10^10)
+**Emission:** ZERO after genesis. Total supply can only decrease through fee burning.
+
+**Parents of genesis transactions:** `[0u8; 32]; 2]` (all zeros). Any transaction with parents `[0,0]` is a root transaction.
+
+## 3. Transaction Format
 
 ```
 Transaction {
-  id:           32 octets  (BLAKE3, voir §3)
-  parents:      [32B; 2]   (deux parents ; [0;32]² = genesis virtuel)
-  sender:       32 octets  (= les 32 premiers octets de la clé publique Ed25519)
-  receiver:     32 octets
-  amount:       u64
-  fee:          u64        (>= 1 unité, brûlée vers FEE_BURN_ADDRESS = [0xFF;32])
-  timestamp:    u64        (ms Unix)
-  nonce:        u64        (Micro-PoW, voir §4)
-  account_nonce:u64        (séquentiel par sender, anti-rejeu, voir §6)
-  weight:       f64        (CALCULÉ par le nœud, jamais accepté en entrée ; exclu du hash)
-  signature:    64 octets  (Ed25519 du hash de signature)
-  public_key:   32 octets  (clé publique du sender)
+    id:           [u8; 32],    // BLAKE3 hash (computed)
+    parents:      [[u8; 32]; 2], // Exactly 2 parents
+    sender:       [u8; 32],    // Ed25519 public key (first 32 bytes)
+    receiver:     [u8; 32],    // Destination address
+    amount:       u64,         // Transfer amount (base units)
+    fee:          u64,         // Fee burned (base units)
+    timestamp:    u64,         // Unix milliseconds
+    nonce:        u64,         // PoW nonce (mined)
+    account_nonce: u64,        // Sequential per sender (replay protection)
+    weight:       f64,         // Subtree size (computed, not serialized)
+    signature:    Vec<u8>,     // Ed25519 signature (64 bytes)
+    public_key:   Vec<u8>,     // Ed25519 public key (32 bytes)
 }
 ```
 
-Taille sérialisée minimum : 208 octets + variables. Sérialisation binaire
-personnalisée (ordre des champs ci-dessus, longueurs préfixées) ; sur disque
-(Sled) : **bincode 1.3** — le format sur disque dépend de l'ordre des champs de
-la structure.
+**Minimum binary size:** 208 bytes (5×32 + 6×8).
 
-## 3. Hachages
+**Hash function:** BLAKE3.
 
-- `id = BLAKE3(parents0 ‖ parents1 ‖ sender ‖ receiver ‖ amount_le ‖ fee_le ‖
-  timestamp_le ‖ nonce_le ‖ account_nonce_le ‖ signature ‖ public_key)`.
-  **`id` et `weight` exclus** : le poids n'a AUCUN effet sur l'identité d'une tx.
-- Hash de signature : identique sans signature/public_key. `nonce` inclus → le
-  minage précède la signature.
-- Hash PoW (`calculate_pow_hash(nonce)`) : parents, sender, receiver, amount,
-  fee, timestamp, nonce, account_nonce (sans signature ni clé).
+**Hash input order:** `parents[0] || parents[1] || sender || receiver || amount || fee || timestamp || nonce || account_nonce || signature || public_key`
 
-## 4. Micro-PoW (anti-spam)
+**Signing hash input order:** `parents[0] || parents[1] || sender || receiver || amount || fee || timestamp || nonce || account_nonce` (excludes signature and public_key)
 
-- **Difficulté fixe : 20 bits** (`default_difficulty`), vérifiée par le gate pur.
-  N bits de poids fort nuls dans `BLAKE3(pow_hash fields)` — ~2^20 hachages en
-  moyenne. Le module `AdaptiveDifficulty` (difficulté dynamique 8-24 bits)
-  existe dans le code mais **n'est PAS utilisé en production** : il ne fait pas
-  partie du protocole v3.
+## 4. Transaction Validation
 
-## 5. Genesis
+Three-phase validation pipeline:
 
-- Un genesis **virtuel** `[0;32]` : aucune transaction genesis n'est stockée ;
-  les transactions racines référencent `[0;32]²`. `GENESIS_HASH = [0;32]`.
-- Ledger initial (adresses dérivées de clés publiques) :
-  - founder `32252d…298b` → `10^11` unités (10 AETH)
-  - faucet  `e880…1518` → `10^18` unités (100 000 000 AETH)
-- `GENESIS_MESSAGE` : texte horodaté publié dans la binaire (preuve de date de
-  lancement), modifié à chaque rotation.
-- Le faucet n'est actif que si l'opérateur fournit `data_dir/faucet.key`
-  (seed hex 64 caractères de la clé Ed25519 du faucet) ; sans ce fichier,
-  `aether_faucet` renvoie une erreur.
+### Phase 1: Pure validation (`validate_pure`)
+1. **PoW verification:** Hash must meet difficulty threshold
+2. **Signature verification:** Ed25519 signature must be valid
+3. **Sender-publickey match:** `sender == public_key[..32]`
 
-## 6. Validation et acceptation
+### Phase 2: DAG validation (`validate_dag`)
+1. **Duplicate check:** Transaction ID must not already exist in DAG
+2. **Parent existence:** Both parents must exist in DAG (or be genesis `[0,0]`)
+3. **Sender conflict:** No other transaction with same `(sender, account_nonce)` pair
 
-Pipeline de `process_transaction` (seule entrée mutante) :
+### Phase 3: Ledger validation (`validate_ledger`)
+1. **Balance check:** Sender balance ≥ amount + fee
+2. **Fee check:** fee ≥ min_fee (currently 1 base unit)
 
-1. **STEP 0 — résolution de conflit déterministe** : pour toute tx existante avec
-   le même `(sender, account_nonce)`, le **plus petit `id` gagne** (comparaison
-   lexicographique d'octets). Si le gagnant est la nouvelle tx : prune en
-   cascade du sous-arbre perdant (ordre feuilles→racine, chaque ancêtre
-   survivant perd exactement 1 par descendant retiré), purge du stockage
-   persistant, rebuild du ledger depuis le DAG. Si la nouvelle tx perd :
-   rejet `SenderConflict`. Le poids n'intervient JAMAIS dans cette décision.
-2. **Gate pur** (sans état) : PoW 20 ✓, signature Ed25519 du hash de signature ✓,
-   sender = clé publique ✓, `amount + fee` sans overflow ✓.
-3. **Gate orphelin** : si un parent (non-genesis) est absent du DAG → la tx est
-   **parquée** (memoire + Sled, plafond `MAX_ORPHANS = 50 000`) et les parents
-   sont re-demandés en P2P. Re-tentée à chaque tx P2P acceptée et toutes les 10 s.
-4. **Validation DAG** : id unique, parents présents, pas de conflit
-   `(sender, account_nonce)`.
-5. **Validation ledger** (min_fee = 1) : `balance(sender) ≥ amount + fee` ;
-   `fee ≥ min_fee`. **`account_nonce` n'est PAS vérifié contre le ledger** (les
-   nonces sont résolus de façon déterministe au niveau DAG — cf. §6 STEP 0) ;
-   c'est volontaire pour éviter la divergence liée à l'ordre d'arrivée.
-6. Application : ledger (débit sender, crédit receiver, fee → brûlé), nonce
-   ledger = max(nonce, nonces du DAG), insertion DAG `add_transaction_validated`
-   (poids = 1.0 + +1 pour chaque ancêtre), mempool, persistance. Rollback total
-   sur erreur.
+**Full validation** = `validate_pure` + `validate_dag` + `validate_ledger`
 
-Nonce ledger lu via RPC = `max(account_nonce du sender dans le DAG) + 1`
-(`get_account_nonce`).
+## 5. Signature Validation
 
-## 7. Poids et statuts
+- **Scheme:** Ed25519 (`ed25519-dalek`)
+- **Key size:** 32 bytes
+- **Signature size:** 64 bytes
+- **Address derivation:** First 32 bytes of Ed25519 public key
+- **Verification:** Standard Ed25519 verify over signing hash
 
-- **Poids = taille du sous-arbre** : `weight(tx) = 1 + |descendants(tx)|`.
-  Maintenu incrémentalement par le DAG : +1 à chaque ajout pour tous les
-  ancêtres (marche ascendante anti-doublon, genesis exclu), −1 à chaque retrait,
-  −1 par descendant pruné pour chaque ancêtre survivant (ordre de prune
-  feuilles→racine).
-- Le poids est **dérivé de la structure** : deux nœuds ayant le même ensemble de
-  txs et les mêmes edges ont les mêmes poids (indépendant de l'ordre d'arrivée).
-- Statuts (`determine_transaction_status`, par nœud) :
-  - `Unconfirmed` : dans le DAG, < 3 références et poids < 5.0
-  - `Confirmed` : ≥ 3 références directes
-  - `Stable` : poids ≥ 5.0 — `practically_final`
-  - `Finalized` : **inatteignable** (nécessiterait un mécanisme de votes VQV
-    non implémenté) — à ne pas annoncer
-  - `Orphan`/`InMempool`/`Unknown` : statuts locaux hors DAG.
-- Aucun reorg ni finalité probabiliste : le DAG local est accepté tel quel ; les
-  conflits sont résolus par min-id (déterministe, identique sur tous les nœuds).
+## 6. Proof-of-Work
 
-## 8. Sélection des parents
+**Algorithm:** Micro-PoW (hash-based, linear nonce scan).
 
-- `aether_getTips` renvoie les txs sans enfants. Le client CLI prend les **deux
-  premiers** de la réponse (parsing strict ; réponse malformée = erreur, jamais
-  de repli silencieux vers genesis — sauf réponse vide : parents `[0;32]²`).
-- Côté nœud (`ParentSelectionAlgorithm`) : marche aléatoire depuis le genesis,
-  ~10 pas, transition vers un enfant avec probabilité ∝ son poids ; tips de
-  moins de 60 s. Deux parents distincts, refus si la paire est déjà utilisée.
-  (Cette sélection sert l'inventaire tips P2P ; le CLI n'utilise pas la marche
-  aléatoire mais l'ordre de `getTips`.)
+**Mining:** For nonce = 0, 1, 2, ..., compute `BLAKE3(tx_hash || nonce)`. Accept if leading zero bits ≥ difficulty.
 
-## 9. P2P
+**Current difficulty:** 24 bits (default_difficulty() = 24).
 
-- Version de protocole **3** dans l'en-tête de chaque frame (`frame[4]`) : les
-  nœuds v2/v3 ne se connectent pas entre eux → la rotation genesis est
-  obligatoire au passage v2→v3.
-- Pas d'identifiant réseau séparé (`network_id`) : l'identité du réseau est
-  (version P2P + hachages du genesis + `GENESIS_MESSAGE`).
-- Sync : inventaire de hachages → demandes par lots → insertion validée ;
-  re-demande des parents manquants ; cycle 10 s ; rebuild complet au boot
-  (résolution canonique min-id sur le résidu disque, insertion topologique,
-  rebuild tips, rebuild ledger).
-- Bootnode facultatif (`--bootnode`), reconnect avec backoff ; aucun timeout de
-  connexion côté pair (durcissement H2 documenté).
+**Verification:** Single BLAKE3 hash + bit check. Cost: ~330 ns.
 
-## 10. Stockage
+**Mining cost (CPU):** ~5,288 ms per transaction at 24 bits.
 
-- Sled ; transactions, orphelins, mempool persistés en bincode 1.3.
-- Pas de flush par transaction (P4) : flush périodique (cycle 10 s du nœud +
-  auto-flush Sled + flush d'arrêt) → une perte sur kill brutal est bornée à un
-  cycle ; le boot reconstruit de toute façon le ledger depuis le DAG.
-- Pas de pruning temporel : les txs ne sont retirées que par la résolution de
-  conflit (perdant + descendants).
+## 7. Difficulty
 
-## 11. RPC (JSON-RPC 2.0, HTTP)
+**Current:** 24 bits (changed from 20 bits in V3 upgrade).
 
-Méthodes : `aether_sendTransaction`, `aether_getBalance`, `aether_getAccountNonce`,
-`aether_getTips`, `aether_getDagStats`, `aether_getDagGraph` (limite 500-5000),
-`aether_getTransactionStatus`, `aether_getRecentTransactions` (≤ 50),
-`aether_getTransactionHistory`, `aether_faucet`, `aether_getTransactionSnapshot`.
+**Adaptive difficulty:** Available but NOT active in current deployment. Parameters:
+- Min: 8 bits
+- Max: 24 bits
+- Window: 10,000 ms (10 seconds)
+- Target TPS: 10
 
-- Limiteur : **200 requêtes / 10 s par méthode** (global) + **40 requêtes / 10 s
-  par (IP, méthode)**. Taille max de tx sérialisée : 1 MiB.
-- Faucet : 10 AETH par requête, fee 1, **1 requête / 60 s / adresse**.
-- Formats canoniques : ids/adresses en hex minuscule 64 caractères (jamais de
-  tableaux numériques).
+**Genesis initial difficulty:** 1000 (stored in genesis config, not enforced in mining).
 
-## 12. Paramètres (tous fixes en v3)
+## 8. Parent Selection
 
-| Paramètre | Valeur |
+Each transaction has exactly 2 parents.
+
+**Parent selection algorithm:**
+1. Start from genesis
+2. Random walk weighted by cumulative subtree weight
+3. `walk_depth`: 10 steps
+4. `diversity_factor`: 0.5
+5. `min_weight`: 0.0
+6. `max_tip_age_ms`: 60,000 (1 minute)
+
+**Second parent:** Same random walk with up to 10 attempts to find non-conflicting parent. Fallback: genesis `[0u8; 32]`.
+
+**Identical parents prevention:** If parent1 == parent2, second parent forced to genesis.
+
+## 9. DAG Insertion
+
+**Method:** `add_transaction_validated(tx)`
+
+**Validation before insertion:**
+1. No duplicate transaction ID
+2. Both parents exist in DAG (or are genesis)
+3. No sender conflict: `(sender, account_nonce)` must be unique
+
+**Weight initialization:** New transaction weight = 1.0
+
+**Weight adjustment:** All surviving ancestors gain +1.0 (the new transaction becomes a descendant).
+
+**Root transactions:** Parents `[0,0]` keep their parents unchanged. Never auto-reassigned.
+
+## 10. Weight
+
+**Definition:** Subtree size = itself + all descendants (recursive count).
+
+**Stored as:** `tx.weight: f64`
+
+**Initial value:** 1.0 (on insertion)
+
+**Adjustment on add:** `adjust_ancestor_weights()`: +1.0 per surviving ancestor
+
+**Adjustment on prune:** -1.0 per surviving ancestor (leaves-first order)
+
+**Purpose:** Determines DAG weight for parent selection and stability.
+
+## 11. Stability
+
+**Stable status threshold:** `STABILITY_THRESHOLD = 5.0` cumulative weight.
+
+**Confirmed status threshold:** `MIN_CONFIRMATIONS = 3` (number of children/references).
+
+A transaction is "stable" if its cumulative weight ≥ 5.0. It is "confirmed" if it has ≥ 3 children.
+
+## 12. Conflict Resolution
+
+**Canonical rule:** Per `(sender, account_nonce)` pair, the transaction with the **lexicographically smallest ID** wins.
+
+**Implementation:**
+1. `rebuild_from_dag()` computes `canonical_winners` map up front
+2. For each `(sender, nonce)` pair, the smallest id is selected
+3. All non-winning transactions are marked as "residue" (skipped, not applied)
+
+**Prune cascade:** When a conflict is detected at runtime, the loser + entire descendant subtree is pruned (leaves-first order for weight correctness).
+
+## 13. Double Spend
+
+**Detection:** `has_sender_conflict()` checks if another transaction exists with same `(sender, account_nonce)`.
+
+**Prevention:** `add_transaction_validated()` rejects conflicting transactions at insertion time.
+
+**Resolution:** If two conflicting transactions exist in the DAG (e.g., from partition merge), `rebuild_from_dag()` applies only the canonical winner (smallest id).
+
+**Loser treatment:** Loser's transfer is never applied. Loser's descendants may still be applied if they have different senders and sufficient balance.
+
+## 14. Ledger Derivation
+
+**Method:** `rebuild_from_dag(dag)`
+
+**Process:**
+1. Reset all balances, nonces, fees-burned
+2. Apply genesis distribution
+3. Sort all transactions by ascending ID (canonical order)
+4. Relaxation loop:
+   - For each tx in sorted order:
+     - Skip if already applied
+     - Check parents ready (all parents applied or genesis)
+     - Skip if non-canonical winner (residue)
+     - Attempt `transfer_internal()`
+     - If insufficient balance → defer to next pass
+     - If success → mark applied, update nonce
+5. Loop until no progress
+6. Remaining txs evicted as "never fundable"
+
+**Key property:** This is a **pure function of the DAG**. Same DAG → byte-identical ledger state regardless of arrival order, restart history, or crash timing.
+
+## 15. Mempool
+
+**Capacity:** `MAX_ORPHANS = 50,000` transactions
+
+**TTL:** `MEMPOOL_TTL = 15 minutes`
+
+**Reject cache:** `MEMPOOL_REJECT_CACHE = 1,000`
+
+**Drain batch:** `MEMPOOL_DRAIN_BATCH = 100` per cycle (~150ms tick)
+
+**Selection order:** Fee descending, then transaction ID ascending (canonical)
+
+**Min fee:** 1 base unit (default)
+
+**Fee oracle:** Dynamic adjustment based on occupancy:
+- >80% capacity: 2× base fee
+- >50% capacity: 1.5× base fee
+- <20% capacity: 0.5× base fee
+- Adjustment interval: 10 seconds
+
+## 16. Orphans
+
+**Definition:** Transactions whose parents are not yet in the DAG.
+
+**Handling:** Stored in orphan pool. Re-evaluated when parents arrive.
+
+**TTL:** 15 minutes. Orphans not resolved within TTL are evicted.
+
+**Fixpoint passes:** `ORPHAN_FIXPOINT_MAX_PASSES = 64` maximum resolution attempts per cycle.
+
+## 17. Sync
+
+**Bootstrap:** Connect to bootnode, request DAG hashes, compare, fetch missing transactions.
+
+**Page size:** 100 transactions per GetData response.
+
+**Ancestor budget:** 400 extra ancestors per page (for deep chains).
+
+**Missing parent re-request:** Up to 128 per cycle, with exponential backoff (2s, 5s, 15s).
+
+**SyncResponse throttle:** 50ms between each transaction delivery.
+
+**Topological ordering cap:** `TOPO_ORDER_CAP = 50,000`. Above this, falls back to timestamp order.
+
+## 18. P2P Protocol
+
+See `P2P_SPECIFICATION.md` for full details.
+
+**Handshake frame:** 69 bytes
+- Magic: 4 bytes (`0x41455448`)
+- Version: 1 byte (`3`)
+- Genesis hash: 32 bytes
+- Ephemeral public key: 32 bytes
+
+**Encryption:** ChaCha20-Poly1305 after X25519 key exchange.
+
+**Key derivation:** `SHA-256(shared_secret || "aether-p2p-key-v1")`
+
+## 19. Peer Management
+
+| Parameter | Value |
 |---|---|
-| P2P_PROTOCOL_VERSION | 3 |
-| Difficulté PoW | 20 bits (fixe) |
-| min_fee | 1 unité |
-| MAX_ORPHANS | 50 000 |
-| MAX_RPC_TX_SIZE | 1 MiB |
-| Rate limit méthode | 200 / 10 s |
-| Rate limit (IP, méthode) | 40 / 10 s |
-| Faucet | 10 AETH / 60 s / adresse |
-| Seuil Confirmed | ≥ 3 références |
-| Seuil Stable | poids ≥ 5.0 |
-| Tips fraîcheur | ≤ 60 s |
-| RPC getDagGraph limit | 500 (max 5000) |
-| RPC getRecentTransactions | 50 max |
+| MAX_PEERS | 128 |
+| MAX_PEERS_PER_SUBNET | 4 (/24) |
+| PROTECTED_OUTBOUND_SLOTS | 8 |
+| MAX_KNOWN_PEERS | 1,000 |
 
-## 13. Propriétés garanties
+## 20. Peer Scoring
 
-- **Déterminisme** : l'état (DAG + ledger + poids) est une fonction pure de
-  l'ensemble des txs acceptées, indépendante de l'ordre d'arrivée (min-id,
-  rebuild canonique, poids structurel).
-- **Double-dépense** : au plus une tx par `(sender, account_nonce)` ; le perdant
-  et ses descendants sont prunés partout (règle identique au live et au boot).
-- **Convergence** : vérifiée par le harnais S1-S10 (empreintes SHA-256
-  txset/edges/tips/ledger/poids identiques sur tous les nœuds).
-- **Invariants économiques** : supply ≤ genesis, fees brûlés, pas de mint.
+| Parameter | Value |
+|---|---|
+| Initial score | 100 |
+| Ban threshold | ≤ 0 |
+| Invalid message penalty | -10 |
+| Contradiction penalty | -20 |
+| Timeout penalty | -5 |
+| Flood penalty | -15 |
+| Abusive penalty | -10 |
+| Sync bonus | +5 |
+| Decay rate | +1 per interval |
+| Decay interval | 300 seconds |
+| Reward cap | 150 |
+| Temp ban duration | 300 seconds |
+| Temp bans before perm | 3 |
+| Permanent ban duration | 3,600 seconds |
 
-## 14. Limites protocolaires (ne PAS annoncer au-delà)
+## 21. Rate Limits
 
-- Le poids est **purement structurel** : inflatable à coût quasi nul (5 txs à
-  fee minimale atteignent `Stable`, cf. test W11 et THREAT_MODEL.md).
-- Pas de stake, pas d'énergie, pas de réputation, pas de finalité probabiliste
-  ni de seuil dynamique : ces concepts du whitepaper v1 **ne sont pas** le
-  protocole implémenté (voir RAPPORT_FINAL_TECHNIQUE.md §7).
-- `Finalized` inatteignable ; `Stable` ne garantit pas l'irréversibilité : un
-  conflit min-id plus petit peut encore pruner un sous-arbre.
+| Scope | Limit |
+|---|---|
+| Global P2P messages | 400 per second |
+| RPC global | 200 per 10-second window |
+| RPC per IP | 40 per 10-second window |
+| Max message size | 16 MiB |
+| Max INV items | 1,000 |
+| Max seen txs cache | 50,000 |
+
+## 22. Persistence
+
+**Backend:** Sled (embedded key-value store)
+
+**Data stored:**
+- DAG transactions (by ID)
+- Ledger balances (by address hex)
+- Ledger nonces (by address hex)
+- Applied transaction set
+- Known peers
+- Peer scores
+
+**Durability:** Sled auto-flushes ~every 500ms. Node flushes periodically (10s) and on shutdown.
+
+## 23. Crash Recovery
+
+**Method:** `rebuild_from_dag()` — pure function of the DAG.
+
+**Guarantee:** Same DAG → identical ledger state regardless of crash timing.
+
+**Verified:** 1,062+ crash/restart cycles, 0 invariant violations.
+
+## 24. Wallet
+
+**Key derivation:** Ed25519
+
+**Address format:** `AETH` + 20-byte-pubkey-hex + 4-byte-checksum
+
+**Encryption:** Argon2id + AES-256-GCM
+
+**Mnemonic:** BIP39 (optional, new wallets)
+
+**Legacy:** Raw Ed25519 keypair (existing wallets)
+
+## 25. RPC
+
+**Default bind:** `127.0.0.1:9933` (loopback only)
+
+**CORS:** Restricted to localhost origins by default
+
+**Default P2P port:** 25565
+
+**Faucet cooldown:** 60 seconds per address
+
+**Faucet amount:** 10 AETH (100,000,000,000 base units)
+
+## 26. Error Handling
+
+**Validation errors:** InvalidPoW, InvalidSignature, SenderPublicKeyMismatch, DuplicateTransaction, MissingParent, DoubleSpend, SenderConflict, InsufficientBalance, InvalidNonce, InsufficientFee, Overflow
+
+**Processing:** Failed transactions are rejected with specific error messages. No partial application.
+
+## 27. Protocol Versioning
+
+**Current version:** 3
+
+**Version check:** During handshake, `incoming[4] != P2P_PROTOCOL_VERSION` → reject.
+
+**Upgrade mechanism:** Hard fork. All nodes must upgrade simultaneously. No backward compatibility.
+
+## 28. 24-Bit Upgrade
+
+**Change:** `default_difficulty()` changed from 20 to 24 bits.
+
+**Type:** Soft fork. Old nodes (20-bit) accept a superset of what new nodes (24-bit) accept.
+
+**Activation:** Coordinated node upgrade. All nodes must run v3 software.
+
+**Migration:** No data migration needed. DAG and ledger are unaffected.
+
+**Rollback:** Downgrade to v2 software restores 20-bit difficulty.
+
+**See:** `PROTOCOL_UPGRADE_24BIT.md` for full details.

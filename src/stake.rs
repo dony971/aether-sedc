@@ -17,7 +17,7 @@
 //! - unbonding validators / slashed validators never vote (clean cutover).
 //! - no memoized quorums/finality beyond stored records (recompute-pure).
 
-use crate::transaction::Vote;
+use crate::transaction::{Vote, VoteId};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -96,11 +96,19 @@ pub type ConflictKey = ([u8; 32], u64);
 /// Finality record: an immutable decision (removable ONLY via
 /// slash-triggered invalidation, which deletes the entry so later
 /// re-resolution starts clean  -  never mutates in place).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// F-D4 finality certificate: supporting_votes pins the quorum vote
+/// ids (sorted) + eligible_total pins the denominator, both at decide
+/// time. The record is therefore re-verifiable and re-gossipable
+/// without the live registry (lost-vote reconstruction): see
+/// verify_certificate. (Serialization shape changed in 4I; no
+/// snapshots exist in the wild - unreleased phase.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FinalizedRecord {
     pub winner: [u8; 32],
     pub epoch: u64,
     pub supporting_weight: u64,
+    pub supporting_votes: Vec<VoteId>,
+    pub eligible_total: u64,
 }
 
 /// Equivocation evidence: two valid signatures by one validator, same
@@ -134,9 +142,18 @@ pub struct StakeRegistry {
     finalized: HashMap<ConflictKey, FinalizedRecord>,
     evidence: HashMap<[u8; 32], EquivocationEvidence>,
     /// Admitted bond ids (replay protection: re-submitting the same bond
-    /// bytes is an idempotent no-op, never a second top-up  -  each top-up
+    /// bytes is an idempotent no-op, never a second top-up — each top-up
     /// needs a FRESH signature, i.e. a new id).
     seen_bonds: HashSet<[u8; 32]>,
+    /// PHASE 4I (order independence): pending unbond intents, address ->
+    /// MAX intent epoch. Entries exist ONLY for validators with NO record
+    /// (unknown at intent time): an unbond arriving before its bond would
+    /// otherwise be lost (or an error), making lifecycle state depend on
+    /// gossip arrival order. At the next bond the intent is consumed and
+    /// epoch-compared (sec. apply_bond). Invariant: record exists ==>
+    /// no map entry (consumed on use; direct unbond intents for known
+    /// validators apply to the record immediately).
+    unbond_intents: HashMap<[u8; 32], u64>,
 }
 
 impl StakeRegistry {
@@ -146,9 +163,16 @@ impl StakeRegistry {
 
     /// Bond a validator (post-validation admission will have checked
     /// signature + MIN_STAKE + funds + non-slashed; see validate_bond).
-    /// Maturation applies to voting eligibility, not to recording.
-    /// Re-bonding a slashed address is rejected (permanent flag).
-    /// Re-bonding an already-bonded address tops up (same lifecycle).
+    /// Amounts SUM (commutative) and bonded_epoch takes the MAXIMUM
+    /// (epoch-ordered, not arrival-ordered: a backdated top-up never
+    /// regresses the maturation horizon; under validated admission all
+    /// bond epochs are near-current anyway). State resolves by recency:
+    /// Unbonding iff the running max unbond intent is >= the max bond
+    /// epoch (exit intent newer-or-tied wins - conservative direction),
+    /// else Bonded. Re-entry always pays maturation again (bonded_epoch
+    /// moves with the latest bond). Slashed (record or tombstone)
+    /// rejects. Consumes any pending unbond intent (order-independence
+    /// family: unbond-before-bond converges with bond-before-unbond).
     pub fn apply_bond(
         &mut self,
         validator: [u8; 32],
@@ -165,23 +189,52 @@ impl StakeRegistry {
                     ValidatorState::Bonded | ValidatorState::Unbonding { .. }
                 ) =>
             {
-                // Top-up / re-bond while exiting: reset to Bonded with the
-                // new maturation horizon (documented: re-entry always pays
-                // the maturation delay again  -  no instant return).
+                // Top-up / re-bond while exiting: amount sums; horizon is
+                // the latest bond epoch; state follows recency against the
+                // implied exit intent (release - delay): an older top-up
+                // grows the position without canceling a newer exit, a
+                // newer top-up re-enters (same latest-wins rule as votes).
+                let intent_epoch = match rec.state {
+                    ValidatorState::Unbonding { release_epoch } => {
+                        Some(release_epoch.saturating_sub(UNBONDING_EPOCHS))
+                    }
+                    _ => None,
+                };
                 let rec = self.validators.get_mut(&validator).expect("present");
                 rec.bonded_amount = rec.bonded_amount.saturating_add(amount);
-                rec.state = ValidatorState::Bonded;
-                rec.bonded_epoch = epoch;
+                if rec.bonded_epoch < epoch {
+                    rec.bonded_epoch = epoch;
+                }
+                match intent_epoch {
+                    Some(ie) if epoch < ie => {
+                        // Older top-up: position grows, exit stands.
+                    }
+                    _ => {
+                        rec.state = ValidatorState::Bonded;
+                    }
+                }
                 return Ok(());
             }
             _ => {}
+        }
+        // Fresh record (tombstone-checked above): consume any pending
+        // unbond intent first, epoch-compared (stale intents do not exit
+        // newer bonds; tied-or-newer intents exit immediately).
+        let intent = self.unbond_intents.remove(&validator);
+        let mut state = ValidatorState::Bonded;
+        if let Some(ie) = intent {
+            if ie >= epoch {
+                state = ValidatorState::Unbonding {
+                    release_epoch: ie.saturating_add(UNBONDING_EPOCHS),
+                };
+            }
         }
         self.validators.insert(
             validator,
             ValidatorRecord {
                 address: validator,
                 bonded_amount: amount,
-                state: ValidatorState::Bonded,
+                state,
                 bonded_epoch: epoch,
                 slashed_epoch: None,
             },
@@ -189,25 +242,60 @@ impl StakeRegistry {
         Ok(())
     }
 
-    /// Request unbond: Bonded -> Unbonding (release at now+delay).
-    /// Voting eligibility ends at request (clean cutover). Idempotent-ish:
-    /// already-unbonding re-request refreshes nothing (keeps earliest
-    /// release); slashed/unbonded/unbonded-missing are errors/no-ops.
+    /// Request unbond. Resolution is epoch-ordered (recency by SIGNED
+    /// epoch, never by arrival order):
+    /// - Bonded: exit iff intent epoch >= bonded horizon (max bond
+    ///   epoch); older intents are stale no-ops (a newer bond is a newer
+    ///   stay intent - same latest-wins rule as votes).
+    /// - Unbonding: release tracks the MAXIMUM intent (later intents
+    ///   extend, never shorten).
+    /// - Unknown: intent recorded (max) for the future bond (unbond-
+    ///   before-bond converges with bond-before-unbond).
+    /// - Unbonded: error (already exited; re-bond then unbond normally).
+    /// - Slashed: error (cannot unbond; funds frozen permanently).
+    /// Voting eligibility ends at request acceptance (clean cutover).
     pub fn apply_unbond(&mut self, validator: [u8; 32], now_epoch: u64) -> Result<(), String> {
-        let rec = self
-            .validators
-            .get_mut(&validator)
-            .ok_or_else(|| "unknown validator".to_string())?;
-        match rec.state {
-            ValidatorState::Bonded => {
+        match self.validators.get(&validator).map(|r| r.state) {
+            None => {
+                // Pending intent (max-rule; consumed at next bond).
+                let entry = self.unbond_intents.entry(validator).or_insert(now_epoch);
+                if *entry < now_epoch {
+                    *entry = now_epoch;
+                }
+                return Ok(());
+            }
+            Some(ValidatorState::Slashed) => {
+                return Err("slashed: cannot unbond".to_string())
+            }
+            Some(ValidatorState::Unbonded) => {
+                return Err("already unbonded".to_string())
+            }
+            Some(ValidatorState::Bonded) => {
+                let bonded_epoch = self
+                    .validators
+                    .get(&validator)
+                    .map(|r| r.bonded_epoch)
+                    .unwrap_or(0);
+                if now_epoch < bonded_epoch {
+                    // Stale intent: a newer bond already supersedes it.
+                    return Ok(());
+                }
+                let rec = self.validators.get_mut(&validator).expect("present");
                 rec.state = ValidatorState::Unbonding {
                     release_epoch: now_epoch.saturating_add(UNBONDING_EPOCHS),
                 };
-                Ok(())
+                return Ok(());
             }
-            ValidatorState::Unbonding { .. } => Ok(()),
-            ValidatorState::Unbonded => Err("already unbonded".to_string()),
-            ValidatorState::Slashed => Err("slashed: cannot unbond".to_string()),
+            Some(ValidatorState::Unbonding { release_epoch }) => {
+                let wanted = now_epoch.saturating_add(UNBONDING_EPOCHS);
+                if wanted > release_epoch {
+                    let rec = self.validators.get_mut(&validator).expect("present");
+                    rec.state = ValidatorState::Unbonding {
+                        release_epoch: wanted,
+                    };
+                }
+                return Ok(());
+            }
         }
     }
 
@@ -276,12 +364,17 @@ impl StakeRegistry {
     }
 
     /// Insert a vote. Returns the disposition:
-    /// - Duplicate (same bytes seen): idempotent Ok, no state change.
+    /// - Duplicate (same triple seen): idempotent Ok. Same-side variants
+    ///   (same side, different bytes) also report Duplicate, but the map
+    ///   slot keeps the SMALLEST vote id (canonical, order-independent).
     /// - Fresh: stored.
     /// - Equivocation (same validator+epoch+key, different side): stored as
     ///  EVIDENCE (both votes kept for proof), accused slashed IMMEDIATELY
-    ///  (weight zero + permanent flag), evidence id returned. The slash is
-    ///  registry-local (no ledger surgery  -  convergence-safe by
+    ///  (weight zero + permanent flag, tombstone if pre-bond per F-A1),
+    ///  evidence id returned. The map slot keeps the smallest vote id
+    ///  (F-A2 canonical slot: snapshots are byte-identical across arrival
+    ///  orders; safe because the accused weighs zero either way). The slash
+    ///  is registry-local (no ledger surgery  -  convergence-safe by
     ///  construction); fund-burn semantics deferred per charter (no
     ///  tokenomics invention).
     /// Assumes validate_vote passed (signature/epoch/window/bonded checks).
@@ -293,12 +386,43 @@ impl StakeRegistry {
         );
         if let Some(existing) = self.votes.get(&key) {
             if existing.side == vote.side {
+                // Same side: no equivocation. Canonical slot (F-A2).
+                if vote.id() < existing.id() {
+                    self.votes.insert(key, vote);
+                }
+                return VoteInsertOutcome::Duplicate;
+            }
+            // Different side: equivocation UNLESS this exact vote was seen
+            // before (re-gossip of either side after the fact). Seen votes
+            // carry the same id; the proof is already on file, so the
+            // replay is an idempotent Duplicate (no rebuild, no re-relay
+            // downstream). Only a genuinely NEW side creates evidence.
+            let vid = vote.id();
+            if vid == existing.id() {
+                return VoteInsertOutcome::Duplicate;
+            }
+            let mut seen_before = false;
+            for ev in self.evidence.values() {
+                if ev.accused == vote.validator
+                    && ev.epoch == vote.epoch
+                    && ev.conflict_sender == vote.conflict_sender
+                    && ev.conflict_nonce == vote.conflict_nonce
+                {
+                    if let Ok((a, b)) = ev.votes() {
+                        if a.id() == vid || b.id() == vid {
+                            seen_before = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if seen_before {
                 return VoteInsertOutcome::Duplicate;
             }
             // Equivocation: same (validator, epoch, key), different side.
-            // The FIRST vote keeps the map slot (deterministic); BOTH votes
-            // are preserved inside the evidence for proof; the accused is
-            // slashed immediately (weight zero + permanent flag).
+            // BOTH votes are preserved inside the evidence for proof; the
+            // accused is slashed immediately (weight zero + permanent flag,
+            // tombstone when pre-bond per F-A1).
             let evidence = EquivocationEvidence::new(
                 vote.validator,
                 vote.epoch,
@@ -307,8 +431,12 @@ impl StakeRegistry {
                 &vote,
             );
             let eid = evidence.id;
+            let keep_new = vote.id() < existing.id();
             self.evidence.insert(eid, evidence);
             self.apply_slash(vote.validator, vote.epoch);
+            if keep_new {
+                self.votes.insert(key, vote);
+            }
             return VoteInsertOutcome::Equivocated { evidence_id: eid };
         }
         self.votes.insert(key, vote);
@@ -317,6 +445,16 @@ impl StakeRegistry {
 
     /// Apply slash: bonded -> 0, permanent Slashed flag (re-bond rejected).
     /// Idempotent (second slash is a no-op returning false).
+    /// F-A1 slash-tombstone: slashing an UNKNOWN validator inserts a
+    /// tombstone record (zero weight, permanent Slashed flag) instead of
+    /// a silent no-op. Rationale: equivocation votes may arrive BEFORE
+    /// the accused bonded (separate gossip kinds, any order). Without a
+    /// tombstone, a LATER bond would mint a clean record and the slash
+    /// would be lost (order-dependent weight). With it, apply_bond
+    /// rejects (Slashed arm) in every order; weight is zero in every
+    /// order. Tombstone bonded_epoch is 0 (origin unknown by construction;
+    /// consensus-irrelevant: Slashed records never vote, never weigh, and
+    /// snapshots treat them identically - see IMPLEMENTATION doc).
     pub fn apply_slash(&mut self, validator: [u8; 32], epoch: u64) -> bool {
         match self.validators.get_mut(&validator) {
             Some(rec) => {
@@ -328,7 +466,19 @@ impl StakeRegistry {
                 rec.slashed_epoch = Some(epoch);
                 true
             }
-            None => false,
+            None => {
+                self.validators.insert(
+                    validator,
+                    ValidatorRecord {
+                        address: validator,
+                        bonded_amount: 0,
+                        state: ValidatorState::Slashed,
+                        bonded_epoch: 0,
+                        slashed_epoch: Some(epoch),
+                    },
+                );
+                true
+            }
         }
     }
 
@@ -349,6 +499,24 @@ impl StakeRegistry {
         at_epoch: u64,
         is_strict_descendant: F,
     ) -> u64
+    where
+        F: Fn(&[u8; 32]) -> bool,
+    {
+        self.support_breakdown(key, side, at_epoch, is_strict_descendant).0
+    }
+
+    /// Supporting weight PLUS the contributing vote ids (sorted, distinct
+    /// validators — latest-per-validator, same selection as support_for).
+    /// Powers finality certificates (F-D4): the quorum vote set pinned
+    /// with the decision, so finality is re-verifiable and re-gossipable
+    /// without the live registry (lost-vote reconstruction).
+    pub fn support_breakdown<F>(
+        &self,
+        key: ConflictKey,
+        side: &[u8; 32],
+        at_epoch: u64,
+        is_strict_descendant: F,
+    ) -> (u64, Vec<VoteId>)
     where
         F: Fn(&[u8; 32]) -> bool,
     {
@@ -381,20 +549,24 @@ impl StakeRegistry {
             }
         }
         let mut total = 0u64;
+        let mut ids: Vec<VoteId> = Vec::new();
         let mut ordered: Vec<[u8; 32]> = latest.keys().copied().collect();
         ordered.sort();
         for v in ordered {
             let bv = latest[&v];
             if bv.side == *side || is_strict_descendant(&bv.side) {
                 total = total.saturating_add(self.voting_weight(&v, at_epoch));
+                ids.push(bv.id());
             }
         }
-        total
+        ids.sort();
+        (total, ids)
     }
 
     /// Try to finalize `key` among `members`: winner = max support
     /// (min-id tiebreak); finalize iff quorum over eligible total AND no
     /// valid finalized entry exists. Returns the decision (new or existing).
+    /// Pins the finality certificate (winner vote ids + denominator).
     /// `is_strict_descendant(member, txid)`: strict DAG descent test supplied
     /// by the caller (same separation as support_for). `at_epoch`: quorum
     /// evaluation epoch (caller: vote epoch or current; deterministic input).
@@ -409,7 +581,7 @@ impl StakeRegistry {
         F: Fn(&[u8; 32], &[u8; 32]) -> bool,
     {
         if let Some(existing) = self.finalized.get(&key) {
-            return Some(*existing);
+            return Some(existing.clone());
         }
         if members.is_empty() {
             return None;
@@ -417,36 +589,95 @@ impl StakeRegistry {
         // Score each member; deterministic order (sorted ids).
         let mut ordered: Vec<[u8; 32]> = members.to_vec();
         ordered.sort();
-        let mut best: Option<([u8; 32], u64)> = None;
+        let mut best: Option<([u8; 32], u64, Vec<VoteId>)> = None;
         for m in &ordered {
             // Strict descendant test for this member; equality with the
             // member itself is handled inside support_for.
-            let s = self.support_for(key, m, at_epoch, |txid: &[u8; 32]| {
+            let (s, ids) = self.support_breakdown(key, m, at_epoch, |txid: &[u8; 32]| {
                 is_strict_descendant(m, txid)
             });
-            let better = match best {
+            let better = match &best {
                 None => true,
-                Some((_, bs)) => s > bs,
+                Some((_, bs, _)) => s > *bs,
             };
             // NOTE: ties keep the FIRST (sorted => smallest id)  -  min-id
             // tiebreak without a second pass.
             if better {
-                best = Some((*m, s));
+                best = Some((*m, s, ids));
             }
         }
-        let (winner, support) = best?;
+        let (winner, support, supporting_votes) = best?;
         let total = self.eligible_stake_total(at_epoch);
         if Self::quorum_met(support, total) {
             let rec = FinalizedRecord {
                 winner,
                 epoch: at_epoch,
                 supporting_weight: support,
+                supporting_votes,
+                eligible_total: total,
             };
-            self.finalized.insert(key, rec);
+            self.finalized.insert(key, rec.clone());
             Some(rec)
         } else {
             None
         }
+    }
+
+    /// F-D4 certificate verification (autonomous, no registry needed).
+    /// Given a finality record, the round `members`, and the candidate
+    /// quorum votes (fetched via backfill/Gossip by id), checks:
+    /// (1) the provided vote ids equal the pinned set exactly;
+    /// (2) every vote verifies (Ed25519 against its validator address);
+    /// (3) every vote targets `key` and points at winner-or-descendant;
+    /// (4) distinct validators (one counted vote each, same rule as
+    ///     support_for);
+    /// (5) pinned quorum arithmetic holds (3S >= 2T on pinned numbers).
+    /// What it does NOT re-prove: the pinned WEIGHTS themselves (they are
+    /// a node claim about that epoch's registry - cross-checkable by any
+    /// node holding the epoch's state, same trust class as checkpoints;
+    /// documented residual). Returns Ok(()) iff all checks pass.
+    pub fn verify_certificate<F>(
+        key: ConflictKey,
+        members: &[[u8; 32]],
+        cert: &FinalizedRecord,
+        votes: &[Vote],
+        is_strict_descendant: F,
+    ) -> Result<(), String>
+    where
+        F: Fn(&[u8; 32], &[u8; 32]) -> bool,
+    {
+        if !members.contains(&cert.winner) {
+            return Err("certificate winner not among members".to_string());
+        }
+        let mut ids: Vec<VoteId> = votes.iter().map(|v| v.id()).collect();
+        ids.sort();
+        let mut pinned = cert.supporting_votes.clone();
+        pinned.sort();
+        if ids != pinned {
+            return Err("vote set does not match pinned certificate set".to_string());
+        }
+        let mut validators: Vec<[u8; 32]> = Vec::with_capacity(votes.len());
+        for v in votes {
+            if !v.verify_signature() {
+                return Err("certificate vote with bad signature".to_string());
+            }
+            if (v.conflict_sender, v.conflict_nonce) != key {
+                return Err("certificate vote for another key".to_string());
+            }
+            if v.side != cert.winner && !is_strict_descendant(&cert.winner, &v.side) {
+                return Err("certificate vote outside winner closure".to_string());
+            }
+            validators.push(v.validator);
+        }
+        validators.sort();
+        validators.dedup();
+        if validators.len() != votes.len() {
+            return Err("certificate counts two votes from one validator".to_string());
+        }
+        if !Self::quorum_met(cert.supporting_weight, cert.eligible_total) {
+            return Err("pinned numbers do not reach quorum".to_string());
+        }
+        Ok(())
     }
 
     /// Invalidate finality after slash-triggered recomputation shows the
@@ -461,10 +692,24 @@ impl StakeRegistry {
         self.finalized.get(key).map(|r| r.winner)
     }
 
+    /// Full finality record (certificate) for a key, if decided.
+    pub fn finalized_record(&self, key: &ConflictKey) -> Option<FinalizedRecord> {
+        self.finalized.get(key).cloned()
+    }
+
     /// Validator lifecycle state (None = unknown address). Validation-layer
     /// read path (slash checks, eligibility error detail).
     pub fn validator_state(&self, validator: &[u8; 32]) -> Option<ValidatorState> {
         self.validators.get(validator).map(|r| r.state)
+    }
+
+    /// Bonded amount for an address (0 if unknown). Used by the fund
+    /// release sweep (F-L1): the full position unlocks at maturity.
+    pub fn bonded_amount(&self, validator: &[u8; 32]) -> u64 {
+        self.validators
+            .get(validator)
+            .map(|r| r.bonded_amount)
+            .unwrap_or(0)
     }
 
     /// Crash-durability snapshot: every map cloned into sorted vecs
@@ -477,18 +722,22 @@ impl StakeRegistry {
         let mut votes: Vec<Vec<u8>> = self.votes.values().map(|v| v.encode()).collect();
         votes.sort();
         let mut finalized: Vec<(ConflictKey, FinalizedRecord)> =
-            self.finalized.iter().map(|(k, r)| (*k, *r)).collect();
+            self.finalized.iter().map(|(k, r)| (*k, r.clone())).collect();
         finalized.sort_by(|a, b| a.0.cmp(&b.0));
         let mut evidence: Vec<EquivocationEvidence> = self.evidence.values().cloned().collect();
         evidence.sort_by(|a, b| a.id.cmp(&b.id));
         let mut seen_bonds: Vec<[u8; 32]> = self.seen_bonds.iter().copied().collect();
         seen_bonds.sort();
+        let mut pending_unbonds: Vec<([u8; 32], u64)> =
+            self.unbond_intents.iter().map(|(k, v)| (*k, *v)).collect();
+        pending_unbonds.sort();
         RegistrySnapshot {
             validators,
             votes,
             finalized,
             evidence,
             seen_bonds,
+            pending_unbonds,
         }
     }
 
@@ -508,6 +757,9 @@ impl StakeRegistry {
         }
         for id in snapshot.seen_bonds {
             reg.seen_bonds.insert(id);
+        }
+        for (addr, epoch) in snapshot.pending_unbonds {
+            reg.unbond_intents.insert(addr, epoch);
         }
         for bytes in &snapshot.votes {
             let vote =
@@ -582,6 +834,7 @@ pub struct RegistrySnapshot {
     pub finalized: Vec<(ConflictKey, FinalizedRecord)>,
     pub evidence: Vec<EquivocationEvidence>,
     pub seen_bonds: Vec<[u8; 32]>,
+    pub pending_unbonds: Vec<([u8; 32], u64)>,
 }
 
 /// Vote insertion disposition (exhaustive, logged by callers).

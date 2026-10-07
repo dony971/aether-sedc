@@ -79,8 +79,16 @@ pub enum ValidationError {
   /// (votes: at_epoch +/- EPOCH_GRACE; bonds/unbonds: not from the future
   /// beyond grace  -  past replays are idempotent via id dedup downstream)
   EpochOutOfWindow { epoch: u64, at_epoch: u64 },
-  /// Unknown vote/bond wire format version (fail closed, never ignore)
-  InvalidStakeVersion { version: u8 },
+    /// Unknown vote/bond wire format version (fail closed, never ignore)
+    InvalidStakeVersion { version: u8 },
+    // -- PHASE 4I (F-D2): post-V6-dated transaction presented while the
+    // wall clock is still pre-activation. Historical paths skip timestamp
+    // checks by design, but nothing legitimate carries a post-activation
+    // timestamp before activation day: such objects are either crafted
+    // future-dated spam (which would also skip the PoW gate) or sync
+    // garbage. Rejected on every mode while now < V6_ACTIVATION_TS;
+    // unreachable once wall-clock passes activation (monotone gate).
+    FutureEraTransaction { tx_ts: u64, activation_ts: u64 },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -228,8 +236,18 @@ impl std::fmt::Display for ValidationError {
   epoch, at_epoch
   )
     }
-  ValidationError::InvalidStakeVersion { version } => {
-  write!(f, "Unknown stake wire version: {}", version)
+            ValidationError::InvalidStakeVersion { version } => {
+                write!(f, "Unknown stake wire version: {}", version)
+            }
+            ValidationError::FutureEraTransaction {
+                tx_ts,
+                activation_ts,
+            } => {
+                write!(
+                    f,
+                    "Future-era transaction: tx_ts {} carries post-activation timestamp (>= {}) before activation day",
+                    tx_ts, activation_ts
+                )
             }
         }
     }
@@ -272,6 +290,28 @@ impl TransactionValidator {
     /// Create validator with custom difficulty
     pub fn with_difficulty(difficulty: u8) -> Self {
         Self { difficulty }
+    }
+
+    /// PHASE 4I (F-D2): pure era-admission predicate (no clock reads;
+    /// callers pass wall-clock explicitly — same discipline as consensus
+    /// fns). Rejects post-V6-dated objects while the wall clock is still
+    /// pre-activation, on EVERY validation mode. Truth table (D2 tests):
+    /// now<V6 × ts<V6 → Ok (ordinary history); now<V6 × ts>=V6 → Err
+    /// (crafted future-dated data, PoW-bypass + dormant-rule trigger);
+    /// now>=V6 × anything → Ok (post-activation normal operation).
+    /// POW_IN_V6_CONSENSUS stays NO: this gate is admission timing, not
+    /// proof-of-work — post-activation Historical sync still skips PoW.
+    pub fn historical_era_check(
+        tx_timestamp: u64,
+        now_ms: u64,
+    ) -> Result<(), ValidationError> {
+        if Transaction::is_v6_active_at(tx_timestamp) && !Transaction::is_v6_active_at(now_ms) {
+            return Err(ValidationError::FutureEraTransaction {
+                tx_ts: tx_timestamp,
+                activation_ts: Transaction::V6_ACTIVATION_TS,
+            });
+        }
+        Ok(())
     }
 
     /// Validate transaction without accessing DAG/Ledger (pure validation) - INTERNAL USE ONLY
@@ -344,6 +384,15 @@ impl TransactionValidator {
         // Historical mode: skip all timestamp checks.
         // The tx was valid when originally created.
         // Parent timestamp ordering (validate_dag) prevents structural abuse.
+        //
+        // PHASE 4I (F-D2): one check still applies in Historical mode.
+        // A post-V6-dated object presented while the wall clock is still
+        // pre-activation can only be crafted future-dated data (nothing
+        // legitimate carries such a timestamp yet): admitting it would
+        // ALSO skip the PoW gate (zero-PoW sync spam) and plant v6-era
+        // members in a dormant DAG. Rejected on every mode until the wall
+        // clock passes activation; afterwards this gate is inert.
+        Self::historical_era_check(tx.timestamp, now_ms)?;
 
   // PoW verification (pre-V6 timestamps ONLY  -  using difficulty derived
   // from timestamp).
@@ -438,8 +487,11 @@ impl TransactionValidator {
         ledger: &Ledger,
         min_fee: u64,
     ) -> Result<(), ValidationError> {
-        // Check balance
-        let sender_balance = ledger.get_balance(&tx.sender);
+        // Check balance: SPENDABLE (balance minus bonded locks, F-L1).
+        // A bonded validator cannot move locked funds through any tx on
+        // any path (drainer, sync, recovery all flow through here or
+        // transfer_internal, which enforces the same rule).
+        let sender_balance = ledger.spendable(&tx.sender);
         let required = match tx.amount.checked_add(tx.fee) {
             Some(sum) => sum,
             None => return Err(ValidationError::Overflow),
@@ -592,10 +644,12 @@ impl TransactionValidator {
   if registry.validator_state(&bond.validator) == Some(ValidatorState::Slashed) {
   return Err(ValidationError::SlashedValidator);
         }
-  // Funds must exist (ledger is the source of truth for balances;
-  // the registry only tracks bonded weight  -  no circularity: this
-  // reads the LEDGER, never the registry, for funds).
-  let balance = ledger.get_balance(&bond.validator);
+  // Funds must exist AND be unencumbered (ledger is the source of
+  // truth for balances; the registry only tracks bonded weight  -  no
+  // circularity: this reads the LEDGER, never the registry, for funds).
+  // Spendable (balance minus locks) closes capital reuse: the same
+  // funds cannot back two bonds (F-L1 Q10).
+  let balance = ledger.spendable(&bond.validator);
   if balance < bond.amount {
   return Err(ValidationError::InsufficientBalance {
   required: bond.amount,
@@ -637,15 +691,15 @@ impl TransactionValidator {
   if !unbond.verify_signature() {
   return Err(ValidationError::InvalidBondSignature);
     }
-  match registry.validator_state(&unbond.validator) {
-  None => {
-  return Err(ValidationError::UnknownValidator {
-  validator: unbond.validator,
-  })
-        }
-  Some(ValidatorState::Slashed) => {
-  return Err(ValidationError::SlashedValidator)
-    }
+        match registry.validator_state(&unbond.validator) {
+            // Unknown validators may still file intents (order
+            // independence: unbond-before-bond converges with
+            // bond-before-unbond via the pending-intent path; the intent
+            // is signature-bound and epoch-windowed like everything else).
+            None => {}
+            Some(ValidatorState::Slashed) => {
+                return Err(ValidationError::SlashedValidator)
+            }
   // Only an actively-bonded validator can begin an exit
   // (already-exiting is a no-op at apply time, but a fresh
   // intent for a non-bonded address is rejected fail-closed).

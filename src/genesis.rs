@@ -28,11 +28,11 @@ pub const FOUNDER_ADDRESS: &str =
 /// by the node operator in a server-only file (`data_dir/faucet.key`) so that
 /// only operators who hold the key can serve testnet faucet funds. Nodes
 /// without that file simply disable the faucet endpoint.
-pub const FAUCET_ADDRESS: &str = "a19ee04cfaeaee20d74e59d066a178f3f9d0e69f48ffa001f8314ead507aabfb";
+pub const FAUCET_ADDRESS: &str = "91769968e9a9e1953030aaf9f338f8ea27f9afb7fdf7f68e29fe35c9bde617b5";
 
 /// Faucet public key hex (public information, no secret).
 pub const FAUCET_PUBLIC_KEY: &str =
-    "a19ee04cfaeaee20d74e59d066a178f3f9d0e69f48ffa001f8314ead507aabfb";
+    "91769968e9a9e1953030aaf9f338f8ea27f9afb7fdf7f68e29fe35c9bde617b5";
 
 /// Genesis ledger with the initial token distribution (FIXED SUPPLY).
 /// Aether's monetary policy: emission is ZERO after genesis; the total supply
