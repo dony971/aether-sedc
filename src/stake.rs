@@ -154,6 +154,17 @@ pub struct StakeRegistry {
     /// no map entry (consumed on use; direct unbond intents for known
     /// validators apply to the record immediately).
     unbond_intents: HashMap<[u8; 32], u64>,
+    /// PHASE 4L (B+G): per-conflict latest-vote index, conflict-key ->
+    /// validator -> latest vote (max by (epoch, vote id), exactly the
+    /// selection support_breakdown used to recompute by scanning the whole
+    /// registry). DERIVED CACHE, not source of truth: the `votes` map stays
+    /// authoritative. Maintained incrementally in insert_vote for the
+    /// affected (key, validator) only (G), rebuilt from scratch by
+    /// rebuild_vote_index (restore path). Excluded from snapshots
+    /// (rebuilt by replay). support_breakdown reads it instead of the
+    /// O(V x T) whole-registry scan. Deterministic iteration via sorted
+    /// keys at read sites, same order as the reference.
+    vote_index: HashMap<ConflictKey, HashMap<[u8; 32], Vote>>,
 }
 
 impl StakeRegistry {
@@ -363,6 +374,84 @@ impl StakeRegistry {
         (support as u128) * 3 >= (total as u128) * 2
     }
 
+    /// PHASE 4L (B+G): refresh the per-conflict index entry for one
+    /// (key, validator) from the authoritative `votes` map (max by
+    /// (epoch, vote id), mirroring exactly what the reference per-validator
+    /// selection finds). Epochs per (validator, key) are few, so this is
+    /// O(epochs), not O(V x T). Called on every insert_vote exit (even
+    /// no-mutation Duplicate paths: idempotent no-op then) so no mutation
+    /// path can leave the index behind.
+    fn refresh_vote_index(&mut self, key: ConflictKey, validator: [u8; 32]) {
+        let mut best: Option<Vote> = None;
+        for ((vv, epoch, k), vote) in self.votes.iter() {
+            if *vv != validator || *k != key {
+                continue;
+            }
+            let better = match &best {
+                None => true,
+                Some(b) => (*epoch, vote.id()) > (b.epoch, b.id()),
+            };
+            if better {
+                best = Some(vote.clone());
+            }
+        }
+        match best {
+            Some(b) => {
+                self.vote_index.entry(key).or_default().insert(validator, b);
+            }
+            None => {
+                // Defensive: map holds no vote for this pair (unreachable
+                // through insert_vote, which just touched it). Drop any
+                // stale entry rather than serve derived incoherence.
+                if let Some(per_v) = self.vote_index.get_mut(&key) {
+                    per_v.remove(&validator);
+                    if per_v.is_empty() {
+                        self.vote_index.remove(&key);
+                    }
+                }
+            }
+        }
+    }
+
+    /// PHASE 4L (B+G): full index rebuild from the authoritative map
+    /// (restore-path safety net; replay already maintains incrementally).
+    fn rebuild_vote_index(&mut self) {
+        self.vote_index.clear();
+        let mut pairs: Vec<([u8; 32], ConflictKey)> = self
+            .votes
+            .keys()
+            .map(|(vv, _, k)| (*vv, *k))
+            .collect();
+        // Deterministic rebuild order (result is order-independent, but
+        // keep it sorted for reproducibility).
+        pairs.sort();
+        pairs.dedup();
+        for (vv, k) in pairs {
+            self.refresh_vote_index(k, vv);
+        }
+    }
+
+    /// PHASE 4L fail-closed harness hooks (tests only): simulate an
+    /// absent/corrupt index, rebuild it, and inspect its size. Production
+    /// builds never see these (cfg(test) stripped).
+    #[cfg(test)]
+    pub fn drop_vote_index_for_test(&mut self) {
+        self.vote_index.clear();
+    }
+
+    /// PHASE 4L harness hook (tests only): explicit full rebuild.
+    #[cfg(test)]
+    pub fn rebuild_vote_index_for_test(&mut self) {
+        self.rebuild_vote_index();
+    }
+
+    /// PHASE 4L harness hook (tests only): total indexed (key, validator)
+    /// entries (memory estimate input).
+    #[cfg(test)]
+    pub fn vote_index_len_for_test(&self) -> usize {
+        self.vote_index.values().map(|m| m.len()).sum()
+    }
+
     /// Insert a vote. Returns the disposition:
     /// - Duplicate (same triple seen): idempotent Ok. Same-side variants
     ///   (same side, different bytes) also report Duplicate, but the map
@@ -379,6 +468,8 @@ impl StakeRegistry {
     ///  tokenomics invention).
     /// Assumes validate_vote passed (signature/epoch/window/bonded checks).
     pub fn insert_vote(&mut self, vote: Vote) -> VoteInsertOutcome {
+        let ck = (vote.conflict_sender, vote.conflict_nonce);
+        let vv = vote.validator;
         let key = (
             vote.validator,
             vote.epoch,
@@ -390,6 +481,7 @@ impl StakeRegistry {
                 if vote.id() < existing.id() {
                     self.votes.insert(key, vote);
                 }
+                self.refresh_vote_index(ck, vv);
                 return VoteInsertOutcome::Duplicate;
             }
             // Different side: equivocation UNLESS this exact vote was seen
@@ -399,6 +491,7 @@ impl StakeRegistry {
             // downstream). Only a genuinely NEW side creates evidence.
             let vid = vote.id();
             if vid == existing.id() {
+                self.refresh_vote_index(ck, vv);
                 return VoteInsertOutcome::Duplicate;
             }
             let mut seen_before = false;
@@ -417,6 +510,7 @@ impl StakeRegistry {
                 }
             }
             if seen_before {
+                self.refresh_vote_index(ck, vv);
                 return VoteInsertOutcome::Duplicate;
             }
             // Equivocation: same (validator, epoch, key), different side.
@@ -437,9 +531,11 @@ impl StakeRegistry {
             if keep_new {
                 self.votes.insert(key, vote);
             }
+            self.refresh_vote_index(ck, vv);
             return VoteInsertOutcome::Equivocated { evidence_id: eid };
         }
         self.votes.insert(key, vote);
+        self.refresh_vote_index(ck, vv);
         VoteInsertOutcome::Accepted
     }
 
@@ -511,6 +607,45 @@ impl StakeRegistry {
     /// with the decision, so finality is re-verifiable and re-gossipable
     /// without the live registry (lost-vote reconstruction).
     pub fn support_breakdown<F>(
+        &self,
+        key: ConflictKey,
+        side: &[u8; 32],
+        at_epoch: u64,
+        is_strict_descendant: F,
+    ) -> (u64, Vec<VoteId>)
+    where
+        F: Fn(&[u8; 32]) -> bool,
+    {
+        // PHASE 4L (B+G optimized path): read the per-conflict latest-vote
+        // index instead of scanning the whole registry. The index entry for
+        // (key, validator) is exactly the reference per-validator selection
+        // (max by (epoch, vote id) over the map), maintained incrementally
+        // on every insert_vote exit and rebuilt on restore. Iteration order
+        // stays sorted, same as the reference. Weights still read live
+        // (eligibility/slash applied at read time, never cached).
+        let mut total = 0u64;
+        let mut ids: Vec<VoteId> = Vec::new();
+        if let Some(per_validator) = self.vote_index.get(&key) {
+            let mut ordered: Vec<[u8; 32]> = per_validator.keys().copied().collect();
+            ordered.sort();
+            for v in ordered {
+                let bv = &per_validator[&v];
+                if bv.side == *side || is_strict_descendant(&bv.side) {
+                    total = total.saturating_add(self.voting_weight(&v, at_epoch));
+                    ids.push(bv.id());
+                }
+            }
+        }
+        ids.sort();
+        (total, ids)
+    }
+
+    /// PHASE 4L reference path (tests only, never compiled into production
+    /// builds): the pre-optimization support computation, kept verbatim so
+    /// the equivalence harness can prove REFERENCE == OPTIMIZED on identical
+    /// datasets. Any divergence fails the harness (consensus bug).
+    #[cfg(test)]
+    pub fn support_breakdown_reference<F>(
         &self,
         key: ConflictKey,
         side: &[u8; 32],
@@ -602,6 +737,61 @@ impl StakeRegistry {
             };
             // NOTE: ties keep the FIRST (sorted => smallest id)  -  min-id
             // tiebreak without a second pass.
+            if better {
+                best = Some((*m, s, ids));
+            }
+        }
+        let (winner, support, supporting_votes) = best?;
+        let total = self.eligible_stake_total(at_epoch);
+        if Self::quorum_met(support, total) {
+            let rec = FinalizedRecord {
+                winner,
+                epoch: at_epoch,
+                supporting_weight: support,
+                supporting_votes,
+                eligible_total: total,
+            };
+            self.finalized.insert(key, rec.clone());
+            Some(rec)
+        } else {
+            None
+        }
+    }
+
+    /// PHASE 4L reference finalize (tests only): the pre-optimization
+    /// decision path, calling the reference support on every member.
+    /// try_finalize itself is unchanged apart from reading the optimized
+    /// support_breakdown, so this method proves the decision (winner,
+    /// weight, vote set, denominator, record) is identical.
+    #[cfg(test)]
+    pub fn try_finalize_reference<F>(
+        &mut self,
+        key: ConflictKey,
+        members: &[[u8; 32]],
+        at_epoch: u64,
+        is_strict_descendant: F,
+    ) -> Option<FinalizedRecord>
+    where
+        F: Fn(&[u8; 32], &[u8; 32]) -> bool,
+    {
+        if let Some(existing) = self.finalized.get(&key) {
+            return Some(existing.clone());
+        }
+        if members.is_empty() {
+            return None;
+        }
+        let mut ordered: Vec<[u8; 32]> = members.to_vec();
+        ordered.sort();
+        let mut best: Option<([u8; 32], u64, Vec<VoteId>)> = None;
+        for m in &ordered {
+            let (s, ids) =
+                self.support_breakdown_reference(key, m, at_epoch, |txid: &[u8; 32]| {
+                    is_strict_descendant(m, txid)
+                });
+            let better = match &best {
+                None => true,
+                Some((_, bs, _)) => s > *bs,
+            };
             if better {
                 best = Some((*m, s, ids));
             }
@@ -791,6 +981,11 @@ impl StakeRegistry {
                 return Err("evidence lost on restore".to_string());
             }
         }
+        // PHASE 4L (B+G): full index rebuild safety net. Replay above
+        // already maintained the index incrementally; this single pass
+        // guarantees totality even if a future insert path is added without
+        // its refresh call (rebuild is idempotent and order-independent).
+        reg.rebuild_vote_index();
         Ok(reg)
     }
 

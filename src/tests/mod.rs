@@ -10,6 +10,7 @@ pub mod phase4c_adversarial_audit_tests;
 pub mod phase4g_stake_finality_tests;
 pub mod phase4h_v6_adversarial_audit_tests;
 pub mod phase4i_v6_remediation_tests;
+pub mod phase4l_v6_scalability_tests;
 pub mod pow_economics;
 pub mod scalability;
 pub mod security_tests;
