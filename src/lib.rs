@@ -7,6 +7,7 @@
 //! - Deterministic double-spend conflict resolution
 //! - Zero-emission monetary policy (fixed genesis supply, fees burned)
 
+pub mod anchor;
 pub mod config;
 pub mod genesis;
 pub mod json_storage;
