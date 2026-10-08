@@ -389,8 +389,43 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
         }
     };
 
-    // INC-01 GUARD: the DAG is the source of truth ONLY when the local store
-    // is complete. A crash can truncate the transaction tree (observed in the
+    // PHASE 4Q: optional V6 anchor trust boundary at boot. Operator-placed
+    // v6_anchor.json (if any) is verified against its own bindings and
+    // checked for consistency with the just-loaded registry; any incoherence
+    // refuses boot fail-closed (same pattern as the manifest path above).
+    // Absent file: boot proceeds EXACTLY as before (fresh/joiner nodes sync
+    // first; nothing is invented). This changes no consensus decision: it
+    // only gates startup on the coherence of operator-supplied bytes.
+    // V6 stays dormant: pre-activation registries carry no V6 finality, and
+    // this check reads no clock and applies no era rule.
+    let bootstrap_verdict = {
+        let reg = stake_registry.read().await;
+        crate::anchor::verify_bootstrap_anchor(&data_dir, &reg, |_, _| false)
+    };
+    match bootstrap_verdict {
+        Ok(crate::anchor::BootstrapVerdict::NoAnchor) => {
+            tracing::info!("  No V6 anchor file - boot proceeds without an anchor boundary");
+        }
+        Ok(crate::anchor::BootstrapVerdict::Accepted { anchor_id, summary }) => {
+            tracing::info!(
+                "  V6 anchor boundary accepted: id {} support {}/{} votes {}",
+                hex::encode(&anchor_id[..8]),
+                summary.support,
+                summary.total,
+                summary.vote_count
+            );
+        }
+        Err(e) => {
+            return Err(format!(
+                "Refusing boot: V6 anchor failed verification ({:?}). Remove or replace {} - never run on an incoherent anchor.",
+                e,
+                crate::anchor::V6_ANCHOR_FILE
+            )
+            .into());
+        }
+    }
+
+    // INC-01 GUARD: the DAG is the source of truth ONLY when the local store    // is complete. A crash can truncate the transaction tree (observed in the
     // incident: 10004 -> 20 persisted txs). Deriving the ledger from a partial
     // DAG and SAVING it permanently destroys the persisted ledger (observed:
     // supply 1000000099999000986 -> 1000000099999999188). Rules:
