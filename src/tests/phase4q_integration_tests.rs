@@ -27,6 +27,7 @@ fn wallet_n(n: u64) -> Wallet {
 fn signed_vote(w: &Wallet, epoch: u64, key: ([u8; 32], u64), side: [u8; 32]) -> Vote {
     let mut v = Vote {
         format_version: VOTE_FORMAT_VERSION,
+        network_id: 0,
         validator: w.address(),
         epoch,
         conflict_sender: key.0,
@@ -74,7 +75,7 @@ fn active_network(key: ([u8; 32], u64)) -> (StakeRegistry, AnchorBundle) {
     }
     reg.try_finalize(key, &[side_x(), side_y()], AT, |_, _| false).expect("quorum");
     let set = reg.snapshot().validators;
-    let anchor = build_anchor(AT, key, side_x(), vec![side_x(), side_y()], votes, &set, ANCHOR_GENESIS_PREV);
+    let anchor = build_anchor(AT, key, side_x(), vec![side_x(), side_y()], votes, &set, ANCHOR_GENESIS_PREV, 0);
     (reg, AnchorBundle { anchor, validator_set: set })
 }
 
@@ -105,7 +106,7 @@ fn q02_bootstrap_accepts_coherent_anchor() {
     let (reg, bundle) = active_network(key_j(202));
     let dir = tempfile::tempdir().expect("tempdir");
     write_bundle(dir.path(), &bundle);
-    match verify_bootstrap_anchor(dir.path(), &reg, |_, _| false) {
+    match verify_bootstrap_anchor(dir.path(), &reg, 0, |_, _| false) {
         Ok(BootstrapVerdict::Accepted { summary, .. }) => {
             assert_eq!((summary.support, summary.total), (6000, 6000));
         }
@@ -119,12 +120,12 @@ fn q03_bootstrap_without_anchor_unchanged() {
     let (reg, _) = active_network(key_j(203));
     let dir = tempfile::tempdir().expect("tempdir");
     assert_eq!(
-        verify_bootstrap_anchor(dir.path(), &reg, |_, _| false),
+        verify_bootstrap_anchor(dir.path(), &reg, 0, |_, _| false),
         Ok(BootstrapVerdict::NoAnchor)
     );
     // Also on a totally empty registry (fresh node): same verdict.
     assert_eq!(
-        verify_bootstrap_anchor(dir.path(), &StakeRegistry::new(), |_, _| false),
+        verify_bootstrap_anchor(dir.path(), &StakeRegistry::new(), 0, |_, _| false),
         Ok(BootstrapVerdict::NoAnchor)
     );
 }
@@ -151,7 +152,7 @@ fn q04_bootstrap_refuses_tampered_bundles() {
         ("sig", tamper_sig),
     ] {
         write_bundle(dir.path(), &b);
-        match verify_bootstrap_anchor(dir.path(), &reg, |_, _| false) {
+        match verify_bootstrap_anchor(dir.path(), &reg, 0, |_, _| false) {
             Err(BootstrapError::Verify(_)) => {}
             other => panic!("{} tamper must refuse via Verify, got {:?}", name, other),
         }
@@ -159,11 +160,11 @@ fn q04_bootstrap_refuses_tampered_bundles() {
     // Truncated file and garbage file refuse at parse/io-independent stage.
     std::fs::write(dir.path().join(V6_ANCHOR_FILE), b"{broken").expect("write");
     assert!(matches!(
-        verify_bootstrap_anchor(dir.path(), &reg, |_, _| false),
+        verify_bootstrap_anchor(dir.path(), &reg, 0, |_, _| false),
         Err(BootstrapError::Parse(_))
     ));
     std::fs::write(dir.path().join(V6_ANCHOR_FILE), b"\x00\x01\x02").expect("write");
-    assert!(verify_bootstrap_anchor(dir.path(), &reg, |_, _| false).is_err());
+    assert!(verify_bootstrap_anchor(dir.path(), &reg, 0, |_, _| false).is_err());
 }
 
 #[test]
@@ -176,7 +177,7 @@ fn q05_cross_epoch_refused_integrated() {
     shifted.anchor.epoch = AT + 1000;
     write_bundle(dir.path(), &shifted);
     let (reg, _) = active_network(key_j(205));
-    assert!(verify_bootstrap_anchor(dir.path(), &reg, |_, _| false).is_err());
+    assert!(verify_bootstrap_anchor(dir.path(), &reg, 0, |_, _| false).is_err());
 }
 
 #[test]
@@ -186,7 +187,7 @@ fn q06_cross_set_refused_integrated() {
     let mut bad = bundle.clone();
     bad.validator_set[0].bonded_amount += 5;
     write_bundle(dir.path(), &bad);
-    assert!(verify_bootstrap_anchor(dir.path(), &reg, |_, _| false).is_err());
+    assert!(verify_bootstrap_anchor(dir.path(), &reg, 0, |_, _| false).is_err());
 }
 
 #[test]
@@ -196,7 +197,7 @@ fn q07_denominator_refused_integrated() {
     let mut bad = bundle.clone();
     bad.anchor.claimed_total = bad.anchor.claimed_total.saturating_sub(1);
     write_bundle(dir.path(), &bad);
-    assert!(verify_bootstrap_anchor(dir.path(), &reg, |_, _| false).is_err());
+    assert!(verify_bootstrap_anchor(dir.path(), &reg, 0, |_, _| false).is_err());
 }
 
 #[test]
@@ -205,7 +206,7 @@ fn q08_combined_matrix_integrated() {
     let (reg, bundle) = active_network(key_j(208));
     let dir = tempfile::tempdir().expect("tempdir");
     write_bundle(dir.path(), &bundle);
-    assert!(verify_bootstrap_anchor(dir.path(), &reg, |_, _| false).is_ok());
+    assert!(verify_bootstrap_anchor(dir.path(), &reg, 0, |_, _| false).is_ok());
     for (name, mut b) in [
         ("E2", {
             let mut x = bundle.clone();
@@ -226,7 +227,7 @@ fn q08_combined_matrix_integrated() {
     ] {
         let _ = name;
         write_bundle(dir.path(), &b);
-        assert!(verify_bootstrap_anchor(dir.path(), &reg, |_, _| false).is_err(), "{}", name);
+        assert!(verify_bootstrap_anchor(dir.path(), &reg, 0, |_, _| false).is_err(), "{}", name);
     }
 }
 
@@ -279,7 +280,7 @@ fn q10_joiner_converges_and_passes_state_check() {
     assert_eq!(fb.winner, fa.winner);
     assert_eq!(fb.supporting_weight, fa.supporting_weight);
     // Full bootstrap hook on the converged joiner accepts.
-    match verify_bootstrap_anchor(dir_b.path(), &rb, |_, _| false) {
+    match verify_bootstrap_anchor(dir_b.path(), &rb, 0, |_, _| false) {
         Ok(BootstrapVerdict::Accepted { .. }) => {}
         other => panic!("converged joiner must be accepted, got {:?}", other),
     }
@@ -293,7 +294,7 @@ fn q11_rebuild_keeps_anchor_context() {
     write_bundle(dir.path(), &bundle);
     let mut rebuilt = StakeRegistry::restore(reg.snapshot()).expect("restore");
     rebuilt.rebuild_vote_index_for_test();
-    assert!(verify_bootstrap_anchor(dir.path(), &rebuilt, |_, _| false).is_ok());
+    assert!(verify_bootstrap_anchor(dir.path(), &rebuilt, 0, |_, _| false).is_ok());
     assert_eq!(rebuilt.snapshot(), reg.snapshot());
 }
 
@@ -305,7 +306,7 @@ fn q12_restart_save_load_identical() {
     store.save_registry(&reg).expect("save");
     write_bundle(dir.path(), &bundle);
     let back = store.load_registry().expect("load").expect("present");
-    assert!(verify_bootstrap_anchor(dir.path(), &back, |_, _| false).is_ok());
+    assert!(verify_bootstrap_anchor(dir.path(), &back, 0, |_, _| false).is_ok());
     check_state_against_anchor(&back, &bundle.anchor).expect("restart state");
 }
 
@@ -328,7 +329,7 @@ fn q13_persistence_roundtrip_stable() {
     let back = store.load_registry().expect("load").expect("present");
     let again = parse_anchor_bundle(&raw1).expect("parse");
     let id = anchor_id(&again.anchor);
-    assert!(crate::anchor::verify_anchor(&again.anchor, &again.validator_set, id, |_, _| false).is_ok());
+    assert!(crate::anchor::verify_anchor(&again.anchor, &again.validator_set, id, 0, |_, _| false).is_ok());
     check_state_against_anchor(&back, &again.anchor).expect("persisted state");
 }
 
@@ -340,8 +341,8 @@ fn q14_dormant_pure_deterministic() {
     let (reg, bundle) = active_network(key_j(214));
     let dir = tempfile::tempdir().expect("tempdir");
     write_bundle(dir.path(), &bundle);
-    let r1 = verify_bootstrap_anchor(dir.path(), &reg, |_, _| false);
-    let r2 = verify_bootstrap_anchor(dir.path(), &reg, |_, _| false);
+    let r1 = verify_bootstrap_anchor(dir.path(), &reg, 0, |_, _| false);
+    let r2 = verify_bootstrap_anchor(dir.path(), &reg, 0, |_, _| false);
     assert_eq!(r1, r2);
     // Era-indifference at the verification layer: the bundle carries epoch
     // numbers as data; verification never consults wall-clock or activation.
@@ -360,7 +361,7 @@ fn q15_parents_ignored_by_verification() {
     // history only if amounts mismatch; here it fails the pinned id set
     // only when compared against the ORIGINAL tag. Assert both facts:
     let orig_id = anchor_id(&bundle.anchor);
-    assert!(crate::anchor::verify_anchor(&other.anchor, &other.validator_set, orig_id, |_, _| false).is_err());
+    assert!(crate::anchor::verify_anchor(&other.anchor, &other.validator_set, orig_id, 0, |_, _| false).is_err());
 }
 
 #[test]
@@ -369,7 +370,7 @@ fn q16_bootstrap_hook_timing() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_bundle(dir.path(), &bundle);
     let t0 = std::time::Instant::now();
-    let v = verify_bootstrap_anchor(dir.path(), &reg, |_, _| false).expect("hook");
+    let v = verify_bootstrap_anchor(dir.path(), &reg, 0, |_, _| false).expect("hook");
     let dt = t0.elapsed();
     assert!(matches!(v, BootstrapVerdict::Accepted { .. }));
     eprintln!("4Q bootstrap hook 6 votes + file: {:?}", dt);
@@ -377,7 +378,7 @@ fn q16_bootstrap_hook_timing() {
     let empty = tempfile::tempdir().expect("tempdir");
     let t1 = std::time::Instant::now();
     assert_eq!(
-        verify_bootstrap_anchor(empty.path(), &reg, |_, _| false),
+        verify_bootstrap_anchor(empty.path(), &reg, 0, |_, _| false),
         Ok(BootstrapVerdict::NoAnchor)
     );
     assert!(t1.elapsed().as_millis() < 100);

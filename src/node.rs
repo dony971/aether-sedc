@@ -25,8 +25,42 @@ pub struct NodeHandles {
     pub dag_store_path: PathBuf,
 }
 
-fn parse_bootnode_address(addr_str: &str) -> Result<SocketAddr, Box<dyn std::error::Error>> {
-    if let Ok(addr) = addr_str.parse::<SocketAddr>() {
+/// PHASE 4V: storage network marker (`network.id`, u64 LE). Prevents two
+/// networks from silently sharing one data directory (their Sled trees
+/// would merge DAG/votes/registry state). Fresh dir: marker written. Pre-4V
+/// dir without marker: adopted once (single-network assumption). Mismatch
+/// or corrupt marker: Err (caller refuses boot fail-closed, same pattern as
+/// the stake manifest path). Sidecar file only: no tree, key, or manifest
+/// format is touched. Pure filesystem logic: fully unit-testable without
+/// booting a node.
+pub(crate) fn verify_data_dir_network(
+    data_dir: &std::path::Path,
+    network_id: u64,
+) -> Result<(), String> {
+    let marker = data_dir.join(crate::anchor::NETWORK_MARKER_FILE);
+    match std::fs::read(&marker) {
+        Ok(bytes) if bytes.len() == 8 => {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(&bytes);
+            let found = u64::from_le_bytes(arr);
+            if found != network_id {
+                return Err(format!(
+                    "Refusing boot: data dir {:?} belongs to network {} but this node is network {}. Use a separate data directory per network - never share one.",
+                    data_dir, found, network_id
+                ));
+            }
+            Ok(())
+        }
+        Ok(_) => Err(format!(
+            "Refusing boot: corrupt network marker at {:?} (expected 8 bytes). Delete it only if you know this data dir's network, then restart.",
+            marker
+        )),
+        Err(_) => std::fs::write(&marker, network_id.to_le_bytes())
+            .map_err(|e| format!("Failed to write network marker: {}", e)),
+    }
+}
+
+fn parse_bootnode_address(addr_str: &str) -> Result<SocketAddr, Box<dyn std::error::Error>> {    if let Ok(addr) = addr_str.parse::<SocketAddr>() {
         return Ok(addr);
     }
     if addr_str.contains(':') && !addr_str.starts_with('/') {
@@ -66,6 +100,10 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     let p2p_port = cfg.p2p_port;
     let rpc_port = cfg.rpc_port;
     let rpc_bind = cfg.rpc_bind;
+    // PHASE 4V: network identity threads from here into P2P (handshake),
+    // stake admission (processor + RPC submit paths), and the storage
+    // marker below. 0 = legacy default.
+    let network_id = cfg.network_id;
 
     let mut bootnodes: Vec<SocketAddr> = Vec::new();
     for addr_str in &cfg.bootnodes {
@@ -107,6 +145,14 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     let db_path = data_dir.join("sled_db");
     let dag_store_path = data_dir.join("dag.json");
     let ledger_path = data_dir.join("ledger.json");
+
+    // PHASE 4V: storage network marker (fail closed on mismatch; absent or
+    // corrupt marker handling lives in verify_data_dir_network below).
+    verify_data_dir_network(&data_dir, network_id).map_err(|e| {
+        tracing::error!("⛔ network marker: {}", e);
+        e
+    })?;
+    tracing::info!("  Network marker: data dir {:?} OK for network {}", data_dir, network_id);
 
     tracing::info!("🗄️  Initializing Sled database at {:?}", db_path);
     let storage = Arc::new(RwLock::new(
@@ -400,7 +446,8 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     // this check reads no clock and applies no era rule.
     let bootstrap_verdict = {
         let reg = stake_registry.read().await;
-        crate::anchor::verify_bootstrap_anchor(&data_dir, &reg, |_, _| false)
+        // PHASE 4V: the boot boundary enforces the node's own network.
+        crate::anchor::verify_bootstrap_anchor(&data_dir, &reg, network_id, |_, _| false)
     };
     match bootstrap_verdict {
         Ok(crate::anchor::BootstrapVerdict::NoAnchor) => {
@@ -661,6 +708,8 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
         dns_seeds: cfg.dns_seeds.clone(),
         // Phase 1: persist known peers under the node data directory.
         peer_store_path: Some(data_dir.join("known_peers.json")),
+        // PHASE 4V: handshake network gate (0 = legacy default).
+        network_id: cfg.network_id,
     };
 
     tracing::info!("🌐 Initializing P2P network...");
@@ -733,6 +782,8 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                 sync_ctx_for_p2p.clone(),
             );
   rpc_impl.set_stake_registry(stake_for_p2p.clone());
+  // PHASE 4V: P2P-path RPC admission under the node's network.
+  rpc_impl.set_network_id(network_id);
 
             match rpc_impl
                 .process_transaction(tx, "P2P", ingress_mode)
@@ -784,6 +835,8 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
   tracing::info!("✅ P2P stake receiver task spawned");
   let mut processor = TransactionProcessor::new();
   processor.set_stake_registry(stake_for_stake.clone());
+  // PHASE 4V: P2P stake gossip admitted under the node's network.
+  processor.set_network_id(network_id);
   while let Some(payload) = stake_receiver.recv().await {
   match payload {
   StakePayload::Vote(vote) => {
@@ -870,6 +923,8 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             sync_ctx_for_drain,
         );
   rpc_impl.set_stake_registry(stake_for_drain);
+  // PHASE 4V: drainer-path RPC admission under the node's network.
+  rpc_impl.set_network_id(network_id);
         let mut last_log = std::time::Instant::now();
         let mut last_removed: u64 = 0;
         loop {
@@ -971,6 +1026,8 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                 sync_ctx_periodic.clone(),
             );
   rpc_impl.set_stake_registry(stake_periodic.clone());
+  // PHASE 4V: periodic-task RPC admission under the node's network.
+  rpc_impl.set_network_id(network_id);
 
             rpc_impl.process_orphans().await;
 

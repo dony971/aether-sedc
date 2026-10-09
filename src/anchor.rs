@@ -27,9 +27,14 @@ pub const ANCHOR_GENESIS_PREV: [u8; 32] = [0u8; 32];
 /// `votes`; `claimed_total` MUST equal the recomputed eligible total;
 /// `set_root` MUST equal the recomputed set commitment at `epoch`.
 /// `state_root` is RESERVED (None until a ledger state-hash exists).
+/// PHASE 4V: `network_id` binds the whole bundle to one network (checked
+/// against the expected network AND against every vote's network).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct V6Anchor {
     pub epoch: u64,
+    /// PHASE 4V: network discriminator (covered by the bundle tag,
+    /// checked against the expected network).
+    pub network_id: u64,
     pub key: ConflictKey,
     pub winner: [u8; 32],
     pub members: Vec<[u8; 32]>,
@@ -72,6 +77,8 @@ pub enum AnchorError {
     DenominatorMismatch { claimed: u64, recomputed: u64 },
     QuorumNotReached { support: u64, total: u64 },
     WinnerNotMember,
+    /// PHASE 4V: bundle or member vote bound to another network.
+    WrongNetwork { expected: u64, found: u64 },
 }
 
 /// Canonical per-validator record encoding (4O sec.7), fixed sizes:
@@ -172,6 +179,7 @@ pub fn anchor_id(anchor: &V6Anchor) -> [u8; 32] {
     let mut preimage = Vec::new();
     preimage.push(ANCHOR_FORMAT_VERSION);
     preimage.extend_from_slice(&anchor.epoch.to_le_bytes());
+    preimage.extend_from_slice(&anchor.network_id.to_le_bytes());
     preimage.extend_from_slice(&anchor.key.0);
     preimage.extend_from_slice(&anchor.key.1.to_le_bytes());
     preimage.extend_from_slice(&anchor.winner);
@@ -206,12 +214,14 @@ pub fn build_anchor(
     votes: Vec<Vote>,
     set: &[ValidatorRecord],
     prev: [u8; 32],
+    network_id: u64,
 ) -> V6Anchor {
     let (set_root, total) = validator_set_root(set, epoch);
     let mut supporting: Vec<VoteId> = votes.iter().map(|v| v.id()).collect();
     supporting.sort();
     V6Anchor {
         epoch,
+        network_id,
         key,
         winner,
         members,
@@ -232,6 +242,7 @@ pub fn verify_anchor<F>(
     anchor: &V6Anchor,
     set: &[ValidatorRecord],
     expected_id: [u8; 32],
+    expected_network: u64,
     is_strict_descendant: F,
 ) -> Result<AnchorSummary, AnchorError>
 where
@@ -240,6 +251,15 @@ where
     // 0. Bundle integrity first: any tampering invalidates the tag.
     if anchor_id(anchor) != expected_id {
         return Err(AnchorError::AnchorIdMismatch);
+    }
+    // PHASE 4V: network domain separation. The bundle's network must equal
+    // the expected network (cross-network anchor replay), and every quorum
+    // vote must carry the same network (mixed-network bundles).
+    if anchor.network_id != expected_network {
+        return Err(AnchorError::WrongNetwork {
+            expected: expected_network,
+            found: anchor.network_id,
+        });
     }
     // State root reserved: this version anchors decision + set only.
     if anchor.state_root.is_some() {
@@ -274,6 +294,15 @@ where
     // 4. Per-vote checks against the committed set.
     let mut by_validator: Vec<([u8; 32], u64)> = Vec::with_capacity(anchor.votes.len());
     for (i, v) in anchor.votes.iter().enumerate() {
+        // PHASE 4V: every quorum vote must carry the anchor's network
+        // (mixed-network bundles fail here even when each vote verifies
+        // under its own network elsewhere).
+        if v.network_id != expected_network {
+            return Err(AnchorError::WrongNetwork {
+                expected: expected_network,
+                found: v.network_id,
+            });
+        }
         if !v.verify_signature() {
             return Err(AnchorError::BadSignature(i));
         }
@@ -345,6 +374,12 @@ where
 /// and boot exactly as before (sec.6 no-anchor behavior).
 pub const V6_ANCHOR_FILE: &str = "v6_anchor.json";
 
+/// PHASE 4V: storage network-marker file name inside the node data
+/// directory. Holds the u64 LE network id that claimed the directory;
+/// a different network refuses to boot on it (fail closed). Sidecar file
+/// only: no storage tree, key, or manifest format is touched.
+pub const NETWORK_MARKER_FILE: &str = "network.id";
+
 /// Distribution bundle: the anchor plus the validator set it commits to.
 /// The set MUST reproduce `anchor.set_root` at `anchor.epoch` or the
 /// bundle is incoherent (SetRootMismatch), however it was delivered.
@@ -372,6 +407,10 @@ pub fn encode_anchor_bundle(bundle: &AnchorBundle) -> Result<Vec<u8>, BundleErro
     let mut root = Map::new();
     root.insert("format".to_string(), Value::from(ANCHOR_FORMAT_VERSION));
     root.insert("epoch".to_string(), Value::from(bundle.anchor.epoch));
+    root.insert(
+        "network_id".to_string(),
+        Value::from(bundle.anchor.network_id),
+    );
     root.insert(
         "key_sender".to_string(),
         Value::from(hex_of(&bundle.anchor.key.0)),
@@ -470,6 +509,9 @@ pub fn parse_anchor_bundle(bytes: &[u8]) -> Result<AnchorBundle, BundleError> {
     let epoch = get("epoch")?
         .as_u64()
         .ok_or_else(|| BundleError::Json("bad epoch".to_string()))?;
+    let network_id = get("network_id")?
+        .as_u64()
+        .ok_or_else(|| BundleError::Json("bad network_id".to_string()))?;
     let key_sender = hex_32(
         get("key_sender")?
             .as_str()
@@ -544,6 +586,7 @@ pub fn parse_anchor_bundle(bytes: &[u8]) -> Result<AnchorBundle, BundleError> {
     Ok(AnchorBundle {
         anchor: V6Anchor {
             epoch,
+            network_id,
             key: (key_sender, key_nonce),
             winner,
             members,
@@ -644,6 +687,7 @@ pub enum BootstrapError {
 pub fn verify_bootstrap_anchor(
     data_dir: &std::path::Path,
     registry: &StakeRegistry,
+    expected_network: u64,
     is_strict_descendant: impl Fn(&[u8; 32], &[u8; 32]) -> bool,
 ) -> Result<BootstrapVerdict, BootstrapError> {
     let path = data_dir.join(V6_ANCHOR_FILE);
@@ -658,6 +702,7 @@ pub fn verify_bootstrap_anchor(
         &bundle.anchor,
         &bundle.validator_set,
         id,
+        expected_network,
         is_strict_descendant,
     )
     .map_err(BootstrapError::Verify)?;

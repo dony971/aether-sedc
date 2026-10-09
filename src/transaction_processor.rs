@@ -109,6 +109,13 @@ impl TransactionProcessor {
   self.stake_registry = Some(registry);
     }
 
+  /// PHASE 4V: set the expected V6 stake network (node boot path, from
+  /// config; tests set non-default values explicitly). Forwards to the
+  /// inner validator used by vote/bond/unbond admission.
+  pub fn set_network_id(&mut self, network_id: u64) {
+  self.validator.set_network_id(network_id);
+    }
+
     /// PHASE D: expose the pure gate (PoW + signature) to the mempool ACCEPT
     /// path, so unvalidated junk never occupies a queue slot (parity with the
     /// H1 orphan rule: entering any store costs one valid PoW + signature).

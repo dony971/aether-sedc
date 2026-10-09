@@ -27,6 +27,7 @@ fn signed_vote(
 ) -> Vote {
     let mut v = Vote {
         format_version: VOTE_FORMAT_VERSION,
+        network_id: 0,
         validator: w.address(),
         epoch,
         conflict_sender: key.0,

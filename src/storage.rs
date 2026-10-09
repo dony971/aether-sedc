@@ -56,7 +56,7 @@ pub enum TreeName {
     AppliedTx,    // C2 P3: ids of transactions whose ledger effects were applied
   // PHASE 4G: stake-finality trees (additive only  -  existing trees untouched)
     Validators,   // validator address (32B) -> bincode(ValidatorRecord)
-    Votes,        // vote id (32B) -> canonical vote encoding (257B)
+    Votes,        // vote id (32B) -> canonical vote encoding (265B v2)
     Finalized,    // sender (32B) ++ nonce LE (8B) -> bincode(FinalizedRecord)
     Evidence,     // evidence id (32B) -> bincode(EquivocationEvidence)
     // PHASE 4I (F-L1): bonded-stake locks, address (32B) -> amount u64 LE.
@@ -781,7 +781,7 @@ impl Storage {
     }
     }
 
-  /// Store one vote (keyed by vote id, canonical 257B encoding).
+  /// Store one vote (keyed by vote id, canonical 265B v2 encoding).
   pub fn put_vote(&self, vote: &Vote) -> Result<(), StorageError> {
   self.tree(TreeName::Votes).insert(vote.id(), vote.encode())?;
   Ok(())

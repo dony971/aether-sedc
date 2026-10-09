@@ -822,6 +822,8 @@ impl StakeRegistry {
     /// (4) distinct validators (one counted vote each, same rule as
     ///     support_for);
     /// (5) pinned quorum arithmetic holds (3S >= 2T on pinned numbers).
+    /// (6) PHASE 4V: every vote carries `expected_network` (cross-network
+    ///     certificate replay fails here even when every other check holds).
     /// What it does NOT re-prove: the pinned WEIGHTS themselves (they are
     /// a node claim about that epoch's registry - cross-checkable by any
     /// node holding the epoch's state, same trust class as checkpoints;
@@ -831,6 +833,7 @@ impl StakeRegistry {
         members: &[[u8; 32]],
         cert: &FinalizedRecord,
         votes: &[Vote],
+        expected_network: u64,
         is_strict_descendant: F,
     ) -> Result<(), String>
     where
@@ -848,6 +851,9 @@ impl StakeRegistry {
         }
         let mut validators: Vec<[u8; 32]> = Vec::with_capacity(votes.len());
         for v in votes {
+            if v.network_id != expected_network {
+                return Err("certificate vote for another network".to_string());
+            }
             if !v.verify_signature() {
                 return Err("certificate vote with bad signature".to_string());
             }

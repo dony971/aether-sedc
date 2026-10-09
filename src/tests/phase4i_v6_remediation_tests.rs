@@ -52,6 +52,7 @@ fn signed_vote(
 ) -> Vote {
     let mut v = Vote {
         format_version: VOTE_FORMAT_VERSION,
+        network_id: 0,
         validator: w.address(),
         epoch,
         conflict_sender: key.0,
@@ -73,6 +74,7 @@ fn signed_vote(
 fn signed_bond(w: &Wallet, amount: u64, epoch: u64) -> Bond {
     let mut b = Bond {
         format_version: BOND_FORMAT_VERSION,
+        network_id: 0,
         validator: w.address(),
         amount,
         epoch,
@@ -89,6 +91,7 @@ fn signed_bond(w: &Wallet, amount: u64, epoch: u64) -> Bond {
 fn signed_unbond(w: &Wallet, epoch: u64) -> crate::transaction::Unbond {
     let mut u = crate::transaction::Unbond {
         format_version: BOND_FORMAT_VERSION,
+        network_id: 0,
         validator: w.address(),
         epoch,
         signature: [0u8; 64],
@@ -778,7 +781,7 @@ fn d3_finalized_key_joiner_reproduces_record() {
         .try_finalize(key, &members, at, |_, _| false)
         .expect("joiner finalizes");
     assert_eq!(rec2, rec);
-    StakeRegistry::verify_certificate(key, &members, &rec2, &fetched, |_, _| false)
+    StakeRegistry::verify_certificate(key, &members, &rec2, &fetched, 0, |_, _| false)
         .expect("certificate verifies from backfilled votes");
 }
 
@@ -1402,7 +1405,7 @@ fn d4_verify_ok_from_backfilled_votes() {
     let rec = reg
         .try_finalize(key, &members, at, |_, _| false)
         .expect("unanimous");
-    StakeRegistry::verify_certificate(key, &members, &rec, &[va, vb], |_, _| false)
+    StakeRegistry::verify_certificate(key, &members, &rec, &[va, vb], 0, |_, _| false)
         .expect("joiner verifies from votes alone");
 }
 
@@ -1430,7 +1433,7 @@ fn d4_verify_wrong_set_rejected() {
         .try_finalize(key, &members, at, |_, _| false)
         .expect("quorum");
     // Drop vb: set mismatch.
-    assert!(StakeRegistry::verify_certificate(key, &members, &rec, &[va.clone()], |_, _| false)
+    assert!(StakeRegistry::verify_certificate(key, &members, &rec, &[va.clone()], 0, |_, _| false)
         .is_err());
     // Add outsider (loser-side) vote: set mismatch + closure mismatch.
     assert!(StakeRegistry::verify_certificate(
@@ -1438,7 +1441,7 @@ fn d4_verify_wrong_set_rejected() {
         &members,
         &rec,
         &[va, vb, vc],
-        |_, _| false
+        0, |_, _| false
     )
     .is_err());
 }
@@ -1469,7 +1472,7 @@ fn d4_verify_bad_sig_rejected() {
     // (id-changing) for the direct-sig path... simplest: corrupt the
     // signature bytes (id changes as well - set check fires).
     bad.signature = [0u8; 64];
-    assert!(StakeRegistry::verify_certificate(key, &members, &rec, &[va, bad], |_, _| false)
+    assert!(StakeRegistry::verify_certificate(key, &members, &rec, &[va, bad], 0, |_, _| false)
         .is_err());
 }
 
@@ -1494,7 +1497,7 @@ fn d4_verify_wrong_side_rejected() {
         .expect("400/600 quorum");
     // Present ONLY the loser vote against a winner cert: set mismatch
     // (and closure mismatch) - rejected.
-    assert!(StakeRegistry::verify_certificate(key, &members, &rec, &[vb], |_, _| false)
+    assert!(StakeRegistry::verify_certificate(key, &members, &rec, &[vb], 0, |_, _| false)
         .is_err());
     let _ = va;
 }
@@ -1520,7 +1523,7 @@ fn d4_verify_bad_numbers_rejected() {
         .try_finalize(key, &members, at, |_, _| false)
         .expect("unanimous");
     rec.supporting_weight = 1;
-    assert!(StakeRegistry::verify_certificate(key, &members, &rec, &[va, vb], |_, _| false)
+    assert!(StakeRegistry::verify_certificate(key, &members, &rec, &[va, vb], 0, |_, _| false)
         .is_err());
 }
 
@@ -1623,6 +1626,7 @@ fn a2_same_side_variants_canonical() {
     let mk = |parents: [[u8; 32]; 2]| {
         let mut v = Vote {
             format_version: VOTE_FORMAT_VERSION,
+            network_id: 0,
             validator: w.address(),
             epoch: at,
             conflict_sender: key.0,
@@ -1692,12 +1696,14 @@ fn a2_three_sides_deterministic_semantics() {
         snaps.push(reg.snapshot());
     }
     // Map slots: global min id in all orders (canonical slot).
+    // NOTE (4V): validator address sits at bytes 9..41 since the network
+    // u64 joined the vote encoding (was 1..33 pre-4V).
     let first_slots: Vec<Vec<u8>> = snaps
         .iter()
         .map(|s| {
             s.votes
                 .iter()
-                .find(|b| b[1..33] == w.address())
+                .find(|b| b[9..41] == w.address())
                 .cloned()
                 .expect("slot")
         })

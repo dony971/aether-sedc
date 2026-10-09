@@ -21,6 +21,7 @@ fn wallet_n(n: u64) -> Wallet {
 fn signed_vote(w: &Wallet, epoch: u64, key: ([u8; 32], u64), side: [u8; 32]) -> Vote {
     let mut v = Vote {
         format_version: VOTE_FORMAT_VERSION,
+        network_id: 0,
         validator: w.address(),
         epoch,
         conflict_sender: key.0,
@@ -83,7 +84,7 @@ fn n01_valid_certificate_verifies() {
         &[side_x(), side_y()],
         &cert,
         &votes,
-        |_, _| false,
+        0, |_, _| false,
     );
     let dt = t0.elapsed();
     assert!(r.is_ok(), "valid cert must verify: {:?}", r);
@@ -100,7 +101,7 @@ fn n02_tampered_winner_rejected() {
         &[side_x(), side_y()],
         &cert,
         &votes,
-        |_, _| false
+        0, |_, _| false
     )
     .is_err());
 }
@@ -117,7 +118,7 @@ fn n03_tampered_numbers_rejected() {
         &[side_x(), side_y()],
         &bad,
         &votes,
-        |_, _| false
+        0, |_, _| false
     )
     .is_err());
     // Deflate the weight below quorum: rejected as well.
@@ -128,7 +129,7 @@ fn n03_tampered_numbers_rejected() {
         &[side_x(), side_y()],
         &bad2,
         &votes,
-        |_, _| false
+        0, |_, _| false
     )
     .is_err());
 }
@@ -143,7 +144,7 @@ fn n04_truncated_or_padded_set_rejected() {
         &[side_x(), side_y()],
         &cert,
         &votes[..3],
-        |_, _| false
+        0, |_, _| false
     )
     .is_err());
     // Pad with a duplicate-validator vote: distinct-validators rule fires.
@@ -154,7 +155,7 @@ fn n04_truncated_or_padded_set_rejected() {
         &[side_x(), side_y()],
         &cert,
         &padded,
-        |_, _| false
+        0, |_, _| false
     )
     .is_err());
 }
@@ -172,7 +173,7 @@ fn n05_wrong_key_or_closure_vote_rejected() {
         &[side_x(), side_y()],
         &cert,
         &wrong,
-        |_, _| false
+        0, |_, _| false
     )
     .is_err());
     // Swap in a vote pointing outside the winner closure.
@@ -183,7 +184,7 @@ fn n05_wrong_key_or_closure_vote_rejected() {
         &[side_x(), side_y()],
         &cert,
         &outside,
-        |_, _| false
+        0, |_, _| false
     )
     .is_err());
 }
@@ -201,7 +202,7 @@ fn n06_bad_signature_rejected() {
         &[side_x(), side_y()],
         &cert,
         &bad,
-        |_, _| false
+        0, |_, _| false
     )
     .is_err());
 }
@@ -220,7 +221,7 @@ fn n07_epoch_is_advisory_documents_residual() {
             &[side_x(), side_y()],
             &cert,
             &votes,
-            |_, _| false
+            0, |_, _| false
         )
         .is_ok(),
         "epoch is currently advisory: altered epoch still verifies (residual)"
@@ -242,7 +243,7 @@ fn n08_denominator_is_a_claim_documents_residual() {
             &[side_x(), side_y()],
             &cert,
             &votes,
-            |_, _| false
+            0, |_, _| false
         )
         .is_ok(),
         "deflated denominator still verifies (residual: claims, not proof)"
@@ -262,7 +263,7 @@ fn n09_no_state_root_bound_documents_residual() {
         &[side_x(), side_y()],
         &cert,
         &votes,
-        |_, _| false
+        0, |_, _| false
     )
     .is_ok());
 }
@@ -366,10 +367,10 @@ fn n12_anchor_decides() {
     }
     let f1p = alt.try_finalize(key, &[side_x(), side_y()], AT, |_, _| false).expect("F1p");
     // Correct anchor verifies.
-    assert!(StakeRegistry::verify_certificate(key, &[side_x(), side_y()], &f1, &real_votes, |_, _| false).is_ok());
+    assert!(StakeRegistry::verify_certificate(key, &[side_x(), side_y()], &f1, &real_votes, 0, |_, _| false).is_ok());
     // Cross anchors fail both ways.
-    assert!(StakeRegistry::verify_certificate(key, &[side_x(), side_y()], &f1p, &real_votes, |_, _| false).is_err());
-    assert!(StakeRegistry::verify_certificate(key, &[side_x(), side_y()], &f1, &alt_votes, |_, _| false).is_err());
+    assert!(StakeRegistry::verify_certificate(key, &[side_x(), side_y()], &f1p, &real_votes, 0, |_, _| false).is_err());
+    assert!(StakeRegistry::verify_certificate(key, &[side_x(), side_y()], &f1, &alt_votes, 0, |_, _| false).is_err());
     // Slashed-state sanity on the real registry path is untouched.
     assert!(real.validator_state(&wallet_n(910_000).address()) != Some(ValidatorState::Slashed));
 }

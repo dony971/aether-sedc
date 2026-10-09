@@ -852,6 +852,10 @@ pub struct AetherRpcImpl {
   /// closed). Set by the node after boot-loading from storage (5 new()
   /// call sites untouched  -  the handle arrives via the setter).
   stake_registry: Option<Arc<RwLock<StakeRegistry>>>,
+  /// PHASE 4V: expected V6 stake network for submitVote/Bond/Unbond
+  /// admission (0 = legacy default). Set by the node from config via the
+  /// setter below; submit paths forward it to the per-call processor.
+  network_id: u64,
 }
 
 struct FeeOracle {
@@ -921,12 +925,18 @@ impl AetherRpcImpl {
             start_time: std::time::Instant::now(),
             sync_ctx,
   stake_registry: None,
+  network_id: crate::transaction::DEFAULT_NETWORK_ID,
         }
     }
 
   /// PHASE 4G: attach the live stake registry (node boot path).
   pub fn set_stake_registry(&mut self, registry: Arc<RwLock<StakeRegistry>>) {
   self.stake_registry = Some(registry);
+    }
+
+  /// PHASE 4V: set the expected stake network (node boot path, from config).
+  pub fn set_network_id(&mut self, network_id: u64) {
+  self.network_id = network_id;
     }
 
     /// Load the faucet signing key from `data_dir/faucet.key` (a 64-char hex
@@ -1278,7 +1288,7 @@ impl AetherRpcImpl {
   // Admission runs through TransactionProcessor (single entry  -  same
   // discipline as txs); gossip follows ONLY on accept (validation
     // before relay, same as the transaction relay path). Params are hex of the
-  // CANONICAL encodings (vote 257B / bond 113B / unbond 105B).
+  // CANONICAL encodings (vote 265B / bond 121B / unbond 113B).
   // ====================================================================
 
   /// Shared stake processor (registry-attached) or fail-closed RpcError.
@@ -1288,6 +1298,9 @@ impl AetherRpcImpl {
   Some(reg) => {
   let mut processor = TransactionProcessor::new();
   processor.set_stake_registry(reg.clone());
+  // PHASE 4V: submit paths admit under the node's network (foreign-network
+  // stake objects fail validation instead of entering weight/finality).
+  processor.set_network_id(self.network_id);
   Ok(processor)
         }
                     }
@@ -1306,7 +1319,7 @@ impl AetherRpcImpl {
   hex::decode(&hex_str).map_err(|e| RpcError(format!("Invalid hex data: {}", e)))
                 }
 
-  /// aether_submitVote: admit a finality vote (hex of canonical 257B).
+  /// aether_submitVote: admit a finality vote (hex of canonical 265B).
   pub async fn submit_vote(
         &self,
   params: serde_json::Value,
@@ -1349,7 +1362,7 @@ impl AetherRpcImpl {
         })
                 }
 
-  /// aether_submitBond: admit a bond intent (hex of canonical 113B).
+  /// aether_submitBond: admit a bond intent (hex of canonical 121B).
   pub async fn submit_bond(
         &self,
   params: serde_json::Value,
@@ -1371,7 +1384,7 @@ impl AetherRpcImpl {
         })
                     }
 
-  /// aether_submitUnbond: admit an unbond intent (hex of canonical 105B).
+  /// aether_submitUnbond: admit an unbond intent (hex of canonical 113B).
   pub async fn submit_unbond(
         &self,
   params: serde_json::Value,
@@ -3281,6 +3294,7 @@ mod tests {
                 bootnodes: vec![],
                 dns_seeds: vec![],
                 peer_store_path: None,
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
             },
             tx_channel,
             Arc::new(|| Vec::new()),

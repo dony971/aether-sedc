@@ -46,6 +46,10 @@ pub struct NodeConfig {
     pub miner_address: Option<String>,
     pub reset: bool,
     pub repair_ledger: bool,
+    /// PHASE 4V: V6 network identity (0 = legacy default: behaves EXACTLY
+    /// as before; governed nonzero values stay UNSET pending the 4U sheet).
+    /// Old TOML files without the field still parse (serde default) as 0.
+    pub network_id: u64,
 }
 
 impl Default for NodeConfig {
@@ -68,6 +72,7 @@ impl Default for NodeConfig {
             miner_address: None,
             reset: false,
             repair_ledger: false,
+            network_id: crate::transaction::DEFAULT_NETWORK_ID,
         }
     }
 }

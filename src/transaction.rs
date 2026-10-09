@@ -651,17 +651,29 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 /// PHASE 4G: vote wire format version (first byte of every canonical vote
 /// encoding). Unknown versions are rejected fail-closed; extensions ship as
 /// new versions, never silent tail fields.
-pub const VOTE_FORMAT_VERSION: u8 = 1;
+pub const VOTE_FORMAT_VERSION: u8 = 2;
 /// Bond/unbond wire format version (same discipline as votes).
-pub const BOND_FORMAT_VERSION: u8 = 1;
+pub const BOND_FORMAT_VERSION: u8 = 2;
+
+/// PHASE 4V: V6 network identity. Explicit u64 network discriminator bound
+/// into every V6 stake-signed object (vote/bond/unbond: signed, encoded,
+/// validated) plus the P2P handshake and the V6 anchor. 0 = legacy default:
+/// all pre-4V fixtures, configs, and TOML files behave EXACTLY as before
+/// (0 == 0 matches everywhere). Governed (nonzero) values stay UNSET pending
+/// the 4U decision sheet -- this constant is the neutral default, never a
+/// governance choice.
+pub const DEFAULT_NETWORK_ID: u64 = 0;
 
 /// PHASE 4G: a stake-weighted finality vote (P6 exact fields).
 ///
 /// Wire layout is FIXED (field order below, integers little-endian, no
 /// floats, no maps, no variable-length vectors - fixed arrays only):
-/// version u8 | validator [u8;32] | epoch u64 | conflict_sender [u8;32] |
+/// version u8 | network u64 | validator [u8;32] | epoch u64 | conflict_sender [u8;32] |
 /// conflict_nonce u64 | side [u8;32] | stake_epoch u64 | stake_amount u64 |
-/// parents [[u8;32];2] | signature [u8;64] = 1+32+8+32+8+32+8+8+64+64 = 257 B.
+/// parents [[u8;32];2] | signature [u8;64] = 1+8+32+8+32+8+32+8+8+64+64 = 265 B.
+/// PHASE 4V: `network_id` (signed, encoded, validated against the node's
+/// expected network) binds the vote to one network: the same keys/stake on
+/// another network produce a vote that fails validation there.
 /// Validator address IS the ed25519 verifying key (same convention as
 /// transaction sender/public-key binding), so no pubkey field is needed.
 /// `parents` is DAG-embedding CONTEXT only (auditability, fork causality
@@ -673,6 +685,8 @@ pub const BOND_FORMAT_VERSION: u8 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Vote {
     pub format_version: u8,
+    /// PHASE 4V: network discriminator (signed + encoded + validated).
+    pub network_id: u64,
     pub validator: [u8; 32],
     pub epoch: u64,
     pub conflict_sender: [u8; 32],
@@ -692,8 +706,9 @@ pub type VoteId = [u8; 32];
 impl Vote {
     /// Canonical bytes WITHOUT the signature (what gets signed).
     pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(193);
+        let mut out = Vec::with_capacity(201);
         out.push(self.format_version);
+        out.extend_from_slice(&self.network_id.to_le_bytes());
         out.extend_from_slice(&self.validator);
         out.extend_from_slice(&self.epoch.to_le_bytes());
         out.extend_from_slice(&self.conflict_sender);
@@ -713,38 +728,41 @@ impl Vote {
         out
         }
 
-    /// Strict decode: exact length (193 + 64 = 257), exact version, else Err.
+    /// Strict decode: exact length (201 + 64 = 265), exact version, else Err.
     /// Fails closed on truncation, extension, or version mismatch.
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() != 257 {
+        if bytes.len() != 265 {
             return Err(format!("bad vote length: {}", bytes.len()));
-    }
+        }
         if bytes[0] != VOTE_FORMAT_VERSION {
             return Err(format!("unknown vote version: {}", bytes[0]));
         }
-        let mut validator = [0u8; 32];
-        validator.copy_from_slice(&bytes[1..33]);
         let mut u8buf = [0u8; 8];
-        u8buf.copy_from_slice(&bytes[33..41]);
+        u8buf.copy_from_slice(&bytes[1..9]);
+        let network_id = u64::from_le_bytes(u8buf);
+        let mut validator = [0u8; 32];
+        validator.copy_from_slice(&bytes[9..41]);
+        u8buf.copy_from_slice(&bytes[41..49]);
         let epoch = u64::from_le_bytes(u8buf);
         let mut conflict_sender = [0u8; 32];
-        conflict_sender.copy_from_slice(&bytes[41..73]);
-        u8buf.copy_from_slice(&bytes[73..81]);
+        conflict_sender.copy_from_slice(&bytes[49..81]);
+        u8buf.copy_from_slice(&bytes[81..89]);
         let conflict_nonce = u64::from_le_bytes(u8buf);
         let mut side = [0u8; 32];
-        side.copy_from_slice(&bytes[81..113]);
-        u8buf.copy_from_slice(&bytes[113..121]);
-        let stake_epoch = u64::from_le_bytes(u8buf);
+        side.copy_from_slice(&bytes[89..121]);
         u8buf.copy_from_slice(&bytes[121..129]);
+        let stake_epoch = u64::from_le_bytes(u8buf);
+        u8buf.copy_from_slice(&bytes[129..137]);
         let stake_amount = u64::from_le_bytes(u8buf);
         let mut p0 = [0u8; 32];
-        p0.copy_from_slice(&bytes[129..161]);
+        p0.copy_from_slice(&bytes[137..169]);
         let mut p1 = [0u8; 32];
-        p1.copy_from_slice(&bytes[161..193]);
+        p1.copy_from_slice(&bytes[169..201]);
         let mut signature = [0u8; 64];
-        signature.copy_from_slice(&bytes[193..257]);
+        signature.copy_from_slice(&bytes[201..265]);
         Ok(Self {
             format_version: VOTE_FORMAT_VERSION,
+            network_id,
             validator,
             epoch,
             conflict_sender,
@@ -780,15 +798,20 @@ impl Vote {
 }
 
 /// PHASE 4G: bond intent (lock funds into voting weight).
-/// Canonical layout: version u8 | validator [u8;32] | amount u64 LE |
-/// epoch u64 LE | signature [u8;64] = 1+32+8+8+64 = 113 B.
+/// Canonical layout: version u8 | network u64 LE | validator [u8;32] | amount u64 LE |
+/// epoch u64 LE | signature [u8;64] = 1+8+32+8+8+64 = 121 B.
 /// `epoch` records creation epoch (auditability; effectiveness is immediate
 /// by design decision - documented, no maturation delay).
+/// PHASE 4V: `network_id` binds the bond to one network (same pattern as
+/// votes; a replayed foreign bond fails validation instead of minting
+/// weight elsewhere).
 /// No fee field (spam posture: per-peer rate limits + validation-before-
 /// relay + id dedup + MIN_STAKE admission gate; documented residual).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Bond {
     pub format_version: u8,
+    /// PHASE 4V: network discriminator (signed + encoded + validated).
+    pub network_id: u64,
     pub validator: [u8; 32],
     pub amount: u64,
     pub epoch: u64,
@@ -800,8 +823,9 @@ pub type BondId = [u8; 32];
 
 impl Bond {
     pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(49);
+        let mut out = Vec::with_capacity(57);
         out.push(self.format_version);
+        out.extend_from_slice(&self.network_id.to_le_bytes());
         out.extend_from_slice(&self.validator);
         out.extend_from_slice(&self.amount.to_le_bytes());
         out.extend_from_slice(&self.epoch.to_le_bytes());
@@ -815,23 +839,26 @@ impl Bond {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() != 113 {
+        if bytes.len() != 121 {
             return Err(format!("bad bond length: {}", bytes.len()));
     }
         if bytes[0] != BOND_FORMAT_VERSION {
             return Err(format!("unknown bond version: {}", bytes[0]));
     }
-        let mut validator = [0u8; 32];
-        validator.copy_from_slice(&bytes[1..33]);
         let mut u8buf = [0u8; 8];
-        u8buf.copy_from_slice(&bytes[33..41]);
-        let amount = u64::from_le_bytes(u8buf);
+        u8buf.copy_from_slice(&bytes[1..9]);
+        let network_id = u64::from_le_bytes(u8buf);
+        let mut validator = [0u8; 32];
+        validator.copy_from_slice(&bytes[9..41]);
         u8buf.copy_from_slice(&bytes[41..49]);
+        let amount = u64::from_le_bytes(u8buf);
+        u8buf.copy_from_slice(&bytes[49..57]);
         let epoch = u64::from_le_bytes(u8buf);
         let mut signature = [0u8; 64];
-        signature.copy_from_slice(&bytes[49..113]);
+        signature.copy_from_slice(&bytes[57..121]);
         Ok(Self {
             format_version: BOND_FORMAT_VERSION,
+            network_id,
             validator,
             amount,
             epoch,
@@ -859,13 +886,18 @@ impl Bond {
     }
 
 /// PHASE 4G: unbond intent (begin exit; funds release after UNBONDING_EPOCHS).
-/// Canonical layout: version u8 | validator [u8;32] | epoch u64 LE (request
+/// Canonical layout: version u8 | network u64 LE | validator [u8;32] | epoch u64 LE (request
 /// epoch; release at request + UNBONDING_EPOCHS) | signature [u8;64] =
-/// 1+32+8+64 = 105 B. Voting eligibility ends at request acceptance
+/// 1+8+32+8+64 = 113 B. Voting eligibility ends at request acceptance
 /// (clean cutover, no exit-timing games).
+/// PHASE 4V: `network_id` binds the unbond to one network: replaying a
+/// victim's unbond on another network (same reused keys) fails validation
+/// instead of grief-locking their stake there.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Unbond {
     pub format_version: u8,
+    /// PHASE 4V: network discriminator (signed + encoded + validated).
+    pub network_id: u64,
     pub validator: [u8; 32],
     pub epoch: u64,
     pub signature: [u8; 64],
@@ -876,12 +908,13 @@ pub type UnbondId = [u8; 32];
 
 impl Unbond {
     pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(41);
+        let mut out = Vec::with_capacity(49);
         out.push(self.format_version);
+        out.extend_from_slice(&self.network_id.to_le_bytes());
         out.extend_from_slice(&self.validator);
         out.extend_from_slice(&self.epoch.to_le_bytes());
         out
-    }
+}
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = self.signing_bytes();
@@ -890,21 +923,24 @@ impl Unbond {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() != 105 {
+        if bytes.len() != 113 {
             return Err(format!("bad unbond length: {}", bytes.len()));
     }
         if bytes[0] != BOND_FORMAT_VERSION {
             return Err(format!("unknown unbond version: {}", bytes[0]));
     }
-        let mut validator = [0u8; 32];
-        validator.copy_from_slice(&bytes[1..33]);
         let mut u8buf = [0u8; 8];
-        u8buf.copy_from_slice(&bytes[33..41]);
+        u8buf.copy_from_slice(&bytes[1..9]);
+        let network_id = u64::from_le_bytes(u8buf);
+        let mut validator = [0u8; 32];
+        validator.copy_from_slice(&bytes[9..41]);
+        u8buf.copy_from_slice(&bytes[41..49]);
         let epoch = u64::from_le_bytes(u8buf);
         let mut signature = [0u8; 64];
-        signature.copy_from_slice(&bytes[41..105]);
+        signature.copy_from_slice(&bytes[49..113]);
         Ok(Self {
             format_version: BOND_FORMAT_VERSION,
+            network_id,
             validator,
             epoch,
             signature,

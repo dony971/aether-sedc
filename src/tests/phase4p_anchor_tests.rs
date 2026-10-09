@@ -23,6 +23,7 @@ fn wallet_n(n: u64) -> Wallet {
 fn signed_vote(w: &Wallet, epoch: u64, key: ([u8; 32], u64), side: [u8; 32]) -> Vote {
     let mut v = Vote {
         format_version: VOTE_FORMAT_VERSION,
+        network_id: 0,
         validator: w.address(),
         epoch,
         conflict_sender: key.0,
@@ -88,7 +89,7 @@ fn valid_anchor(
         vec![side_x(), side_y()],
         votes,
         &set_of(reg),
-        ANCHOR_GENESIS_PREV,
+        ANCHOR_GENESIS_PREV, 0,
     )
 }
 
@@ -98,7 +99,7 @@ fn p01_valid_anchor_verifies() {
     let anchor = valid_anchor(&reg, key_j(101), side_x(), votes);
     let id = anchor_id(&anchor);
     let t0 = std::time::Instant::now();
-    let sum = verify_anchor(&anchor, &set_of(&reg), id, |_, _| false).expect("valid anchor");
+    let sum = verify_anchor(&anchor, &set_of(&reg), id, 0, |_, _| false).expect("valid anchor");
     let dt = t0.elapsed();
     assert_eq!((sum.support, sum.total, sum.winner), (4000, 4000, side_x()));
     eprintln!("4P anchor verify 4 votes: {:?}", dt);
@@ -115,7 +116,7 @@ fn p02_epoch_mismatch_rejected() {
     let mut shifted = anchor.clone();
     shifted.epoch = AT + 1;
     assert_eq!(
-        verify_anchor(&shifted, &set_of(&reg), id, |_, _| false),
+        verify_anchor(&shifted, &set_of(&reg), id, 0, |_, _| false),
         Err(AnchorError::AnchorIdMismatch)
     );
     // (b) Vote outside the grace window (AT-5 vs E=AT): window rejects.
@@ -132,7 +133,7 @@ fn p02_epoch_mismatch_rejected() {
     }
     let old_anchor = valid_anchor(&reg_old, key_j(102), side_x(), old_votes);
     let oid = anchor_id(&old_anchor);
-    match verify_anchor(&old_anchor, &set_of(&reg_old), oid, |_, _| false) {
+    match verify_anchor(&old_anchor, &set_of(&reg_old), oid, 0, |_, _| false) {
         Err(AnchorError::VoteEpochOutsideWindow { .. }) => {}
         other => panic!("expected VoteEpochOutsideWindow, got {:?}", other),
     }
@@ -144,10 +145,10 @@ fn p02_epoch_mismatch_rejected() {
         vec![side_x(), side_y()],
         votes,
         &set_of(&reg),
-        ANCHOR_GENESIS_PREV,
+        ANCHOR_GENESIS_PREV, 0,
     );
     let fid = anchor_id(&far);
-    assert!(verify_anchor(&far, &set_of(&reg), fid, |_, _| false).is_err());
+    assert!(verify_anchor(&far, &set_of(&reg), fid, 0, |_, _| false).is_err());
 }
 
 #[test]
@@ -156,12 +157,12 @@ fn p03_validator_set_valid_and_mismatch() {
     let anchor = valid_anchor(&reg, key_j(103), side_x(), votes);
     let id = anchor_id(&anchor);
     // Valid set verifies (also part of p01/p07).
-    assert!(verify_anchor(&anchor, &set_of(&reg), id, |_, _| false).is_ok());
+    assert!(verify_anchor(&anchor, &set_of(&reg), id, 0, |_, _| false).is_ok());
     // R2: same keys, one amount changed -> root mismatch.
     let mut set2 = set_of(&reg);
     set2[0].bonded_amount += 1;
     assert_eq!(
-        verify_anchor(&anchor, &set2, id, |_, _| false),
+        verify_anchor(&anchor, &set2, id, 0, |_, _| false),
         Err(AnchorError::SetRootMismatch)
     );
     // R2: vote whose validator is absent from the provided set.
@@ -173,7 +174,7 @@ fn p03_validator_set_valid_and_mismatch() {
     anchor2.supporting.sort();
     let id2 = anchor_id(&anchor2);
     assert_eq!(
-        verify_anchor(&anchor2, &set_of(&reg), id2, |_, _| false),
+        verify_anchor(&anchor2, &set_of(&reg), id2, 0, |_, _| false),
         Err(AnchorError::UnknownValidator(w_out.address()))
     );
 }
@@ -193,7 +194,7 @@ fn p04_claimed_stake_must_match_commitment() {
     tampered[0] = v0;
     let anchor = valid_anchor(&reg, key_j(104), side_x(), tampered);
     let id = anchor_id(&anchor);
-    match verify_anchor(&anchor, &set_of(&reg), id, |_, _| false) {
+    match verify_anchor(&anchor, &set_of(&reg), id, 0, |_, _| false) {
         Err(AnchorError::StakeAmountMismatch { .. }) => {}
         other => panic!("expected StakeAmountMismatch, got {:?}", other),
     }
@@ -207,7 +208,7 @@ fn p05_denominator_mismatch_rejected() {
     // rule catches it because claimed != recomputed.
     anchor.claimed_total = 4000 - 1;
     let id = anchor_id(&anchor);
-    match verify_anchor(&anchor, &set_of(&reg), id, |_, _| false) {
+    match verify_anchor(&anchor, &set_of(&reg), id, 0, |_, _| false) {
         Err(AnchorError::DenominatorMismatch { .. }) => {}
         other => panic!("expected DenominatorMismatch, got {:?}", other),
     }
@@ -222,7 +223,7 @@ fn p06_state_chain_mismatch_rejected() {
     let mut bad = anchor.clone();
     bad.prev = [9u8; 32];
     assert_eq!(
-        verify_anchor(&bad, &set_of(&reg), id, |_, _| false),
+        verify_anchor(&bad, &set_of(&reg), id, 0, |_, _| false),
         Err(AnchorError::AnchorIdMismatch)
     );
     // A state_root where none is specified is rejected (reserved field).
@@ -230,7 +231,7 @@ fn p06_state_chain_mismatch_rejected() {
     bad2.state_root = Some([7u8; 32]);
     let id2 = anchor_id(&bad2);
     assert_eq!(
-        verify_anchor(&bad2, &set_of(&reg), id2, |_, _| false),
+        verify_anchor(&bad2, &set_of(&reg), id2, 0, |_, _| false),
         Err(AnchorError::StateRootPresent)
     );
 }
@@ -247,7 +248,7 @@ fn p07_valid_anchor_full_matrix() {
     assert_eq!(anchor_id(&a1), anchor_id(&a2));
     assert_eq!(canonical_set_bytes(&set_of(&reg), AT), canonical_set_bytes(&set_of(&reg), AT));
     let id = anchor_id(&a1);
-    let sum = verify_anchor(&a1, &set_of(&reg), id, |_, _| false).expect("matrix anchor");
+    let sum = verify_anchor(&a1, &set_of(&reg), id, 0, |_, _| false).expect("matrix anchor");
     assert_eq!((sum.support, sum.total), (6000, 6000));
 }
 
@@ -260,7 +261,7 @@ fn p08_malformed_anchor_rejected() {
     let mut bad = anchor.clone();
     bad.votes.pop();
     assert_eq!(
-        verify_anchor(&bad, &set_of(&reg), anchor_id(&bad), |_, _| false),
+        verify_anchor(&bad, &set_of(&reg), anchor_id(&bad), 0, |_, _| false),
         Err(AnchorError::IdSetMismatch)
     );
     // Empty votes.
@@ -268,19 +269,19 @@ fn p08_malformed_anchor_rejected() {
     bad2.votes.clear();
     bad2.supporting.clear();
     assert_eq!(
-        verify_anchor(&bad2, &set_of(&reg), anchor_id(&bad2), |_, _| false),
+        verify_anchor(&bad2, &set_of(&reg), anchor_id(&bad2), 0, |_, _| false),
         Err(AnchorError::EmptyVotes)
     );
     // Winner outside members.
     let mut bad3 = anchor.clone();
     bad3.winner = [0xEEu8; 32];
     assert_eq!(
-        verify_anchor(&bad3, &set_of(&reg), anchor_id(&bad3), |_, _| false),
+        verify_anchor(&bad3, &set_of(&reg), anchor_id(&bad3), 0, |_, _| false),
         Err(AnchorError::WinnerNotMember)
     );
     // Wrong expected id (bundle fine, tag wrong).
     assert_eq!(
-        verify_anchor(&anchor, &set_of(&reg), [1u8; 32], |_, _| false),
+        verify_anchor(&anchor, &set_of(&reg), [1u8; 32], 0, |_, _| false),
         Err(AnchorError::AnchorIdMismatch)
     );
     let _ = id;
@@ -293,7 +294,7 @@ fn p09_cross_epoch_replay_now_rejected() {
     let (reg, votes) = reg_votes(4, key_j(109));
     let anchor = valid_anchor(&reg, key_j(109), side_x(), votes.clone());
     let id = anchor_id(&anchor);
-    assert!(verify_anchor(&anchor, &set_of(&reg), id, |_, _| false).is_ok());
+    assert!(verify_anchor(&anchor, &set_of(&reg), id, 0, |_, _| false).is_ok());
     // Re-anchor the same votes 1000 epochs later: window + root reject.
     let shifted = build_anchor(
         AT + 1000,
@@ -302,10 +303,10 @@ fn p09_cross_epoch_replay_now_rejected() {
         vec![side_x(), side_y()],
         votes,
         &set_of(&reg),
-        ANCHOR_GENESIS_PREV,
+        ANCHOR_GENESIS_PREV, 0,
     );
     let sid = anchor_id(&shifted);
-    assert!(verify_anchor(&shifted, &set_of(&reg), sid, |_, _| false).is_err());
+    assert!(verify_anchor(&shifted, &set_of(&reg), sid, 0, |_, _| false).is_err());
 }
 
 #[test]
@@ -318,7 +319,7 @@ fn p10_cross_set_replay_now_rejected() {
     // Different validator set that still contains the same keys is
     // impossible here; use a set with one replaced member.
     set2[0] = set_of(&reg)[1].clone();
-    assert!(verify_anchor(&anchor, &set2, id, |_, _| false).is_err());
+    assert!(verify_anchor(&anchor, &set2, id, 0, |_, _| false).is_err());
 }
 
 #[test]
@@ -328,11 +329,11 @@ fn p11_combined_epoch_set_matrix() {
     let anchor = valid_anchor(&reg, key_j(111), side_x(), votes.clone());
     let id = anchor_id(&anchor);
     let set = set_of(&reg);
-    assert!(verify_anchor(&anchor, &set, id, |_, _| false).is_ok());
+    assert!(verify_anchor(&anchor, &set, id, 0, |_, _| false).is_ok());
     // (E1,R2): same epoch, tampered set.
     let mut set2 = set.clone();
     set2[2].bonded_amount += 5;
-    assert!(verify_anchor(&anchor, &set2, id, |_, _| false).is_err());
+    assert!(verify_anchor(&anchor, &set2, id, 0, |_, _| false).is_err());
     // (E2,R1): epoch-shifted bundle.
     let shifted = build_anchor(
         AT + 7,
@@ -341,12 +342,12 @@ fn p11_combined_epoch_set_matrix() {
         vec![side_x(), side_y()],
         votes.clone(),
         &set,
-        ANCHOR_GENESIS_PREV,
+        ANCHOR_GENESIS_PREV, 0,
     );
     let sid = anchor_id(&shifted);
-    assert!(verify_anchor(&shifted, &set, sid, |_, _| false).is_err());
+    assert!(verify_anchor(&shifted, &set, sid, 0, |_, _| false).is_err());
     // (E2,R2): both wrong.
-    assert!(verify_anchor(&shifted, &set2, sid, |_, _| false).is_err());
+    assert!(verify_anchor(&shifted, &set2, sid, 0, |_, _| false).is_err());
 }
 
 #[test]
@@ -363,7 +364,7 @@ fn p12_restart_sync_rebuild_anchor_stable() {
     let back = storage.load_registry().expect("load").expect("present");
     let after = valid_anchor(&back, key_j(112), side_x(), back_votes(&back, key_j(112)));
     assert_eq!(before_id, anchor_id(&after));
-    assert!(verify_anchor(&after, &set_of(&back), anchor_id(&after), |_, _| false).is_ok());
+    assert!(verify_anchor(&after, &set_of(&back), anchor_id(&after), 0, |_, _| false).is_ok());
     // Sync path: restore from snapshot gives the same anchor too.
     let sync = StakeRegistry::restore(back.snapshot()).expect("restore");
     let sync_anchor = valid_anchor(&sync, key_j(112), side_x(), back_votes(&sync, key_j(112)));
@@ -404,16 +405,16 @@ fn p13_fake_anchor_field_matrix() {
     let set = set_of(&reg);
     let mut bad_epoch = anchor.clone();
     bad_epoch.epoch += 1;
-    assert!(verify_anchor(&bad_epoch, &set, id, |_, _| false).is_err());
+    assert!(verify_anchor(&bad_epoch, &set, id, 0, |_, _| false).is_err());
     let mut bad_root = anchor.clone();
     bad_root.set_root = [5u8; 32];
-    assert!(verify_anchor(&bad_root, &set, anchor_id(&bad_root), |_, _| false).is_err());
+    assert!(verify_anchor(&bad_root, &set, anchor_id(&bad_root), 0, |_, _| false).is_err());
     let mut bad_total = anchor.clone();
     bad_total.claimed_total += 1;
-    assert!(verify_anchor(&bad_total, &set, anchor_id(&bad_total), |_, _| false).is_err());
+    assert!(verify_anchor(&bad_total, &set, anchor_id(&bad_total), 0, |_, _| false).is_err());
     let mut bad_vote = anchor.clone();
     bad_vote.votes[0].side = side_y();
-    assert!(verify_anchor(&bad_vote, &set, anchor_id(&bad_vote), |_, _| false).is_err());
+    assert!(verify_anchor(&bad_vote, &set, anchor_id(&bad_vote), 0, |_, _| false).is_err());
     let mut bad_prev = anchor.clone();
     bad_prev.prev = [6u8; 32];
     // prev binds only through the bundle tag (chain resolution needs an
@@ -421,10 +422,10 @@ fn p13_fake_anchor_field_matrix() {
     // tampered bundle fails integrity; re-tagged it is a DIFFERENT anchor
     // whose prev must resolve elsewhere. Both facts asserted.
     assert_eq!(
-        verify_anchor(&bad_prev, &set, id, |_, _| false),
+        verify_anchor(&bad_prev, &set, id, 0, |_, _| false),
         Err(AnchorError::AnchorIdMismatch)
     );
-    assert!(verify_anchor(&bad_prev, &set, anchor_id(&bad_prev), |_, _| false).is_ok());
+    assert!(verify_anchor(&bad_prev, &set, anchor_id(&bad_prev), 0, |_, _| false).is_ok());
 }
 
 #[test]
@@ -441,34 +442,34 @@ fn p14_long_range_anchor_decides() {
     let real_set = set_of(&real);
     let real_anchor = build_anchor(
         AT, key, side_x(), vec![side_x(), side_y()], real_votes.clone(), &real_set,
-        ANCHOR_GENESIS_PREV,
+        ANCHOR_GENESIS_PREV, 0,
     );
     let rid = anchor_id(&real_anchor);
-    assert!(verify_anchor(&real_anchor, &real_set, rid, |_, _| false).is_ok());
+    assert!(verify_anchor(&real_anchor, &real_set, rid, 0, |_, _| false).is_ok());
     // Alternate history, same keys, opposite side: also self-consistent.
     let (mut alt, alt_votes) = reg_votes_at(5, key, side_y(), 950_100);
     let _ = alt.try_finalize(key, &[side_x(), side_y()], AT, |_, _| false);
     let alt_anchor = build_anchor(
         AT, key, side_y(), vec![side_x(), side_y()], alt_votes.clone(), &set_of(&alt),
-        ANCHOR_GENESIS_PREV,
+        ANCHOR_GENESIS_PREV, 0,
     );
     let aid = anchor_id(&alt_anchor);
-    assert!(verify_anchor(&alt_anchor, &set_of(&alt), aid, |_, _| false).is_ok());
+    assert!(verify_anchor(&alt_anchor, &set_of(&alt), aid, 0, |_, _| false).is_ok());
     // Cross with IDENTICAL sets verifies too: the two histories share
     // every validator record, so set scoping cannot separate them. This is
     // the precise boundary of cryptography here -- only the sourcing rule
     // (which anchor the node starts from) picks the history. Asserted as Ok
     // deliberately: expecting Err would be the oversell this phase refuses.
-    assert!(verify_anchor(&alt_anchor, &real_set, aid, |_, _| false).is_ok());
-    assert!(verify_anchor(&real_anchor, &set_of(&alt), rid, |_, _| false).is_ok());
+    assert!(verify_anchor(&alt_anchor, &real_set, aid, 0, |_, _| false).is_ok());
+    assert!(verify_anchor(&real_anchor, &set_of(&alt), rid, 0, |_, _| false).is_ok());
     // Disjoint-set forgery against the real set fails (unknown validators).
     let (dis, dis_votes) = reg_votes_at(5, key, side_y(), 951_100);
     let dis_anchor = build_anchor(
         AT, key, side_y(), vec![side_x(), side_y()], dis_votes, &set_of(&dis),
-        ANCHOR_GENESIS_PREV,
+        ANCHOR_GENESIS_PREV, 0,
     );
     let did = anchor_id(&dis_anchor);
-    assert!(verify_anchor(&dis_anchor, &real_set, did, |_, _| false).is_err());
+    assert!(verify_anchor(&dis_anchor, &real_set, did, 0, |_, _| false).is_err());
 }
 
 fn reg_votes_at(v: u64, key: ([u8; 32], u64), side: [u8; 32], base: u64) -> (StakeRegistry, Vec<Vote>) {
@@ -521,9 +522,9 @@ fn p15_eligibility_agreement_with_consensus() {
     // w1/w2/w3 votes must be rejected from the anchor (ineligible), w0 kept:
     // build the anchor with only the eligible vote to show the rule, and
     // show the full set fails on ineligibility.
-    let full = build_anchor(AT, key_j(116), side_x(), vec![side_x(), side_y()], votes, &set, ANCHOR_GENESIS_PREV);
+    let full = build_anchor(AT, key_j(116), side_x(), vec![side_x(), side_y()], votes, &set, ANCHOR_GENESIS_PREV, 0);
     assert_eq!(
-        verify_anchor(&full, &set, anchor_id(&full), |_, _| false),
+        verify_anchor(&full, &set, anchor_id(&full), 0, |_, _| false),
         Err(AnchorError::IneligibleValidator(w1.address()))
     );
 }
@@ -540,7 +541,7 @@ fn p16_equivalence_with_consensus_decision() {
                 .expect("quorum");
             let anchor = valid_anchor(&reg, key_j(*c), side_x(), votes);
             let sum =
-                verify_anchor(&anchor, &set_of(&reg), anchor_id(&anchor), |_, _| false)
+                verify_anchor(&anchor, &set_of(&reg), anchor_id(&anchor), 0, |_, _| false)
                     .expect("anchor");
             assert_eq!(sum.winner, rec.winner);
             assert_eq!(sum.support, rec.supporting_weight);
@@ -559,7 +560,7 @@ fn p17_era_independent_verification() {
     let (reg, votes) = reg_votes(4, key_j(120));
     let a1 = valid_anchor(&reg, key_j(120), side_x(), votes.clone());
     let id1 = anchor_id(&a1);
-    assert!(verify_anchor(&a1, &set_of(&reg), id1, |_, _| false).is_ok());
+    assert!(verify_anchor(&a1, &set_of(&reg), id1, 0, |_, _| false).is_ok());
     // Same keys re-bonded/voted much later: independent anchor at its own
     // epoch (bonds matured 100 epochs before the votes, so eligibility
     // holds exactly as in the first bundle).
@@ -575,10 +576,10 @@ fn p17_era_independent_verification() {
     }
     let a2 = build_anchor(
         late, key_j(120), side_x(), vec![side_x(), side_y()], votes2,
-        &set_of(&reg2), ANCHOR_GENESIS_PREV,
+        &set_of(&reg2), ANCHOR_GENESIS_PREV, 0,
     );
     let id2 = anchor_id(&a2);
-    assert!(verify_anchor(&a2, &set_of(&reg2), id2, |_, _| false).is_ok());
+    assert!(verify_anchor(&a2, &set_of(&reg2), id2, 0, |_, _| false).is_ok());
     // Cross: a1 bytes are not valid at the later epoch and vice versa.
     assert_ne!(id1, id2);
 }
@@ -590,11 +591,11 @@ fn p18_timing_100_votes() {
     let id = anchor_id(&anchor);
     let set = set_of(&reg);
     let t0 = std::time::Instant::now();
-    let sum = verify_anchor(&anchor, &set, id, |_, _| false).expect("100-anchor");
+    let sum = verify_anchor(&anchor, &set, id, 0, |_, _| false).expect("100-anchor");
     let dt = t0.elapsed();
     assert_eq!((sum.support, sum.total), (100_000, 100_000));
     let t1 = std::time::Instant::now();
-    let _ = build_anchor(AT, key_j(121), side_x(), vec![side_x(), side_y()], anchor.votes.clone(), &set, ANCHOR_GENESIS_PREV);
+    let _ = build_anchor(AT, key_j(121), side_x(), vec![side_x(), side_y()], anchor.votes.clone(), &set, ANCHOR_GENESIS_PREV, 0);
     let build_dt = t1.elapsed();
     eprintln!("4P anchor 100 votes verify={:?} build={:?}", dt, build_dt);
 }

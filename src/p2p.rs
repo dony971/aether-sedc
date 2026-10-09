@@ -1495,7 +1495,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // different genesis hashes must NOT interconnect (cross-network gossip and
 // inventory pollution). The genesis hash (public constant) identifies the
 // network; the protocol version guards the wire format. This is a BREAKING
-// protocol change (the handshake frame grew from 36 to 69 bytes): every node
+// protocol change (the handshake frame grew from 36 to 69 bytes, then to
+// 77 with the 4V network id): every node
 // on the network must run the same binary — safe here because the testnet is
 // not yet public and the genesis ceremony purges all node data dirs.
 // v2 → v3 (WEIGHT): `tx.weight` is now DAG-maintained (subtree size) and
@@ -1517,8 +1518,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Wire format version of the P2P handshake.
 // OBSERVABILITY-ONLY visibility: `pub` so the boot banner can log it.
 pub const P2P_PROTOCOL_VERSION: u8 = 5;
-/// Handshake frame: magic(4) | version(1) | genesis hash(32) | ephemeral key(32)
-const HANDSHAKE_FRAME_LEN: usize = 4 + 1 + 32 + 32;
+/// Handshake frame: magic(4) | version(1) | genesis hash(32) | network(8) | ephemeral key(32)
+/// PHASE 4V: the trailing 8 bytes carry the node's V6 network id (u64 LE,
+/// exact-match checked). Genesis check retained (defense in depth); the
+/// network field is what separates testnets sharing one binary/genesis.
+const HANDSHAKE_FRAME_LEN: usize = 4 + 1 + 32 + 8 + 32;
 
 /// Insert into the seen-transaction cache, evicting old entries once the
 /// cache is full so memory stays bounded under flood.
@@ -1733,6 +1737,9 @@ pub struct P2PConfig {
     pub dns_seeds: Vec<String>,
     /// Path used to persist known peers across restarts (Phase 1)
     pub peer_store_path: Option<std::path::PathBuf>,
+    /// PHASE 4V: V6 network identity checked in the handshake (0 = legacy
+    /// default: behaves EXACTLY as before; governed nonzero values pending).
+    pub network_id: u64,
 }
 
 /// How long a peer remains in the known set after its last disconnect (Phase 1 TTL).
@@ -1752,6 +1759,7 @@ impl Default for P2PConfig {
             bootnodes: Vec::new(),
             dns_seeds: Vec::new(),
             peer_store_path: None,
+            network_id: crate::transaction::DEFAULT_NETWORK_ID,
         }
     }
 }
@@ -2358,8 +2366,8 @@ pub enum P2PMessage {
   // variants keep their bincode indices, so old binaries decode every
   // pre-4G message identically; a pre-4G peer receiving these fails
   // deserialization and error-disconnects per existing discipline).
-  // Payloads are the CANONICAL encodings (Vote 257B / Bond 113B /
-  // Unbond 105B  -  strict-decoded on receipt, never trusted).
+  // Payloads are the CANONICAL encodings (Vote 265B / Bond 121B /
+  // Unbond 113B v2  -  strict-decoded on receipt, never trusted).
   /// Finality vote gossip (canonical vote encoding)
   Vote(Vec<u8>),
   /// Bond intent gossip (canonical bond encoding)
@@ -2611,6 +2619,7 @@ impl P2PNetwork {
         let sync_ctx = Arc::clone(&self.sync_ctx);
         let is_orphan = Arc::clone(&self.is_orphan);
   let stake_hooks = self.stake_hooks.clone();
+  let network_id = self.config.network_id;
         let local_addr = self.config.listen_addr;
         let addresses = self.addresses.clone();
         let (peer_discovery_tx, mut peer_discovery_rx) = mpsc::unbounded_channel::<SocketAddr>();
@@ -2641,6 +2650,7 @@ impl P2PNetwork {
                 sync_ctx,
                 is_orphan,
   stake_hooks,
+  network_id,
             )
             .await;
         });
@@ -3437,6 +3447,7 @@ impl P2PNetwork {
         sync_ctx: Arc<SyncContext>,
         is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
   stake_hooks: StakeHooks,
+  network_id: u64,
     ) {
         loop {
             match listener.accept().await {
@@ -3551,6 +3562,7 @@ impl P2PNetwork {
                             sync_ctx,
                             is_orphan,
   stake_hooks,
+  network_id,
                         )
                         .await;
                     });
@@ -3620,7 +3632,14 @@ impl P2PNetwork {
     /// 2E-A: compares against `handshake_wire_magic()`, so a v3 peer that
     /// still sends the literal "AETH" fails here with the magic error and is
     /// disconnected before it can send an unpadded frame.
-    fn verify_handshake_identity(incoming: &[u8]) -> Result<(), &'static str> {
+    /// PHASE 4V: additionally checks the trailing network id against the
+    /// node's expected network (exact match; 0 == 0 preserves legacy
+    /// behavior). Different testnets on one binary share magic/version/
+    /// genesis, so this field is the operative cross-network gate.
+    fn verify_handshake_identity(
+        incoming: &[u8],
+        expected_network_id: u64,
+    ) -> Result<(), &'static str> {
         if incoming.len() < HANDSHAKE_FRAME_LEN {
             return Err("Short P2P handshake frame");
         }
@@ -3632,6 +3651,11 @@ impl P2PNetwork {
         }
         if incoming[5..37] != crate::genesis::GENESIS_HASH {
             return Err("Network mismatch: peer genesis hash differs from ours");
+        }
+        let mut net = [0u8; 8];
+        net.copy_from_slice(&incoming[37..45]);
+        if u64::from_le_bytes(net) != expected_network_id {
+            return Err("Network mismatch: peer network id differs from ours");
         }
         Ok(())
     }
@@ -3765,9 +3789,12 @@ impl P2PNetwork {
     /// Perform X25519 handshake, derive the session key (shared by both
     /// directions — ChaCha20 nonce uniqueness is enforced via the direction
     /// byte), and return (key, send_direction) for this side.
+    /// PHASE 4V: advertises and checks `network_id` (exact match both ways;
+    /// a legacy/foreign peer fails closed here, before any gossip).
     async fn handshake(
         reader: &mut (impl AsyncReadExt + Unpin),
         writer: &mut (impl AsyncWriteExt + Unpin),
+        network_id: u64,
     ) -> Result<([u8; 32], u8), Box<dyn std::error::Error>> {
         let our_secret = EphemeralSecret::random_from_rng(OsRng);
         let our_public = PublicKey::from(&our_secret);
@@ -3776,6 +3803,7 @@ impl P2PNetwork {
         outgoing.extend_from_slice(&Self::handshake_wire_magic());
         outgoing.push(P2P_PROTOCOL_VERSION);
         outgoing.extend_from_slice(&crate::genesis::GENESIS_HASH);
+        outgoing.extend_from_slice(&network_id.to_le_bytes());
         outgoing.extend_from_slice(our_public.as_bytes());
         if tokio::time::timeout(HANDSHAKE_TIMEOUT, writer.write_all(&outgoing))
             .await
@@ -3788,7 +3816,7 @@ impl P2PNetwork {
         Self::read_exact_timeout(reader, &mut incoming, HANDSHAKE_TIMEOUT)
             .await
             .map_err(|e| format!("P2P handshake read failed: {}", e))?;
-        Self::verify_handshake_identity(&incoming)?;
+        Self::verify_handshake_identity(&incoming, network_id)?;
 
         let mut peer_pk_bytes = [0u8; 32];
         peer_pk_bytes.copy_from_slice(&incoming[HANDSHAKE_FRAME_LEN - 32..]);
@@ -3825,13 +3853,14 @@ impl P2PNetwork {
         sync_ctx: Arc<SyncContext>,
         is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
   stake_hooks: StakeHooks,
+  network_id: u64,
     ) {
         // Split stream into read and write halves (both owned, so the write
         // half can be moved into the send task below).
         let (mut reader, mut writer) = stream.into_split();
 
         // Perform encrypted handshake (X25519 key exchange)
-        let (key_bytes, send_dir) = match Self::handshake(&mut reader, &mut writer)
+        let (key_bytes, send_dir) = match Self::handshake(&mut reader, &mut writer, network_id)
             .await
             .map_err(|e| e.to_string())
         {
@@ -4850,6 +4879,7 @@ impl P2PNetwork {
                 let sync_ctx = Arc::clone(&self.sync_ctx);
                 let is_orphan = Arc::clone(&self.is_orphan);
   let stake_hooks = self.stake_hooks.clone();
+  let network_id = self.config.network_id;
                 let peer_discovery_tx = {
                     let guard = self.peer_discovery_tx.lock().await;
                     guard.clone().unwrap_or_else(|| {
@@ -4877,6 +4907,7 @@ impl P2PNetwork {
                         sync_ctx,
                         is_orphan,
   stake_hooks,
+  network_id,
                     )
                     .await;
                     // Phase 2C: release the reservation only once the session
@@ -5489,7 +5520,8 @@ mod phase2_decentralized_tests {
             bootnodes,
             dns_seeds: vec![],
             peer_store_path: None,
-        })
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+})
     }
 
     /// A node wired to a specific on-disk peer store (Phase 2B store tests).
@@ -5499,7 +5531,8 @@ mod phase2_decentralized_tests {
             bootnodes: vec![],
             dns_seeds: vec![],
             peer_store_path: Some(path),
-        })
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+})
     }
 
     fn net_at_config(cfg: P2PConfig) -> P2PNetwork {
@@ -7539,7 +7572,8 @@ mod phase2_self_healing_tests {
             bootnodes,
             dns_seeds: vec![],
             peer_store_path: None,
-        })
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+})
     }
 
     fn net_at(path: std::path::PathBuf) -> P2PNetwork {
@@ -7548,7 +7582,8 @@ mod phase2_self_healing_tests {
             bootnodes: vec![],
             dns_seeds: vec![],
             peer_store_path: Some(path),
-        })
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+})
     }
 
     fn net_at_config(cfg: P2PConfig) -> P2PNetwork {
@@ -8237,7 +8272,8 @@ mod bootstrap_phase1_tests {
             bootnodes: vec![],
             dns_seeds: vec![],
             peer_store_path: Some(path.clone()),
-        };
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+};
         let (tx, _rx) = mpsc::unbounded_channel();
         let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
         let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
@@ -8271,7 +8307,8 @@ mod bootstrap_phase1_tests {
             bootnodes: vec![],
             dns_seeds: vec![],
             peer_store_path: Some(path),
-        };
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+};
         let (tx2, _rx2) = mpsc::unbounded_channel();
         let sync_ctx2 = Arc::new(SyncContext::default());
         let net2 = P2PNetwork::new(
@@ -8305,7 +8342,8 @@ mod bootstrap_phase1_tests {
             bootnodes: vec![],
             dns_seeds: vec![],
             peer_store_path: None,
-        };
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+};
         let net = P2PNetwork::new(
             cfg,
             tx,
@@ -8367,7 +8405,8 @@ mod bootstrap_phase1_tests {
             ],
             dns_seeds: vec![],
             peer_store_path: None,
-        };
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+};
         assert_eq!(cfg.bootnodes.len(), 3);
     }
 
@@ -8387,7 +8426,8 @@ mod bootstrap_phase1_tests {
             bootnodes: vec![boot],
             dns_seeds: vec![],
             peer_store_path: None,
-        };
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+};
         let net = P2PNetwork::new(
             cfg,
             tx,
@@ -8450,7 +8490,8 @@ mod bootstrap_phase1_tests {
             bootnodes: vec![], // bootnode is down / absent
             dns_seeds: vec![],
             peer_store_path: Some(path),
-        };
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+};
         let net = P2PNetwork::new(
             cfg,
             tx,
@@ -8690,8 +8731,8 @@ mod bootstrap_phase1_tests {
         for _ in 0..8 {
             let (mut a_r, mut b_w) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
             let (mut b_r, mut a_w) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
-            let a = P2PNetwork::handshake(&mut a_r, &mut a_w);
-            let b = P2PNetwork::handshake(&mut b_r, &mut b_w);
+            let a = P2PNetwork::handshake(&mut a_r, &mut a_w, 0);
+            let b = P2PNetwork::handshake(&mut b_r, &mut b_w, 0);
             let (ra, rb) = tokio::join!(a, b);
             let (key_a, dir_a) = ra.expect("handshake A");
             let (key_b, dir_b) = rb.expect("handshake B");
@@ -8704,8 +8745,8 @@ mod bootstrap_phase1_tests {
         for _ in 0..8 {
             let (mut a_r, mut b_w) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
             let (mut b_r, mut a_w) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
-            let a = P2PNetwork::handshake(&mut a_r, &mut a_w);
-            let b = P2PNetwork::handshake(&mut b_r, &mut b_w);
+            let a = P2PNetwork::handshake(&mut a_r, &mut a_w, 0);
+            let b = P2PNetwork::handshake(&mut b_r, &mut b_w, 0);
             let (ra, rb) = tokio::join!(a, b);
             let (key_a, _) = ra.expect("handshake A");
             let (key_b, _) = rb.expect("handshake B");
@@ -8721,8 +8762,8 @@ mod bootstrap_phase1_tests {
         let (mut a_reader, mut b_writer) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
         let (mut b_reader, mut a_writer) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
 
-        let a = P2PNetwork::handshake(&mut a_reader, &mut a_writer);
-        let b = P2PNetwork::handshake(&mut b_reader, &mut b_writer);
+        let a = P2PNetwork::handshake(&mut a_reader, &mut a_writer, 0);
+        let b = P2PNetwork::handshake(&mut b_reader, &mut b_writer, 0);
         let (ra, rb) = tokio::join!(a, b);
 
         let (key_a, dir_a) = ra.expect("side A handshake must succeed");
@@ -8765,7 +8806,8 @@ mod bootstrap_phase1_tests {
             bootnodes: vec![],
             dns_seeds: vec![],
             peer_store_path: None,
-        };
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+};
         let net = P2PNetwork::new(
             cfg,
             tx,
@@ -8813,7 +8855,8 @@ mod bootstrap_phase1_tests {
             bootnodes: vec![boot],
             dns_seeds: vec![],
             peer_store_path: None,
-        };
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+};
         let net = P2PNetwork::new(
             cfg,
             tx,
@@ -8899,19 +8942,19 @@ mod phase2_privacy_tests {
         v3[..4].copy_from_slice(&HANDSHAKE_MAGIC);
         v3[4] = 3;
         v3[5..37].copy_from_slice(&crate::genesis::GENESIS_HASH);
-        let err = P2PNetwork::verify_handshake_identity(&v3).unwrap_err();
+        let err = P2PNetwork::verify_handshake_identity(&v3, 0).unwrap_err();
         assert!(err.contains("magic"), "old magic must fail first: {err}");
 
         // Correct magic, stale version → refused by the version check.
         let mut stale = v3.clone();
         stale[..4].copy_from_slice(&P2PNetwork::handshake_wire_magic());
         stale[4] = P2P_PROTOCOL_VERSION - 1;
-        let err = P2PNetwork::verify_handshake_identity(&stale).unwrap_err();
+        let err = P2PNetwork::verify_handshake_identity(&stale, 0).unwrap_err();
         assert!(err.contains("version"), "old version must be refused: {err}");
 
         stale[4] = P2P_PROTOCOL_VERSION;
         assert!(
-            P2PNetwork::verify_handshake_identity(&stale).is_ok(),
+            P2PNetwork::verify_handshake_identity(&stale, 0).is_ok(),
             "a current-version same-network frame must pass"
         );
     }
@@ -8931,13 +8974,14 @@ mod phase2_privacy_tests {
         assert_eq!(back, HANDSHAKE_MAGIC, "peers must still be able to recover it");
     }
 
-    /// A.3: the handshake is exactly 69 bytes decomposing into magic(4) |
-    /// version(1) | genesis(32) | ephemeral key(32) — nothing else fits, so
-    /// no address, node id or timestamp can ride along with it. (Encrypting
+    /// A.3: the handshake is exactly 77 bytes decomposing into magic(4) |
+    /// version(1) | genesis(32) | network(8) | ephemeral key(32) — every byte
+    /// accounted for by a declared field (PHASE 4V adds the network u64 LE;
+    /// see test_handshake_network_isolation for its semantics). (Encrypting
     /// or authenticating the handshake is OUT OF SCOPE for 2E-A.)
     #[test]
     fn test_handshake_metadata_exposure() {
-        assert_eq!(HANDSHAKE_FRAME_LEN, 69, "layout is magic4+ver1+genesis32+key32");
+        assert_eq!(HANDSHAKE_FRAME_LEN, 77, "layout is magic4+ver1+genesis32+net8+key32");
         let mut key = [0u8; 32];
         key[0] = 0xAB;
         key[31] = 0xCD;
@@ -8946,17 +8990,20 @@ mod phase2_privacy_tests {
         frame.extend_from_slice(&P2PNetwork::handshake_wire_magic());
         frame.push(P2P_PROTOCOL_VERSION);
         frame.extend_from_slice(&crate::genesis::GENESIS_HASH);
+        frame.extend_from_slice(&7u64.to_le_bytes());
         frame.extend_from_slice(&key);
 
         assert_eq!(frame.len(), HANDSHAKE_FRAME_LEN);
-        assert!(P2PNetwork::verify_handshake_identity(&frame).is_ok());
+        assert!(P2PNetwork::verify_handshake_identity(&frame, 7).is_ok());
         // Byte-exact decomposition: every byte is accounted for by a declared
-        // field, so there is no room for a peer address or an identifier.
+        // field, so there is no room for a peer address or an identifier
+        // beyond the declared network id.
         assert_eq!(&frame[..4], &P2PNetwork::handshake_wire_magic());
         assert_ne!(&frame[..4], b"AETH", "signature never on the wire");
         assert_eq!(frame[4], P2P_PROTOCOL_VERSION);
         assert_eq!(&frame[5..37], &crate::genesis::GENESIS_HASH[..]);
-        assert_eq!(&frame[37..69], &key[..]);
+        assert_eq!(&frame[37..45], &7u64.to_le_bytes()[..]);
+        assert_eq!(&frame[45..77], &key[..]);
     }
 
     // --- A.3 frame length padding -----------------------------------------
@@ -9535,6 +9582,7 @@ mod tests {
 
   let vote = Vote {
   format_version: VOTE_FORMAT_VERSION,
+  network_id: 0,
   validator: [0x11u8; 32],
   epoch: 600_000,
   conflict_sender: [0x22u8; 32],
@@ -9560,6 +9608,7 @@ mod tests {
   // Wrong-kind bytes dropped (bond encoding as vote).
   let bond = Bond {
   format_version: crate::transaction::BOND_FORMAT_VERSION,
+  network_id: 0,
   validator: [0x11u8; 32],
   amount: 30_000_000,
   epoch: 1,
@@ -9680,6 +9729,8 @@ mod tests {
     /// H4/V-24: handshake identity check — a peer from another network
     /// (different genesis hash) or another protocol version must be rejected,
     /// while a same-network frame passes.
+    /// PHASE 4V: the trailing network id is checked exactly (0 == 0 keeps
+    /// legacy behavior; nonzero networks isolate testnets sharing binary).
     #[test]
     fn test_handshake_identity_mismatch_rejected() {
         let mut frame = vec![0u8; HANDSHAKE_FRAME_LEN];
@@ -9689,33 +9740,47 @@ mod tests {
         frame[..4].copy_from_slice(&P2PNetwork::handshake_wire_magic());
         frame[4] = P2P_PROTOCOL_VERSION;
         frame[5..37].copy_from_slice(&crate::genesis::GENESIS_HASH);
+        // Network bytes zero -> legacy network 0.
 
         // Correct same-network frame passes.
         assert!(
-            P2PNetwork::verify_handshake_identity(&frame).is_ok(),
+            P2PNetwork::verify_handshake_identity(&frame, 0).is_ok(),
             "a same-network frame must pass"
         );
 
         // Wrong magic is rejected.
         let mut wrong_magic = frame.clone();
         wrong_magic[0] = 0x00;
-        let err = P2PNetwork::verify_handshake_identity(&wrong_magic).unwrap_err();
+        let err = P2PNetwork::verify_handshake_identity(&wrong_magic, 0).unwrap_err();
         assert!(err.contains("magic"), "got: {}", err);
 
         // Version mismatch is rejected.
         let mut wrong_version = frame.clone();
         wrong_version[4] = P2P_PROTOCOL_VERSION + 1;
-        let err = P2PNetwork::verify_handshake_identity(&wrong_version).unwrap_err();
+        let err = P2PNetwork::verify_handshake_identity(&wrong_version, 0).unwrap_err();
         assert!(err.contains("version"), "got: {}", err);
 
         // Genesis (network) mismatch is rejected.
         let mut wrong_genesis = frame.clone();
         wrong_genesis[5] = 0x42;
-        let err = P2PNetwork::verify_handshake_identity(&wrong_genesis).unwrap_err();
+        let err = P2PNetwork::verify_handshake_identity(&wrong_genesis, 0).unwrap_err();
         assert!(err.contains("genesis"), "got: {}", err);
 
         // Truncated frame is rejected.
-        assert!(P2PNetwork::verify_handshake_identity(&frame[..8]).is_err());
+        assert!(P2PNetwork::verify_handshake_identity(&frame[..8], 0).is_err());
+
+        // PHASE 4V: foreign network id is rejected even when everything
+        // else matches.
+        let mut foreign = frame.clone();
+        foreign[37..45].copy_from_slice(&7u64.to_le_bytes());
+        let err = P2PNetwork::verify_handshake_identity(&foreign, 0).unwrap_err();
+        assert!(err.contains("network"), "got: {}", err);
+        // ...and accepted by its own network.
+        assert!(P2PNetwork::verify_handshake_identity(&foreign, 7).is_ok());
+
+        // PHASE 4V: pre-change 69-byte frame (no network field) is too
+        // short -> clean length rejection, never silent acceptance.
+        assert!(P2PNetwork::verify_handshake_identity(&frame[..69], 0).is_err());
     }
 
     /// H4/V-24: two ends of the SAME network complete the X25519 handshake
@@ -9725,14 +9790,40 @@ mod tests {
         let (mut a_reader, mut b_writer) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
         let (mut b_reader, mut a_writer) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
 
-        let a = P2PNetwork::handshake(&mut a_reader, &mut a_writer);
-        let b = P2PNetwork::handshake(&mut b_reader, &mut b_writer);
+        let a = P2PNetwork::handshake(&mut a_reader, &mut a_writer, 0);
+        let b = P2PNetwork::handshake(&mut b_reader, &mut b_writer, 0);
         let (ra, rb) = tokio::join!(a, b);
 
         let (key_a, dir_a) = ra.expect("side A handshake must succeed");
         let (key_b, dir_b) = rb.expect("side B handshake must succeed");
         assert_eq!(key_a, key_b, "both ends must derive the same session key");
         assert_ne!(dir_a, dir_b, "directions must be opposite");
+    }
+
+    /// PHASE 4V: same-network duplex handshakes complete on nonzero
+    /// networks, and cross-network duplex handshakes fail on BOTH ends
+    /// (neither side accepts silently).
+    #[tokio::test]
+    async fn test_handshake_network_isolation() {
+        for net in [7u64, 9u64] {
+            let (mut a_reader, mut b_writer) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
+            let (mut b_reader, mut a_writer) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
+            let a = P2PNetwork::handshake(&mut a_reader, &mut a_writer, net);
+            let b = P2PNetwork::handshake(&mut b_reader, &mut b_writer, net);
+            let (ra, rb) = tokio::join!(a, b);
+            let (key_a, _) = ra.expect("same-network handshake must succeed");
+            let (key_b, _) = rb.expect("same-network handshake must succeed");
+            assert_eq!(key_a, key_b);
+        }
+        // Cross-network: A=7 advertises 7, B=9 advertises 9; each side
+        // rejects the other's frame, so both futures fail.
+        let (mut a_reader, mut b_writer) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
+        let (mut b_reader, mut a_writer) = tokio::io::duplex(HANDSHAKE_FRAME_LEN * 2);
+        let a = P2PNetwork::handshake(&mut a_reader, &mut a_writer, 7);
+        let b = P2PNetwork::handshake(&mut b_reader, &mut b_writer, 9);
+        let (ra, rb) = tokio::join!(a, b);
+        assert!(ra.is_err(), "A=7 must reject B=9 frame");
+        assert!(rb.is_err(), "B=9 must reject A=7 frame");
     }
 
     #[tokio::test]

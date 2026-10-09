@@ -89,6 +89,10 @@ pub enum ValidationError {
     // garbage. Rejected on every mode while now < V6_ACTIVATION_TS;
     // unreachable once wall-clock passes activation (monotone gate).
     FutureEraTransaction { tx_ts: u64, activation_ts: u64 },
+    // -- PHASE 4V: stake object bound to another network. The network id is
+    // signed inside vote/bond/unbond bytes; cross-network replay fails here
+    // (fail closed) instead of entering weight/finality elsewhere.
+    WrongNetwork { expected: u64, found: u64 },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -249,6 +253,13 @@ impl std::fmt::Display for ValidationError {
                     tx_ts, activation_ts
                 )
             }
+            ValidationError::WrongNetwork { expected, found } => {
+                write!(
+                    f,
+                    "Wrong network: object bound to network {} but this node expects {}",
+                    found, expected
+                )
+            }
         }
     }
 }
@@ -277,6 +288,10 @@ pub enum ValidationMode {
 pub struct TransactionValidator {
     /// PoW difficulty requirement
     difficulty: u8,
+    /// PHASE 4V: expected V6 network id for stake admission
+    /// (vote/bond/unbond). 0 = legacy default: behaves EXACTLY as before
+    /// (objects bound to 0 validate; anything else is cross-network replay).
+    network_id: u64,
 }
 
 impl TransactionValidator {
@@ -284,12 +299,22 @@ impl TransactionValidator {
     pub fn new() -> Self {
         Self {
             difficulty: Transaction::default_difficulty(),
+            network_id: crate::transaction::DEFAULT_NETWORK_ID,
         }
     }
 
     /// Create validator with custom difficulty
     pub fn with_difficulty(difficulty: u8) -> Self {
-        Self { difficulty }
+        Self {
+            difficulty,
+            network_id: crate::transaction::DEFAULT_NETWORK_ID,
+        }
+    }
+
+    /// PHASE 4V: set the expected stake network (node config thread-through;
+    /// tests set non-default values explicitly for cross-network vectors).
+    pub fn set_network_id(&mut self, network_id: u64) {
+        self.network_id = network_id;
     }
 
     /// PHASE 4I (F-D2): pure era-admission predicate (no clock reads;
@@ -572,6 +597,16 @@ impl TransactionValidator {
   if !vote.verify_signature() {
   return Err(ValidationError::InvalidVoteSignature);
     }
+  // PHASE 4V: network domain separation. Checked AFTER version/signature
+  // (fail-closed order: malformed/forged first, wrong-network second).
+  // A vote signed for another network is cryptographically valid but
+  // inadmissible here: cross-network replay of finality weight.
+  if vote.network_id != self.network_id {
+  return Err(ValidationError::WrongNetwork {
+  expected: self.network_id,
+  found: vote.network_id,
+  });
+    }
   // Epoch window: current +/- EPOCH_GRACE (skew tolerance). Older or
   // newer votes are stale (dropped, never slashed  -  staleness is not
   // equivocation). Saturating: epoch 0 band underflows cleanly.
@@ -634,6 +669,13 @@ impl TransactionValidator {
   if !bond.verify_signature() {
   return Err(ValidationError::InvalidBondSignature);
         }
+  // PHASE 4V: network domain separation (same rule as votes).
+  if bond.network_id != self.network_id {
+  return Err(ValidationError::WrongNetwork {
+  expected: self.network_id,
+  found: bond.network_id,
+  });
+        }
   if bond.amount < MIN_STAKE {
   return Err(ValidationError::InsufficientStake {
   required: MIN_STAKE,
@@ -690,6 +732,14 @@ impl TransactionValidator {
         }
   if !unbond.verify_signature() {
   return Err(ValidationError::InvalidBondSignature);
+    }
+  // PHASE 4V: network domain separation (same rule as votes/bonds:
+  // cross-network unbond replay would grief-lock a victim's stake here).
+  if unbond.network_id != self.network_id {
+  return Err(ValidationError::WrongNetwork {
+  expected: self.network_id,
+  found: unbond.network_id,
+  });
     }
         match registry.validator_state(&unbond.validator) {
             // Unknown validators may still file intents (order

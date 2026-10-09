@@ -65,6 +65,11 @@ struct Cli {
     /// Rebuild the ledger (balances) from genesis + DAG replay on startup
     #[arg(long)]
     repair_ledger: bool,
+
+    /// V6 network identity (0 = legacy default, behaves exactly as before;
+    /// governed nonzero values pending the 4U decision sheet)
+    #[arg(long, default_value_t = 0)]
+    network_id: u64,
 }
 
 #[derive(Subcommand)]
@@ -321,6 +326,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if cli.repair_ledger {
         cfg.repair_ledger = true;
+    }
+    // PHASE 4V: explicit opt-in like rpc_bind (default 0 = legacy behavior).
+    if cli.network_id != 0 {
+        cfg.network_id = cli.network_id;
     }
 
     // OBSERVABILITY-ONLY (n°4): node file logging. Tag = data-dir name

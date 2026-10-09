@@ -50,6 +50,7 @@ fn signed_vote(
 ) -> Vote {
     let mut v = Vote {
         format_version: VOTE_FORMAT_VERSION,
+        network_id: 0,
         validator: w.address(),
         epoch,
         conflict_sender: key.0,
@@ -71,6 +72,7 @@ fn signed_vote(
 fn signed_bond(w: &Wallet, amount: u64, epoch: u64) -> Bond {
     let mut b = Bond {
         format_version: BOND_FORMAT_VERSION,
+        network_id: 0,
         validator: w.address(),
         amount,
         epoch,
@@ -87,6 +89,7 @@ fn signed_bond(w: &Wallet, amount: u64, epoch: u64) -> Bond {
 fn signed_unbond(w: &Wallet, epoch: u64) -> Unbond {
     let mut u = Unbond {
         format_version: BOND_FORMAT_VERSION,
+        network_id: 0,
         validator: w.address(),
         epoch,
         signature: [0u8; 64],
@@ -121,7 +124,7 @@ fn g03_vote_codec_roundtrip_and_sizes() {
     let w = wallet_a();
     let v = signed_vote(&w, 10, ([9u8; 32], 3), [7u8; 32], MIN_STAKE);
     let enc = v.encode();
-    assert_eq!(enc.len(), 257, "vote wire size is fixed 257B");
+    assert_eq!(enc.len(), 265, "vote wire size is fixed 265B (4V network u64)");
     let back = Vote::decode(&enc).expect("decode own encoding");
     assert_eq!(v, back);
     assert_eq!(v.id(), back.id(), "id deterministic");
@@ -138,7 +141,7 @@ fn g04_vote_decode_rejects_bad_length_and_version() {
     let w = wallet_a();
     let v = signed_vote(&w, 10, ([9u8; 32], 3), [7u8; 32], MIN_STAKE);
     let mut enc = v.encode();
-    assert!(Vote::decode(&enc[..256]).is_err(), "truncation rejected");
+    assert!(Vote::decode(&enc[..264]).is_err(), "truncation rejected");
     enc.push(0x00);
     assert!(Vote::decode(&enc).is_err(), "extension rejected");
     let mut bad_ver = v.encode();
@@ -150,14 +153,14 @@ fn g04_vote_decode_rejects_bad_length_and_version() {
 fn g05_bond_unbond_codec_and_sizes() {
     let w = wallet_a();
     let b = signed_bond(&w, MIN_STAKE, 4);
-    assert_eq!(b.encode().len(), 113, "bond wire size is fixed 113B");
+    assert_eq!(b.encode().len(), 121, "bond wire size is fixed 121B (4V network u64)");
     let back = Bond::decode(&b.encode()).expect("bond roundtrip");
     assert_eq!(b, back);
     assert!(back.verify_signature());
-    assert!(Bond::decode(&[0u8; 112]).is_err());
+    assert!(Bond::decode(&[0u8; 120]).is_err());
 
     let u = signed_unbond(&w, 6);
-    assert_eq!(u.encode().len(), 105, "unbond wire size is fixed 105B");
+    assert_eq!(u.encode().len(), 113, "unbond wire size is fixed 113B (4V network u64)");
     let back_u = Unbond::decode(&u.encode()).expect("unbond roundtrip");
     assert_eq!(u, back_u);
     assert!(back_u.verify_signature());
@@ -1414,6 +1417,7 @@ async fn g36_rpc_stake_endpoints_end_to_end() {
             bootnodes: vec![],
             dns_seeds: vec![],
             peer_store_path: None,
+            network_id: crate::transaction::DEFAULT_NETWORK_ID,
         },
         tx_channel,
         Arc::new(|| Vec::new()),
