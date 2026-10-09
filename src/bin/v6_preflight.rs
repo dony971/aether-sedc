@@ -1,0 +1,475 @@
+//! V6 offline release preflight (Phase 4Z).
+//!
+//! Read-only pre-verification of a governance release manifest. Never
+//! writes, never contacts the network, never activates V6, never mutates
+//! node state. All filesystem access is reads (manifest, anchor bytes,
+//! artifact files for hashing); all git access is read-only plumbing
+//! (rev-parse, cat-file, status). Exit 0 = every verifiable check passed;
+//! exit 1 = one or more checks failed; exit 2 = manifest unusable.
+//!
+//! A PASS evaluates the MANIFEST's internal coherence only. It does NOT
+//! prove value authenticity or authority: governance must confirm
+//! provenance out of band (printed on every run, see SCOPE_NOTE).
+
+use aether_unified::anchor::{
+    anchor_id, validator_set_root, verify_anchor,
+};
+use aether_unified::stake::{StakeRegistry, ValidatorRecord};
+use aether_unified::transaction::Vote;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+const TOOL_MANIFEST_FORMAT: u64 = 1;
+const HISTORICAL_TAG: &str = "v1.4.0-testnet";
+const HISTORICAL_COMMIT: &str = "ad08e308ffbb96152f1ed6d4d7a2ea8e9ed54316";
+
+const SCOPE_NOTE: &str = "SCOPE: this tool checks manifest coherence only (formats, recomputation, local git objects, file hashes). It cannot prove value authenticity or governance authority: provenance must be confirmed out of band.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Finding {
+    code: &'static str,
+    detail: String,
+}
+
+struct Report {
+    errors: Vec<Finding>,
+    notes: Vec<String>,
+}
+
+impl Report {
+    fn new() -> Self {
+        Self { errors: Vec::new(), notes: Vec::new() }
+    }
+    fn fail(&mut self, code: &'static str, detail: String) {
+        self.errors.push(Finding { code, detail });
+    }
+    fn note(&mut self, s: String) {
+        self.notes.push(s);
+    }
+    fn has_failures(&self) -> bool {
+        !self.errors.is_empty()
+    }
+}
+
+// --- strict JSON: duplicate keys rejected (serde_json is last-wins) ---
+
+fn reject_duplicate_keys(text: &str) -> Result<(), String> {
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let mut stack: Vec<HashSet<String>> = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let c = bytes[i] as char;
+        if c.is_whitespace() || c == ',' {
+            i += 1;
+            continue;
+        }
+        if c == '{' {
+            stack.push(HashSet::new());
+            i += 1;
+            continue;
+        }
+        if c == '}' || c == ']' {
+            if c == '}' {
+                stack.pop();
+            }
+            i += 1;
+            continue;
+        }
+        if c == '[' {
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            let mut s = String::new();
+            let mut j = i + 1;
+            let mut esc = false;
+            loop {
+                if j >= n {
+                    return Err("E_INPUT_FORMAT: unterminated string".to_string());
+                }
+                let d = bytes[j] as char;
+                if esc {
+                    s.push(d);
+                    esc = false;
+                } else if d == '\\' {
+                    esc = true;
+                } else if d == '"' {
+                    break;
+                } else {
+                    s.push(d);
+                }
+                j += 1;
+            }
+            // Look ahead for ':' (key) vs value position.
+            let mut k = j + 1;
+            while k < n && ((bytes[k] as char).is_whitespace()) {
+                k += 1;
+            }
+            if k < n && bytes[k] as char == ':' {
+                if let Some(set) = stack.last_mut() {
+                    if !set.insert(s.clone()) {
+                        return Err(format!("E_INPUT_DUPLICATE: duplicate key {:?}", s));
+                    }
+                }
+            }
+            i = j + 1;
+            continue;
+        }
+        if c == ':' {
+            i += 1;
+            continue;
+        }
+        // numbers, true/false/null: skip one token.
+        i += 1;
+    }
+    Ok(())
+}
+
+// --- manifest schema (tool input contract, documented, not a protocol) ---
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Manifest {
+    format: u64,
+    activation_ts: u64,
+    network_id: u64,
+    release_version: String,
+    release_commit: String,
+    validator_set: Vec<ValidatorRecord>,
+    stake: StakeSection,
+    anchor: serde_json::Value,
+    artifacts: Vec<Artifact>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StakeSection {
+    claimed_eligible_total: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Artifact {
+    path: String,
+    sha256: String,
+}
+
+fn is_hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|e| format!("git unavailable: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn check_artifact(repo: &Path, art: &Artifact, rep: &mut Report) {
+    if art.path.is_empty() || art.path.starts_with('/') || art.path.split('/').any(|p| p == "..") {
+        rep.fail("E_ARTIFACT_PATH", format!("unsafe artifact path {:?}", art.path));
+        return;
+    }
+    if !is_hex(&art.sha256, 64) {
+        rep.fail("E_ARTIFACT_FORMAT", format!("artifact {:?} sha256 must be 64 hex chars", art.path));
+        return;
+    }
+    let full = repo.join(&art.path);
+    let bytes = match std::fs::read(&full) {
+        Ok(b) => b,
+        Err(e) => {
+            rep.fail("E_ARTIFACT_MISSING", format!("artifact {:?} unreadable: {}", art.path, e));
+            return;
+        }
+    };
+    let mut hasher = sha2::Sha256::new();
+    use sha2::Digest;
+    hasher.update(&bytes);
+    let got = hex::encode(hasher.finalize());
+    if got != art.sha256.to_lowercase() {
+        rep.fail(
+            "E_ARTIFACT_CHECKSUM",
+            format!("artifact {:?} checksum mismatch (manifest declares {}, file is {})", art.path, art.sha256, got),
+        );
+    }
+}
+
+fn run(manifest_path: &Path, repo: &Path, rep: &mut Report) -> bool {
+    // Returns true when evaluation completed (even with failures).
+    let text = match std::fs::read_to_string(manifest_path) {
+        Ok(t) => t,
+        Err(e) => {
+            rep.fail("E_INPUT_UNREADABLE", format!("cannot read manifest: {}", e));
+            return false;
+        }
+    };
+    if let Err(e) = reject_duplicate_keys(&text) {
+        rep.fail("E_INPUT_DUPLICATE", e);
+        return false;
+    }
+    let m: Manifest = match serde_json::from_str(&text) {
+        Ok(m) => m,
+        Err(e) => {
+            rep.fail("E_INPUT_FORMAT", format!("manifest parse failed: {}", e));
+            return false;
+        }
+    };
+    if m.format != TOOL_MANIFEST_FORMAT {
+        rep.fail(
+            "E_INPUT_FORMAT",
+            format!("manifest format {} != tool format {}", m.format, TOOL_MANIFEST_FORMAT),
+        );
+        return false;
+    }
+
+    // A. inputs present + well-formed (serde guarantees shape; rules below).
+    if m.activation_ts == 0 {
+        rep.fail("E_TS_MISSING", "activation_ts must be an explicit nonzero unix-ms timestamp".to_string());
+    }
+    if m.release_version.is_empty() {
+        rep.fail("E_VERSION_MISSING", "release_version must be a nonempty string".to_string());
+    }
+    if !is_hex(&m.release_commit, 40) {
+        rep.fail("E_COMMIT_FORMAT", "release_commit must be 40 hex chars".to_string());
+    }
+    if m.validator_set.is_empty() {
+        rep.fail("E_SET_EMPTY", "validator_set must list at least one validator".to_string());
+    }
+    // Network: present u64 is guaranteed by schema; zero never governs.
+    if m.network_id == 0 {
+        rep.fail("E_NETWORK_ZERO", "network_id 0 is legacy-neutral and never satisfies a V6 prerequisite".to_string());
+    }
+
+    // Validator set structural checks (no policy invented beyond recompute).
+    {
+        let mut seen = HashSet::new();
+        for r in &m.validator_set {
+            if !seen.insert(r.address) {
+                rep.fail("E_SET_DUPLICATE", "validator_set contains a duplicate address".to_string());
+                break;
+            }
+            if r.bonded_amount == 0 {
+                rep.fail("E_SET_ZERO_STAKE", "validator with zero bonded_amount".to_string());
+            }
+        }
+    }
+
+    // Anchor bundle parse (existing format, strict).
+    let anchor_bytes = serde_json::to_vec(&m.anchor).unwrap_or_default();
+    let bundle = match aether_unified::anchor::parse_anchor_bundle(&anchor_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            // Anchor unparsable: crypto checks cannot run at all -> the
+            // manifest is unusable for its core purpose (exit 2 path).
+            rep.fail("E_ANCHOR_FORMAT", format!("anchor bundle parse failed: {:?}", e));
+            return false;
+        }
+    };
+
+    // B/C. cryptographic + coherence checks over recomputation.
+    // Set root recomputed at the anchor epoch; totals recomputed.
+    let (root, total) = validator_set_root(&bundle.validator_set, bundle.anchor.epoch);
+    if root != bundle.anchor.set_root {
+        rep.fail("E_SET_ROOT", "anchor set_root does not match recomputation from validator_set".to_string());
+    }
+    if total != bundle.anchor.claimed_total {
+        rep.fail(
+            "E_STAKE_MISMATCH",
+            format!("claimed_total {} != recomputed eligible total {}", bundle.anchor.claimed_total, total),
+        );
+    }
+    if m.stake.claimed_eligible_total != total {
+        rep.fail(
+            "E_STAKE_MISMATCH",
+            format!(
+                "stake.claimed_eligible_total {} != recomputed {} (validator set at anchor epoch {})",
+                m.stake.claimed_eligible_total, total, bundle.anchor.epoch
+            ),
+        );
+    }
+    // Anchor network must equal manifest network (cross-network bundle).
+    if bundle.anchor.network_id != m.network_id {
+        rep.fail(
+            "E_NETWORK_MISMATCH",
+            format!("anchor network {} != manifest network {}", bundle.anchor.network_id, m.network_id),
+        );
+    }
+    // Full anchor verification (structure/encoding/epoch/network/root/
+    // votes/signatures/quorum/chain/tag via existing verifier).
+    let id = anchor_id(&bundle.anchor);
+    match verify_anchor(&bundle.anchor, &bundle.validator_set, id, m.network_id, |_, _| false) {
+        Ok(sum) => {
+            rep.note(format!(
+                "anchor verifies: support {}/{} votes {} winner {}",
+                sum.support,
+                sum.total,
+                sum.vote_count,
+                hex::encode(sum.winner)
+            ));
+        }
+        Err(e) => {
+            rep.fail("E_ANCHOR_VERIFY", format!("anchor verification failed: {:?}", e));
+        }
+    }
+
+    // D. release commit + artifacts (local git objects + files only).
+    match git(repo, &["cat-file", "-t", &m.release_commit]) {
+        Ok(t) if t == "commit" => {}
+        Ok(other) => {
+            rep.fail("E_COMMIT_TYPE", format!("{} is a {}, not a commit", m.release_commit, other));
+        }
+        Err(e) => {
+            rep.fail("E_COMMIT_MISSING", format!("release commit not found locally: {}", e));
+        }
+    }
+    if m.release_commit == HISTORICAL_COMMIT {
+        rep.fail("E_COMMIT_HISTORICAL", "release commit is the historical ad08e30 object".to_string());
+    }
+    if m.release_version == HISTORICAL_TAG {
+        rep.fail("E_VERSION_HISTORICAL", "release version collides with v1.4.0-testnet".to_string());
+    }
+    // Source correspondence, best effort, honestly bounded: HEAD equality +
+    // clean tree proves the CHECKED-OUT source matches, never that a
+    // shipped binary was built from it (reproducibility NOT claimed).
+    match git(repo, &["rev-parse", "HEAD"]) {
+        Ok(head) if head == m.release_commit => match git(repo, &["status", "--porcelain"]) {
+            Ok(s) if s.is_empty() => {
+                rep.note("source correspondence: HEAD equals release commit with clean tree".to_string());
+            }
+            Ok(_) => {
+                rep.fail("E_SOURCE_DIRTY", "working tree dirty: checked-out source differs from release commit".to_string());
+            }
+            Err(e) => {
+                rep.fail("E_GIT", format!("git status failed: {}", e));
+            }
+        },
+        Ok(head) => {
+            rep.fail(
+                "E_SOURCE_MISMATCH",
+                format!("checked-out HEAD {} != release commit {}", head, m.release_commit),
+            );
+        }
+        Err(e) => {
+            rep.fail("E_GIT", format!("git rev-parse failed: {}", e));
+        }
+    }
+    for art in &m.artifacts {
+        check_artifact(repo, art, rep);
+    }
+    if m.artifacts.is_empty() {
+        rep.note("no artifacts declared: nothing hashed (explicitly allowed, recorded)".to_string());
+    }
+
+    // Evaluation COMPLETED (findings, if any, are in the report and drive
+    // exit 1 via has_failures; only the early returns above mean NOT_EVALUATED).
+    true
+}
+
+fn print_verdicts(rep: &Report, evaluated: bool) {
+    fn is_input_code(code: &str) -> bool {
+        matches!(
+            code,
+            "E_INPUT_UNREADABLE"
+                | "E_INPUT_DUPLICATE"
+                | "E_INPUT_FORMAT"
+                | "E_TS_MISSING"
+                | "E_VERSION_MISSING"
+                | "E_COMMIT_FORMAT"
+                | "E_SET_EMPTY"
+                | "E_NETWORK_ZERO"
+                | "E_SET_DUPLICATE"
+                | "E_SET_ZERO_STAKE"
+        )
+    }
+    let input_fail = rep.errors.iter().any(|f| is_input_code(f.code));
+    println!("V6_RELEASE_PREFLIGHT verdicts");
+    println!(
+        "A INPUTS_COMPLETE: {}",
+        if !evaluated {
+            "NOT_EVALUATED"
+        } else if input_fail {
+            "FAIL"
+        } else {
+            "PASS"
+        }
+    );
+    let crypto_fail = rep.errors.iter().any(|f| f.code.starts_with("E_ANCHOR") || f.code.starts_with("E_SET") || f.code == "E_STAKE_MISMATCH");
+    println!("B CRYPTOGRAPHIC_CHECKS: {}", if crypto_fail { "FAIL" } else { "PASS" });
+    let coherence_fail = rep.errors.iter().any(|f| f.code.starts_with("E_NETWORK") || f.code.starts_with("E_STAKE") || f.code.starts_with("E_TS") || f.code.starts_with("E_VERSION"));
+    println!("C CONFIGURATION_COHERENCE: {}", if coherence_fail { "FAIL" } else { "PASS" });
+    let release_fail = rep.errors.iter().any(|f| f.code.starts_with("E_COMMIT") || f.code.starts_with("E_SOURCE") || f.code.starts_with("E_ARTIFACT") || f.code.starts_with("E_GIT"));
+    println!("D RELEASE_ARTIFACT_CHECKS: {}", if release_fail { "FAIL" } else { "PASS" });
+    let gov_fail = rep.errors.iter().any(|f| f.code == "E_NETWORK_ZERO" || f.code.starts_with("E_INPUT") || f.code.starts_with("E_TS") || f.code.starts_with("E_VERSION") || f.code.starts_with("E_COMMIT") || f.code.starts_with("E_SET_EMPTY"));
+    println!("E GOVERNANCE_READY: {}", if gov_fail || !evaluated { "NO" } else { "YES (inputs complete+consistent; authenticity NOT proven offline)" });
+    println!("F TECHNICAL_READY: {}", if rep.has_failures() || !evaluated { "NO" } else { "YES (checks green; suite evidence separate, cited in 4R)" });
+    println!("G OPERATIONAL_READY: NO (preflight cannot observe operations; nothing deployed)");
+    println!("{}", SCOPE_NOTE);
+    for f in &rep.errors {
+        println!("{}: {}", f.code, f.detail);
+    }
+    for n in &rep.notes {
+        println!("note: {}", n);
+    }
+}
+
+fn main() {
+    let mut manifest: Option<String> = None;
+    let mut repo = String::from(".");
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--manifest" => manifest = args.next(),
+            "--repo" => {
+                if let Some(r) = args.next() {
+                    repo = r;
+                }
+            }
+            "--help" | "-h" => {
+                println!("v6-preflight: offline V6 release-manifest pre-verification (dry-run only).");
+                println!("usage: v6-preflight --manifest <path> [--repo <path>]");
+                println!("Reads only. Exit 0 = all checks pass; 1 = checks failed; 2 = manifest unusable.");
+                println!("{}", SCOPE_NOTE);
+                return;
+            }
+            other => {
+                eprintln!("unknown argument (no activate/deploy/publish/start-network subcommands exist): {}", other);
+                std::process::exit(2);
+            }
+        }
+    }
+    let manifest_path = match manifest {
+        Some(p) => PathBuf::from(p),
+        None => {
+            eprintln!("E_INPUT_MISSING: --manifest <path> is required");
+            std::process::exit(2);
+        }
+    };
+    let mut rep = Report::new();
+    let evaluated = run(&manifest_path, Path::new(&repo), &mut rep);
+    print_verdicts(&rep, evaluated);
+    if !evaluated {
+        std::process::exit(2);
+    }
+    if rep.has_failures() {
+        std::process::exit(1);
+    }
+}
+
+#[allow(dead_code)]
+fn _use_types() {
+    // Keep imports referenced under all feature sets.
+    let _ = std::mem::size_of::<StakeRegistry>();
+    let _ = std::mem::size_of::<Vote>();
+}
