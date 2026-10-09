@@ -66,10 +66,11 @@ struct Cli {
     #[arg(long)]
     repair_ledger: bool,
 
-    /// V6 network identity (0 = legacy default, behaves exactly as before;
-    /// governed nonzero values pending the 4U decision sheet)
-    #[arg(long, default_value_t = 0)]
-    network_id: u64,
+    /// V6 network identity (absent = unconfigured legacy; explicit values
+    /// including 0 are recorded as configured. Governed nonzero values
+    /// pending the 4U decision sheet; absence here never counts as a choice).
+    #[arg(long)]
+    network_id: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -327,8 +328,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.repair_ledger {
         cfg.repair_ledger = true;
     }
-    // PHASE 4V: explicit opt-in like rpc_bind (default 0 = legacy behavior).
-    if cli.network_id != 0 {
+    // PHASE 4V/4X: explicit opt-in only (absent CLI preserves file value,
+    // including an explicit 0 there; never fabricate a choice).
+    if cli.network_id.is_some() {
         cfg.network_id = cli.network_id;
     }
 

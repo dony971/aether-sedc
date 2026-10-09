@@ -413,6 +413,51 @@ impl StakeRegistry {
         }
     }
 
+    /// PHASE 4X: fail-closed network pre-check over a snapshot's vote
+    /// bytes (map votes AND evidence-embedded votes). Decodes each encoding
+    /// and requires its network to equal `expected_network`. Runs BEFORE any
+    /// insert, so a foreign snapshot can never half-populate a registry:
+    /// first mismatch aborts with no state touched.
+    pub fn snapshot_uses_only_network(
+        snapshot: &RegistrySnapshot,
+        expected_network: u64,
+    ) -> Result<(), String> {
+        use crate::transaction::Vote;
+        for bytes in &snapshot.votes {
+            let v =
+                Vote::decode(bytes).map_err(|e| format!("snapshot vote undecodable: {}", e))?;
+            if v.network_id != expected_network {
+                return Err(format!(
+                    "snapshot vote for network {} but expected {}",
+                    v.network_id, expected_network
+                ));
+            }
+        }
+        for ev in &snapshot.evidence {
+            let (a, b) = ev.votes()?;
+            for v in [&a, &b] {
+                if v.network_id != expected_network {
+                    return Err(format!(
+                        "snapshot evidence vote for network {} but expected {}",
+                        v.network_id, expected_network
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// PHASE 4X: restore guarded by the snapshot network pre-check above.
+    /// Plain restore() keeps its legacy behavior (tests pin it); production
+    /// load paths use this variant with the node's effective network.
+    pub fn restore_on_network(
+        snapshot: RegistrySnapshot,
+        expected_network: u64,
+    ) -> Result<Self, String> {
+        Self::snapshot_uses_only_network(&snapshot, expected_network)?;
+        Self::restore(snapshot)
+    }
+
     /// PHASE 4L (B+G): full index rebuild from the authoritative map
     /// (restore-path safety net; replay already maintains incrementally).
     fn rebuild_vote_index(&mut self) {

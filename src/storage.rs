@@ -983,6 +983,28 @@ impl Storage {
   StakeRegistry::restore(snap).map_err(StorageError::DatabaseError)?;
   Ok(Some(registry))
   }
+
+  /// PHASE 4X: registry load guarded by the snapshot network pre-check.
+  /// Plain load_registry() keeps its legacy behavior (tests pin it);
+  /// production boot paths use this variant with the node's effective
+  /// network. A foreign-network snapshot refuses here with DatabaseError
+  /// BEFORE the caller may use the registry (fail closed; the built
+  /// registry is discarded with the Err). Costs one extra snapshot pass
+  /// at boot only.
+  pub fn load_registry_on_network(
+  &self,
+  expected_network: u64,
+  ) -> Result<Option<StakeRegistry>, StorageError> {
+  match self.load_registry()? {
+  None => Ok(None),
+  Some(reg) => {
+  let snap = reg.snapshot();
+  StakeRegistry::snapshot_uses_only_network(&snap, expected_network)
+  .map_err(StorageError::DatabaseError)?;
+  Ok(Some(reg))
+        }
+      }
+  }
 }
 
 /// Batch operation for atomic writes

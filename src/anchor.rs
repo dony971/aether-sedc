@@ -712,3 +712,56 @@ pub fn verify_bootstrap_anchor(
         summary,
     })
 }
+
+// =====================================================================
+// PHASE 4X: central V6 network gate (single source of truth for "may V6
+// engage here"). Pure function over EXPLICIT configuration state:
+//   node:    the node's configured id (None = absent/unconfigured).
+//   storage: the data-dir marker id, if a marker file exists.
+//   anchor:  the anchor bundle's network, if an anchor file parsed.
+// Verdicts:
+//   - node None            -> NotConfigured (V6 forbidden; V5 unaffected).
+//   - node Some(0)         -> LegacyZero (explicitly legacy; V6 forbidden).
+//   - storage Some(m != n) -> StorageMismatch (never relabel silently).
+//   - anchor Some(a != n)  -> AnchorMismatch (never adopt foreign anchors).
+//   - else Ok(n)           -> V6-eligible (further V6 rules still apply).
+// Callers gate V6 ENGAGEMENT (boot with V6-finalized state, anchored
+// adoption), never V5 paths and never per-vote math (which stays
+// era+rule pure so pinned suites keep their meaning).
+// =====================================================================
+
+/// Central V6 gate failures (fail-closed, one per violated requirement).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V6NetworkError {
+    /// No network configured: V6 forbidden (V5 legacy path unaffected).
+    NotConfigured,
+    /// Explicitly legacy network 0: V6 forbidden (V5 unaffected).
+    LegacyZero,
+    /// Data-dir marker names another network: separate dirs required.
+    StorageMismatch { node: u64, storage: u64 },
+    /// Anchor bundle names another network: adopt nothing from it.
+    AnchorMismatch { node: u64, anchor: u64 },
+}
+
+pub fn validate_v6_network_configuration(
+    node: Option<u64>,
+    storage: Option<u64>,
+    anchor: Option<u64>,
+) -> Result<u64, V6NetworkError> {
+    let n = match node {
+        None => return Err(V6NetworkError::NotConfigured),
+        Some(0) => return Err(V6NetworkError::LegacyZero),
+        Some(n) => n,
+    };
+    if let Some(m) = storage {
+        if m != n {
+            return Err(V6NetworkError::StorageMismatch { node: n, storage: m });
+        }
+    }
+    if let Some(a) = anchor {
+        if a != n {
+            return Err(V6NetworkError::AnchorMismatch { node: n, anchor: a });
+        }
+    }
+    Ok(n)
+}

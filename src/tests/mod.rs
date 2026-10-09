@@ -15,6 +15,7 @@ pub mod phase4n_checkpoint_tests;
 pub mod phase4p_anchor_tests;
 pub mod phase4q_integration_tests;
 pub mod phase4v_network_tests;
+pub mod phase4x_network_guard_tests;
 pub mod pow_economics;
 pub mod scalability;
 pub mod security_tests;

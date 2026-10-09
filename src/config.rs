@@ -46,10 +46,14 @@ pub struct NodeConfig {
     pub miner_address: Option<String>,
     pub reset: bool,
     pub repair_ledger: bool,
-    /// PHASE 4V: V6 network identity (0 = legacy default: behaves EXACTLY
-    /// as before; governed nonzero values stay UNSET pending the 4U sheet).
-    /// Old TOML files without the field still parse (serde default) as 0.
-    pub network_id: u64,
+    /// PHASE 4V: V6 network identity (legacy default 0 when mapped).
+    /// PHASE 4X: Option to distinguish UNSET (absent: legacy V5 path, V6
+    /// forbidden) from EXPLICITLY_SET (Some, including Some(0) = explicitly
+    /// legacy: V6 likewise forbidden, V5 unaffected). Old TOML files without
+    /// the field parse as None (serde default). Governed nonzero values stay
+    /// UNSET pending the 4U sheet; None here is "unconfigured", never a
+    /// governance choice.
+    pub network_id: Option<u64>,
 }
 
 impl Default for NodeConfig {
@@ -72,7 +76,7 @@ impl Default for NodeConfig {
             miner_address: None,
             reset: false,
             repair_ledger: false,
-            network_id: crate::transaction::DEFAULT_NETWORK_ID,
+            network_id: None,
         }
     }
 }

@@ -103,7 +103,10 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     // PHASE 4V: network identity threads from here into P2P (handshake),
     // stake admission (processor + RPC submit paths), and the storage
     // marker below. 0 = legacy default.
-    let network_id = cfg.network_id;
+    // PHASE 4X: Option preserves UNSET vs explicit-0 distinction for the V6
+    // gate; `network_id` below is the EFFECTIVE id (legacy mapping).
+    let cfg_network = cfg.network_id;
+    let network_id = cfg_network.unwrap_or(crate::transaction::DEFAULT_NETWORK_ID);
 
     let mut bootnodes: Vec<SocketAddr> = Vec::new();
     for addr_str in &cfg.bootnodes {
@@ -409,7 +412,9 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     tracing::info!("🗳️ Loading stake registry...");
     let stake_registry: Arc<RwLock<StakeRegistry>> = {
         let storage_read = storage.read().await;
-        match storage_read.load_registry() {
+        // PHASE 4X: guarded load (foreign-network snapshots refuse here,
+        // before any state is adopted; legacy behavior otherwise identical).
+        match storage_read.load_registry_on_network(network_id) {
             Ok(Some(reg)) => {
                 let snap = reg.snapshot();
                 tracing::info!(
@@ -434,6 +439,50 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             }
         }
     };
+
+    // PHASE 4X: V6 activation guard. Fires ONLY when the loaded state
+    // already holds V6-finalized records (V6 would otherwise engage on
+    // this node). Fresh/pre-finality boots skip it entirely (V5 path
+    // untouched). On fire, the CENTRAL validator decides from explicit
+    // configuration state (no silent fallback to legacy rules after the
+    // boundary: refusal carries an explicit error, per charter sec.6).
+    {
+        let reg = stake_registry.read().await;
+        if !reg.finalized_keys().is_empty() {
+            let marker_net = std::fs::read(data_dir.join(crate::anchor::NETWORK_MARKER_FILE))
+                .ok()
+                .filter(|b| b.len() == 8)
+                .map(|b| {
+                    let mut arr = [0u8; 8];
+                    arr.copy_from_slice(&b);
+                    u64::from_le_bytes(arr)
+                });
+            let anchor_path = data_dir.join(crate::anchor::V6_ANCHOR_FILE);
+            let anchor_net = std::fs::read(&anchor_path)
+                .ok()
+                .and_then(|bytes| crate::anchor::parse_anchor_bundle(&bytes).ok())
+                .map(|bundle| bundle.anchor.network_id);
+            match crate::anchor::validate_v6_network_configuration(
+                cfg_network,
+                marker_net,
+                anchor_net,
+            ) {
+                Ok(n) => {
+                    tracing::info!(
+                        "  V6 activation guard passed: explicit network {} with V6-finalized state",
+                        n
+                    );
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Refusing boot: V6-finalized state present but network gate failed ({:?}). Configure an explicit nonzero network_id, matching storage marker and anchor, before operating V6 state - never run V6 unconfigured.",
+                        e
+                    )
+                    .into());
+                }
+            }
+        }
+    }
 
     // PHASE 4Q: optional V6 anchor trust boundary at boot. Operator-placed
     // v6_anchor.json (if any) is verified against its own bindings and
@@ -709,7 +758,9 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
         // Phase 1: persist known peers under the node data directory.
         peer_store_path: Some(data_dir.join("known_peers.json")),
         // PHASE 4V: handshake network gate (0 = legacy default).
-        network_id: cfg.network_id,
+        // PHASE 4X: effective mapping (None -> legacy 0); explicitness is
+        // enforced by the V6 gate above, not by the handshake itself.
+        network_id,
     };
 
     tracing::info!("🌐 Initializing P2P network...");
