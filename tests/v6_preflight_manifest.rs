@@ -592,7 +592,7 @@ fn g08_symlink_escape_rejected_or_not_run() {
                 assert!(out.contains("E_ARTIFACT_PATH"), "out: {}", out);
             }
             Err(e) => {
-                eprintln!("NOT_RUN: symlink creation unavailable ({})", e);
+                not_run_or_fail("symlink creation", &e);
             }
         }
     }
@@ -611,7 +611,7 @@ fn g08_symlink_escape_rejected_or_not_run() {
                 assert!(out.contains("E_ARTIFACT_PATH"), "out: {}", out);
             }
             Err(e) => {
-                eprintln!("NOT_RUN: symlink creation unavailable ({})", e);
+                not_run_or_fail("symlink creation", &e);
             }
         }
     }
@@ -626,6 +626,8 @@ fn g08_symlink_escape_rejected_or_not_run() {
             });
             let (code, out) = run_tool(&ctx, &text);
             assert_eq!(code, 0, "inside symlink must verify. out: {}", out);
+        } else if symlink_strict() {
+            panic!("STRICT: inside symlink creation unavailable; failing instead of NOT_RUN");
         } else {
             eprintln!("NOT_RUN: inside symlink creation unavailable");
         }
@@ -640,6 +642,8 @@ fn g08_symlink_escape_rejected_or_not_run() {
             });
             let (code, out) = run_tool(&ctx, &text);
             assert_eq!(code, 0, "inside symlink must verify. out: {}", out);
+        } else if symlink_strict() {
+            panic!("STRICT: inside symlink creation unavailable; failing instead of NOT_RUN");
         } else {
             eprintln!("NOT_RUN: inside symlink creation unavailable");
         }
@@ -648,4 +652,85 @@ fn g08_symlink_escape_rejected_or_not_run() {
 
 fn setup_repo_dir() -> Ctx {
     setup()
+}
+
+/// PHASE 4AE: strict CI mode. When PREFLIGHT_SYMLINK_STRICT=1, a symlink
+/// test that cannot even create its links must FAIL (not record NOT_RUN),
+/// so a runner without link privileges can never silently pass the gate.
+/// Default (unset/0) preserves the tolerant local behavior.
+fn symlink_strict() -> bool {
+    std::env::var("PREFLIGHT_SYMLINK_STRICT").map(|v| v == "1").unwrap_or(false)
+}
+
+fn not_run_or_fail(context: &str, err: &std::io::Error) {
+    if symlink_strict() {
+        panic!(
+            "STRICT: {} unavailable on this runner ({}); failing instead of NOT_RUN",
+            context, err
+        );
+    } else {
+        eprintln!("NOT_RUN: {} unavailable ({})", context, err);
+    }
+}
+
+/// Cross-platform symlink creation for fixtures (unix: symlink, Windows:
+/// file symlink). Returns Err when the OS refuses (e.g. Windows 1314).
+fn try_link(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+}
+
+#[test]
+fn g09_symlink_chain_escaping_root_rejected() {
+    // link2 -> link1 -> outside: canonicalization resolves the full chain,
+    // so the escape is caught by the same starts_with gate (no separate
+    // chain logic exists or is needed).
+    let ctx = setup_repo_dir();
+    std::fs::write(ctx.dir.path().join("real-outside.bin"), b"evil").expect("write");
+    let l1 = ctx.repo.join("link1.bin");
+    let l2 = ctx.repo.join("link2.bin");
+    match try_link(&ctx.dir.path().join("real-outside.bin"), &l1)
+        .and(try_link(&l1, &l2))
+    {
+        Ok(()) => {
+            let sha = sha_of(b"evil");
+            let text = manifest_text(&ctx, |m| {
+                m["artifacts"] = serde_json::json!([{"path": "link2.bin", "sha256": sha}]);
+            });
+            let (code, out) = run_tool(&ctx, &text);
+            assert_eq!(code, 1, "escaping chain must fail. out: {}", out);
+            assert!(out.contains("E_ARTIFACT_PATH"), "out: {}", out);
+        }
+        Err(e) => {
+            not_run_or_fail("symlink chain creation", &e);
+        }
+    }
+}
+
+#[test]
+fn g10_symlink_missing_target_refused() {
+    // Link whose target does not exist: canonicalization fails, mapping to
+    // E_ARTIFACT_MISSING (explicit refusal, never silent acceptance).
+    let ctx = setup_repo_dir();
+    let missing = ctx.repo.join("no-such-target.bin");
+    let link = ctx.repo.join("dangling.bin");
+    match try_link(&missing, &link) {
+        Ok(()) => {
+            let text = manifest_text(&ctx, |m| {
+                m["artifacts"] = serde_json::json!([{"path": "dangling.bin", "sha256": "00".repeat(32)}]);
+            });
+            let (code, out) = run_tool(&ctx, &text);
+            assert_eq!(code, 1, "dangling link must fail. out: {}", out);
+            assert!(out.contains("E_ARTIFACT_MISSING"), "out: {}", out);
+        }
+        Err(e) => {
+            not_run_or_fail("dangling symlink creation", &e);
+        }
+    }
 }

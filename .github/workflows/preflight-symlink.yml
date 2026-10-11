@@ -1,0 +1,64 @@
+name: Preflight Symlink Security
+
+# PHASE 4AE: executes the v6_preflight symlink security tests for real and
+# fails if the runner cannot perform them. Ephemeral hosted runners only,
+# minimal permissions, no secrets, no network targets, no published
+# artifacts. A green job means the cases below REALLY RAN (search the log
+# for their names); a privilege-less runner fails loudly instead of
+# passing silently via PREFLIGHT_SYMLINK_STRICT=1.
+#
+# Windows note: GitHub-hosted windows-latest images run with Developer Mode
+# enabled, so file-symlink creation works without elevation there. If that
+# ever changes, the strict gate fails the job with a clear message instead
+# of recording NOT_RUN.
+
+on:
+  pull_request:
+    paths:
+      - "src/bin/v6_preflight.rs"
+      - "tests/v6_preflight_manifest.rs"
+      - ".github/workflows/preflight-symlink.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  PREFLIGHT_SYMLINK_STRICT: "1"
+
+jobs:
+  symlink-security:
+    name: Symlink security (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build preflight binary
+        run: cargo build --bin v6_preflight --verbose
+
+      - name: Symlink path unit tests (host-independent lexical matrix)
+        run: cargo test --bin v6_preflight path_tests --verbose
+
+      - name: Symlink integration tests (STRICT -- real links or red job)
+        run: cargo test --test v6_preflight_manifest g08 --verbose
+
+      - name: Symlink chain and missing-target tests (STRICT)
+        run: cargo test --test v6_preflight_manifest g09 --verbose
+
+      - name: Symlink missing-target test (STRICT)
+        run: cargo test --test v6_preflight_manifest g10 --verbose
+
+      - name: Full preflight manifest suite (non-regression)
+        run: cargo test --test v6_preflight_manifest --verbose
