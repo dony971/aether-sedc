@@ -177,16 +177,99 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn check_artifact(repo: &Path, art: &Artifact, rep: &mut Report) {
-    if art.path.is_empty() || art.path.starts_with('/') || art.path.split('/').any(|p| p == "..") {
-        rep.fail("E_ARTIFACT_PATH", format!("unsafe artifact path {:?}", art.path));
-        return;
+/// PHASE 4AB: lexical artifact-path contract (pure, host-independent: it
+/// must reject Windows forms even when the tool runs on Linux, so no
+/// `std::path` host semantics are used here -- only byte-level rules).
+/// Accepted: relative paths with no escape, e.g. `artifact.bin`,
+/// `sub/dir/file`. Rejected: empty paths, POSIX absolutes (`/...`),
+/// Windows rooted (`\...`), drive prefixes (`C:`, `C:\`, `C:/`), UNC and
+/// device prefixes (`\\server\..`, `\\?\..`, `\\.\..`, and `//...`), and any
+/// `..` component under either separator (including mixed `../..\`).
+/// `.` components are allowed (canonical confinement below normalizes them;
+/// they cannot escape). Reserved device names need no rule: reads fail
+/// closed as missing/unreadable.
+fn validate_artifact_path(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("empty artifact path".to_string());
     }
+    if path.starts_with('/') || path.starts_with('\\') {
+        return Err(format!("absolute/rooted artifact path {:?}", path));
+    }
+    let bytes = path.as_bytes();
+    // Drive prefix `X:` (covers `C:\`, `C:/`, bare `C:`).
+    if bytes.len() >= 2 && bytes[1] == b':' && (bytes[0] as char).is_ascii_alphabetic() {
+        return Err(format!("drive-prefixed artifact path {:?}", path));
+    }
+    // UNC / device / POSIX-double-slash prefixes.
+    if path.starts_with("\\\\") || path.starts_with("//") {
+        return Err(format!("UNC/device artifact path {:?}", path));
+    }
+    // `..` under either separator (forward, backslash, or mixed).
+    if path.split(['/', '\\']).any(|p| p == "..") {
+        return Err(format!("parent-traversal artifact path {:?}", path));
+    }
+    Ok(())
+}
+
+/// Confinement failures, kept distinct so callers map them to stable
+/// codes (missing/unreadable vs escape attempt) without string sniffing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfineError {
+    Missing(String),
+    Escape(String),
+}
+
+/// PHASE 4AB: confinement of a lexically valid path to the release root.
+/// Canonicalizes BOTH sides (the root itself may involve symlinks, e.g.
+/// macOS /private aliases or Windows junctions) and requires the target to
+/// stay inside. Symlinks pointing outside are rejected here; symlinks
+/// resolving inside are accepted (same content guarantee as a direct file:
+/// the hash covers the bytes actually read).
+/// TOCTOU note: std offers no openat2-style primitive, so a hostile writer
+/// with access to these operator paths could swap a symlink between this
+/// check and the read below. Impact stays read-only (a hash over bytes into
+/// a local report). Documented, not pretended away.
+fn confine_artifact_path(repo: &Path, path: &str) -> Result<PathBuf, ConfineError> {
+    validate_artifact_path(path).map_err(ConfineError::Escape)?;
+    let root = repo
+        .canonicalize()
+        .map_err(|e| ConfineError::Missing(format!("release root unresolvable: {}", e)))?;
+    let joined = root.join(path);
+    let target = joined
+        .canonicalize()
+        .map_err(|_| ConfineError::Missing(format!("artifact {:?} absent or unreadable", path)))?;
+    if !target.starts_with(&root) {
+        return Err(ConfineError::Escape(format!(
+            "artifact {:?} escapes the release root",
+            path
+        )));
+    }
+    Ok(target)
+}
+
+fn check_artifact(repo: &Path, art: &Artifact, rep: &mut Report) {
     if !is_hex(&art.sha256, 64) {
         rep.fail("E_ARTIFACT_FORMAT", format!("artifact {:?} sha256 must be 64 hex chars", art.path));
         return;
     }
-    let full = repo.join(&art.path);
+    // PHASE 4AB: lexical gate, then confined resolution (symlink-aware),
+    // then a SINGLE read whose bytes are both hashed and reported. The hash
+    // always covers the file actually read; no re-read, no replacement.
+    if let Err(e) = validate_artifact_path(&art.path) {
+        rep.fail("E_ARTIFACT_PATH", e);
+        return;
+    }
+    let full = match confine_artifact_path(repo, &art.path) {
+        Ok(p) => p,
+        Err(ConfineError::Missing(e)) => {
+            rep.fail("E_ARTIFACT_MISSING", format!("artifact {:?} unreadable: {}", art.path, e));
+            return;
+        }
+        Err(ConfineError::Escape(e)) => {
+            rep.fail("E_ARTIFACT_PATH", e);
+            return;
+        }
+    };
     let bytes = match std::fs::read(&full) {
         Ok(b) => b,
         Err(e) => {
@@ -472,4 +555,75 @@ fn _use_types() {
     // Keep imports referenced under all feature sets.
     let _ = std::mem::size_of::<StakeRegistry>();
     let _ = std::mem::size_of::<Vote>();
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::validate_artifact_path;
+
+    #[test]
+    fn legitimate_relative_paths_accepted() {
+        for good in [
+            "artifact.bin",
+            "sub/dir/file.bin",
+            "a/./b.bin",
+            ".hidden",
+            "deep/nested/ok.dat",
+        ] {
+            assert!(validate_artifact_path(good).is_ok(), "must accept {:?}", good);
+        }
+    }
+
+    #[test]
+    fn posix_absolute_and_parent_rejected() {
+        for bad in ["/abs.bin", "/etc/passwd", "../outside.bin", "sub/../../outside.bin", "//server/share.bin"] {
+            assert!(validate_artifact_path(bad).is_err(), "must reject {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn windows_drive_forms_rejected() {
+        // Host-independent: lexical rules, never Path semantics.
+        for bad in [
+            "C:\\outside.bin",
+            "C:/outside.bin",
+            "C:outside.bin",
+            "c:\\x\\y.bin",
+            "D:/artifact.bin",
+        ] {
+            assert!(validate_artifact_path(bad).is_err(), "must reject {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn windows_unc_device_rooted_rejected() {
+        for bad in [
+            "\\\\server\\share\\artifact.bin",
+            "\\\\?\\C:\\artifact.bin",
+            "\\\\.\\C:\\artifact.bin",
+            "\\rooted.bin",
+        ] {
+            assert!(validate_artifact_path(bad).is_err(), "must reject {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn backslash_and_mixed_traversal_rejected() {
+        for bad in [
+            "..\\outside.bin",
+            "sub\\..\\..\\outside.bin",
+            "../..\\outside.bin",
+            "..\\/../outside.bin",
+            "sub/..\\outside.bin",
+        ] {
+            assert!(validate_artifact_path(bad).is_err(), "must reject {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn empty_and_dot_segments_rejected_or_safe() {
+        assert!(validate_artifact_path("").is_err(), "empty path rejected");
+        // A lone ".." is a traversal attempt, not a file.
+        assert!(validate_artifact_path("..").is_err());
+    }
 }

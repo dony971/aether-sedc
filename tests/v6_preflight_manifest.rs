@@ -443,3 +443,209 @@ fn f99_no_activate_subcommand() {
     }
     let _ = ctx;
 }
+
+// --- PHASE 4AB: path-hardening integration (F4AA-1 closure) ---
+
+fn sha_of(bytes: &[u8]) -> String {
+    let mut hasher = sha2::Sha256::new();
+    use sha2::Digest;
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+#[test]
+fn g01_backslash_traversal_rejected() {
+    // Former bypass (4AA probe): outside file with CORRECT hash must now
+    // fail at the lexical gate, never satisfy the check.
+    let ctx = setup();
+    let outside = ctx.dir.path().join("outside.bin");
+    std::fs::write(&outside, b"outside-bytes").expect("write");
+    let sha = sha_of(b"outside-bytes");
+    let text = manifest_text(&ctx, |m| {
+        m["artifacts"] = serde_json::json!([{"path": "..\\outside.bin", "sha256": sha}]);
+    });
+    let (code, out) = run_tool(&ctx, &text);
+    assert_eq!(code, 1, "backslash traversal must fail. out: {}", out);
+    assert!(out.contains("E_ARTIFACT_PATH"), "out: {}", out);
+}
+
+#[test]
+fn g02_drive_absolute_rejected() {
+    let ctx = setup();
+    let text = manifest_text(&ctx, |m| {
+        m["artifacts"] = serde_json::json!([{"path": "C:\\outside.bin", "sha256": "00".repeat(32)}]);
+    });
+    let (code, out) = run_tool(&ctx, &text);
+    assert_eq!(code, 1, "drive-absolute must fail. out: {}", out);
+    assert!(out.contains("E_ARTIFACT_PATH"), "out: {}", out);
+}
+
+#[test]
+fn g03_drive_relative_and_unc_rejected() {
+    let ctx = setup();
+    for hostile in [
+        "C:outside.bin",
+        "\\\\server\\share\\artifact.bin",
+        "\\\\?\\C:\\artifact.bin",
+        "\\\\.\\C:\\artifact.bin",
+        "\\rooted.bin",
+        "//server/share.bin",
+    ] {
+        let text = manifest_text(&ctx, |m| {
+            m["artifacts"] = serde_json::json!([{"path": hostile, "sha256": "00".repeat(32)}]);
+        });
+        let (code, out) = run_tool(&ctx, &text);
+        assert_eq!(code, 1, "{:?} must fail. out: {}", hostile, out);
+        assert!(out.contains("E_ARTIFACT_PATH"), "out: {}", out);
+    }
+}
+
+#[test]
+fn g04_mixed_separator_traversal_rejected() {
+    let ctx = setup();
+    for hostile in ["../..\\outside.bin", "..\\/../outside.bin", "sub/..\\outside.bin"] {
+        let text = manifest_text(&ctx, |m| {
+            m["artifacts"] = serde_json::json!([{"path": hostile, "sha256": "00".repeat(32)}]);
+        });
+        let (code, out) = run_tool(&ctx, &text);
+        assert_eq!(code, 1, "{:?} must fail. out: {}", hostile, out);
+        assert!(out.contains("E_ARTIFACT_PATH"), "out: {}", out);
+    }
+}
+
+#[test]
+fn g05_empty_and_malformed_paths_rejected() {
+    let ctx = setup();
+    for hostile in ["", ".."] {
+        let text = manifest_text(&ctx, |m| {
+            m["artifacts"] = serde_json::json!([{"path": hostile, "sha256": "00".repeat(32)}]);
+        });
+        let (code, out) = run_tool(&ctx, &text);
+        assert_eq!(code, 1, "{:?} must fail. out: {}", hostile, out);
+        assert!(out.contains("E_ARTIFACT_PATH"), "out: {}", out);
+    }
+}
+
+#[test]
+fn g06_legitimate_nested_paths_accepted() {
+    // Non-regression: real relative layouts (incl. subdirectories) still
+    // verify when bytes match. The artifact is committed first: an
+    // untracked file would (correctly) trip the clean-tree correspondence
+    // check, which is a separate, intended finding.
+    let ctx = setup();
+    std::fs::create_dir_all(ctx.repo.join("sub/dir")).expect("mkdir");
+    std::fs::write(ctx.repo.join("sub/dir/file.bin"), b"nested-bytes").expect("write");
+    let g = |a: &[&str]| {
+        let o = std::process::Command::new("git").arg("-C").arg(&ctx.repo).args(a).output().expect("git");
+        assert!(o.status.success(), "git {:?} failed", a);
+    };
+    g(&["add", "."]);
+    g(&["commit", "-qm", "nested artifact"]);
+    let sha = sha_of(b"nested-bytes");
+    let head = {
+        let o = std::process::Command::new("git")
+            .arg("-C").arg(&ctx.repo).args(["rev-parse", "HEAD"]).output().expect("git");
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let text = manifest_text(&ctx, |m| {
+        m["artifacts"] = serde_json::json!([{"path": "sub/dir/file.bin", "sha256": sha}]);
+        m.as_object_mut().unwrap()["release_commit"] = serde_json::json!(head);
+    });
+    let (code, out) = run_tool(&ctx, &text);
+    assert_eq!(code, 0, "legitimate nested path must verify. out: {}", out);
+}
+
+#[test]
+fn g07_external_correct_checksum_still_rejected() {
+    // The crux: even a CORRECT hash of an OUTSIDE file must not satisfy an
+    // artifact check (confinement, not just hashing).
+    let ctx = setup();
+    let outside = ctx.dir.path().join("outside.bin");
+    std::fs::write(&outside, b"outside-bytes").expect("write");
+    let sha = sha_of(b"outside-bytes");
+    let text = manifest_text(&ctx, |m| {
+        m["artifacts"] = serde_json::json!([{"path": "../outside.bin", "sha256": sha}]);
+    });
+    let (code, out) = run_tool(&ctx, &text);
+    assert_eq!(code, 1, "outside file must never satisfy. out: {}", out);
+    assert!(out.contains("E_ARTIFACT_PATH"), "out: {}", out);
+}
+
+#[test]
+fn g08_symlink_escape_rejected_or_not_run() {
+    // Symlink pointing outside the repo: must be rejected via canonical
+    // confinement. Symlink creation needs privileges on some Windows
+    // setups: record NOT_RUN instead of passing vacuously.
+    let ctx = setup_repo_dir();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        std::fs::write(ctx.dir.path().join("real-outside.bin"), b"evil").expect("write");
+        match symlink(ctx.dir.path().join("real-outside.bin"), ctx.repo.join("link.bin")) {
+            Ok(()) => {
+                let sha = sha_of(b"evil");
+                let text = manifest_text(&ctx, |m| {
+                    m["artifacts"] = serde_json::json!([{"path": "link.bin", "sha256": sha}]);
+                });
+                let (code, out) = run_tool(&ctx, &text);
+                assert_eq!(code, 1, "escaping symlink must fail. out: {}", out);
+                assert!(out.contains("E_ARTIFACT_PATH"), "out: {}", out);
+            }
+            Err(e) => {
+                eprintln!("NOT_RUN: symlink creation unavailable ({})", e);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::symlink_file;
+        std::fs::write(ctx.dir.path().join("real-outside.bin"), b"evil").expect("write");
+        match symlink_file(ctx.dir.path().join("real-outside.bin"), ctx.repo.join("link.bin")) {
+            Ok(()) => {
+                let sha = sha_of(b"evil");
+                let text = manifest_text(&ctx, |m| {
+                    m["artifacts"] = serde_json::json!([{"path": "link.bin", "sha256": sha}]);
+                });
+                let (code, out) = run_tool(&ctx, &text);
+                assert_eq!(code, 1, "escaping symlink must fail. out: {}", out);
+                assert!(out.contains("E_ARTIFACT_PATH"), "out: {}", out);
+            }
+            Err(e) => {
+                eprintln!("NOT_RUN: symlink creation unavailable ({})", e);
+            }
+        }
+    }
+    // Symlink resolving INSIDE the repo stays accepted (same-content rule).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let target = ctx.repo.join(ctx.artifact.clone());
+        if symlink(&target, ctx.repo.join("link-inside.bin")).is_ok() {
+            let text = manifest_text(&ctx, |m| {
+                m["artifacts"] = serde_json::json!([{"path": "link-inside.bin", "sha256": ctx.artifact_sha.clone()}]);
+            });
+            let (code, out) = run_tool(&ctx, &text);
+            assert_eq!(code, 0, "inside symlink must verify. out: {}", out);
+        } else {
+            eprintln!("NOT_RUN: inside symlink creation unavailable");
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::symlink_file;
+        let target = ctx.repo.join(ctx.artifact.clone());
+        if symlink_file(&target, ctx.repo.join("link-inside.bin")).is_ok() {
+            let text = manifest_text(&ctx, |m| {
+                m["artifacts"] = serde_json::json!([{"path": "link-inside.bin", "sha256": ctx.artifact_sha.clone()}]);
+            });
+            let (code, out) = run_tool(&ctx, &text);
+            assert_eq!(code, 0, "inside symlink must verify. out: {}", out);
+        } else {
+            eprintln!("NOT_RUN: inside symlink creation unavailable");
+        }
+    }
+}
+
+fn setup_repo_dir() -> Ctx {
+    setup()
+}
