@@ -583,9 +583,14 @@ fn g08_symlink_escape_rejected_or_not_run() {
         std::fs::write(ctx.dir.path().join("real-outside.bin"), b"evil").expect("write");
         match symlink(ctx.dir.path().join("real-outside.bin"), ctx.repo.join("link.bin")) {
             Ok(()) => {
+                // PHASE 4AH: commit the link so the clean-tree gate (g11)
+                // does not mask the path verdict: the escape must fail on
+                // confinement alone.
+                let head = git_add_commit(&ctx.repo, &["link.bin"], "fixture link");
                 let sha = sha_of(b"evil");
                 let text = manifest_text(&ctx, |m| {
                     m["artifacts"] = serde_json::json!([{"path": "link.bin", "sha256": sha}]);
+                    m["release_commit"] = serde_json::json!(head);
                 });
                 let (code, out) = run_tool(&ctx, &text);
                 assert_eq!(code, 1, "escaping symlink must fail. out: {}", out);
@@ -602,9 +607,12 @@ fn g08_symlink_escape_rejected_or_not_run() {
         std::fs::write(ctx.dir.path().join("real-outside.bin"), b"evil").expect("write");
         match symlink_file(ctx.dir.path().join("real-outside.bin"), ctx.repo.join("link.bin")) {
             Ok(()) => {
+                // PHASE 4AH: see unix leg above.
+                let head = git_add_commit(&ctx.repo, &["link.bin"], "fixture link");
                 let sha = sha_of(b"evil");
                 let text = manifest_text(&ctx, |m| {
                     m["artifacts"] = serde_json::json!([{"path": "link.bin", "sha256": sha}]);
+                    m["release_commit"] = serde_json::json!(head);
                 });
                 let (code, out) = run_tool(&ctx, &text);
                 assert_eq!(code, 1, "escaping symlink must fail. out: {}", out);
@@ -621,8 +629,12 @@ fn g08_symlink_escape_rejected_or_not_run() {
         use std::os::unix::fs::symlink;
         let target = ctx.repo.join(ctx.artifact.clone());
         if symlink(&target, ctx.repo.join("link-inside.bin")).is_ok() {
+            // PHASE 4AH: commit the link first: the tool correctly refuses
+            // dirty trees, so an exit-0 assertion requires a clean one.
+            let head = git_add_commit(&ctx.repo, &["link-inside.bin"], "fixture inside link");
             let text = manifest_text(&ctx, |m| {
                 m["artifacts"] = serde_json::json!([{"path": "link-inside.bin", "sha256": ctx.artifact_sha.clone()}]);
+                m["release_commit"] = serde_json::json!(head);
             });
             let (code, out) = run_tool(&ctx, &text);
             assert_eq!(code, 0, "inside symlink must verify. out: {}", out);
@@ -637,8 +649,11 @@ fn g08_symlink_escape_rejected_or_not_run() {
         use std::os::windows::fs::symlink_file;
         let target = ctx.repo.join(ctx.artifact.clone());
         if symlink_file(&target, ctx.repo.join("link-inside.bin")).is_ok() {
+            // PHASE 4AH: see unix leg above.
+            let head = git_add_commit(&ctx.repo, &["link-inside.bin"], "fixture inside link");
             let text = manifest_text(&ctx, |m| {
                 m["artifacts"] = serde_json::json!([{"path": "link-inside.bin", "sha256": ctx.artifact_sha.clone()}]);
+                m["release_commit"] = serde_json::json!(head);
             });
             let (code, out) = run_tool(&ctx, &text);
             assert_eq!(code, 0, "inside symlink must verify. out: {}", out);
@@ -652,6 +667,32 @@ fn g08_symlink_escape_rejected_or_not_run() {
 
 fn setup_repo_dir() -> Ctx {
     setup()
+}
+
+/// PHASE 4AH: commit explicit fixture paths inside a fixture repo and
+/// return the new HEAD. Used so symlink (or regular) fixture files do not
+/// trip the clean-tree correspondence gate that the tool correctly
+/// enforces: the gate is the subject of g11, never an obstacle to work
+/// around anywhere else.
+fn git_add_commit(repo: &std::path::Path, paths: &[&str], msg: &str) -> String {
+    let mut add = vec!["add"];
+    add.extend_from_slice(paths);
+    for args in [add.as_slice(), &["commit", "-qm", msg][..]] {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git binary required for fixtures");
+        assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git binary required for fixtures");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// PHASE 4AE: strict CI mode. When PREFLIGHT_SYMLINK_STRICT=1, a symlink
@@ -733,4 +774,31 @@ fn g10_symlink_missing_target_refused() {
             not_run_or_fail("dangling symlink creation", &e);
         }
     }
+}
+
+#[test]
+fn g11_untracked_file_trips_dirty_gate() {
+    // PHASE 4AH regression: the clean-tree correspondence gate must keep
+    // refusing a dirty fixture repo, with no symlink involved (runs on
+    // every OS, including privilege-less hosts). This is the exact
+    // mechanism that masked g08's inside leg before its fixtures were
+    // committed: untracked declared file -> E_SOURCE_DIRTY, exit 1.
+    let ctx = setup_repo_dir();
+    std::fs::write(ctx.repo.join("extra.bin"), b"extra").expect("write");
+    let sha = sha_of(b"extra");
+    let text = manifest_text(&ctx, |m| {
+        m["artifacts"] = serde_json::json!([{"path": "extra.bin", "sha256": sha}]);
+    });
+    let (code, out) = run_tool(&ctx, &text);
+    assert_eq!(code, 1, "dirty tree must fail. out: {}", out);
+    assert!(out.contains("E_SOURCE_DIRTY"), "out: {}", out);
+    // Committing the file restores exit 0: the gate keys on tracked-state
+    // hygiene, and committing is the documented fixture pattern (see g08).
+    let head = git_add_commit(&ctx.repo, &["extra.bin"], "fixture extra");
+    let text = manifest_text(&ctx, |m| {
+        m["artifacts"] = serde_json::json!([{"path": "extra.bin", "sha256": sha}]);
+        m["release_commit"] = serde_json::json!(head);
+    });
+    let (code, out) = run_tool(&ctx, &text);
+    assert_eq!(code, 0, "committed tree must pass. out: {}", out);
 }
