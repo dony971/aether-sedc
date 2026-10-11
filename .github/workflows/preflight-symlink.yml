@@ -13,6 +13,13 @@ name: Preflight Symlink Security
 # of recording NOT_RUN.
 
 on:
+  push:
+    branches:
+      - dev/phase2-decentralized-network
+    paths:
+      - "src/bin/v6_preflight.rs"
+      - "tests/v6_preflight_manifest.rs"
+      - ".github/workflows/preflight-symlink.yml"
   pull_request:
     paths:
       - "src/bin/v6_preflight.rs"
