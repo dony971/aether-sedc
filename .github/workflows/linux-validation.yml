@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 5
+          fetch-depth: 6
           ref: ${{ github.sha }}
           persist-credentials: false
 
@@ -49,13 +49,13 @@ jobs:
         run: |
           echo "SHA: $(git rev-parse HEAD)"
           echo "PARENT: $(git rev-parse HEAD^)"
-          test "$(git rev-parse HEAD^)" = "ca0d501490509929affd5cc45147241f7bed9bd0"
+          test "$(git rev-parse HEAD^)" = "b449f780dcd12dce69ceee53fc4c43dc1ae13f26"
           echo "BASELINE-ANCESTOR:"
           git merge-base --is-ancestor bdc4a7aa1ea069af54cc8845d68a3c668ca644fb HEAD
           changed_files="$(git diff --name-only HEAD^ HEAD | sort -u)"
           echo "CHANGED_SINCE_PARENT:"
           printf '%s\n' "$changed_files"
-          test "$changed_files" = "$(printf '.github/workflows/linux-validation.yml\ntests/phase4ar_file_identity_tests.rs')"
+          test "$changed_files" = ".github/workflows/linux-validation.yml"
           echo "BRANCH: $(git rev-parse --abbrev-ref HEAD)"
           test -z "$(git status --short)"
           for f in Cargo.toml Cargo.lock src/bin/v6_preflight.rs src/lib.rs \
@@ -131,3 +131,47 @@ jobs:
             exit 1
           fi
           rm -f "$log_file"
+
+  windows-symlink-validation:
+    name: Native Windows symlink validation (w11)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 6
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust exactly 1.97.1
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+
+      - name: Assert tested commit identity
+        shell: bash
+        run: |
+          echo "SHA: $(git rev-parse HEAD)"
+          echo "PARENT: $(git rev-parse HEAD^)"
+          test "$(git rev-parse HEAD^)" = "b449f780dcd12dce69ceee53fc4c43dc1ae13f26"
+          git merge-base --is-ancestor bdc4a7aa1ea069af54cc8845d68a3c668ca644fb HEAD
+          changed_files="$(git diff --name-only HEAD^ HEAD | sort -u)"
+          test "$changed_files" = ".github/workflows/linux-validation.yml"
+          test -z "$(git status --short)"
+
+      - name: Native Windows test w11 (must create a real symlink)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $logFile = Join-Path $env:TEMP "aether-w11-$env:GITHUB_RUN_ID.log"
+          cargo test --test phase4bb_windows_hardlinks_tests w11_symlinks_never_grouped_with_hardlinks --verbose -- --nocapture 2>&1 | Tee-Object -FilePath $logFile
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) { exit $testExit }
+          $output = Get-Content -Raw -Path $logFile
+          if ($output -notmatch 'test w11_symlinks_never_grouped_with_hardlinks \.\.\. ok') {
+            throw "w11 did not report a successful test execution"
+          }
+          if ($output -match 'NOT_RUN: (native Windows walk requires a Windows runner|hardlink creation refused by FS/rights|symlink creation refused \(privileges\))') {
+            throw "w11 was skipped or its filesystem prerequisites were unavailable"
+          }
+          Remove-Item -Force $logFile
