@@ -180,6 +180,42 @@ fn q08_symlink_internal_recorded_never_followed() {
 }
 
 #[test]
+fn q08b_symlink_absolute_with_parent_segment_inside_root_not_external() {
+    let d = tempfile::tempdir().expect("tempdir");
+    write_tree(d.path(), &[("real.txt", b"content"), ("sub/present.txt", b"anchor")]);
+    let target = d.path().join("sub").join("..").join("real.txt");
+    let link = d.path().join("link-dotdot.txt");
+    if try_link(&target, &link).is_err() {
+        eprintln!("NOT_RUN: symlink creation unavailable (absolute target with .. inside)");
+        return;
+    }
+
+    let inv = walk_release_root(d.path(), &[], None).expect("walk");
+    let e = inv.entries.iter().find(|e| e.normalized_path == "link-dotdot.txt").expect("link entry");
+    assert_eq!(e.kind, EntryKind::Symlink);
+    assert!(!e.flags.iter().any(|f| f == "external-link"), "resolved internal target must not be external");
+    assert!(!inv.warnings.external_links.iter().any(|p| p == "link-dotdot.txt"));
+}
+
+#[test]
+fn q08c_symlink_target_name_containing_two_dots_inside_root_not_external() {
+    let d = tempfile::tempdir().expect("tempdir");
+    write_tree(d.path(), &[("a..b.txt", b"content")]);
+    let target = d.path().join("a..b.txt");
+    let link = d.path().join("link-dotdot-name.txt");
+    if try_link(&target, &link).is_err() {
+        eprintln!("NOT_RUN: symlink creation unavailable (target name containing ..)");
+        return;
+    }
+
+    let inv = walk_release_root(d.path(), &[], None).expect("walk");
+    let e = inv.entries.iter().find(|e| e.normalized_path == "link-dotdot-name.txt").expect("link entry");
+    assert_eq!(e.kind, EntryKind::Symlink);
+    assert!(!e.flags.iter().any(|f| f == "external-link"), "literal .. in a filename is not a path escape");
+    assert!(!inv.warnings.external_links.iter().any(|p| p == "link-dotdot-name.txt"));
+}
+
+#[test]
 fn q09_symlink_external_flagged() {
     let outer = tempfile::tempdir().expect("tempdir");
     let d = tempfile::tempdir().expect("tempdir");

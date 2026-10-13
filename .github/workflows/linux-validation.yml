@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 3
+          fetch-depth: 4
           ref: ${{ github.sha }}
           persist-credentials: false
 
@@ -49,13 +49,13 @@ jobs:
         run: |
           echo "SHA: $(git rev-parse HEAD)"
           echo "PARENT: $(git rev-parse HEAD^)"
-          test "$(git rev-parse HEAD^)" = "37f274d8097ab3f92a4b33355f123125168931ad"
-          echo "BASELINE: $(git rev-parse HEAD^^)"
-          test "$(git rev-parse HEAD^^)" = "bdc4a7aa1ea069af54cc8845d68a3c668ca644fb"
-          changed_files="$(git diff --name-only HEAD^^ HEAD | sort -u)"
-          echo "CHANGED_SINCE_BASELINE:"
+          test "$(git rev-parse HEAD^)" = "00d6cac003da9a3365e9b1417be889a91fac7399"
+          echo "BASELINE-ANCESTOR:"
+          git merge-base --is-ancestor bdc4a7aa1ea069af54cc8845d68a3c668ca644fb HEAD
+          changed_files="$(git diff --name-only HEAD^ HEAD | sort -u)"
+          echo "CHANGED_SINCE_PARENT:"
           printf '%s\n' "$changed_files"
-          test "$changed_files" = ".github/workflows/linux-validation.yml"
+          test "$changed_files" = "$(printf '.github/workflows/linux-validation.yml\nsrc/inventory.rs\ntests/phase4aq_inventory_tests.rs')"
           echo "BRANCH: $(git rev-parse --abbrev-ref HEAD)"
           test -z "$(git status --short)"
           for f in Cargo.toml Cargo.lock src/bin/v6_preflight.rs src/lib.rs \

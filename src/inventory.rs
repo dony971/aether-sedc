@@ -508,34 +508,31 @@ pub fn walk_release_root(
             }
             let ft = meta.file_type();
             if ft.is_symlink() {
-                let target_str = std::fs::read_link(&abs)
+                // Keep the native PathBuf for resolution; target_str is only
+                // the stable, slash-normalized diagnostic/hash representation.
+                let target = std::fs::read_link(&abs);
+                let target_str = target
+                    .as_ref()
                     .map(|p| p.to_string_lossy().replace('\\', "/"))
                     .unwrap_or_else(|e| format!("<read-link-failed:{}>", e));
                 let hex = sha_hex(target_str.as_bytes());
-                // External-link heuristic: absolute target, or `..` escape,
-                // or (for relative targets) resolved path outside root.
-                let mut is_external = target_str.starts_with('/')
-                    || target_str.contains("..")
-                    || Path::new(&target_str).is_absolute();
-                if !is_external {
-                    // Resolve relative to the link's parent dir (best effort,
-                    // read-only, no content access).
-                    if let Some(parent) = abs.parent() {
-                        let cand = parent.join(std::fs::read_link(&abs).unwrap_or_default());
-                        if let (Ok(r), Ok(t)) = (canon_root.canonicalize(), cand.canonicalize()) {
-                            if !t.starts_with(&r) {
-                                is_external = true;
-                            }
-                        } else {
-                            // Dangling link: target absent. Not external by
-                            // construction, but explicitly flagged dangling.
-                        }
+                // Classify by the resolved destination, not lexical spelling:
+                // an absolute target (or one containing `..`) may still resolve
+                // inside RELEASE_ROOT. Symlinks are never followed for content.
+                let mut is_external = false;
+                if let (Some(parent), Ok(target)) = (abs.parent(), target.as_ref()) {
+                    let cand = parent.join(target);
+                    if let (Ok(r), Ok(t)) = (canon_root.canonicalize(), cand.canonicalize()) {
+                        is_external = !t.starts_with(&r);
                     }
+                    // If resolution fails, leave classification to the explicit
+                    // dangling-target check below; do not guess externality.
                 }
                 // Dangling detection (best effort, no follow for content).
-                let dangling = std::fs::read_link(&abs)
+                let dangling = target
+                    .as_ref()
                     .map(|t| {
-                        let cand = abs.parent().map(|p| p.join(&t)).unwrap_or(t);
+                        let cand = abs.parent().map(|p| p.join(t)).unwrap_or_else(|| t.clone());
                         cand.symlink_metadata().is_err()
                     })
                     .unwrap_or(true);
