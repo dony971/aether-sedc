@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 6
+          fetch-depth: 7
           ref: ${{ github.sha }}
           persist-credentials: false
 
@@ -49,7 +49,7 @@ jobs:
         run: |
           echo "SHA: $(git rev-parse HEAD)"
           echo "PARENT: $(git rev-parse HEAD^)"
-          test "$(git rev-parse HEAD^)" = "b449f780dcd12dce69ceee53fc4c43dc1ae13f26"
+          test "$(git rev-parse HEAD^)" = "cf32b53b77d478a71a506248ca44270ec44d796d"
           echo "BASELINE-ANCESTOR:"
           git merge-base --is-ancestor bdc4a7aa1ea069af54cc8845d68a3c668ca644fb HEAD
           changed_files="$(git diff --name-only HEAD^ HEAD | sort -u)"
@@ -139,7 +139,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 6
+          fetch-depth: 7
           ref: ${{ github.sha }}
           persist-credentials: false
 
@@ -153,11 +153,27 @@ jobs:
         run: |
           echo "SHA: $(git rev-parse HEAD)"
           echo "PARENT: $(git rev-parse HEAD^)"
-          test "$(git rev-parse HEAD^)" = "b449f780dcd12dce69ceee53fc4c43dc1ae13f26"
+          test "$(git rev-parse HEAD^)" = "cf32b53b77d478a71a506248ca44270ec44d796d"
           git merge-base --is-ancestor bdc4a7aa1ea069af54cc8845d68a3c668ca644fb HEAD
           changed_files="$(git diff --name-only HEAD^ HEAD | sort -u)"
           test "$changed_files" = ".github/workflows/linux-validation.yml"
           test -z "$(git status --short)"
+
+      - name: Native Windows tests q08 family (must create real symlinks)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $logFile = Join-Path $env:TEMP "aether-q08-$env:GITHUB_RUN_ID.log"
+          cargo test --test phase4aq_inventory_tests --verbose -- --nocapture 2>&1 | Tee-Object -FilePath $logFile
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) { exit $testExit }
+          $output = Get-Content -Raw -Path $logFile
+          foreach ($t in @('q08_symlink_internal_recorded_never_followed','q08b_symlink_absolute_with_parent_segment_inside_root_not_external','q08c_symlink_target_name_containing_two_dots_inside_root_not_external','q09_symlink_external_flagged','q10_symlink_chain_and_dangling')) {
+            if ($output -notmatch "test $t \.\.\. ok") { throw "Critical test missing or failed: $t" }
+          }
+          if ($output -match 'NOT_RUN: symlink creation unavailable') { throw "A critical symlink scenario was skipped (creation refused)" }
+          if ($output -match 'NOT_RUN: symlink chain/dangling creation unavailable') { throw "q10 prerequisites were skipped (creation refused)" }
+          Remove-Item -Force $logFile
 
       - name: Native Windows test w11 (must create a real symlink)
         shell: pwsh
