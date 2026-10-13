@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 3
           ref: ${{ github.sha }}
           persist-credentials: false
 
@@ -49,7 +49,13 @@ jobs:
         run: |
           echo "SHA: $(git rev-parse HEAD)"
           echo "PARENT: $(git rev-parse HEAD^)"
-          test "$(git rev-parse HEAD^)" = "8f2055016e888e9bed6623b2be49765dd8af92be"
+          test "$(git rev-parse HEAD^)" = "37f274d8097ab3f92a4b33355f123125168931ad"
+          echo "BASELINE: $(git rev-parse HEAD^^)"
+          test "$(git rev-parse HEAD^^)" = "bdc4a7aa1ea069af54cc8845d68a3c668ca644fb"
+          changed_files="$(git diff --name-only HEAD^^ HEAD | sort -u)"
+          echo "CHANGED_SINCE_BASELINE:"
+          printf '%s\n' "$changed_files"
+          test "$changed_files" = ".github/workflows/linux-validation.yml"
           echo "BRANCH: $(git rev-parse --abbrev-ref HEAD)"
           test -z "$(git status --short)"
           for f in Cargo.toml Cargo.lock src/bin/v6_preflight.rs src/lib.rs \
