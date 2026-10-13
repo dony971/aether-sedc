@@ -1,0 +1,89 @@
+name: Linux Validation (tmp)
+
+# PHASE 4BH: one-shot native Linux validation of the exact 4AQ-4BB working
+# tree on the free ubuntu-latest runner. Trigger: push to this temporary
+# branch ONLY. No other branch, tag, PR, dispatch, release, artifact,
+# deploy or secret is involved. Every step fails the job on error; no
+# `|| true`, no continue-on-error, NOT_RUN is never upgraded to PASS.
+
+on:
+  push:
+    branches: ['tmp/linux-validation-20261013']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-validation:
+    name: Linux validation (4AQ-4BB exact tree)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install Rust exactly 1.97.1
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+
+      - name: Assert Rust version
+        run: |
+          rustc --version
+          cargo --version
+          test "$(rustc --version)" = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+
+      - name: System deps (OpenSSL for the pre-existing reqwest chain)
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
+      - name: Identity of tested code
+        # Blob bytes (git-normalized), never working-copy bytes: identical
+        # on every platform regardless of line-ending settings. The auditor
+        # compares this printout to the 4BH report manifest.
+        run: |
+          echo "SHA: $(git rev-parse HEAD)"
+          echo "PARENT: $(git rev-parse HEAD^)"
+          test "$(git rev-parse HEAD^)" = "8f2055016e888e9bed6623b2be49765dd8af92be"
+          echo "BRANCH: $(git rev-parse --abbrev-ref HEAD)"
+          test -z "$(git status --short)"
+          for f in Cargo.toml Cargo.lock src/bin/v6_preflight.rs src/lib.rs \
+            src/inventory.rs src/evidence_log.rs \
+            tests/phase4aq_inventory_tests.rs tests/phase4ar_file_identity_tests.rs \
+            tests/phase4as_evidence_log_tests.rs tests/phase4bb_windows_hardlinks_tests.rs \
+            tests/v6_preflight_manifest.rs \
+            .github/workflows/linux-validation.yml \
+            $(git ls-files 'src/tests/*.rs'); do
+            printf '%s  %s\n' "$(git cat-file -p HEAD:$f | sha256sum | cut -d' ' -f1)" "$f"
+          done
+
+      - name: Build lib
+        run: cargo build --lib --verbose
+
+      - name: Build v6_preflight binary
+        run: cargo build --bin v6_preflight --verbose
+
+      - name: Inventory tests (4AQ)
+        run: cargo test --test phase4aq_inventory_tests --verbose
+
+      - name: File identity tests (4AR)
+        run: cargo test --test phase4ar_file_identity_tests --verbose
+
+      - name: Evidence log tests (4AS/4AU)
+        run: cargo test --test phase4as_evidence_log_tests --verbose
+
+      - name: Preflight manifest suite
+        run: cargo test --test v6_preflight_manifest --verbose
+
+      - name: Preflight unit tests
+        run: cargo test --bin v6_preflight --verbose
+
+      - name: Lib inventory unit tests
+        run: cargo test --lib inventory --verbose
+
+      - name: Lib evidence_log unit tests
+        run: cargo test --lib evidence_log --verbose
