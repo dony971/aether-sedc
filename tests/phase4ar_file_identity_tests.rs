@@ -108,7 +108,7 @@ fn r04_replacement_detected_when_reproducible() {
     let held = std::fs::File::open(&f).expect("open handle");
     let held_meta = held.metadata().expect("handle meta");
     drop(held);
-    let _ = (pre, held_meta);
+    let _ = (&pre, held_meta);
     // Now replace the path with a different object (delete + recreate).
     std::fs::remove_file(&f).expect("rm");
     write_file(&f, b"replacement-content!!");

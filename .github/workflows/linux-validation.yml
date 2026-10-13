@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 4
+          fetch-depth: 5
           ref: ${{ github.sha }}
           persist-credentials: false
 
@@ -49,13 +49,13 @@ jobs:
         run: |
           echo "SHA: $(git rev-parse HEAD)"
           echo "PARENT: $(git rev-parse HEAD^)"
-          test "$(git rev-parse HEAD^)" = "00d6cac003da9a3365e9b1417be889a91fac7399"
+          test "$(git rev-parse HEAD^)" = "ca0d501490509929affd5cc45147241f7bed9bd0"
           echo "BASELINE-ANCESTOR:"
           git merge-base --is-ancestor bdc4a7aa1ea069af54cc8845d68a3c668ca644fb HEAD
           changed_files="$(git diff --name-only HEAD^ HEAD | sort -u)"
           echo "CHANGED_SINCE_PARENT:"
           printf '%s\n' "$changed_files"
-          test "$changed_files" = "$(printf '.github/workflows/linux-validation.yml\nsrc/inventory.rs\ntests/phase4aq_inventory_tests.rs')"
+          test "$changed_files" = "$(printf '.github/workflows/linux-validation.yml\ntests/phase4ar_file_identity_tests.rs')"
           echo "BRANCH: $(git rev-parse --abbrev-ref HEAD)"
           test -z "$(git status --short)"
           for f in Cargo.toml Cargo.lock src/bin/v6_preflight.rs src/lib.rs \
@@ -74,8 +74,29 @@ jobs:
       - name: Build v6_preflight binary
         run: cargo build --bin v6_preflight --verbose
 
-      - name: Inventory tests (4AQ)
-        run: cargo test --test phase4aq_inventory_tests --verbose
+      - name: Inventory tests (4AQ; require real symlink execution)
+        shell: bash
+        run: |
+          set -o pipefail
+          log_file="$(mktemp)"
+          cargo test --test phase4aq_inventory_tests --verbose -- --nocapture 2>&1 | tee "$log_file"
+          for test_name in \
+            q08_symlink_internal_recorded_never_followed \
+            q08b_symlink_absolute_with_parent_segment_inside_root_not_external \
+            q08c_symlink_target_name_containing_two_dots_inside_root_not_external \
+            q09_symlink_external_flagged \
+            q10_symlink_chain_and_dangling; do
+            if ! grep -Fq "test ${test_name} ... ok" "$log_file"; then
+              echo "::error::Critical symlink test missing or failed: ${test_name}"
+              exit 1
+            fi
+          done
+          if grep -Fq "NOT_RUN: symlink creation unavailable" "$log_file"; then
+            echo "::error::At least one critical symlink scenario was skipped"
+            grep -F "NOT_RUN: symlink creation unavailable" "$log_file"
+            exit 1
+          fi
+          rm -f "$log_file"
 
       - name: File identity tests (4AR)
         run: cargo test --test phase4ar_file_identity_tests --verbose
@@ -94,3 +115,19 @@ jobs:
 
       - name: Lib evidence_log unit tests
         run: cargo test --lib evidence_log --verbose
+
+      - name: Unix link behavior regression (4BB / w12)
+        shell: bash
+        run: |
+          set -o pipefail
+          log_file="$(mktemp)"
+          cargo test --test phase4bb_windows_hardlinks_tests --verbose -- --nocapture 2>&1 | tee "$log_file"
+          if ! grep -Fq "test w12_unix_behavior_unchanged ... ok" "$log_file"; then
+            echo "::error::w12 Unix test did not run successfully"
+            exit 1
+          fi
+          if grep -Fq "NOT_RUN: unix legs not compiled on this runner" "$log_file"; then
+            echo "::error::Unix behavior leg was marked NOT_RUN on Linux"
+            exit 1
+          fi
+          rm -f "$log_file"
