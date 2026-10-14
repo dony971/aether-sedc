@@ -10,6 +10,7 @@
 pub mod anchor;
 pub mod config;
 pub mod genesis;
+pub mod inventory;
 pub mod json_storage;
 pub mod ledger;
 pub mod log_privacy;

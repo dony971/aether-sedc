@@ -60,3 +60,10 @@ argon2 = { version = "0.5.3", features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3.8"
+
+# PHASE 4BB (option B): native Windows file identity for hardlink
+# detection. Windows-only, exact pin, minimal features (FileSystem API +
+# Foundation HANDLE type). No new vendor: windows-sys is already in the
+# locked transitive supply chain (tokio/mio/tempfile/eframe).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", default-features = false, features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
