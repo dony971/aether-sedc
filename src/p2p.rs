@@ -12,8 +12,9 @@ use rand::rngs::{OsRng, StdRng};
 use rand::{Rng, SeedableRng};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1471,9 +1472,22 @@ async fn ingress_address(
 
     let mut mgr = addresses.write().await;
     match mgr.admit(addr, source, admission_quality(source), now, at, &connected) {
-        // Already present: just refresh the TTL clock.
+        // Already present: refresh the TTL clock — or, when the announce
+        // source is PEX, halve the failure debt (see `pex_refresh`).
+        // NOTE (4CH): the production `P2PMessage::Peers` arm now refreshes
+        // every held address itself (one halving per announce, intra-message
+        // duplicates collapsed) and no longer routes held addresses through
+        // this function; this PEX branch only covers the membership race
+        // where an address is inserted between the arm's snapshot and this
+        // admission call. The network wake paths are: PEX refresh, a
+        // completed handshake (record_success), and TTL expiry followed by
+        // fresh admission.
         Admission::AlreadyKnown => {
-            mgr.touch(addr, at);
+            if source == PeerSource::Pex {
+                mgr.pex_refresh(addr, at);
+            } else {
+                mgr.touch(addr, at);
+            }
             true
         }
         Admission::Inserted { .. } => true,
@@ -1490,6 +1504,19 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 /// Outbound connect budget (black-holed addresses must not stall discovery).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 4CE hygiene: consecutive dial failures after which a never-successful,
+/// non-configured entry sleeps out of redial (see `redial_sleep`). Five
+/// failures span roughly the first minute of redial (backoffs 1,2,4,8,16s
+/// inside the 5s cycle): a merely flaky peer (1-2 fails) is unaffected,
+/// while an address that has never completed one handshake stops costing a
+/// dial per backoff window until a handshake completes (either direction)
+/// or the TTL expires and the address is admitted fresh. A PEX
+/// re-announcement reaches held addresses since 4CH and halves their debt
+/// once per announce (never a full reset), so it is a progressive — not
+/// immediate — wake (see `pex_refresh`). Configured seeds are exempt
+/// (operator intent outranks hygiene).
+const MAX_DIAL_FAILURES_SLEEP: u32 = 5;
 
 // H4/V-24: network identity in the P2P handshake. Two networks with
 // different genesis hashes must NOT interconnect (cross-network gossip and
@@ -1880,6 +1907,10 @@ impl AddressEntry {
     fn record_success(&mut self, now: u64) {
         self.last_success = Some(now);
         self.attempts = self.attempts.saturating_add(1);
+        // 4CE hygiene: a completed handshake forgives failure debt. Sleep is
+        // keyed on consecutive-unproven failure, so a peer that proves
+        // itself once must not carry its old debt into the next outage.
+        self.failures = 0;
         self.quality = (self.quality + 10).min(PEER_QUALITY_MAX);
     }
 
@@ -1990,6 +2021,41 @@ impl AddressManager {
     fn record_failure(&mut self, addr: SocketAddr) {
         if let Some(e) = self.entries.get_mut(&addr) {
             e.record_failure();
+        }
+    }
+
+    /// 4CE hygiene: true when this entry should sit out of redial selection.
+    /// Sleeps only never-successful entries past the failure threshold.
+    /// Anchors always carry `last_success`, connected sessions are skipped by
+    /// the caller anyway, and configured seeds are exempted at the call site
+    /// (config membership — a dialed seed carries source Outbound, so source
+    /// alone cannot identify it). Unknown addresses report false: there is
+    /// nothing to rest. Sleep never deletes: TTL expiry and the peer store
+    /// still own the entry's lifetime, and inbound connections bypass
+    /// redial entirely.
+    fn redial_sleep(&self, addr: &SocketAddr) -> bool {
+        match self.entries.get(addr) {
+            Some(e) => e.failures >= MAX_DIAL_FAILURES_SLEEP && e.last_success.is_none(),
+            None => false,
+        }
+    }
+
+    /// 4CE hygiene, FUNCTION-level contract (4CG): refresh the TTL clock and
+    /// halve the failure debt for an address announced again — never a full
+    /// reset (one wave must not erase sustained failure; repeated waves keep
+    /// halving toward zero). NOTE (4CH): the production `P2PMessage::Peers`
+    /// arm calls this once per held address per announce (intra-message
+    /// duplicates collapsed by the arm's `seen` set), after the same
+    /// validity/loopback/private/reserved filters as admission, and without
+    /// pushing the address to the discovery channel — a refresh never forces
+    /// a dial; the bounded redial selection decides retries. The isolated
+    /// behaviour stays pinned by `ce_pex_refresh_fn_isolated_halves_debt`;
+    /// the wired network path is pinned by
+    /// `phase4ch_pex_wiring_tests::ch_real_path_peers_frame_wires_refresh`.
+    fn pex_refresh(&mut self, addr: SocketAddr, at: Instant) {
+        if let Some(e) = self.entries.get_mut(&addr) {
+            e.last_seen = at;
+            e.failures /= 2;
         }
     }
 
@@ -2541,6 +2607,21 @@ pub struct P2PNetwork {
     sync_ctx: Arc<SyncContext>,
     /// B4: true when the hash is already in the orphan store (sync dedup)
     is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
+    /// 4CB: cooperative shutdown flag. Set by `shutdown()`; read by dial
+    /// paths to refuse new sessions while teardown is in progress.
+    /// Long-lived loops are stopped by aborting their tracked handles
+    /// (see `tasks`); the flag only gates NEW work, never fakes completion.
+    shutdown: Arc<AtomicBool>,
+    /// 4CB: registry of long-lived background tasks (accept loop,
+    /// discovery, recovery, redial, peer-store, anchor, DNS, PEX, cache,
+    /// initial sweep) plus per-peer `handle_peer` tasks. Every handle is
+    /// aborted AND awaited with a bounded timeout in `shutdown()`; a task
+    /// that does not terminate is a reported error, never silently leaked.
+    /// Short-lived fire-and-forget relay/dial helpers are NOT tracked:
+    /// they carry a timeout or bounded jitter and exit on their own.
+    /// `std::sync::Mutex` (never held across `.await`) so registration is
+    /// a synchronous call from any task context.
+    tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl P2PNetwork {
@@ -2577,7 +2658,117 @@ impl P2PNetwork {
             sync_ctx,
             is_orphan,
   stake_hooks: StakeHooks::default(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Phase 4CH: same construction as [`P2PNetwork::new`], but the wire
+    /// transport is supplied by the caller. Production code builds through
+    /// `new()` (always TCP); only tests install a substitute — typically a
+    /// dial-refusing transport that records every outbound attempt and never
+    /// opens a socket, so a synthetic public address can be exercised through
+    /// the real receive path without any real connection leaving the machine.
+    /// A test transport should still delegate `bind` to [`TcpTransport`] when
+    /// the test needs real inbound sockets.
+    pub fn new_with_transport(
+        config: P2PConfig,
+        tx_channel: mpsc::UnboundedSender<Transaction>,
+        get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
+        get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
+        get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
+        sync_ctx: Arc<SyncContext>,
+        is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
+        transport: Arc<dyn Transport>,
+    ) -> Self {
+        Self {
+            transport,
+            ..Self::new(
+                config,
+                tx_channel,
+                get_dag_hashes,
+                get_transaction_by_hash,
+                get_tips,
+                sync_ctx,
+                is_orphan,
+            )
+        }
+    }
+
+    /// 4CB: spawn a long-lived background task and register its handle so
+    /// `shutdown()` can abort AND await it. Synchronous (std-mutex push,
+    /// never held across `.await`); call sites keep their existing `});`
+    /// closings unchanged.
+    fn spawn_tracked(&self, fut: impl Future<Output = ()> + Send + 'static) {
+        let handle = tokio::spawn(fut);
+        match self.tasks.lock() {
+            Ok(mut guard) => guard.push(handle),
+            Err(e) => {
+                let mut guard = e.into_inner();
+                guard.push(handle);
+            }
+        }
+    }
+
+    /// 4CB: explicit graceful shutdown.
+    ///
+    /// Sequence: set the flag (no new dials/sessions), close the discovery
+    /// channel, snapshot and clear the session map (drops senders so per-peer
+    /// send tasks observe `None` and exit), clear dial/outbound guards, then
+    /// abort every tracked handle and await each with a bounded timeout.
+    /// Aborted tasks report cancellation (expected, not an error); a task
+    /// that neither completes nor cancels within the timeout, or that
+    /// panicked, is returned as `Err` with its index. The listener is owned
+    /// by the accept task, so awaiting that task proves the OS port is
+    /// released; the session map is cleared a second time after the joins
+    /// to catch any insert that raced the first clear.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.shutdown.store(true, Ordering::Relaxed);
+        {
+            let mut tx_lock = self.peer_discovery_tx.lock().await;
+            *tx_lock = None;
+        }
+        {
+            let mut peers = self.peers.write().await;
+            peers.clear();
+        }
+        self.dialing.write().await.clear();
+        self.outbound_sessions.write().await.clear();
+        let handles: Vec<tokio::task::JoinHandle<()>> = {
+            match self.tasks.lock() {
+                Ok(mut guard) => guard.drain(..).collect(),
+                Err(e) => e.into_inner().drain(..).collect(),
+            }
+        };
+        let mut failures: Vec<String> = Vec::new();
+        for (i, handle) in handles.into_iter().enumerate() {
+            handle.abort();
+            match tokio::time::timeout(Duration::from_secs(5), handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) if e.is_cancelled() => {}
+                Ok(Err(e)) => failures.push(format!("task {} join error: {}", i, e)),
+                Err(_) => failures.push(format!("task {} did not terminate within 5s", i)),
+            }
+        }
+        {
+            let mut peers = self.peers.write().await;
+            peers.clear();
+        }
+        self.dialing.write().await.clear();
+        self.outbound_sessions.write().await.clear();
+        // Best-effort peer-store flush (no-op when no path configured).
+        self.save_known_peers().await;
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    /// 4CB: true once `shutdown()` has been called. Dial paths consult this
+    /// to refuse new sessions during teardown.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown.load(Ordering::Relaxed)
     }
 
   /// PHASE 4G: wire the node stake receiver (called once at boot, before
@@ -2599,6 +2790,9 @@ impl P2PNetwork {
     /// Start the P2P network
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         info!("Starting P2P network on {}", self.config.listen_addr);
+
+        // 4CB: a restarted instance must accept new work again.
+        self.shutdown.store(false, Ordering::Relaxed);
 
         // Phase 1: restore known peers from disk before first dial.
         self.load_known_peers().await;
@@ -2628,12 +2822,18 @@ impl P2PNetwork {
             *tx_lock = Some(peer_discovery_tx.clone());
         }
         let p2p_discovery = self.clone();
-        tokio::spawn(async move {
+        // 4CB: tracked so shutdown() aborts AND awaits it (was detached).
+        self.spawn_tracked(async move {
             while let Some(addr) = peer_discovery_rx.recv().await {
                 p2p_discovery.connect_to_peer(addr).await;
             }
         });
-        tokio::spawn(async move {
+        // 4CB: the accept task owns the listener; awaiting it in shutdown()
+        // proves the OS port is released. Per-peer sessions spawned inside
+        // accept_loop are tracked via the same registry.
+        let accept_tasks = self.tasks.clone();
+        let accept_shutdown = self.shutdown.clone();
+        self.spawn_tracked(async move {
             Self::accept_loop(
                 listener,
                 peers,
@@ -2651,6 +2851,8 @@ impl P2PNetwork {
                 is_orphan,
   stake_hooks,
   network_id,
+                accept_tasks,
+                accept_shutdown,
             )
             .await;
         });
@@ -2690,7 +2892,8 @@ impl P2PNetwork {
         // on a serial sweep of possibly-dead addresses.
         {
             let sweep = self.clone();
-            tokio::spawn(async move {
+            // 4CB: tracked (was detached); one-shot dial sweep.
+            self.spawn_tracked(async move {
                 sweep.initial_dial_sweep().await;
             });
         }
@@ -2831,7 +3034,8 @@ impl P2PNetwork {
     /// Phase 1: expire peers whose last_seen is older than PEER_TTL and flush the store.
     async fn start_peer_store_task(&self) {
         let peers = self.clone();
-        tokio::spawn(async move {
+        // 4CB: tracked (was detached).
+        self.spawn_tracked(async move {
             let mut last_flush = Instant::now();
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
@@ -2892,7 +3096,8 @@ impl P2PNetwork {
     /// (Principle 5 / R6). The staged escalation that consumes them lives in 2D.
     async fn start_anchor_task(&self) {
         let node = self.clone();
-        tokio::spawn(async move {
+        // 4CB: tracked (was detached).
+        self.spawn_tracked(async move {
             loop {
                 tokio::time::sleep(ANCHOR_REFRESH_INTERVAL).await;
                 node.refresh_anchors().await;
@@ -2961,7 +3166,8 @@ impl P2PNetwork {
     /// case, so it never doubles the dial pressure of a healthy node.
     async fn start_recovery_task(&self) {
         let node = self.clone();
-        tokio::spawn(async move {
+        // 4CB: tracked (was detached).
+        self.spawn_tracked(async move {
             loop {
                 // 2E-A (A.2 iii): bounded jitter on the recovery cadence so
                 // the 5s self-heal beat is not a fixed fingerprint. The
@@ -3156,7 +3362,17 @@ impl P2PNetwork {
 
         let picked = {
             let mgr = self.addresses.read().await;
-            let known = mgr.addresses();
+            // 4CE hygiene: never-successful entries past the failure threshold
+            // sit out of redial (their dials have never completed). Configured
+            // seeds are exempt by config membership (a seed dialed once carries
+            // source Outbound, so source alone cannot exempt it); everything
+            // else still flows to the unchanged group-aware selection below.
+            let seed_set: HashSet<SocketAddr> = seeds.iter().copied().collect();
+            let known: Vec<SocketAddr> = mgr
+                .addresses()
+                .into_iter()
+                .filter(|a| seed_set.contains(a) || !mgr.redial_sleep(a))
+                .collect();
             let ordered = Self::redial_candidates(&known, &seeds, local);
             // Everything `redial_candidates` appended sits behind the known
   // half; that exact tail  -  not "is this a configured seed"  -  is what
@@ -3194,7 +3410,8 @@ impl P2PNetwork {
         let peers = self.peers.clone();
         let p2p_network = self.clone();
 
-        tokio::spawn(async move {
+        // 4CB: tracked (was detached).
+        self.spawn_tracked(async move {
             let mut retry_counts: std::collections::HashMap<String, u32> =
                 std::collections::HashMap::new();
             let mut next_attempt: std::collections::HashMap<String, Instant> =
@@ -3261,7 +3478,8 @@ impl P2PNetwork {
     /// Start cache cleanup task to evict old seen transactions
     async fn start_cache_cleanup(&self) {
         let seen_transactions = self.seen_transactions.clone();
-        tokio::spawn(async move {
+        // 4CB: tracked (was detached).
+        self.spawn_tracked(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(300)).await;
                 let now = Instant::now();
@@ -3289,7 +3507,8 @@ impl P2PNetwork {
         let default_port = self.config.listen_addr.port();
         let p2p = self.clone();
 
-        tokio::spawn(async move {
+        // 4CB: tracked (was detached); one-shot resolve.
+        self.spawn_tracked(async move {
                 for seed in &dns_seeds {
                     match tokio::net::lookup_host(format!("{}:{}", seed, default_port)).await {
                         Ok(addrs) => {
@@ -3326,7 +3545,8 @@ impl P2PNetwork {
         let default_port = self.config.listen_addr.port();
         let p2p = self.clone();
 
-        tokio::spawn(async move {
+        // 4CB: tracked (was detached).
+        self.spawn_tracked(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(120)).await; // Every 2 minutes
                 for seed in &dns_seeds {
@@ -3386,7 +3606,8 @@ impl P2PNetwork {
         let addresses = self.addresses.clone();
         let local_addr = self.config.listen_addr;
 
-        tokio::spawn(async move {
+        // 4CB: tracked (was detached).
+        self.spawn_tracked(async move {
             loop {
                 // 2E-A (A.2 ii): bounded jitter around the 15s baseline. The
                 // exact period used to be a clean metronome a passive
@@ -3448,6 +3669,9 @@ impl P2PNetwork {
         is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
   stake_hooks: StakeHooks,
   network_id: u64,
+        // 4CB: registry for per-peer session tasks + shutdown flag.
+        tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+        shutdown: Arc<AtomicBool>,
     ) {
         loop {
             match listener.accept().await {
@@ -3543,7 +3767,14 @@ impl P2PNetwork {
                     let sync_ctx = Arc::clone(&sync_ctx);
                     let is_orphan = Arc::clone(&is_orphan);
   let stake_hooks = stake_hooks.clone();
-                    tokio::spawn(async move {
+                    // 4CB: tracked session (was detached); aborted+awaited
+                    // in shutdown(). Shutdown flag refuses NEW sessions.
+                    if shutdown.load(Ordering::Relaxed) {
+                        let mut peers_lock = peers.write().await;
+                        peers_lock.remove(&addr);
+                        continue;
+                    }
+                    let session_handle = tokio::spawn(async move {
                         Self::handle_peer(
                             stream,
                             addr,
@@ -3566,6 +3797,12 @@ impl P2PNetwork {
                         )
                         .await;
                     });
+                    match tasks.lock() {
+                        Ok(mut guard) => guard.push(session_handle),
+                        Err(e) => {
+                            e.into_inner().push(session_handle);
+                        }
+                    }
                 }
                 Err(e) => {
                     error!("Failed to accept connection: {}", e);
@@ -4567,7 +4804,19 @@ impl P2PNetwork {
                             // receive/dial path only: operator bootnodes and
                             // DNS seeds stay unrestricted so private testnets
                             // keep working.
-                            let to_add: Vec<SocketAddr> = {
+                            //
+                            // Phase 4CH: every address in ONE announce is
+                            // examined exactly once (`seen` collapses
+                            // intra-message duplicates, so a doubled entry
+                            // cannot halve an address's failure debt twice),
+                            // then split: addresses the table already holds are
+                            // refreshed in place; unknown ones keep the
+                            // unchanged admission path below. A PEX announce is
+                            // a limited-trust discovery hint — it is never
+                            // treated as proof of identity or of ownership of
+                            // the address it names.
+                            let mut seen: HashSet<SocketAddr> = HashSet::new();
+                            let (to_add, to_refresh): (Vec<SocketAddr>, Vec<SocketAddr>) = {
                                 // Snapshot the session table and release first:
                                 // `peers` and `addresses` are never held together.
                                 let connected: HashSet<SocketAddr> =
@@ -4577,14 +4826,28 @@ impl P2PNetwork {
                                     .iter()
                                     .take(MAX_INV_ITEMS)
                                     .filter(|p| {
-                                        !mgr.contains(**p)
-                                            && **p != local_addr
+                                        **p != local_addr
                                             && !connected.contains(p)
                                             && !is_private_or_reserved(**p)
                                     })
+                                    .filter(|p| seen.insert(**p))
                                     .copied()
-                                    .collect()
+                                    .partition(|p| !mgr.contains(*p))
                             };
+                            // 4CH: refresh held addresses in place — the failure
+                            // debt halves and the TTL clock advances — and
+                            // deliberately do NOT push them to the discovery
+                            // channel: a re-announce never forces a dial, the
+                            // bounded redial selection decides if and when the
+                            // address is retried. One write guard covers the
+                            // whole (<= MAX_INV_ITEMS) batch.
+                            if !to_refresh.is_empty() {
+                                let at = Instant::now();
+                                let mut mgr = addresses.write().await;
+                                for peer_addr in &to_refresh {
+                                    mgr.pex_refresh(*peer_addr, at);
+                                }
+                            }
                             for peer_addr in to_add {
                                 let ok = ingress_address(
                                     &addresses,
@@ -4780,6 +5043,10 @@ impl P2PNetwork {
     /// the in-flight set collapses them into a single session so the `peers` map
     /// never gets a sender silently overwritten by a duplicate connection.
     async fn connect_to_peer(&self, addr: SocketAddr) {
+        // 4CB: refuse new dials once shutdown has begun.
+        if self.shutdown.load(Ordering::Relaxed) {
+            return;
+        }
         {
             let mut dialing = self.dialing.write().await;
             if !dialing.insert(addr) {
@@ -4888,34 +5155,48 @@ impl P2PNetwork {
                     })
                 };
                 let outbound_sessions = self.outbound_sessions.clone();
-                tokio::spawn(async move {
-                    Self::handle_peer(
-                        stream,
-                        addr,
-                        peers,
-                        local_addr,
-                        addresses,
-                        tx_channel,
-                        get_dag_hashes,
-                        get_transaction_by_hash,
-                        get_tips,
-                        seen_transactions,
-                        propagation_state,
-                        msg_sender,
-                        msg_receiver,
-                        peer_discovery_tx,
-                        sync_ctx,
-                        is_orphan,
-  stake_hooks,
-  network_id,
-                    )
-                    .await;
-                    // Phase 2C: release the reservation only once the session
-                    // is really gone. Cleaning up here rather than inside
-                    // `handle_peer` keeps `handle_peer`'s signature — and
-                    // therefore the inbound path — untouched.
-                    outbound_sessions.write().await.remove(&addr);
-                });
+                // 4CB: tracked session (was detached).
+                let session_tasks = self.tasks.clone();
+                let session_shutdown = self.shutdown.clone();
+                if session_shutdown.load(Ordering::Relaxed) {
+                    let mut peers_lock = peers.write().await;
+                    peers_lock.remove(&addr);
+                } else {
+                    let session_handle = tokio::spawn(async move {
+                        Self::handle_peer(
+                            stream,
+                            addr,
+                            peers,
+                            local_addr,
+                            addresses,
+                            tx_channel,
+                            get_dag_hashes,
+                            get_transaction_by_hash,
+                            get_tips,
+                            seen_transactions,
+                            propagation_state,
+                            msg_sender,
+                            msg_receiver,
+                            peer_discovery_tx,
+                            sync_ctx,
+                            is_orphan,
+                            stake_hooks,
+                            network_id,
+                        )
+                        .await;
+                        // Phase 2C: release the reservation only once the session
+                        // is really gone. Cleaning up here rather than inside
+                        // `handle_peer` keeps `handle_peer`'s signature — and
+                        // therefore the inbound path — untouched.
+                        outbound_sessions.write().await.remove(&addr);
+                    });
+                    match session_tasks.lock() {
+                        Ok(mut guard) => guard.push(session_handle),
+                        Err(e) => {
+                            e.into_inner().push(session_handle);
+                        }
+                    }
+                }
             }
             Ok(Err(e)) => {
                 warn!("Failed to connect to {}: {}", addr, e);
@@ -11165,5 +11446,726 @@ mod phase2_privacy_propagation_tests {
             duplication <= 1.0001,
             "some link still carries more than one copy"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 4CE: redial hygiene + inbound-only rediscovery contracts.
+//
+// Address model (four categories, NOT interchangeable):
+//  1. configured bootnode — config membership; always redialed (operator
+//     intent outranks hygiene; a dialed seed carries source Outbound, so the
+//     exemption is membership-tested, never source-tested).
+//  2. inbound-observed socket addr — the peer's EPHEMERAL source port, never
+//     its listen addr (4CD live proof); redialing it fails until TTL expiry.
+//  3. outbound/PEX target — a dialable listen addr (or hint); redialed with
+//     per-candidate backoff (1,2,4..60s) inside the 5s redial cycle.
+//  4. verified listen addr — DOES NOT EXIST: no advertisement, no persistent
+//     peer identity binds an addr to a peer (handshake authenticates the
+//     socket only). See the §5 proposal below; no wire change is made here.
+//
+// Hygiene rule (redial-candidate management ONLY, DAG/consensus untouched):
+// a never-successful, non-seed entry with >= MAX_DIAL_FAILURES_SLEEP
+// consecutive dial failures sleeps out of `outbound_candidates` until a
+// completed handshake resets it or the TTL expires and the address is
+// admitted fresh. A PEX re-announcement reaches held addresses since 4CH
+// (the receive arm refreshes them once per announce, duplicates collapsed),
+// halving — never resetting — the debt; `pex_refresh` is also still reached
+// on membership races. Functional PEX wiring is pinned by
+// `phase4ch_pex_wiring_tests`. Sleep never deletes; inbound always works.
+//
+// §5 PROPOSAL (not implemented — needs a protocol decision first):
+// durable inbound-only rediscovery requires the peer's listen addr bound to
+// an authenticated identity. Candidate: self-announced listen addr carried
+// over the ALREADY-encrypted session, verified by dial-back before admission
+// (callback verification — the dialer proves control of the claimed addr),
+// then admitted through the EXISTING D6/private gates (never bypassing them)
+// with the existing quality/ban machinery applied. Wire impact: additive
+// message kind (enum tail, like 4G/4I) + version consideration; spam bounded
+// by per-peer announce rate-limit + table capacity. Until then, a restarted
+// inbound-only peer is rediscovered iff it dials out (>= 1 bootnode) or an
+// operator configures its listen addr — an OPERATIONAL requirement, not a
+// code defect.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod phase4ce_hygiene_tests {
+    use super::*;
+    use std::time::Duration as StdDuration;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn mgr_with(entries: Vec<(SocketAddr, PeerSource, u32, Option<u64>)>) -> AddressManager {
+        // (addr, source, failures, last_success)
+        let mut mgr = AddressManager::new();
+        let now = unix_now();
+        let at = Instant::now();
+        for (a, src, fails, succ) in entries {
+            mgr.observe(a, src, now, at);
+            let e = mgr.entries_mut().get_mut(&a).expect("inserted");
+            e.failures = fails;
+            e.last_success = succ;
+        }
+        mgr
+    }
+
+    fn net_seeded(seeds: Vec<SocketAddr>) -> P2PNetwork {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
+        let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> = Arc::new(|_| None);
+        P2PNetwork::new(
+            P2PConfig {
+                listen_addr: addr("127.0.0.1:31991"),
+                bootnodes: seeds,
+                dns_seeds: vec![],
+                peer_store_path: None,
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+            },
+            tx,
+            empty.clone(),
+            empty_opt,
+            empty,
+            Arc::new(SyncContext::default()),
+            Arc::new(|_| false),
+        )
+    }
+
+    // --- cost reproduction: dead entries stay candidates until TTL ---------
+
+    /// Pre-fix behavior, pinned: a never-successful entry past the threshold
+    /// is STILL returned by the selection path it feeds (the waste 4CE
+    /// bounds: ~1 dial per backoff window per dead entry until the 3600s
+    /// TTL expires it — quantified here through the real functions).
+    #[test]
+    fn ce_cost_dead_entry_returned_every_round_pre_ttl() {
+        let dead = addr("203.0.113.77:25565");
+        let mgr = mgr_with(vec![(dead, PeerSource::Pex, 9, None)]);
+        // Still a member, not expired (fresh clock), and the redial order
+        // still yields it: every redial cycle would dial it again.
+        assert!(mgr.entry(dead).is_some(), "dead entry retained pre-TTL");
+        let out = P2PNetwork::redial_candidates(&[dead], &[], addr("127.0.0.1:31991"));
+        assert_eq!(out, vec![dead], "pre-fix: dead entry returned every round");
+        // ...which is exactly what the sleep predicate now gates:
+        assert!(
+            mgr.redial_sleep(&dead),
+            "sleep predicate fires at failures=9, never-success"
+        );
+    }
+
+    /// Unknown addresses report false: there is nothing to rest, and failed
+    /// dials to them create nothing (`record_failure` is a no-op without an
+    /// entry — the 4CD audit, pinned here).
+    #[test]
+    fn ce_unknown_addr_never_sleeps_and_gains_no_entry() {
+        let mut mgr = AddressManager::new();
+        let ghost = addr("203.0.113.99:25565");
+        assert!(!mgr.redial_sleep(&ghost));
+        mgr.record_failure(ghost);
+        assert!(
+            mgr.entry(ghost).is_none(),
+            "failed dial to unknown creates no entry"
+        );
+    }
+
+    // --- sleep predicate boundaries ----------------------------------------
+
+    #[test]
+    fn ce_sleep_boundaries_success_and_threshold() {
+        let flop = addr("203.0.113.10:25565");
+        let proven = addr("203.0.113.11:25565");
+        let mgr = mgr_with(vec![
+            (flop, PeerSource::Pex, MAX_DIAL_FAILURES_SLEEP - 1, None),
+            (proven, PeerSource::Pex, 100, Some(1_700_000_000)),
+        ]);
+        assert!(
+            !mgr.redial_sleep(&flop),
+            "below threshold stays a candidate (flaky peers unaffected)"
+        );
+        assert!(
+            !mgr.redial_sleep(&proven),
+            "proven peers never sleep, however many past failures"
+        );
+    }
+
+    #[test]
+    fn ce_sleep_fires_at_threshold_never_success() {
+        let dead = addr("203.0.113.12:25565");
+        let mgr = mgr_with(vec![(
+            dead,
+            PeerSource::Inbound,
+            MAX_DIAL_FAILURES_SLEEP,
+            None,
+        )]);
+        assert!(
+            mgr.redial_sleep(&dead),
+            "inbound-observed ephemeral sleeps at threshold (it can never answer)"
+        );
+    }
+
+    // --- pex_refresh halves debt (FUNCTION-LEVEL; the wired path is 4CH) ----
+
+    // 4CH NOTE: this test exercises `pex_refresh` IN ISOLATION. The wired
+    // network path — a real `P2PMessage::Peers` frame over a real session —
+    // is validated by `phase4ch_pex_wiring_tests` (in-module, real sockets,
+    // real sealed frames); this function-level pin stays as the cheap
+    // contract check. Handshake success and TTL expiry + fresh admission
+    // remain covered by the ce01/ce02 integration tests plus the TTL/store
+    // round-trip tests below.
+    #[test]
+    fn ce_pex_refresh_fn_isolated_halves_debt() {
+        let mut mgr = mgr_with(vec![(addr("203.0.113.13:25565"), PeerSource::Pex, 5, None)]);
+        let a = addr("203.0.113.13:25565");
+        assert!(mgr.redial_sleep(&a), "asleep at 5");
+        mgr.pex_refresh(a, Instant::now());
+        assert_eq!(
+            mgr.entry(a).expect("entry").failures,
+            2,
+            "one wave halves 5→2"
+        );
+        assert!(!mgr.redial_sleep(&a), "halved debt reactivates");
+        // ...but sustained failure re-sleeps (one wave does not forgive):
+        for _ in 0..3 {
+            mgr.record_failure(a);
+        }
+        assert_eq!(mgr.entry(a).expect("entry").failures, 5);
+        assert!(mgr.redial_sleep(&a), "re-sleeps after 3 more fails");
+    }
+
+    // --- success forgives ----------------------------------------------------
+
+    #[test]
+    fn ce_success_resets_failure_debt() {
+        let mut mgr = mgr_with(vec![(addr("203.0.113.14:25565"), PeerSource::Pex, 4, None)]);
+        let a = addr("203.0.113.14:25565");
+        mgr.record_success(a, unix_now());
+        assert_eq!(
+            mgr.entry(a).expect("entry").failures,
+            0,
+            "handshake clears debt"
+        );
+        assert!(!mgr.redial_sleep(&a));
+    }
+
+    // --- seed exemption through the real selection path ----------------------
+
+    /// A configured seed with failures past the threshold is STILL yielded by
+    /// `outbound_candidates` (membership exemption); a non-seed peer with the
+    /// same debt is NOT. Runs the production async selection, no network.
+    #[tokio::test]
+    async fn ce_seed_exempt_nonseed_sleeps_in_outbound_candidates() {
+        let seed = addr("127.0.0.1:31982");
+        let peer = addr("127.0.0.1:31983");
+        let net = net_seeded(vec![seed]);
+        // Ingress exactly as the production paths do: seed via the outbound
+        // dial path (source Outbound — NOT Configured), peer via PEX.
+        let empty_sessions = Arc::new(RwLock::new(HashMap::new()));
+        let local = addr("127.0.0.1:31991");
+        assert!(
+            ingress_address(
+                &net.addresses,
+                &empty_sessions,
+                local,
+                seed,
+                PeerSource::Outbound
+            )
+            .await
+        );
+        assert!(
+            ingress_address(
+                &net.addresses,
+                &empty_sessions,
+                local,
+                peer,
+                PeerSource::Pex
+            )
+            .await
+        );
+        {
+            let mut mgr = net.addresses.write().await;
+            for _ in 0..9 {
+                mgr.record_failure(seed);
+                mgr.record_failure(peer);
+            }
+        }
+        let cands = net.outbound_candidates(32).await;
+        assert!(
+            cands.contains(&seed),
+            "configured seed retried despite 9 failures, got {:?}",
+            cands
+        );
+        assert!(
+            !cands.contains(&peer),
+            "slept non-seed excluded despite table membership, got {:?}",
+            cands
+        );
+        // Membership retained (sleep ≠ delete): TTL/store still own it.
+        assert!(net.addresses.read().await.entry(peer).is_some());
+    }
+
+    // --- TTL still owns lifetime ----------------------------------------------
+
+    #[test]
+    fn ce_ttl_expiry_evicts_slept_entries() {
+        let mut mgr = mgr_with(vec![(addr("203.0.113.15:25565"), PeerSource::Pex, 9, None)]);
+        let a = addr("203.0.113.15:25565");
+        assert!(mgr.redial_sleep(&a));
+        // Age past the 3600s TTL (direct state construction — no clock
+        // abstraction needed, no production delay touched).
+        mgr.entries_mut().get_mut(&a).expect("entry").last_seen =
+            Instant::now() - StdDuration::from_secs(3601);
+        let (kept, expired) = mgr.refresh_and_expire(
+            &HashSet::new(),
+            Instant::now(),
+            StdDuration::from_secs(3600),
+        );
+        assert_eq!(kept, 0);
+        assert_eq!(expired, 1, "slept entry still expires on TTL");
+        assert!(mgr.entry(a).is_none());
+    }
+
+    // --- store round-trip preserves sleep state ---------------------------------
+
+    #[test]
+    fn ce_store_roundtrip_preserves_sleep() {
+        let mut mgr = mgr_with(vec![(addr("203.0.113.16:25565"), PeerSource::Pex, 7, None)]);
+        let a = addr("203.0.113.16:25565");
+        assert!(mgr.redial_sleep(&a));
+        let file = mgr.to_store();
+        let mut re = AddressManager::new();
+        let n = re.load_v2(&file, addr("127.0.0.1:31991"), unix_now(), Instant::now());
+        assert_eq!(n, 1);
+        assert!(re.redial_sleep(&a), "sleep survives peer-store restart");
+    }
+
+    // --- contracts: D6/R4 filters + inbound-only gap -----------------------------
+
+    /// Contract (must hold under ANY future change): loopback is rejected on
+    /// the PEX receive path but unrestricted on direct/operator paths.
+    #[test]
+    fn ce_contract_private_gate_and_operator_freedom() {
+        assert!(
+            is_private_or_reserved(addr("127.0.0.1:44783")),
+            "D6: loopback is private/reserved (PEX receive path must drop it)"
+        );
+        assert!(
+            !is_private_or_reserved(addr("203.0.113.20:25565")),
+            "public addrs stay PEX-eligible"
+        );
+    }
+
+    /// Contract gap demo (structural, 4CD finding): an inbound-observed entry
+    /// keys the EPHEMERAL port; redial can only ever dial that key (which
+    /// fails), and after threshold failures it sleeps — bounding, not
+    /// closing, the gap. Durable rediscovery needs the §5 proposal.
+    #[test]
+    fn ce_contract_inbound_key_is_ephemeral_only() {
+        let eph = addr("127.0.0.1:54124");
+        let mgr = mgr_with(vec![(
+            eph,
+            PeerSource::Inbound,
+            MAX_DIAL_FAILURES_SLEEP,
+            None,
+        )]);
+        // The entry's key IS the only dialable identity redial will ever use:
+        let out = P2PNetwork::redial_candidates(&[eph], &[], addr("127.0.0.1:31991"));
+        assert_eq!(out, vec![eph], "no listen-addr derivation exists pre-fix");
+        // ...and hygiene at least stops paying for it:
+        assert!(mgr.redial_sleep(&eph), "dead ephemeral sleeps at threshold");
+    }
+}
+
+// ======== PHASE 4CH: real-path PEX refresh wiring ============================
+//
+// Corrects the 4CF finding: `pex_refresh` existed but the production
+// `P2PMessage::Peers` arm skipped addresses the table already held, so a
+// held or sleeping entry was refreshed only via a membership race or an
+// intra-batch duplicate. The arm now refreshes every held, admissible
+// address once per announce (duplicates collapsed), without forcing a dial.
+//
+// This suite is the AUTHENTICATED path proof (§5 of the 4CH brief): a real
+// peer socket completes the production X25519 handshake and sends REAL
+// sealed `P2PMessage::Peers` frames (pad + ChaCha20-Poly1305 + length
+// prefix, mirrored through the production helpers themselves); assertions
+// read the AddressManager state those frames actually changed. Synthetic
+// public addresses go through a dial-refusing test transport (the 4CH
+// `new_with_transport` seam): every outbound attempt is recorded, NO socket
+// is ever opened toward the Internet, and `bind` still delegates to real
+// TCP so the inbound session is genuine loopback. Exact debt values and
+// intra-message dedup are observable here because the cfg(test) state
+// accessors exist only inside this crate build; the foreign-client wire
+// interop twin lives in `tests/phase4ch_pex_refresh_tests.rs`.
+#[cfg(test)]
+mod phase4ch_pex_wiring_tests {
+    use super::*;
+    use crate::transport::TransportError;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration as StdDuration;
+
+    /// Dial-refusing transport: records every dial attempt, never opens a
+    /// socket. `bind` delegates to the real TCP transport so the node still
+    /// accepts genuine loopback connections.
+    struct RejectAllTransport {
+        log: Arc<StdMutex<Vec<SocketAddr>>>,
+    }
+
+    impl Transport for RejectAllTransport {
+        fn dial(
+            &self,
+            addr: &PeerAddr,
+        ) -> crate::transport::BoxFuture<'_, Result<TransportStream, TransportError>> {
+            let target = match *addr {
+                PeerAddr::Ip(a) => a,
+            };
+            self.log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(target);
+            Box::pin(async move {
+                Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "4CH test transport: outbound dial refused (no Internet traffic)",
+                )))
+            })
+        }
+
+        fn bind(
+            &self,
+            addr: &PeerAddr,
+        ) -> crate::transport::BoxFuture<'_, Result<TransportListener, TransportError>> {
+            let transport = TcpTransport::new();
+            let endpoint = *addr;
+            Box::pin(async move { transport.bind(&endpoint).await })
+        }
+    }
+
+    fn dial_count(log: &Arc<StdMutex<Vec<SocketAddr>>>, target: SocketAddr) -> usize {
+        log.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|a| **a == target)
+            .count()
+    }
+
+    async fn wait_for<F, Fut>(what: &str, timeout: Duration, mut cond: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if cond().await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("TIMEOUT waiting for: {}", what));
+    }
+
+    /// A real peer over a real loopback socket: the production handshake,
+    /// then real sealed frames built through the production helpers
+    /// (`pad_message`, `valid_frame_len`, `build_nonce`, `send_direction`),
+    /// so the wire format cannot drift from what `handle_peer` decodes.
+    struct RawPeer {
+        writer: tokio::net::tcp::OwnedWriteHalf,
+        // Kept alive so the node's session stays open for the test window.
+        _reader: tokio::net::tcp::OwnedReadHalf,
+        key: [u8; 32],
+        dir: u8,
+        counter: u64,
+    }
+
+    impl RawPeer {
+        async fn connect(port: u16) -> Self {
+            let stream = tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)),
+            )
+            .await
+            .expect("raw connect must not hang")
+            .expect("raw connect");
+            let (mut reader, mut writer) = stream.into_split();
+            let (key, dir) = Self::handshake(&mut reader, &mut writer).await;
+            Self {
+                writer,
+                _reader: reader,
+                key,
+                dir,
+                counter: 0,
+            }
+        }
+
+        /// Mirror of the production `handshake()` from the client side:
+        /// ephemeral X25519, DH, SHA256("aether-p2p-key-v1"), direction byte.
+        async fn handshake(
+            reader: &mut (impl tokio::io::AsyncReadExt + Unpin),
+            writer: &mut (impl tokio::io::AsyncWriteExt + Unpin),
+        ) -> ([u8; 32], u8) {
+            let secret = EphemeralSecret::random_from_rng(OsRng);
+            let public = PublicKey::from(&secret);
+            let mut outgoing = Vec::with_capacity(HANDSHAKE_FRAME_LEN);
+            let mut magic = [0u8; 4];
+            for i in 0..4 {
+                magic[i] = HANDSHAKE_MAGIC[i] ^ HANDSHAKE_MAGIC_MASK[i];
+            }
+            outgoing.extend_from_slice(&magic);
+            outgoing.push(P2P_PROTOCOL_VERSION);
+            outgoing.extend_from_slice(&crate::genesis::GENESIS_HASH);
+            outgoing.extend_from_slice(&crate::transaction::DEFAULT_NETWORK_ID.to_le_bytes());
+            outgoing.extend_from_slice(public.as_bytes());
+            writer.write_all(&outgoing).await.expect("hs write");
+            let mut incoming = [0u8; HANDSHAKE_FRAME_LEN];
+            tokio::time::timeout(Duration::from_secs(10), reader.read_exact(&mut incoming))
+                .await
+                .expect("server handshake reply must not hang")
+                .expect("server handshake reply");
+            assert_eq!(&incoming[..4], &magic, "server wire magic");
+            assert_eq!(incoming[4], P2P_PROTOCOL_VERSION, "server protocol version");
+            assert_eq!(
+                &incoming[5..37],
+                &crate::genesis::GENESIS_HASH,
+                "server genesis"
+            );
+            let mut peer_pk = [0u8; 32];
+            peer_pk.copy_from_slice(&incoming[HANDSHAKE_FRAME_LEN - 32..]);
+            let shared = secret.diffie_hellman(&PublicKey::from(peer_pk));
+            let mut hasher = Sha256::new();
+            hasher.update(b"aether-p2p-key-v1");
+            hasher.update(shared.as_bytes());
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&hasher.finalize());
+            let dir = P2PNetwork::send_direction(public.as_bytes(), &peer_pk);
+            (key, dir)
+        }
+
+        /// One production-shaped frame: pad, seal, length-prefix.
+        async fn send(&mut self, msg: &P2PMessage) {
+            let payload = bincode::serialize(msg).expect("serialize P2PMessage");
+            let padded = P2PNetwork::pad_message(&payload).expect("pad");
+            self.counter += 1;
+            let nonce_bytes = P2PNetwork::build_nonce(self.counter, self.dir);
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
+            let nonce = Nonce::from_slice(&nonce_bytes);
+            let ciphertext = cipher.encrypt(nonce, padded.as_ref()).expect("seal");
+            let total_len = 12 + ciphertext.len();
+            assert!(
+                P2PNetwork::valid_frame_len(total_len),
+                "test frame must be bucket-legal like production frames"
+            );
+            self.writer
+                .write_all(&(total_len as u32).to_be_bytes())
+                .await
+                .expect("frame len");
+            self.writer
+                .write_all(&nonce_bytes)
+                .await
+                .expect("frame nonce");
+            self.writer.write_all(&ciphertext).await.expect("frame ct");
+        }
+    }
+
+    /// §5 end-to-end: one real `P2PMessage::Peers` frame refreshes a held
+    /// sleeping address exactly once (dedup), filters D6 addrs, preserves the
+    /// unknown-address admission path, forces no dial, and hands the address
+    /// back to the normal bounded redial selection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ch_real_path_peers_frame_wires_refresh() {
+        const PORT: u16 = 44805;
+        let x: SocketAddr = "203.0.113.50:25565".parse().unwrap();
+        let y: SocketAddr = "203.0.113.99:25565".parse().unwrap();
+        let filtered: Vec<SocketAddr> = ["10.0.0.7:8080", "192.168.44.9:4001", "127.0.0.1:6666"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+
+        let dial_log = Arc::new(StdMutex::new(Vec::new()));
+        let transport = Arc::new(RejectAllTransport {
+            log: Arc::clone(&dial_log),
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
+        let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> = Arc::new(|_| None);
+        let net = P2PNetwork::new_with_transport(
+            P2PConfig {
+                listen_addr: format!("127.0.0.1:{}", PORT).parse().unwrap(),
+                bootnodes: vec![],
+                dns_seeds: vec![],
+                peer_store_path: None,
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+            },
+            tx,
+            empty.clone(),
+            empty_opt,
+            empty,
+            Arc::new(SyncContext::default()),
+            Arc::new(|_| false),
+            transport,
+        );
+
+        // (5.1) The address is already known and past the sleep threshold —
+        // constructed directly through the cfg(test) state accessors, so no
+        // real dial toward the synthetic public address ever happens.
+        {
+            let mut mgr = net.addresses.write().await;
+            mgr.observe(x, PeerSource::Pex, unix_now(), Instant::now());
+            let e = mgr.entries_mut().get_mut(&x).expect("seeded entry");
+            e.failures = MAX_DIAL_FAILURES_SLEEP * 2 + 2; // 12: asleep, room to observe a wrong double-halving (3)
+            e.last_success = None;
+        }
+        net.start()
+            .await
+            .expect("start must bind the loopback listener");
+        assert!(
+            net.addresses.read().await.redial_sleep(&x),
+            "asleep before any announce"
+        );
+        assert!(
+            !net.outbound_candidates(16).await.contains(&x),
+            "asleep entry excluded from every candidate source (redial AND recovery)"
+        );
+        {
+            let log = dial_log.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                log.is_empty(),
+                "no source dials an asleep address before any announce: {:?}",
+                *log
+            );
+        }
+
+        // (5.2) A connected real peer transmits a REAL sealed PEX frame:
+        // held X three times (duplicate stress), D6-filtered addrs, unknown Y.
+        let mut peer = RawPeer::connect(PORT).await;
+        wait_for("session registered", Duration::from_secs(10), || async {
+            net.peer_count().await == 1
+        })
+        .await;
+        peer.send(&P2PMessage::Peers(vec![
+            x,
+            x,
+            filtered[0],
+            filtered[1],
+            filtered[2],
+            y,
+            x,
+        ]))
+        .await;
+
+        // (5.3)(5.4)(5.5) Exactly one halving: 12 → 6. A missed wire would
+        // leave 12; a double refresh (dedup broken) would give 3; a debt
+        // reset would give 0. The entry staying asleep at 6 is also the
+        // backbone of (5.7): while asleep, NO legitimate dial source can
+        // pick X, so any dial attempt on X could only come from a forced
+        // dial inside PEX processing itself.
+        wait_for(
+            "refresh applied exactly once (12->6)",
+            Duration::from_secs(10),
+            || async { net.addresses.read().await.entry(x).map(|e| e.failures) == Some(6) },
+        )
+        .await;
+        assert!(
+            net.addresses.read().await.redial_sleep(&x),
+            "6 failures remain past the threshold — no source may dial X"
+        );
+        // Settle window: a handler-forced dial (discovery channel) would
+        // land here, within milliseconds of the frame.
+        tokio::time::sleep(StdDuration::from_millis(800)).await;
+        {
+            let log = dial_log.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                !log.contains(&x),
+                "PEX processing forced no dial on the refreshed address: {:?}",
+                *log
+            );
+        }
+
+        // (5.6) D6: private/loopback announces neither enter the table nor
+        // ever reach a dial.
+        {
+            let mgr = net.addresses.read().await;
+            for p in &filtered {
+                assert!(mgr.entry(*p).is_none(), "{} must stay filtered", p);
+                let log = dial_log.lock().unwrap_or_else(|e| e.into_inner());
+                assert!(!log.contains(p), "{} must never be dialed", p);
+            }
+        }
+        // The unknown-address admission path keeps its exact pre-4CH shape:
+        // admitted with the announcing session as origin, then pushed to the
+        // discovery channel (which dials — refused by the test transport, so
+        // nothing leaves the machine).
+        {
+            let mgr = net.addresses.read().await;
+            let ye = mgr.entry(y).expect("unknown public address still admitted");
+            assert_eq!(ye.source, PeerSource::Pex, "admitted via PEX");
+            assert!(
+                matches!(mgr.origin_of(y), Some(a) if a.ip().is_loopback()),
+                "D5 origin recorded as the announcing session"
+            );
+        }
+        wait_for(
+            "admission path still dials the unknown address (via transport)",
+            Duration::from_secs(10),
+            || async { dial_count(&dial_log, y) >= 1 },
+        )
+        .await;
+        {
+            let log = dial_log.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                !log.contains(&x),
+                "admission of Y must not dial X: {:?}",
+                *log
+            );
+        }
+
+        // Second announce: progressive halving (6 -> 3), still never a reset,
+        // still once per message.
+        peer.send(&P2PMessage::Peers(vec![x])).await;
+        wait_for(
+            "second wave halves again (6->3)",
+            Duration::from_secs(10),
+            || async { net.addresses.read().await.entry(x).map(|e| e.failures) == Some(3) },
+        )
+        .await;
+
+        // (5.8) Debt back under the threshold: the REAL selection function
+        // yields the address again, and the normal bounded mechanism really
+        // dials it (the attempt is the observable; the transport refuses, so
+        // zero traffic leaves the process).
+        assert!(
+            !net.addresses.read().await.redial_sleep(&x),
+            "3 failures: no longer asleep"
+        );
+        assert!(
+            net.outbound_candidates(16).await.contains(&x),
+            "normal selection yields the refreshed address"
+        );
+        wait_for(
+            "normal redial/recovery attempts X after refresh",
+            Duration::from_secs(25),
+            || async { dial_count(&dial_log, x) >= 1 },
+        )
+        .await;
+
+        // (5.9) Clean stop: client gone, sessions released, port free.
+        let _ = peer.send(&P2PMessage::Ping).await; // keepalive in case the wait ran long
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(15), net.shutdown())
+            .await
+            .expect("TIMEOUT: shutdown hung")
+            .expect("shutdown must succeed");
+        wait_for(
+            "peer_count==0 after shutdown",
+            Duration::from_secs(10),
+            || async { net.peer_count().await == 0 },
+        )
+        .await;
+        std::net::TcpListener::bind(format!("127.0.0.1:{}", PORT))
+            .expect("port must be released after shutdown");
+        // Bounded growth: the whole exchange ever created at most three
+        // table entries (X, Y, the client's ephemeral) and two dial targets.
+        let table_len = net.addresses.read().await.addresses().len();
+        assert!(table_len <= 3, "address table bounded: {}", table_len);
+        drop(net);
     }
 }
