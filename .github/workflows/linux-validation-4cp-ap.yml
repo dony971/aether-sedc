@@ -1,0 +1,103 @@
+name: Linux Validation (temporary, 4CP-AQ)
+
+# PHASE 4CP-AQ: validation-only workflow for the temporary CI branch. It runs
+# the targeted Linux test matrix against the exact pushed commit. It performs
+# NO deployment, NO release, NO publication, and references NO secrets.
+# Least privilege: contents:read. Delete the temporary branch once validated.
+
+on:
+  push:
+    branches:
+      - ci/linux-validation-4cp-ap-b609a25
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-validation:
+    name: Linux targeted validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          target: x86_64-unknown-linux-gnu
+          override: true
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Versions
+        if: always()
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: node_identity unit tests
+        if: always()
+        run: "cargo test --lib node_identity::"
+
+      - name: peer store tests
+        if: always()
+        run: cargo test --lib phase4ak_peer_store_save_tests
+
+      - name: p2p suite
+        if: always()
+        run: cargo test --lib "p2p::"
+
+      - name: compile lib tests
+        if: always()
+        run: cargo test --lib --no-run
+
+      - name: build lib
+        if: always()
+        run: cargo build --lib
+
+      - name: build bins
+        if: always()
+        run: cargo build --bins
+
+      - name: integration phase4aq_inventory_tests
+        if: always()
+        run: cargo test --test phase4aq_inventory_tests
+
+      - name: integration phase4bz_restart_rebuild_tests
+        if: always()
+        run: cargo test --test phase4bz_restart_rebuild_tests
+
+      - name: integration phase4ca_twonode_sync_restart_tests
+        if: always()
+        run: cargo test --test phase4ca_twonode_sync_restart_tests
+
+      - name: integration phase4cb_lifecycle_restart_tests
+        if: always()
+        run: cargo test --test phase4cb_lifecycle_restart_tests
+
+      - name: integration phase4cc_adversarial_robustness_tests
+        if: always()
+        run: cargo test --test phase4cc_adversarial_robustness_tests
+
+      - name: integration phase4cd_peer_discovery_tests
+        if: always()
+        run: cargo test --test phase4cd_peer_discovery_tests
+
+      - name: integration phase4ce_peer_hygiene_tests
+        if: always()
+        run: cargo test --test phase4ce_peer_hygiene_tests
+
+      - name: integration phase4ch_pex_refresh_tests
+        if: always()
+        run: cargo test --test phase4ch_pex_refresh_tests
+
+      - name: integration v6_preflight_manifest
+        if: always()
+        run: cargo test --test v6_preflight_manifest
