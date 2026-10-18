@@ -4,9 +4,8 @@ name: Linux Validation (temporary, 4CP-AQ)
 # the targeted Linux test matrix against the exact pushed commit. It performs
 # NO deployment, NO release, NO publication, and references NO secrets.
 # Least privilege: contents:read. Delete the temporary branch once validated.
-# Failure output is surfaced two ways so it is readable without authentication:
-#   1) the tail of each failing test log is emitted as ::error:: annotations;
-#   2) all test logs are uploaded as a short-lived artifact.
+# Failures are surfaced as ::error:: annotations (colour-stripped, targeted
+# lines only) and all test logs are uploaded as a short-lived artifact.
 # The tests themselves are NOT modified.
 
 on:
@@ -48,35 +47,29 @@ jobs:
       - name: node_identity unit tests
         if: always()
         run: |
-          name=node_identity; log=/tmp/${name}.log
-          set +e
-          cargo test --lib node_identity:: 2>&1 | tee "$log"
-          code=${PIPESTATUS[0]}
-          if [ "$code" -ne 0 ]; then
-            echo "::error::$name failed on Linux (exit $code)"
-            tail -n 120 "$log" | while IFS= read -r l; do echo "::error::$l"; done
-          fi
-          exit "$code"
+          n=node_identity; log=/tmp/$n.log; set +e
+          cargo test --lib node_identity:: 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          exit "$c"
 
       - name: peer store tests
         if: always()
         run: |
-          name=peer_store; log=/tmp/${name}.log
-          set +e
-          cargo test --lib phase4ak_peer_store_save_tests 2>&1 | tee "$log"
-          code=${PIPESTATUS[0]}
-          if [ "$code" -ne 0 ]; then echo "::error::$name failed on Linux (exit $code)"; tail -n 120 "$log" | while IFS= read -r l; do echo "::error::$l"; done; fi
-          exit "$code"
+          n=peer_store; log=/tmp/$n.log; set +e
+          cargo test --lib phase4ak_peer_store_save_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          exit "$c"
 
       - name: p2p suite
         if: always()
         run: |
-          name=p2p; log=/tmp/${name}.log
-          set +e
-          cargo test --lib "p2p::" 2>&1 | tee "$log"
-          code=${PIPESTATUS[0]}
-          if [ "$code" -ne 0 ]; then echo "::error::$name failed on Linux (exit $code)"; tail -n 120 "$log" | while IFS= read -r l; do echo "::error::$l"; done; fi
-          exit "$code"
+          n=p2p; log=/tmp/$n.log; set +e
+          cargo test --lib "p2p::" 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          exit "$c"
 
       - name: compile lib tests
         if: always()
@@ -93,92 +86,83 @@ jobs:
       - name: integration phase4aq_inventory_tests
         if: always()
         run: |
-          name=phase4aq; log=/tmp/${name}.log
-          set +e
-          cargo test --test phase4aq_inventory_tests 2>&1 | tee "$log"
-          code=${PIPESTATUS[0]}
-          if [ "$code" -ne 0 ]; then echo "::error::$name failed on Linux (exit $code)"; tail -n 120 "$log" | while IFS= read -r l; do echo "::error::$l"; done; fi
-          exit "$code"
+          n=phase4aq; log=/tmp/$n.log; set +e
+          cargo test --test phase4aq_inventory_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          exit "$c"
 
       - name: integration phase4bz_restart_rebuild_tests
         if: always()
         run: |
-          name=phase4bz; log=/tmp/${name}.log
-          set +e
-          cargo test --test phase4bz_restart_rebuild_tests 2>&1 | tee "$log"
-          code=${PIPESTATUS[0]}
-          if [ "$code" -ne 0 ]; then echo "::error::$name failed on Linux (exit $code)"; tail -n 120 "$log" | while IFS= read -r l; do echo "::error::$l"; done; fi
-          exit "$code"
+          n=phase4bz; log=/tmp/$n.log; set +e
+          cargo test --test phase4bz_restart_rebuild_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          exit "$c"
 
       - name: integration phase4ca_twonode_sync_restart_tests
         if: always()
         run: |
-          name=phase4ca; log=/tmp/${name}.log
-          set +e
-          cargo test --test phase4ca_twonode_sync_restart_tests 2>&1 | tee "$log"
-          code=${PIPESTATUS[0]}
-          if [ "$code" -ne 0 ]; then echo "::error::$name failed on Linux (exit $code)"; tail -n 120 "$log" | while IFS= read -r l; do echo "::error::$l"; done; fi
-          exit "$code"
+          n=phase4ca; log=/tmp/$n.log; set +e
+          cargo test --test phase4ca_twonode_sync_restart_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          exit "$c"
 
       - name: integration phase4cb_lifecycle_restart_tests
         if: always()
         run: |
-          name=phase4cb; log=/tmp/${name}.log
-          set +e
-          cargo test --test phase4cb_lifecycle_restart_tests 2>&1 | tee "$log"
-          code=${PIPESTATUS[0]}
-          if [ "$code" -ne 0 ]; then echo "::error::$name failed on Linux (exit $code)"; tail -n 120 "$log" | while IFS= read -r l; do echo "::error::$l"; done; fi
-          exit "$code"
+          n=phase4cb; log=/tmp/$n.log; set +e
+          cargo test --test phase4cb_lifecycle_restart_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          exit "$c"
 
       - name: integration phase4cc_adversarial_robustness_tests
         if: always()
         run: |
-          name=phase4cc; log=/tmp/${name}.log
-          set +e
-          cargo test --test phase4cc_adversarial_robustness_tests 2>&1 | tee "$log"
-          code=${PIPESTATUS[0]}
-          if [ "$code" -ne 0 ]; then echo "::error::$name failed on Linux (exit $code)"; tail -n 120 "$log" | while IFS= read -r l; do echo "::error::$l"; done; fi
-          exit "$code"
+          n=phase4cc; log=/tmp/$n.log; set +e
+          cargo test --test phase4cc_adversarial_robustness_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          exit "$c"
 
       - name: integration phase4cd_peer_discovery_tests
         if: always()
         run: |
-          name=phase4cd; log=/tmp/${name}.log
-          set +e
-          cargo test --test phase4cd_peer_discovery_tests 2>&1 | tee "$log"
-          code=${PIPESTATUS[0]}
-          if [ "$code" -ne 0 ]; then echo "::error::$name failed on Linux (exit $code)"; tail -n 120 "$log" | while IFS= read -r l; do echo "::error::$l"; done; fi
-          exit "$code"
+          n=phase4cd; log=/tmp/$n.log; set +e
+          cargo test --test phase4cd_peer_discovery_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          exit "$c"
 
       - name: integration phase4ce_peer_hygiene_tests
         if: always()
         run: |
-          name=phase4ce; log=/tmp/${name}.log
-          set +e
-          cargo test --test phase4ce_peer_hygiene_tests 2>&1 | tee "$log"
-          code=${PIPESTATUS[0]}
-          if [ "$code" -ne 0 ]; then echo "::error::$name failed on Linux (exit $code)"; tail -n 120 "$log" | while IFS= read -r l; do echo "::error::$l"; done; fi
-          exit "$code"
+          n=phase4ce; log=/tmp/$n.log; set +e
+          cargo test --test phase4ce_peer_hygiene_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          exit "$c"
 
       - name: integration phase4ch_pex_refresh_tests
         if: always()
         run: |
-          name=phase4ch; log=/tmp/${name}.log
-          set +e
-          cargo test --test phase4ch_pex_refresh_tests 2>&1 | tee "$log"
-          code=${PIPESTATUS[0]}
-          if [ "$code" -ne 0 ]; then echo "::error::$name failed on Linux (exit $code)"; tail -n 120 "$log" | while IFS= read -r l; do echo "::error::$l"; done; fi
-          exit "$code"
+          n=phase4ch; log=/tmp/$n.log; set +e
+          cargo test --test phase4ch_pex_refresh_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          exit "$c"
 
       - name: integration v6_preflight_manifest
         if: always()
         run: |
-          name=v6_preflight_manifest; log=/tmp/${name}.log
-          set +e
-          cargo test --test v6_preflight_manifest 2>&1 | tee "$log"
-          code=${PIPESTATUS[0]}
-          if [ "$code" -ne 0 ]; then echo "::error::$name failed on Linux (exit $code)"; tail -n 120 "$log" | while IFS= read -r l; do echo "::error::$l"; done; fi
-          exit "$code"
+          n=v6_preflight_manifest; log=/tmp/$n.log; set +e
+          cargo test --test v6_preflight_manifest 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          exit "$c"
 
       - name: Upload test logs
         if: always()
