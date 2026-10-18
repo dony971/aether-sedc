@@ -71,6 +71,12 @@ struct Cli {
     /// pending the 4U decision sheet; absence here never counts as a choice).
     #[arg(long)]
     network_id: Option<u64>,
+
+    /// P2P handshake protocol: `legacy_v5` or `authenticated_v6`.
+    /// 4CP-U: an EXPLICIT choice (overrides the TOML `p2p_protocol`). The node
+    /// refuses to start unless a value is provided here or in the config file.
+    #[arg(long, value_name = "MODE")]
+    p2p_protocol: Option<aether_unified::p2p::P2PProtocolMode>,
 }
 
 #[derive(Subcommand)]
@@ -333,6 +339,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.network_id.is_some() {
         cfg.network_id = cli.network_id;
     }
+    // 4CP-U (4CPT-03): the P2P handshake is an EXPLICIT choice. The CLI flag
+    // overrides the TOML value; when neither is present the node fails closed
+    // in `run_node` (there is no implicit legacy fallback).
+    if let Some(mode) = cli.p2p_protocol {
+        cfg.p2p_protocol = Some(mode);
+    }
+
     // 4CP-AI (AH-2): secure the data directory at the FIRST point it is needed.
     // The file-logging bootstrap below creates it (via `logs/`), before the
     // node's own startup (`ensure_data_dir`) would, so without this the

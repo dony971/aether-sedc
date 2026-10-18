@@ -9,7 +9,7 @@ use crate::transaction::{Bond, Unbond, Vote};
 use chacha20poly1305::aead::{Aead, NewAead};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand::rngs::{OsRng, StdRng};
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngCore, SeedableRng};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -354,17 +354,18 @@ const PROPAGATION_JITTER_MAX: Duration = Duration::from_millis(250);
 /// of them (minus the source).
 const MAX_PROPAGATION_FANOUT: usize = 4;
 
-/// 2E-A (A.1): write `contents` to `path` so the peer store is readable by
-/// its owner only (0600) instead of inheriting a world-readable umask
-/// (0644). The file holds every IP this node has ever dialed, which is the
+/// 2E-A (A.1): write `contents` to `path` so the file is readable by its owner
+/// only (0600) instead of inheriting a world-readable umask (0644); the mode is
+/// re-asserted after the write, so a file left wide by a previous crash is
+/// tightened. The file holds every IP this node has ever dialed, which is the
 /// local half of `LOCAL_METADATA_EXPOSURE`.
 ///
-/// Written via `OpenOptions::mode()` because `std::fs::write` cannot set a
-/// mode, and `mode()` only applies at creation — so permissions are re-asserted
-/// after the write for the case where a crash left a wide-permission `.tmp`
-/// behind. `rename()` in `save_known_peers` carries these permissions onto the
-/// final file. On Windows the mode bits do not exist; the file is still
-/// created fresh through the same path so behaviour stays uniform.
+/// Test-only since 4CP-AK / 4CP-AM: production now stages with
+/// `write_private_file_new` (exclusive `create_new`, `0600`) and publishes with
+/// `rename`, so it never truncates a file in place. This helper keeps the
+/// historical create/truncate-and-re-tighten behaviour covered by
+/// `test_peer_store_privacy`.
+#[cfg(test)]
 fn write_private_file(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -386,6 +387,221 @@ fn write_private_file(path: &std::path::Path, contents: &str) -> std::io::Result
         std::fs::write(path, contents)
     }
 }
+
+// ---------------------------------------------------------------------------
+// 4CP-AK (AB-1): coordination of peer-store saves.
+//
+// `try_save_known_peers` runs its file I/O on a `spawn_blocking` thread so the
+// `shutdown()` deadline can bound the wait for it. Two consequences had to be
+// handled:
+//
+//   * the previous code staged into a FIXED `known_peers.json.tmp`, so two
+//     saves could truncate each other's staging file and publish a snapshot
+//     neither writer ever produced;
+//   * a `spawn_blocking` closure is never cancelled, so a save that outlives a
+//     `shutdown()` timeout keeps running, and its unconditional `rename` could
+//     replace a snapshot written by the *next* cycle.
+//
+// Both are fixed by coordinating writers **inside the blocking work itself**
+// (per destination path), not in an async guard: cancelling the awaiting future
+// cannot drop the coordination, because the coordination lives on the thread
+// that actually performs the write. No async guard is ever held across an
+// `.await`, and the async runtime is never blocked.
+// ---------------------------------------------------------------------------
+
+/// Process-wide, monotonic source of peer-store save generations. Taken while
+/// the address read lock is held (see `try_save_known_peers`), so a higher
+/// generation can never describe an older snapshot.
+static PEER_STORE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// One coordination slot per destination path, shared by every writer in the
+/// process — including a fresh `P2PNetwork` started after a `shutdown()` that
+/// timed out on an earlier save.
+#[derive(Default)]
+struct PeerStoreSlot {
+    /// Held for the whole write+publish of a single save, **on the blocking
+    /// thread**. Never acquired from async context.
+    write_lock: std::sync::Mutex<()>,
+    /// Highest generation whose snapshot has actually been published to this
+    /// path. A save older than this is discarded instead of being allowed to
+    /// replace the newer snapshot.
+    published: AtomicU64,
+}
+
+static PEER_STORE_SLOTS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, Arc<PeerStoreSlot>>>,
+> = std::sync::OnceLock::new();
+
+/// Return (creating if needed) the slot for `key`. `key` is a stable,
+/// canonicalised form of the destination file, so two spellings of the same
+/// path share one slot.
+fn peer_store_slot(key: &std::path::Path) -> Arc<PeerStoreSlot> {
+    let registry = PEER_STORE_SLOTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut map = registry.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(key.to_path_buf())
+        .or_insert_with(|| Arc::new(PeerStoreSlot::default()))
+        .clone()
+}
+
+/// Per-save staging path: a hidden sibling of the destination, on the same
+/// filesystem (so the final rename is atomic), uniquely named by pid, the save
+/// generation and a process-wide counter. Never a fixed name, so two saves can
+/// never share a staging file.
+fn peer_store_staging_path(path: &std::path::Path, generation: u64) -> std::path::PathBuf {
+    static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "known_peers.json".to_string());
+    parent.join(format!(
+        ".{}.{}.{}.{}.tmp",
+        name,
+        std::process::id(),
+        generation,
+        seq
+    ))
+}
+
+/// Removes a staging file when it goes out of scope, on every exit path. On the
+/// success path the file was renamed away first, so the removal then sees
+/// `NotFound` and is a no-op.
+struct StagingGuard {
+    path: std::path::PathBuf,
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    "could not remove peer-store staging file {:?}: {}",
+                    self.path, e
+                );
+            }
+        }
+    }
+}
+
+/// Create `path` exclusively and write `contents` with owner-only permissions
+/// on Unix. `create_new` makes a name collision a hard error rather than a
+/// silent truncation of another writer's staging file.
+///
+/// `flush` + `sync_all` propagate write/durability errors from the file
+/// contents. They do NOT claim that the rename's *directory entry* survives a
+/// power loss on every platform — that stronger guarantee is deliberately not
+/// promised here; the peer store is a best-effort cache rebuilt from discovery.
+fn write_private_file_new(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(contents.as_bytes())?;
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        f.flush()?;
+        f.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        f.write_all(contents.as_bytes())?;
+        f.flush()?;
+        f.sync_all()?;
+        Ok(())
+    }
+}
+
+/// Write `json` to `path`, atomically and coordinated process-wide per path.
+/// Runs on a blocking thread; every failure is a distinct `Err`.
+///
+/// Invariants (4CP-AK / AB-1):
+///   * the write+publish is serialised per destination path, so two saves never
+///     share a staging file;
+///   * a save whose generation is older than the last published one is
+///     discarded — an old survivor of a cancelled/timed-out save can never
+///     replace a newer snapshot;
+///   * the destination is replaced by an in-directory `rename` (atomic on Unix
+///     and on Windows via `MOVEFILE_REPLACE_EXISTING`); it is never deleted
+///     first, so a reader never observes a missing file;
+///   * the staging file is removed on every exit path.
+fn save_peer_store_blocking(
+    path: &std::path::Path,
+    json: &str,
+    generation: u64,
+) -> Result<(), String> {
+    run_peer_store_test_hook(generation);
+
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("create peer store dir {:?}: {}", parent, e))?;
+
+    // Canonicalise so two spellings of the same destination share one slot.
+    let key = match std::fs::canonicalize(parent) {
+        Ok(p) => p.join(path.file_name().unwrap_or_default()),
+        Err(_) => path.to_path_buf(),
+    };
+    let slot = peer_store_slot(&key);
+
+    // Serialise the whole write+publish for this path. Held only here, on the
+    // blocking thread, and never across an `.await`.
+    let _guard = slot.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Freshness gate. A save that lost the race — or the survivor of a
+    // cancelled/timed-out save — must not overwrite a newer snapshot that
+    // already landed. A newer generation always wins, so new work can never be
+    // displaced by the older work it waited behind.
+    let published = slot.published.load(Ordering::SeqCst);
+    if generation < published {
+        debug!(
+            "peer-store save gen {} discarded: gen {} already published",
+            generation, published
+        );
+        return Ok(());
+    }
+
+    let tmp = peer_store_staging_path(path, generation);
+    let _tmp_guard = StagingGuard { path: tmp.clone() };
+
+    write_private_file_new(&tmp, json)
+        .map_err(|e| format!("write peer store {:?}: {}", tmp, e))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("replace peer store {:?}: {}", path, e))?;
+
+    slot.published.store(generation, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Test-only ordering hook (4CP-AK). It is compiled out of production builds, so
+/// it cannot change the production path. Tests use it to hold one generation
+/// inside the blocking thread and interleave a newer save.
+#[cfg(test)]
+static PEER_STORE_TEST_HOOK: std::sync::Mutex<Option<Arc<dyn Fn(u64) + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn run_peer_store_test_hook(generation: u64) {
+    let hook = PEER_STORE_TEST_HOOK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(h) = hook {
+        h(generation);
+    }
+}
+
+#[cfg(not(test))]
+fn run_peer_store_test_hook(_generation: u64) {}
 
 /// DEEP SYNC: maximum transactions per SyncResponse page.
 /// Each page is ancestor-closed and topologically sorted.
@@ -1504,6 +1720,19 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 /// Outbound connect budget (black-holed addresses must not stall discovery).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// 4CP-Y (X-2) / 4CP-AA: the single teardown deadline for `shutdown()`. It is
+/// armed once, after the synchronous teardown steps, and the remaining time is
+/// applied to *both* bounded waits that can plausibly block: aborting+awaiting
+/// every tracked task and the final peer-store flush. A per-task 5 s allowance
+/// (5 s × N) is deliberately not used. The deadline does NOT cover the handful
+/// of synchronous lock acquisitions or the `session_auth` registry seal that
+/// precede it — those are not awaited I/O — so the total wall time of
+/// `shutdown()` is this budget plus that fixed, small prologue.
+const SHUTDOWN_TASK_BUDGET: Duration = Duration::from_secs(30);
+/// 4CP-Y (X-4): per-write budget for the per-session send task. A peer that
+/// stops reading must not pin the task (and the task's socket) forever; on
+/// timeout the session's writer is dropped and the task ends.
+const SESSION_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 4CE hygiene: consecutive dial failures after which a never-successful,
 /// non-configured entry sleeps out of redial (see `redial_sleep`). Five
@@ -1550,6 +1779,41 @@ pub const P2P_PROTOCOL_VERSION: u8 = 5;
 /// exact-match checked). Genesis check retained (defense in depth); the
 /// network field is what separates testnets sharing one binary/genesis.
 const HANDSHAKE_FRAME_LEN: usize = 4 + 1 + 32 + 8 + 32;
+
+// ---------------------------------------------------------------------------
+// PHASE 4CP: authenticated P2P v6 handshake.
+//
+// v5 remains byte-for-byte unchanged as an explicitly selected legacy mode.
+// v6 adds a nonce and a persistent Ed25519 `NodeId` to the Hello and then
+// exchanges an Ed25519 signature over a canonical transcript. There is NO
+// capability negotiation and NO automatic v6 -> v5 fallback: a peer that does
+// not speak v6 fails the handshake, always.
+// ---------------------------------------------------------------------------
+/// Wire format version of the authenticated P2P handshake.
+pub const P2P_PROTOCOL_VERSION_V6: u8 = 6;
+/// v6 Hello: magic(4) | version(1) | genesis(32) | network(8) |
+/// ephemeral X25519 key(32) | fresh nonce(32) | node id(32).
+const V6_HELLO_LEN: usize = 4 + 1 + 32 + 8 + 32 + 32 + 32;
+/// Ed25519 signature carried after the Hello exchange (raw 64 bytes).
+const V6_SIG_LEN: usize = 64;
+/// Signature domain separator for the v6 session transcript.
+const V6_AUTH_DOMAIN: &[u8] = b"aether-p2p-auth-v1";
+/// Session-key domain separator; distinct from v5's `aether-p2p-key-v1` so a
+/// v5 and a v6 session can never derive the same key material.
+const V6_KEY_DOMAIN: &[u8] = b"aether-p2p-key-v2";
+/// Role tags used in the transcript and in the signed message. The role byte
+/// inside the signature is what defeats reflection of one side's signature
+/// back to it (a reflected signature carries the wrong role).
+const V6_ROLE_INITIATOR: u8 = 0x01;
+const V6_ROLE_RESPONDER: u8 = 0x02;
+
+/// PHASE 4CP: the three identity-bearing fields of a v6 Hello.
+#[derive(Clone, Copy)]
+struct V6Hello {
+    eph: [u8; 32],
+    nonce: [u8; 32],
+    node_id: [u8; 32],
+}
 
 /// Insert into the seen-transaction cache, evicting old entries once the
 /// cache is full so memory stays bounded under flood.
@@ -1788,6 +2052,180 @@ impl Default for P2PConfig {
             peer_store_path: None,
             network_id: crate::transaction::DEFAULT_NETWORK_ID,
         }
+    }
+}
+
+/// PHASE 4CP: which handshake a node speaks.
+///
+/// This is the **P2P wire protocol** version only. It is unrelated to the V6
+/// governance feature (`ACTIVATION_ALLOWED=NO`); the two must never be
+/// conflated.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum P2PProtocolMode {
+    /// Historical, encrypted-but-**unauthenticated** v5 handshake. Preserves
+    /// the 77-byte frame and key derivation exactly. Opt-in only.
+    #[default]
+    LegacyV5,
+    /// Authenticated v6 handshake: a persistent Ed25519 `NodeId` plus a
+    /// signature over the session transcript. Requires a node identity.
+    AuthenticatedV6,
+}
+
+impl std::str::FromStr for P2PProtocolMode {
+    type Err = String;
+
+    /// 4CP-U: the operator-facing spelling of the handshake choice, used by the
+    /// `--p2p-protocol` CLI flag. Accepts the TOML snake_case names plus the
+    /// short aliases operators type by hand. Rejects everything else so a typo
+    /// is a hard error rather than a silent legacy fallback.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "legacy_v5" | "legacy" | "v5" => Ok(P2PProtocolMode::LegacyV5),
+            "authenticated_v6" | "authenticated" | "v6" => Ok(P2PProtocolMode::AuthenticatedV6),
+            other => Err(format!(
+                "unknown P2P protocol '{}': expected 'legacy_v5' or 'authenticated_v6'",
+                other
+            )),
+        }
+    }
+}
+
+/// PHASE 4CP: the verified provenance of a live session.
+///
+/// A legacy session is **always** `EncryptedUnauthenticated`; it is never
+/// presented as `Authenticated`. Future reputation / address-announcement work
+/// must branch on this so an unauthenticated peer can never be treated as a
+/// verified identity.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum P2PSessionAuth {
+    /// v5 session: confidentiality only, peer identity NOT proven.
+    EncryptedUnauthenticated,
+    /// v6 session: the peer proved possession of the private key naming it.
+    Authenticated {
+        node_id: crate::node_identity::NodeId,
+    },
+    /// A session that failed during establishment (no live session).
+    Failed,
+}
+
+/// PHASE 4CP-S: one recorded session's provenance.
+#[derive(Clone, Debug)]
+struct SessionAuthEntry {
+    /// The peer endpoint this session is talking to. Recorded for observability
+    /// only — it is NOT the map key, because two live sessions can share an
+    /// endpoint (see `SessionAuthRegistry`).
+    addr: SocketAddr,
+    state: P2PSessionAuth,
+}
+
+/// PHASE 4CP-S: verified provenance of the currently-live sessions.
+///
+/// Keyed by a node-local, monotonically increasing **session id** — never by
+/// `SocketAddr`. An endpoint is not a session: a peer can dial us from a source
+/// port we are also dialing, and a fast reconnect can reuse an endpoint while
+/// the old task is still tearing down. Keying by address made a late teardown
+/// able to erase (or a legacy insert able to overwrite) a *different* session's
+/// state (4CP-R F1). With a unique id, each session's record/clear can only
+/// ever touch its own entry; a closing session can never remove a newer one.
+#[derive(Default)]
+struct SessionAuthRegistry {
+    entries: HashMap<u64, SessionAuthEntry>,
+    /// 4CP-W: the network cycle this registry currently serves. Bumped by
+    /// `begin_generation` on every `start()`; a registration/clear carrying an
+    /// older generation is refused so a late handshake from a previous cycle
+    /// can never write into a later one, even after a restart with the exact
+    /// same configuration.
+    generation: u64,
+    /// 4CP-W: set by `close_and_clear` when a cycle is shut down. Once closed,
+    /// every `record_if_active`/`clear_if_active` is refused, so a handshake
+    /// that reaches the registration point after teardown records nothing.
+    closed: bool,
+}
+
+impl SessionAuthRegistry {
+    /// Record (or replace) the state for one exact session id.
+    fn record(&mut self, session_id: u64, addr: SocketAddr, state: P2PSessionAuth) {
+        self.entries
+            .insert(session_id, SessionAuthEntry { addr, state });
+    }
+
+    /// 4CP-W: open a fresh cycle. Clears any state and makes the registry
+    /// accept registrations tagged with `generation`. Called by `start()`
+    /// under the registry write lock, so it races neither a registration nor a
+    /// close.
+    fn begin_generation(&mut self, generation: u64) {
+        self.generation = generation;
+        self.closed = false;
+        self.entries.clear();
+    }
+
+    /// 4CP-W: atomically close the registry and drop every entry. After this
+    /// returns, no `record_if_active` for this registry can succeed, so a
+    /// handshake that already passed its provenance check records nothing.
+    /// This is the serialisation point between "record a session" and
+    /// "tear the cycle down".
+    fn close_and_clear(&mut self) {
+        self.closed = true;
+        self.entries.clear();
+    }
+
+    /// 4CP-W: register a session only if this registry still serves
+    /// `generation` and the cycle is open. Returns whether the record was
+    /// applied. The generation check and the write happen under the same lock,
+    /// so a late handshake can never reintroduce an entry after teardown, and a
+    /// previous cycle can never register into a newer one.
+    fn record_if_active(
+        &mut self,
+        generation: u64,
+        session_id: u64,
+        addr: SocketAddr,
+        state: P2PSessionAuth,
+    ) -> bool {
+        if self.closed || self.generation != generation {
+            return false;
+        }
+        self.record(session_id, addr, state);
+        true
+    }
+
+    /// 4CP-W: drop one session only if the caller still belongs to the live
+    /// cycle. A teardown from an old generation can never touch the current
+    /// cycle's map (session ids are also process-unique, so it could not alias
+    /// another session even without this check).
+    fn clear_if_active(&mut self, generation: u64, session_id: u64) -> bool {
+        if self.closed || self.generation != generation {
+            return false;
+        }
+        self.clear(session_id);
+        true
+    }
+
+    /// Drop one session's state. Removing an unknown id is a no-op, and can
+    /// never affect another session.
+    fn clear(&mut self, session_id: u64) {
+        self.entries.remove(&session_id);
+    }
+
+    fn get(&self, session_id: u64) -> Option<&SessionAuthEntry> {
+        self.entries.get(&session_id)
+    }
+
+    /// All live sessions currently at `addr`, oldest session id first. There
+    /// may legitimately be several; the caller must not assume one.
+    fn for_addr(&self, addr: &SocketAddr) -> Vec<(u64, P2PSessionAuth)> {
+        let mut v: Vec<(u64, P2PSessionAuth)> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| &e.addr == addr)
+            .map(|(id, e)| (*id, e.state.clone()))
+            .collect();
+        v.sort_by_key(|(id, _)| *id);
+        v
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -2541,6 +2979,187 @@ fn bound_payload_cache<T>(map: &mut HashMap<Vec<u8>, T>, age_of: impl Fn(&T) -> 
     }
 }
 
+/// PHASE 4CP-U: conceptual lifecycle state of a [`P2PNetwork`].
+///
+/// This is the observable answer to "may this node still be configured, and is
+/// it live?". It exists so that the set-once configuration (protocol mode +
+/// node identity) and the start/shutdown transitions are decided under one
+/// lock, never by a check-then-act across independent flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum P2PNetworkState {
+    /// No protocol mode was chosen yet. `start()` refuses with an explicit
+    /// error (4CP-W V-3): there is no implicit fallback to `LegacyV5`. Setters
+    /// are accepted.
+    Unconfigured,
+    /// A protocol mode (and, for v6, an identity) was chosen explicitly via
+    /// `set_protocol_mode` / the `p2p_protocol` setting / `--p2p-protocol`;
+    /// not started yet. Setters are accepted.
+    Configured,
+    /// `start()` is in progress: the configuration is frozen and the network
+    /// is not yet live. Setters are refused. A `shutdown()` may engage during
+    /// this window; it wins, and `start()` must not return to `Started`.
+    Starting,
+    /// `start()` completed; the network is live. The configuration is frozen
+    /// forever (see [`NetworkLifecycle`]). Setters are refused.
+    Started,
+    /// `shutdown()` is in progress: task admission is already closed and the
+    /// cycle is being torn down. Setters and a new `start()` are refused until
+    /// the teardown finishes and the state becomes `Stopped`.
+    Stopping,
+    /// The last `start()` failed (for example a bind error) and left no live
+    /// session. Setters are accepted again so the operator can fix the choice
+    /// and retry; `start()` may be called again.
+    Failed,
+    /// `shutdown()` completed on a live network. The configuration stays frozen
+    /// (immutable once started); a restart reuses the exact same snapshot and
+    /// still cannot be reconfigured.
+    Stopped,
+}
+
+/// The exact, immutable configuration a network was started with. Both the
+/// accept loop and the dial path read this snapshot, never the live setters, so
+/// every session the node opens speaks one handshake decided at one instant.
+struct StartedConfig {
+    mode: P2PProtocolMode,
+    identity: Option<Arc<crate::node_identity::NodeIdentity>>,
+}
+
+/// PHASE 4CP-U (4CPT-01): the single source of truth for a `P2PNetwork`'s
+/// configuration and lifecycle.
+///
+/// One `std::sync::Mutex` protects the lifecycle state, the chosen mode, the
+/// identity and the frozen start snapshot *together*. `set_protocol_mode`,
+/// `set_node_identity` and `start()` therefore serialise against each other:
+/// a setter can never interleave between `start()` reading the configuration
+/// and the network becoming live, and the snapshot the accept loop and the dial
+/// path use is always the one the same critical section froze. The lock is
+/// never held across an `.await`.
+struct NetworkLifecycle {
+    state: P2PNetworkState,
+    /// The chosen mode; `LegacyV5` until a setter runs.
+    mode: P2PProtocolMode,
+    /// The chosen identity, if any.
+    identity: Option<Arc<crate::node_identity::NodeIdentity>>,
+    /// The frozen snapshot, present from `start()` until a failed start or a
+    /// shutdown clears it.
+    active: Option<Arc<StartedConfig>>,
+    /// 4CP-W: monotonic network-cycle id, bumped by every `start()`. Tasks and
+    /// session registrations carry the generation they were created under, so
+    /// a late result from a torn-down cycle is rejected even if a restart
+    /// reuses the exact same configuration.
+    generation: u64,
+    /// 4CP-Y (X-6): true for the whole duration of a `shutdown()`, from the
+    /// moment the stop is engaged until the teardown completes. It closes the
+    /// window in which a `start()` racing a `shutdown()` on a *non-live* state
+    /// (`Configured` / `Failed` / `Unconfigured`) could slip through: while a
+    /// stop is in flight, `start()` refuses regardless of the recorded state.
+    stopping: bool,
+}
+
+impl NetworkLifecycle {
+    fn new() -> Self {
+        Self {
+            state: P2PNetworkState::Unconfigured,
+            mode: P2PProtocolMode::LegacyV5,
+            identity: None,
+            active: None,
+            generation: 0,
+            stopping: false,
+        }
+    }
+
+    /// True once the configuration has been frozen by a `start()` attempt
+    /// (live, in progress, or cleanly stopped). Once frozen it can never be
+    /// reconfigured, even across a restart.
+    fn is_frozen(&self) -> bool {
+        matches!(
+            self.state,
+            P2PNetworkState::Starting
+                | P2PNetworkState::Started
+                | P2PNetworkState::Stopping
+                | P2PNetworkState::Stopped
+        )
+    }
+}
+
+/// 4CP-W: the atomic task-admission control for one network cycle.
+///
+/// One `std::sync::Mutex` guards the acceptance flag, the current generation
+/// and the list of tracked handles *together*, so "may I register a task?" and
+/// "close admission" are a single decision. This removes the previous race in
+/// which a task was spawned after `shutdown()` had already drained the task
+/// list (the flag check and the `push` were not atomic): a spawn either lands
+/// before the close and is therefore included in the teardown, or the cycle is
+/// already closed and the spawn is refused (its future is never created, so it
+/// acquires no resources). The lock is never held across an `.await`.
+struct TaskAdmission {
+    /// True only while a cycle is live. 4CP-Y (X-3): closed by construction and
+    /// opened only by `start()` (under the lifecycle lock), so a network that
+    /// never started admits no session task — there is no pre-start window in
+    /// which an operational dial could register a session. Test harnesses that
+    /// need a dialable cycle without binding a socket open it explicitly through
+    /// `open_cycle_for_test`.
+    accepting: bool,
+    /// The generation of the cycle currently accepting tasks.
+    generation: u64,
+    /// Handles of this cycle's long-lived tasks, drained+aborted by
+    /// `shutdown()`.
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl TaskAdmission {
+    fn new() -> Self {
+        Self {
+            accepting: false,
+            generation: 0,
+            tasks: Vec::new(),
+        }
+    }
+}
+
+/// 4CP-W (tests only): a rendezvous that lets a test interleave a `shutdown()`
+/// deterministically in the middle of `start()`, or a real `handle_peer` in the
+/// middle of its session registration. Production never installs one, so the
+/// only cost on those paths is a single `None` check.
+#[allow(dead_code)]
+#[derive(Default)]
+struct StartGate {
+    /// Signalled by the gated function once it has reached the rendezvous.
+    arrived: tokio::sync::Notify,
+    /// Awaited by the gated function; the test fires it after it has shut the
+    /// cycle down.
+    release: tokio::sync::Notify,
+}
+
+/// 4CP-AA (X-2): why `shutdown()` did not report a clean teardown. The classes
+/// are kept distinct so a caller can tell a task that refused to stop from a
+/// task that panicked from a peer-store flush that could not finish in time.
+/// The public signature stays `Result<(), String>`; these are rendered to
+/// strings only at the boundary.
+#[derive(Debug)]
+enum ShutdownError {
+    /// A tracked task did not terminate within the global teardown budget.
+    TaskTimeout(usize),
+    /// A tracked task panicked (a join error that is not a cancellation).
+    TaskPanic(usize, String),
+    /// The peer store could not be flushed within the global teardown budget.
+    PeerStoreSave(String),
+}
+
+impl std::fmt::Display for ShutdownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShutdownError::TaskTimeout(i) => write!(
+                f,
+                "task {} did not terminate within the {:?} shutdown budget",
+                i, SHUTDOWN_TASK_BUDGET
+            ),
+            ShutdownError::TaskPanic(i, e) => write!(f, "task {} join error: {}", i, e),
+            ShutdownError::PeerStoreSave(e) => write!(f, "peer-store save failed: {}", e),
+        }
+    }
+}
+
 /// P2P network manager
 #[derive(Clone)]
 pub struct P2PNetwork {
@@ -2610,18 +3229,45 @@ pub struct P2PNetwork {
     /// 4CB: cooperative shutdown flag. Set by `shutdown()`; read by dial
     /// paths to refuse new sessions while teardown is in progress.
     /// Long-lived loops are stopped by aborting their tracked handles
-    /// (see `tasks`); the flag only gates NEW work, never fakes completion.
+    /// (see `admission`); the flag only gates NEW work, never fakes completion.
     shutdown: Arc<AtomicBool>,
-    /// 4CB: registry of long-lived background tasks (accept loop,
+    /// 4CB / 4CP-W: registry of long-lived background tasks (accept loop,
     /// discovery, recovery, redial, peer-store, anchor, DNS, PEX, cache,
-    /// initial sweep) plus per-peer `handle_peer` tasks. Every handle is
-    /// aborted AND awaited with a bounded timeout in `shutdown()`; a task
-    /// that does not terminate is a reported error, never silently leaked.
-    /// Short-lived fire-and-forget relay/dial helpers are NOT tracked:
-    /// they carry a timeout or bounded jitter and exit on their own.
-    /// `std::sync::Mutex` (never held across `.await`) so registration is
-    /// a synchronous call from any task context.
-    tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// initial sweep) plus per-peer `handle_peer` tasks, combined with the
+    /// atomic acceptance flag and the cycle generation (see [`TaskAdmission`]).
+    /// Every handle is aborted AND awaited with a bounded timeout in
+    /// `shutdown()`; a task that does not terminate is a reported error, never
+    /// silently leaked. Registration is a synchronous call from any task
+    /// context (the mutex is never held across an `.await`).
+    admission: Arc<std::sync::Mutex<TaskAdmission>>,
+    /// 4CP-W: serialises concurrent `shutdown()` calls so the second one waits
+    /// for the first teardown instead of observing a half-torn-down cycle.
+    shutdown_lock: Arc<tokio::sync::Mutex<()>>,
+    /// 4CP-W: test-only start rendezvous (see [`StartGate`]). `None` in
+    /// production.
+    #[cfg(test)]
+    start_gate: Arc<std::sync::Mutex<Option<Arc<StartGate>>>>,
+    /// 4CP-AA (Y-5, tests): test-only outbound registration rendezvous (see
+    /// [`StartGate`]). `None` in production; consumed once by the outbound
+    /// session path so a test can interleave a `shutdown()` inside a real
+    /// outbound `handle_peer`.
+    #[cfg(test)]
+    outbound_record_gate: Arc<std::sync::Mutex<Option<Arc<StartGate>>>>,
+    /// PHASE 4CP-U (4CPT-01): the one place that owns the handshake choice, the
+    /// persistent node identity, the start/shutdown lifecycle state and the
+    /// frozen start snapshot. Replaces the former `protocol_mode` RwLock,
+    /// `started` AtomicBool and `node_identity` RwLock, whose independent
+    /// guards allowed a setter to race `start()`. See [`NetworkLifecycle`].
+    lifecycle: Arc<std::sync::Mutex<NetworkLifecycle>>,
+    /// PHASE 4CP-S: verified provenance of the live sessions, keyed by a
+    /// node-local unique session id (NEVER by `SocketAddr` — see
+    /// `SessionAuthRegistry`). Observability only in this phase: reputation and
+    /// address announcements do NOT consume it yet.
+    session_auth: Arc<RwLock<SessionAuthRegistry>>,
+    /// PHASE 4CP-S: monotonic source of `session_auth` session ids. Each
+    /// `handle_peer` invocation takes exactly one; ids are never reused within
+    /// the process.
+    session_seq: Arc<AtomicU64>,
 }
 
 impl P2PNetwork {
@@ -2659,7 +3305,265 @@ impl P2PNetwork {
             is_orphan,
   stake_hooks: StakeHooks::default(),
             shutdown: Arc::new(AtomicBool::new(false)),
-            tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
+            admission: Arc::new(std::sync::Mutex::new(TaskAdmission::new())),
+            shutdown_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            start_gate: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            outbound_record_gate: Arc::new(std::sync::Mutex::new(None)),
+            // PHASE 4CP-U: legacy by default; authenticated mode and the node
+            // identity are wired explicitly (see `set_protocol_mode` /
+            // `set_node_identity`) before the node starts. The lifecycle mutex
+            // holds both plus the start/shutdown state.
+            lifecycle: Arc::new(std::sync::Mutex::new(NetworkLifecycle::new())),
+            session_auth: Arc::new(RwLock::new(SessionAuthRegistry::default())),
+            session_seq: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// 4CP-U: lock the lifecycle, ignoring poisoning (a panic while holding it
+    /// cannot leave the node with a half-configured state — the data is plain
+    /// and every accessor tolerates the poison).
+    fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, NetworkLifecycle> {
+        match self.lifecycle.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        }
+    }
+
+    /// 4CP-W: lock the admission control, ignoring poisoning (plain data; the
+    /// guard tolerates a poisoned mutex so a panic in one task cannot wedge
+    /// teardown).
+    fn lock_admission(&self) -> std::sync::MutexGuard<'_, TaskAdmission> {
+        match self.admission.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        }
+    }
+
+    /// 4CP-W: the generation of the current network cycle (diagnostics / tests).
+    pub fn generation(&self) -> u64 {
+        self.lock_lifecycle().generation
+    }
+
+    /// PHASE 4CP: select the handshake protocol. Intended to be called once,
+    /// before `start()`. Never triggers a fallback: the mode is authoritative.
+    /// 4CP-U (4CPT-01): refused once the configuration is frozen (starting,
+    /// live, or stopped), decided under the same lock `start()` uses.
+    pub fn set_protocol_mode(&self, mode: P2PProtocolMode) {
+        let mut lc = self.lock_lifecycle();
+        if lc.is_frozen() {
+            tracing::error!(
+                "set_protocol_mode ignored: the P2P protocol mode is immutable after start()"
+            );
+            return;
+        }
+        lc.mode = mode;
+        lc.state = P2PNetworkState::Configured;
+    }
+
+    /// PHASE 4CP: the currently selected handshake protocol.
+    pub fn protocol_mode(&self) -> P2PProtocolMode {
+        self.lock_lifecycle().mode
+    }
+
+    /// PHASE 4CP-U: the current lifecycle state (diagnostics / tests).
+    pub fn lifecycle_state(&self) -> P2PNetworkState {
+        self.lock_lifecycle().state
+    }
+
+    /// PHASE 4CP-U: the mode the *running* network was actually started with,
+    /// taken from the frozen snapshot. `None` before any successful `start()`.
+    /// Lets a test prove the dial path and the accept loop speak the snapshot,
+    /// not whatever a racing setter wrote.
+    pub fn started_protocol_mode(&self) -> Option<P2PProtocolMode> {
+        self.lock_lifecycle().active.as_ref().map(|s| s.mode)
+    }
+
+    /// PHASE 4CP: install the persistent network identity used by v6.
+    /// `AuthenticatedV6` mode fails closed without one. 4CP-U (4CPT-01): like
+    /// the mode, refused once the configuration is frozen.
+    pub fn set_node_identity(&self, identity: crate::node_identity::NodeIdentity) {
+        let mut lc = self.lock_lifecycle();
+        if lc.is_frozen() {
+            tracing::error!(
+                "set_node_identity ignored: the node identity is immutable after start()"
+            );
+            return;
+        }
+        lc.identity = Some(Arc::new(identity));
+    }
+
+    /// PHASE 4CP: this node's persistent network identity, if configured.
+    pub fn node_identity(&self) -> Option<Arc<crate::node_identity::NodeIdentity>> {
+        self.lock_lifecycle().identity.clone()
+    }
+
+    /// PHASE 4CP-U: the frozen `(mode, identity)` pair the running network uses.
+    /// 4CP-Y (X-3): `None` when there is no live cycle. There is no fallback to
+    /// the live setters: a dial must be able to observe "not operational" so it
+    /// can refuse, instead of silently opening a session with an un-frozen mode.
+    fn started_config(
+        &self,
+    ) -> Option<(
+        P2PProtocolMode,
+        Option<Arc<crate::node_identity::NodeIdentity>>,
+    )> {
+        let lc = self.lock_lifecycle();
+        lc.active
+            .as_ref()
+            .map(|s| (s.mode, s.identity.clone()))
+    }
+
+    /// PHASE 4CP-S: take the next unique session id (process-monotonic).
+    /// Test-only surface: `handle_peer` draws its id straight from the shared
+    /// counter (it has no `&self`).
+    #[cfg(test)]
+    fn next_session_id(&self) -> u64 {
+        self.session_seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// PHASE 4CP-S: record a session's verified provenance under its exact id.
+    /// Test-only surface mirroring `handle_peer`'s registry write.
+    #[cfg(test)]
+    async fn record_session_auth(&self, session_id: u64, addr: SocketAddr, state: P2PSessionAuth) {
+        self.session_auth
+            .write()
+            .await
+            .record(session_id, addr, state);
+    }
+
+    /// PHASE 4CP-S: drop exactly one session's state (teardown). Never affects
+    /// any other session, even one sharing the same endpoint.
+    /// Test-only surface mirroring `handle_peer`'s registry clear.
+    #[cfg(test)]
+    async fn clear_session_auth(&self, session_id: u64) {
+        self.session_auth.write().await.clear(session_id);
+    }
+
+    /// 4CP-W: the exact registration `handle_peer` performs, exposed so a test
+    /// can prove the cycle/generation guard on the real code path. Returns
+    /// whether the session was recorded. 4CP-AA (X-5): test-only — it is not
+    /// compiled into the production binary.
+    #[cfg(test)]
+    async fn record_session_auth_if_active(
+        &self,
+        generation: u64,
+        session_id: u64,
+        addr: SocketAddr,
+        state: P2PSessionAuth,
+    ) -> bool {
+        self.session_auth
+            .write()
+            .await
+            .record_if_active(generation, session_id, addr, state)
+    }
+
+    /// 4CP-W: the exact teardown clear `handle_peer` performs, exposed for the
+    /// same reason. Returns whether an entry was removed (and it belonged to
+    /// the live cycle). 4CP-AA (X-5): test-only — not compiled into production.
+    #[cfg(test)]
+    async fn clear_session_auth_if_active(&self, generation: u64, session_id: u64) -> bool {
+        self.session_auth
+            .write()
+            .await
+            .clear_if_active(generation, session_id)
+    }
+
+    /// 4CP-W (tests): install a one-shot `StartGate` so a test can interleave a
+    /// `shutdown()` deterministically inside `start()`.
+    #[cfg(test)]
+    fn install_start_gate(&self) -> Arc<StartGate> {
+        let gate = Arc::new(StartGate::default());
+        *self.start_gate.lock().unwrap_or_else(|e| e.into_inner()) = Some(gate.clone());
+        gate
+    }
+
+    /// 4CP-AA (Y-5, tests): install a one-shot outbound registration rendezvous,
+    /// so a test can interleave a `shutdown()` inside a real *outbound*
+    /// `handle_peer`, exactly as `install_start_gate` does for `start()`.
+    #[cfg(test)]
+    fn install_outbound_record_gate(&self) -> Arc<StartGate> {
+        let gate = Arc::new(StartGate::default());
+        *self
+            .outbound_record_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(gate.clone());
+        gate
+    }
+
+    /// 4CP-AA (Y-5): consume the outbound registration rendezvous. Always `None`
+    /// in production, so the outbound path pays a single `Option` check.
+    fn take_outbound_record_gate(&self) -> Option<Arc<StartGate>> {
+        #[cfg(test)]
+        {
+            self.outbound_record_gate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+
+    /// 4CP-Y (X-3, tests): open one operational cycle WITHOUT binding a socket,
+    /// so a harness that exercises the dialing paths (recovery, PEX) has the
+    /// same frozen snapshot, open task admission, live lifecycle state and
+    /// registry generation that a real `start()` would install. This isolates
+    /// the "dialable before start" concession to tests; production can only
+    /// reach these states through `start()`.
+    #[cfg(test)]
+    async fn open_cycle_for_test(&self, mode: P2PProtocolMode) {
+        let generation = {
+            let mut lc = self.lock_lifecycle();
+            lc.generation = lc.generation.wrapping_add(1);
+            let generation = lc.generation;
+            lc.active = Some(Arc::new(StartedConfig {
+                mode,
+                identity: lc.identity.clone(),
+            }));
+            lc.state = P2PNetworkState::Started;
+            lc.stopping = false;
+            generation
+        };
+        {
+            let mut adm = self.lock_admission();
+            adm.accepting = true;
+            adm.generation = generation;
+        }
+        self.shutdown.store(false, Ordering::Relaxed);
+        self.session_auth.write().await.begin_generation(generation);
+    }
+
+    /// PHASE 4CP-S: how the session with this exact id was authenticated.
+    pub async fn session_auth_by_id(&self, session_id: u64) -> Option<P2PSessionAuth> {
+        self.session_auth
+            .read()
+            .await
+            .get(session_id)
+            .map(|e| e.state.clone())
+    }
+
+    /// PHASE 4CP-S: the states of every live session at `addr`. There can be
+    /// more than one (same endpoint, distinct sessions); never assume one.
+    pub async fn session_auth_for_addr(&self, addr: &SocketAddr) -> Vec<(u64, P2PSessionAuth)> {
+        self.session_auth.read().await.for_addr(addr)
+    }
+
+    /// PHASE 4CP-S: number of live recorded sessions (diagnostics / tests).
+    pub async fn session_auth_len(&self) -> usize {
+        self.session_auth.read().await.len()
+    }
+
+    /// PHASE 4CP: classify a completed handshake into a session state. Pure,
+    /// so the legacy/authenticated split is unit-testable and cannot drift
+    /// from `handle_peer`.
+    fn session_auth_for(peer: Option<crate::node_identity::NodeId>) -> P2PSessionAuth {
+        match peer {
+            Some(node_id) => P2PSessionAuth::Authenticated { node_id },
+            None => P2PSessionAuth::EncryptedUnauthenticated,
         }
     }
 
@@ -2695,73 +3599,196 @@ impl P2PNetwork {
         }
     }
 
-    /// 4CB: spawn a long-lived background task and register its handle so
-    /// `shutdown()` can abort AND await it. Synchronous (std-mutex push,
-    /// never held across `.await`); call sites keep their existing `});`
-    /// closings unchanged.
-    fn spawn_tracked(&self, fut: impl Future<Output = ()> + Send + 'static) {
-        let handle = tokio::spawn(fut);
-        match self.tasks.lock() {
-            Ok(mut guard) => guard.push(handle),
-            Err(e) => {
-                let mut guard = e.into_inner();
-                guard.push(handle);
-            }
+    /// 4CB / 4CP-W: spawn a long-lived background task and register its handle
+    /// so `shutdown()` can abort AND await it. 4CP-W: the acceptance check and
+    /// the handle registration are one atomic step under the admission lock, so
+    /// a task can never be spawned after `shutdown()` has drained the registry.
+    /// Returns whether the task was admitted (callers may ignore this; a
+    /// refused task is simply never created).
+    fn spawn_tracked(&self, fut: impl Future<Output = ()> + Send + 'static) -> bool {
+        Self::admit_task(&self.admission, |_generation| fut)
+    }
+
+    /// 4CP-W: the atomic admission primitive. The closure receives the
+    /// generation of the cycle it is admitted into and returns the future to
+    /// spawn; it is not called at all when the cycle is closed, so refusing a
+    /// task creates nothing. Free-function form so `accept_loop` (which has no
+    /// `&self`) shares the exact same mechanism.
+    fn admit_task<F, Fut>(admission: &Arc<std::sync::Mutex<TaskAdmission>>, make: F) -> bool
+    where
+        F: FnOnce(u64) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut guard = match admission.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if !guard.accepting {
+            return false;
         }
+        // 4CP-AA (X-4): reap handles that already finished, so the tracked set
+        // is bounded by the number of *live* tasks rather than by every task
+        // ever admitted (long-lived nodes churn sessions). A completed handle
+        // carries no teardown obligation; a panic has already been reported by
+        // the task's own panic hook.
+        guard.tasks.retain(|h| !h.is_finished());
+        let handle = tokio::spawn(make(guard.generation));
+        guard.tasks.push(handle);
+        true
     }
 
     /// 4CB: explicit graceful shutdown.
     ///
-    /// Sequence: set the flag (no new dials/sessions), close the discovery
-    /// channel, snapshot and clear the session map (drops senders so per-peer
-    /// send tasks observe `None` and exit), clear dial/outbound guards, then
-    /// abort every tracked handle and await each with a bounded timeout.
-    /// Aborted tasks report cancellation (expected, not an error); a task
-    /// that neither completes nor cancels within the timeout, or that
-    /// panicked, is returned as `Err` with its index. The listener is owned
-    /// by the accept task, so awaiting that task proves the OS port is
-    /// released; the session map is cleared a second time after the joins
-    /// to catch any insert that raced the first clear.
+    /// ## Contract (4CP-AA, X-2)
+    ///
+    /// `Ok(())` guarantees, at the instant it returns:
+    /// 1. no new dials and no new sessions — the shutdown flag is set and task
+    ///    admission is closed, so every later spawn is refused;
+    /// 2. the session registry is sealed and cleared for this cycle, so a
+    ///    handshake still in flight registers nothing;
+    /// 3. the peer/dial/outbound maps are cleared;
+    /// 4. every tracked task was aborted and *observed to terminate* within the
+    ///    single [`SHUTDOWN_TASK_BUDGET`] deadline (a task that did not is
+    ///    reported, never silently leaked);
+    /// 5. the peer store was flushed within the same deadline;
+    /// 6. the lifecycle is `Stopped` (or `Unconfigured` for a never-configured
+    ///    network) with no live snapshot.
+    ///
+    /// `Err` reports *which* of (4)/(5) failed, classified as a task timeout, a
+    /// task panic, or a peer-store save failure. A `shutdown()` that returns
+    /// `Ok` performed every step; a partial teardown never masquerades as
+    /// success. The few steps *before* the deadline is armed (the lifecycle
+    /// transitions, the discovery-channel drop and the registry seal) are
+    /// synchronous and are not awaited I/O, so they are outside the budget.
+    ///
+    /// ## Sequence
+    ///
+    /// (1) serialise concurrent callers (`shutdown_lock`); (2) under the
+    /// lifecycle lock, move `Starting|Started` -> `Stopping`, and a never-live
+    /// `Configured|Failed` -> `Stopped`; (3) under the admission lock, close
+    /// task admission and detach every tracked handle atomically; (4) under the
+    /// registry write lock, `close_and_clear` the session map; (5) abort+await
+    /// the detached handles under one shared deadline; (6) flush the peer store
+    /// under the same deadline; (7) finalise the state as `Stopped` with no live
+    /// snapshot.
+    ///
+    /// No lock is held across the awaits in (5)/(6).
     pub async fn shutdown(&self) -> Result<(), String> {
+        // Serialise concurrent shutdown() calls: the second waits until the
+        // first teardown is fully done, then runs its (empty) pass.
+        let _serial = self.shutdown_lock.lock().await;
+        // (2) Engage the stop under the lifecycle lock.
+        {
+            let mut lc = self.lock_lifecycle();
+            match lc.state {
+                P2PNetworkState::Starting | P2PNetworkState::Started => {
+                    lc.state = P2PNetworkState::Stopping;
+                }
+                // 4CP-Y (X-6): a stop on a never-live network still freezes it
+                // as `Stopped`, so a concurrent start() can never observe a
+                // stale `Configured`/`Failed` and slip through.
+                P2PNetworkState::Configured | P2PNetworkState::Failed => {
+                    lc.state = P2PNetworkState::Stopped;
+                }
+                P2PNetworkState::Stopping
+                | P2PNetworkState::Stopped
+                | P2PNetworkState::Unconfigured => {}
+            }
+            lc.stopping = true;
+            lc.active = None;
+        }
         self.shutdown.store(true, Ordering::Relaxed);
         {
             let mut tx_lock = self.peer_discovery_tx.lock().await;
             *tx_lock = None;
         }
+        // (3) Close task admission and detach this cycle's handles atomically.
+        let handles: Vec<tokio::task::JoinHandle<()>> = {
+            let mut adm = self.lock_admission();
+            adm.accepting = false;
+            adm.tasks.drain(..).collect()
+        };
         {
             let mut peers = self.peers.write().await;
             peers.clear();
         }
         self.dialing.write().await.clear();
         self.outbound_sessions.write().await.clear();
-        let handles: Vec<tokio::task::JoinHandle<()>> = {
-            match self.tasks.lock() {
-                Ok(mut guard) => guard.drain(..).collect(),
-                Err(e) => e.into_inner().drain(..).collect(),
-            }
-        };
-        let mut failures: Vec<String> = Vec::new();
+        // (4) Close+clear the session registry: no late registration survives.
+        self.session_auth.write().await.close_and_clear();
+        // (5) Arm ONE teardown deadline and abort+await every detached handle
+        // under it. The same deadline then covers the peer-store flush in (6),
+        // so the bounded part of the teardown is a single budget regardless of
+        // how many tasks the cycle registered. No lock is held across these
+        // awaits.
+        let mut failures: Vec<ShutdownError> = Vec::new();
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_TASK_BUDGET;
         for (i, handle) in handles.into_iter().enumerate() {
             handle.abort();
-            match tokio::time::timeout(Duration::from_secs(5), handle).await {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                failures.push(ShutdownError::TaskTimeout(i));
+                continue;
+            }
+            match tokio::time::timeout(remaining, handle).await {
+                // Cancellation is the expected outcome of `abort()`.
                 Ok(Ok(())) => {}
                 Ok(Err(e)) if e.is_cancelled() => {}
-                Ok(Err(e)) => failures.push(format!("task {} join error: {}", i, e)),
-                Err(_) => failures.push(format!("task {} did not terminate within 5s", i)),
+                Ok(Err(e)) => failures.push(ShutdownError::TaskPanic(i, e.to_string())),
+                Err(_) => failures.push(ShutdownError::TaskTimeout(i)),
             }
         }
+        // A late accepted connection cannot have re-inserted itself: its spawn
+        // was refused by the closed admission. Clear again defensively.
         {
             let mut peers = self.peers.write().await;
             peers.clear();
         }
         self.dialing.write().await.clear();
         self.outbound_sessions.write().await.clear();
-        // Best-effort peer-store flush (no-op when no path configured).
-        self.save_known_peers().await;
+        // (6) Flush the peer store under the SAME deadline. A flush that cannot
+        // finish is a distinct teardown failure, not a silent best-effort miss.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            failures.push(ShutdownError::PeerStoreSave(format!(
+                "not attempted: shutdown budget of {:?} exhausted",
+                SHUTDOWN_TASK_BUDGET
+            )));
+        } else {
+            match tokio::time::timeout(remaining, self.try_save_known_peers()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => failures.push(ShutdownError::PeerStoreSave(e)),
+                Err(_) => failures.push(ShutdownError::PeerStoreSave(format!(
+                    "did not complete within the {:?} shutdown budget",
+                    SHUTDOWN_TASK_BUDGET
+                ))),
+            }
+        }
+        // (7) 4CP-W: a live network that has shut down becomes `Stopped`. The
+        // configuration stays frozen (immutable once started) and the snapshot
+        // is released; a later restart re-reads the same mode/identity and gets
+        // a fresh generation.
+        {
+            let mut lc = self.lock_lifecycle();
+            if matches!(
+                lc.state,
+                P2PNetworkState::Stopping
+                    | P2PNetworkState::Started
+                    | P2PNetworkState::Starting
+            ) {
+                lc.state = P2PNetworkState::Stopped;
+            }
+            lc.stopping = false;
+            lc.active = None;
+        }
         if failures.is_empty() {
             Ok(())
         } else {
-            Err(failures.join("; "))
+            Err(failures
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; "))
         }
     }
 
@@ -2789,19 +3816,137 @@ impl P2PNetwork {
 
     /// Start the P2P network
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
-        info!("Starting P2P network on {}", self.config.listen_addr);
+        // 4CP-W (4CPT-01/02/10): freeze the configuration, bump the cycle
+        // generation, move to `Starting` and OPEN task admission — all under the
+        // lifecycle lock, so no setter can interleave and no shutdown can be
+        // half-observed. From this commit point an engaged `shutdown()` always
+        // wins: it moves the state off `Starting`, and the final check below
+        // refuses to move back to `Started`.
+        let (snapshot, generation) = {
+            let mut lc = self.lock_lifecycle();
+            match lc.state {
+                P2PNetworkState::Starting => {
+                    return Err("P2P network is already starting".into());
+                }
+                P2PNetworkState::Started => {
+                    return Err("P2P network is already started".into());
+                }
+                P2PNetworkState::Stopping => {
+                    return Err("P2P network is shutting down".into());
+                }
+                // 4CP-W (V-3): no implicit v5. An unconfigured network must be
+                // given an explicit mode first (set_protocol_mode / TOML /
+                // --p2p-protocol); a silent legacy start is exactly the bug.
+                P2PNetworkState::Unconfigured => {
+                    return Err("P2P protocol mode not configured: call set_protocol_mode \
+                                (or set `p2p_protocol`) before start()"
+                        .into());
+                }
+                P2PNetworkState::Configured
+                | P2PNetworkState::Failed
+                | P2PNetworkState::Stopped => {}
+            }
+            // 4CP-Y (X-6): a stop that is in flight for a non-live state also
+            // blocks a racing start, so the outcome never depends on which of
+            // the two reached the lifecycle lock first.
+            if lc.stopping {
+                return Err("P2P network is shutting down".into());
+            }
+            // 4CPT-02: AuthenticatedV6 must never start without an identity —
+            // fail closed here even if the caller forgot, leaving the lifecycle
+            // un-frozen so the operator can fix it and retry.
+            if lc.mode == P2PProtocolMode::AuthenticatedV6 && lc.identity.is_none() {
+                return Err("AuthenticatedV6 requires a node identity before start()".into());
+            }
+            lc.generation = lc.generation.wrapping_add(1);
+            let generation = lc.generation;
+            let snap = Arc::new(StartedConfig {
+                mode: lc.mode,
+                identity: lc.identity.clone(),
+            });
+            lc.active = Some(snap.clone());
+            lc.state = P2PNetworkState::Starting;
+            // Open task admission for this cycle while still holding the
+            // lifecycle lock (lock order: lifecycle -> admission, never the
+            // reverse). A concurrent shutdown() cannot have run yet: it needs
+            // the lifecycle lock we hold.
+            {
+                let mut adm = self.lock_admission();
+                adm.accepting = true;
+                adm.generation = generation;
+            }
+            self.shutdown.store(false, Ordering::Relaxed);
+            (snap, generation)
+        };
+        // Open the session registry for this generation (clears any prior
+        // cycle's state). This is serialised with a late handshake's
+        // registration by the registry write lock.
+        self.session_auth.write().await.begin_generation(generation);
 
-        // 4CB: a restarted instance must accept new work again.
-        self.shutdown.store(false, Ordering::Relaxed);
+        info!(
+            "Starting P2P network on {} (cycle {})",
+            self.config.listen_addr, generation
+        );
+
+        // 4CP-W (tests): a deterministic interleaving point. A test installs a
+        // gate, then shuts the cycle down while `start()` is parked here.
+        #[cfg(test)]
+        {
+            let gate = self
+                .start_gate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(gate) = gate {
+                gate.arrived.notify_one();
+                gate.release.notified().await;
+            }
+        }
+
+        // If a shutdown() engaged while we were parked (or during the registry
+        // setup), abandon the start before acquiring any resource.
+        if !self.lock_admission().accepting {
+            return Err("P2P start() was superseded by a concurrent shutdown()".into());
+        }
 
         // Phase 1: restore known peers from disk before first dial.
         self.load_known_peers().await;
 
-        // Start listening for incoming connections
-        let listener = self
+        // Start listening for incoming connections. 4CPT-10: a bind failure
+        // must not leave the network looking started — move to `Failed`, clear
+        // the snapshot and report the error.
+        let listener = match self
             .transport
             .bind(&PeerAddr::Ip(self.config.listen_addr))
-            .await?;
+            .await
+        {
+            Ok(listener) => listener,
+            Err(e) => {
+                {
+                    let mut adm = self.lock_admission();
+                    adm.accepting = false;
+                }
+                {
+                    let mut lc = self.lock_lifecycle();
+                    lc.active = None;
+                    // Only the start that actually owns `Starting` may record
+                    // the failure; a racing shutdown keeps its Stopping/Stopped
+                    // state.
+                    if lc.state == P2PNetworkState::Starting {
+                        lc.state = P2PNetworkState::Failed;
+                    }
+                }
+                // 4CP-Y (X-7): a failed start leaves no live cycle, so seal the
+                // session registry opened for this generation. No residual
+                // session state survives, and no dial can proceed either (the
+                // dial path refuses without a live snapshot).
+                {
+                    self.session_auth.write().await.close_and_clear();
+                }
+                tracing::error!("P2P bind on {} failed: {}", self.config.listen_addr, e);
+                return Err(e.into());
+            }
+        };
         let peers = self.peers.clone();
         let outbound_sessions = self.outbound_sessions.clone();
         let tx_channel = self.tx_channel.clone();
@@ -2816,6 +3961,12 @@ impl P2PNetwork {
   let network_id = self.config.network_id;
         let local_addr = self.config.listen_addr;
         let addresses = self.addresses.clone();
+        // PHASE 4CP: handshake selection + identity + session-auth registry,
+        // read from the frozen snapshot so both loops agree.
+        let protocol_mode = snapshot.mode;
+        let node_identity = snapshot.identity.clone();
+        let session_auth = self.session_auth.clone();
+        let session_seq = self.session_seq.clone();
         let (peer_discovery_tx, mut peer_discovery_rx) = mpsc::unbounded_channel::<SocketAddr>();
         {
             let mut tx_lock = self.peer_discovery_tx.lock().await;
@@ -2828,11 +3979,11 @@ impl P2PNetwork {
                 p2p_discovery.connect_to_peer(addr).await;
             }
         });
-        // 4CB: the accept task owns the listener; awaiting it in shutdown()
-        // proves the OS port is released. Per-peer sessions spawned inside
-        // accept_loop are tracked via the same registry.
-        let accept_tasks = self.tasks.clone();
-        let accept_shutdown = self.shutdown.clone();
+        // 4CB / 4CP-W: the accept task owns the listener; awaiting it in
+        // shutdown() proves the OS port is released. Per-peer sessions spawned
+        // inside accept_loop are admitted through the same atomic admission
+        // control, so none can escape teardown.
+        let accept_admission = self.admission.clone();
         self.spawn_tracked(async move {
             Self::accept_loop(
                 listener,
@@ -2851,8 +4002,11 @@ impl P2PNetwork {
                 is_orphan,
   stake_hooks,
   network_id,
-                accept_tasks,
-                accept_shutdown,
+                protocol_mode,
+                node_identity,
+                session_auth,
+                session_seq,
+                accept_admission,
             )
             .await;
         });
@@ -2898,7 +4052,20 @@ impl P2PNetwork {
             });
         }
 
-        Ok(())
+        // 4CP-W: every task is spawned and the listener is held — the network
+        // is live. Freeze the lifecycle as `Started`, but ONLY if the cycle is
+        // still the one we committed: if a `shutdown()` engaged in the meantime
+        // it moved the state to `Stopping`/`Stopped` and closed admission, and
+        // it must never be undone by this late start. In that case the failed
+        // start reports the supersession and leaves the stop in force.
+        {
+            let mut lc = self.lock_lifecycle();
+            if lc.state == P2PNetworkState::Starting {
+                lc.state = P2PNetworkState::Started;
+                return Ok(());
+            }
+        }
+        Err("P2P start() was superseded by a concurrent shutdown()".into())
     }
 
     /// Phase 2A: the very first outbound dial pass. Seeds go first because a
@@ -2978,31 +4145,41 @@ impl P2PNetwork {
     /// Entries without metadata (possible only while a table is being rebuilt)
     /// are written with defaults rather than dropped, so no address is lost.
     async fn save_known_peers(&self) {
+        // 4CP-AA (X-2): best-effort wrapper for the periodic task and existing
+        // callers; `shutdown()` uses `try_save_known_peers` so a flush that
+        // cannot complete is reported as a distinct teardown error.
+        if let Err(e) = self.try_save_known_peers().await {
+            warn!("{}", e);
+        }
+    }
+
+    /// 4CP-AA (X-2): the fallible form of the peer-store flush. Returns `Ok(())`
+    /// when there is nothing to save (no configured path) or the atomic replace
+    /// succeeded; every failure is a distinct `Err` so `shutdown()` can classify
+    /// it apart from a task that did not stop. The blocking file I/O runs on a
+    /// `spawn_blocking` thread, so the `shutdown()` deadline is a real bound on
+    /// the wait (a synchronous write on the async thread could not be preempted
+    /// by `tokio::time::timeout`).
+    async fn try_save_known_peers(&self) -> Result<(), String> {
         let Some(path) = self.config.peer_store_path.clone() else {
-            return;
+            return Ok(());
         };
-        let file = {
+        // 4CP-AK (AB-1): the snapshot and its generation are taken together,
+        // under the address read lock. Two concurrent readers holding it observe
+        // the same frozen state, so a higher generation can never describe
+        // older content. All write coordination then happens on the blocking
+        // thread (see `save_peer_store_blocking`), so a cancelled await cannot
+        // drop it.
+        let (file, generation) = {
             let mgr = self.addresses.read().await;
-            mgr.to_store()
+            let generation = PEER_STORE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+            (mgr.to_store(), generation)
         };
-        let json = match serde_json::to_string(&file) {
-            Ok(j) => j,
-            Err(e) => {
-                warn!("Failed to serialize peer store: {}", e);
-                return;
-            }
-        };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let tmp = path.with_extension("json.tmp");
-        if let Err(e) = write_private_file(&tmp, &json) {
-            warn!("Failed to write peer store {:?}: {}", tmp, e);
-            return;
-        }
-        if let Err(e) = std::fs::rename(&tmp, &path) {
-            warn!("Failed to replace peer store {:?}: {}", path, e);
-        }
+        let json = serde_json::to_string(&file)
+            .map_err(|e| format!("serialize peer store: {}", e))?;
+        tokio::task::spawn_blocking(move || save_peer_store_blocking(&path, &json, generation))
+            .await
+            .map_err(|e| format!("peer-store save task failed to join: {}", e))?
     }
 
     /// Phase 1: mark a peer as currently/just known (updates TTL clock).
@@ -3562,9 +4739,14 @@ impl P2PNetwork {
                                 )
                                 .await;
                                 if ok && !p2p.is_connected(addr).await {
-                                    let p2p_clone = p2p.clone();
-                                    tokio::spawn(async move {
-                                        p2p_clone.connect_to_peer(addr).await;
+                                    // 4CP-AA (X-4): track the child dial so it is
+                                    // aborted+awaited by `shutdown()` like the
+                                    // discovery loop that spawns it, instead of
+                                    // being detached. A closed cycle refuses the
+                                    // spawn outright, so no dial outlives teardown.
+                                    let dialer = p2p.clone();
+                                    p2p.spawn_tracked(async move {
+                                        dialer.connect_to_peer(addr).await;
                                     });
                                 }
                             }
@@ -3669,9 +4851,15 @@ impl P2PNetwork {
         is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
   stake_hooks: StakeHooks,
   network_id: u64,
-        // 4CB: registry for per-peer session tasks + shutdown flag.
-        tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-        shutdown: Arc<AtomicBool>,
+        // PHASE 4CP: handshake selection + identity + verified session state.
+        protocol_mode: P2PProtocolMode,
+        node_identity: Option<Arc<crate::node_identity::NodeIdentity>>,
+        session_auth: Arc<RwLock<SessionAuthRegistry>>,
+        session_seq: Arc<AtomicU64>,
+        // 4CP-W: atomic task admission for per-peer session tasks. Replaces the
+        // former separate `tasks` registry + `shutdown` flag, whose
+        // check-then-push let a session task escape teardown.
+        admission: Arc<std::sync::Mutex<TaskAdmission>>,
     ) {
         loop {
             match listener.accept().await {
@@ -3767,14 +4955,18 @@ impl P2PNetwork {
                     let sync_ctx = Arc::clone(&sync_ctx);
                     let is_orphan = Arc::clone(&is_orphan);
   let stake_hooks = stake_hooks.clone();
-                    // 4CB: tracked session (was detached); aborted+awaited
-                    // in shutdown(). Shutdown flag refuses NEW sessions.
-                    if shutdown.load(Ordering::Relaxed) {
-                        let mut peers_lock = peers.write().await;
-                        peers_lock.remove(&addr);
-                        continue;
-                    }
-                    let session_handle = tokio::spawn(async move {
+                    // PHASE 4CP: inbound session -> this node is the responder.
+                    let node_identity = node_identity.clone();
+                    let session_auth = session_auth.clone();
+                    let session_seq = session_seq.clone();
+                    // 4CP-W: admit the session task and register its handle in
+                    // ONE atomic step. If shutdown() has already closed the
+                    // cycle, `admit_task` refuses (the future is never created,
+                    // so the stream is dropped) and we unregister the peer we
+                    // optimistically inserted. There is no separate
+                    // check-then-spawn window any more.
+                    let session_admission = admission.clone();
+                    let admitted = Self::admit_task(&admission, |generation| async move {
                         Self::handle_peer(
                             stream,
                             addr,
@@ -3794,14 +4986,22 @@ impl P2PNetwork {
                             is_orphan,
   stake_hooks,
   network_id,
+                            protocol_mode,
+                            node_identity,
+                            false,
+                            session_auth,
+                            session_seq,
+                            generation,
+                            None,
+                            session_admission,
+                            HANDSHAKE_TIMEOUT,
                         )
                         .await;
                     });
-                    match tasks.lock() {
-                        Ok(mut guard) => guard.push(session_handle),
-                        Err(e) => {
-                            e.into_inner().push(session_handle);
-                        }
+                    if !admitted {
+                        let mut peers_lock = peers.write().await;
+                        peers_lock.remove(&addr);
+                        continue;
                     }
                 }
                 Err(e) => {
@@ -4059,6 +5259,14 @@ impl P2PNetwork {
         peer_pk_bytes.copy_from_slice(&incoming[HANDSHAKE_FRAME_LEN - 32..]);
         let peer_public = PublicKey::from(peer_pk_bytes);
         let shared_secret = our_secret.diffie_hellman(&peer_public);
+        // 4CP-S / F2: reject a non-contributory X25519 result (a low-order or
+        // all-zero peer ephemeral forces the shared secret to a known value,
+        // removing our contribution to the key). A conforming peer sends a
+        // random ephemeral and is unaffected; only cryptographically invalid
+        // exchanges are refused. Verified independently of any signature.
+        if !shared_secret.was_contributory() {
+            return Err("P2P handshake: non-contributory X25519 peer key rejected".into());
+        }
 
         let mut hasher = Sha256::new();
         hasher.update(b"aether-p2p-key-v1");
@@ -4069,6 +5277,262 @@ impl P2PNetwork {
         result.copy_from_slice(&key_bytes);
         let send_dir = Self::send_direction(our_public.as_bytes(), &peer_pk_bytes);
         Ok((result, send_dir))
+    }
+
+    /// PHASE 4CP: build the canonical, role-ordered v6 transcript that both
+    /// sides must agree on byte-for-byte.
+    ///
+    /// Layout:
+    /// `domain | magic(4) | version(1) | genesis(32) | network(8 LE) |
+    ///  init_tag(1) | init_eph(32) | init_nonce(32) | init_node(32) |
+    ///  resp_tag(1) | resp_eph(32) | resp_nonce(32) | resp_node(32)`
+    ///
+    /// The initiator/responder split is fixed by the dial direction, so both
+    /// ends compute the same bytes; a signature over it therefore covers the
+    /// versions, magic, genesis, network id, BOTH ephemeral keys, BOTH nonces,
+    /// BOTH identities and the roles.
+    fn v6_transcript(network_id: u64, initiator: &V6Hello, responder: &V6Hello) -> Vec<u8> {
+        let mut t = Vec::with_capacity(
+            V6_AUTH_DOMAIN.len() + 4 + 1 + 32 + 8 + 1 + 32 + 32 + 32 + 1 + 32 + 32 + 32,
+        );
+        t.extend_from_slice(V6_AUTH_DOMAIN);
+        t.extend_from_slice(&Self::handshake_wire_magic());
+        t.push(P2P_PROTOCOL_VERSION_V6);
+        t.extend_from_slice(&crate::genesis::GENESIS_HASH);
+        t.extend_from_slice(&network_id.to_le_bytes());
+        t.push(V6_ROLE_INITIATOR);
+        t.extend_from_slice(&initiator.eph);
+        t.extend_from_slice(&initiator.nonce);
+        t.extend_from_slice(&initiator.node_id);
+        t.push(V6_ROLE_RESPONDER);
+        t.extend_from_slice(&responder.eph);
+        t.extend_from_slice(&responder.nonce);
+        t.extend_from_slice(&responder.node_id);
+        t
+    }
+
+    /// PHASE 4CP: the exact bytes each side signs. Binding the signer's role
+    /// (not just the symmetric transcript) is what makes a reflected signature
+    /// useless: the peer would have to sign the OPPOSITE role's message.
+    fn v6_signed_message(role: u8, transcript: &[u8]) -> Vec<u8> {
+        let mut m = Vec::with_capacity(V6_AUTH_DOMAIN.len() + 1 + transcript.len());
+        m.extend_from_slice(V6_AUTH_DOMAIN);
+        m.push(role);
+        m.extend_from_slice(transcript);
+        m
+    }
+
+    /// PHASE 4CP: authenticated v6 handshake.
+    ///
+    /// Symmetric two-step exchange: Hello (magic/version/genesis/network/
+    /// ephemeral/nonce/node id) each way, then an Ed25519 signature over the
+    /// role-bound transcript. The session key is domain-separated from v5 and
+    /// bound to the transcript. Returns
+    /// `(session_key, send_direction, peer_node_id)`.
+    ///
+    /// No fallback of any kind: any mismatch, malformed frame, truncated read,
+    /// timeout or invalid signature is an error that ends the session.
+    ///
+    /// 4CP-AC (4CPT-07): the whole negotiation runs under ONE global budget
+    /// (`HANDSHAKE_TIMEOUT` in production), enforced via
+    /// `handshake_v6_with_budget`. A slow peer can no longer spend a fresh full
+    /// timeout at each step.
+    /// 4CP-AC: production reaches the handshake through
+    /// `handshake_v6_with_budget` (from `handle_peer`, with `HANDSHAKE_TIMEOUT`);
+    /// this convenience wrapper (always `HANDSHAKE_TIMEOUT`) is used by the
+    /// contract tests that do not exercise a custom budget.
+    #[cfg(test)]
+    async fn handshake_v6(
+        reader: &mut (impl AsyncReadExt + Unpin),
+        writer: &mut (impl AsyncWriteExt + Unpin),
+        network_id: u64,
+        identity: &crate::node_identity::NodeIdentity,
+        is_initiator: bool,
+    ) -> Result<([u8; 32], u8, crate::node_identity::NodeId), Box<dyn std::error::Error>> {
+        Self::handshake_v6_with_budget(
+            reader,
+            writer,
+            network_id,
+            identity,
+            is_initiator,
+            HANDSHAKE_TIMEOUT,
+        )
+        .await
+    }
+
+    /// 4CP-AC (4CPT-07): run one v6 handshake I/O step under the SINGLE global
+    /// deadline captured at handshake entry. `remaining` is recomputed from the
+    /// absolute deadline on every call, so progress on an earlier step (a
+    /// completed write, a partial read) never resets or extends the budget: a
+    /// slow peer cannot spend a fresh full per-step timeout at each stage.
+    ///
+    /// Distinguishes the two failure classes: an I/O error (peer disconnected
+    /// or malformed stream) surfaces as `... failed: <io error>`, while expiry
+    /// of the shared budget surfaces as `... timeout during <step>`.
+    async fn handshake_io<F, T>(
+        deadline: tokio::time::Instant,
+        what: &str,
+        op: F,
+    ) -> Result<T, Box<dyn std::error::Error>>
+    where
+        F: std::future::Future<Output = std::io::Result<T>>,
+    {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, op).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(format!("P2P v6 handshake {} failed: {}", what, e).into()),
+            Err(_) => Err(format!("P2P v6 handshake timeout during {}", what).into()),
+        }
+    }
+
+    /// 4CP-AC (4CPT-07): the v6 handshake with an explicit GLOBAL budget.
+    ///
+    /// Production calls it with `HANDSHAKE_TIMEOUT`; tests call it with a short
+    /// budget to prove a slow peer cannot cumulate several per-step timeouts.
+    /// The whole negotiation — Hello write/flush, 5-byte prefix read, Hello
+    /// rest read, signature write/flush and signature read — shares ONE
+    /// absolute deadline armed here, at entry, so a peer that dribbles data
+    /// step by step is bounded by the total, not by the slowest single read.
+    async fn handshake_v6_with_budget(
+        reader: &mut (impl AsyncReadExt + Unpin),
+        writer: &mut (impl AsyncWriteExt + Unpin),
+        network_id: u64,
+        identity: &crate::node_identity::NodeIdentity,
+        is_initiator: bool,
+        budget: Duration,
+    ) -> Result<([u8; 32], u8, crate::node_identity::NodeId), Box<dyn std::error::Error>> {
+        use crate::node_identity::{verify_message, NodeId};
+
+        // The one and only deadline for this handshake.
+        let deadline = tokio::time::Instant::now() + budget;
+
+        let our_secret = EphemeralSecret::random_from_rng(OsRng);
+        let our_public = PublicKey::from(&our_secret);
+        let mut our_nonce = [0u8; 32];
+        OsRng.fill_bytes(&mut our_nonce);
+        let our_node_id = identity.node_id();
+        let ours = V6Hello {
+            eph: *our_public.as_bytes(),
+            nonce: our_nonce,
+            node_id: *our_node_id.as_bytes(),
+        };
+
+        // --- Step A: Hello ---
+        let mut outgoing = Vec::with_capacity(V6_HELLO_LEN);
+        outgoing.extend_from_slice(&Self::handshake_wire_magic());
+        outgoing.push(P2P_PROTOCOL_VERSION_V6);
+        outgoing.extend_from_slice(&crate::genesis::GENESIS_HASH);
+        outgoing.extend_from_slice(&network_id.to_le_bytes());
+        outgoing.extend_from_slice(&ours.eph);
+        outgoing.extend_from_slice(&ours.nonce);
+        outgoing.extend_from_slice(&ours.node_id);
+        debug_assert_eq!(outgoing.len(), V6_HELLO_LEN);
+        Self::handshake_io(deadline, "Hello write", writer.write_all(&outgoing)).await?;
+        Self::handshake_io(deadline, "Hello flush", writer.flush()).await?;
+
+        // 4CP-S / F7: read the fixed 5-byte prefix (magic + version) first, so
+        // an incompatible peer is rejected immediately instead of waiting the
+        // whole Hello budget for 136 bytes it will never send. Only the v6 read
+        // path changes; the channel is still cleartext, so no encrypted byte is
+        // consumed. Magic and version remain strictly checked.
+        //
+        // 4CP-AC: the prefix read and the rest read draw on the SAME deadline
+        // armed above, so the fast-reject behaviour is preserved without giving
+        // the peer a second full budget after the prefix.
+        let mut incoming = [0u8; V6_HELLO_LEN];
+        Self::handshake_io(
+            deadline,
+            "Hello prefix read",
+            reader.read_exact(&mut incoming[..5]),
+        )
+        .await?;
+        if incoming[..4] != Self::handshake_wire_magic() {
+            return Err("P2P v6 handshake: invalid magic (not an Aether node)".into());
+        }
+        if incoming[4] != P2P_PROTOCOL_VERSION_V6 {
+            return Err(format!(
+                "P2P v6 handshake: peer protocol version {} is not v{}",
+                incoming[4], P2P_PROTOCOL_VERSION_V6
+            )
+            .into());
+        }
+        Self::handshake_io(deadline, "Hello read", reader.read_exact(&mut incoming[5..])).await?;
+
+        if incoming[5..37] != crate::genesis::GENESIS_HASH {
+            return Err("P2P v6 handshake: peer genesis hash differs from ours".into());
+        }
+        let mut net = [0u8; 8];
+        net.copy_from_slice(&incoming[37..45]);
+        if u64::from_le_bytes(net) != network_id {
+            return Err("P2P v6 handshake: peer network id differs from ours".into());
+        }
+        let mut peer = V6Hello {
+            eph: [0u8; 32],
+            nonce: [0u8; 32],
+            node_id: [0u8; 32],
+        };
+        peer.eph.copy_from_slice(&incoming[45..77]);
+        peer.nonce.copy_from_slice(&incoming[77..109]);
+        peer.node_id.copy_from_slice(&incoming[109..141]);
+        let peer_node_id = NodeId::from_bytes(peer.node_id);
+
+        // --- Step B: transcript + signatures ---
+        let (initiator, responder) = if is_initiator {
+            (&ours, &peer)
+        } else {
+            (&peer, &ours)
+        };
+        let transcript = Self::v6_transcript(network_id, initiator, responder);
+        let our_role = if is_initiator {
+            V6_ROLE_INITIATOR
+        } else {
+            V6_ROLE_RESPONDER
+        };
+        let peer_role = if is_initiator {
+            V6_ROLE_RESPONDER
+        } else {
+            V6_ROLE_INITIATOR
+        };
+
+        let our_sig = identity.sign_message(&Self::v6_signed_message(our_role, &transcript));
+        Self::handshake_io(deadline, "signature write", writer.write_all(&our_sig)).await?;
+        Self::handshake_io(deadline, "signature flush", writer.flush()).await?;
+
+        let mut peer_sig = [0u8; V6_SIG_LEN];
+        Self::handshake_io(
+            deadline,
+            "signature read",
+            reader.read_exact(&mut peer_sig),
+        )
+        .await?;
+
+        let peer_message = Self::v6_signed_message(peer_role, &transcript);
+        if !verify_message(&peer_node_id, &peer_message, &peer_sig) {
+            return Err(format!(
+                "P2P v6 handshake: invalid Ed25519 signature for peer {}",
+                peer_node_id
+            )
+            .into());
+        }
+
+        // --- Session key: domain-separated from v5 and bound to the transcript ---
+        let peer_public = PublicKey::from(peer.eph);
+        let shared_secret = our_secret.diffie_hellman(&peer_public);
+        // 4CP-S / F2: reject a non-contributory X25519 result. This is checked
+        // independently of the Ed25519 signature: a valid identity can still
+        // sign a transcript carrying a low-order ephemeral, so the signature is
+        // NOT a substitute for this check.
+        if !shared_secret.was_contributory() {
+            return Err("P2P v6 handshake: non-contributory X25519 peer key rejected".into());
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(V6_KEY_DOMAIN);
+        hasher.update(shared_secret.as_bytes());
+        hasher.update(Sha256::digest(&transcript));
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&hasher.finalize());
+        let send_dir = Self::send_direction(our_public.as_bytes(), &peer.eph);
+        Ok((key, send_dir, peer_node_id))
     }
 
     /// Handle a peer connection
@@ -4091,18 +5555,72 @@ impl P2PNetwork {
         is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
   stake_hooks: StakeHooks,
   network_id: u64,
+        // PHASE 4CP: handshake selection + identity + verified session state.
+        protocol_mode: P2PProtocolMode,
+        node_identity: Option<Arc<crate::node_identity::NodeIdentity>>,
+        is_initiator: bool,
+        session_auth: Arc<RwLock<SessionAuthRegistry>>,
+        session_seq: Arc<AtomicU64>,
+        // 4CP-W: the network cycle this session was admitted into. Every
+        // record/clear below is refused if the registry has moved on (cycle
+        // closed, or a newer generation started).
+        generation: u64,
+        // 4CP-Y (tests): a rendezvous installed only by a test that drives a
+        // real `handle_peer` against a concurrent `shutdown()`. `None` on every
+        // production path.
+        record_gate: Option<Arc<StartGate>>,
+        // 4CP-AA (X-4): the cycle's admission control, so the per-session send
+        // task is registered in the SAME set `shutdown()` aborts+awaits rather
+        // than being left detached. A refused admission (cycle already closed)
+        // simply drops the send half without creating a task.
+        admission: Arc<std::sync::Mutex<TaskAdmission>>,
+        // 4CP-AC (4CPT-07): the GLOBAL budget for the v6 handshake this session
+        // will run. Production passes `HANDSHAKE_TIMEOUT`; tests pass a short
+        // one to prove the total (not per-step) bound and the teardown on
+        // expiry. The v5 path ignores it (its historical timeouts are unchanged).
+        handshake_budget: Duration,
     ) {
+        let _ = &record_gate;
+        // 4CP-S: this session's unique id. Every record/clear below is keyed by
+        // it, never by `addr` — two live sessions can share one endpoint.
+        let session_id = session_seq.fetch_add(1, Ordering::Relaxed);
         // Split stream into read and write halves (both owned, so the write
         // half can be moved into the send task below).
         let (mut reader, mut writer) = stream.into_split();
 
-        // Perform encrypted handshake (X25519 key exchange)
-        let (key_bytes, send_dir) = match Self::handshake(&mut reader, &mut writer, network_id)
-            .await
-            .map_err(|e| e.to_string())
-        {
+        // PHASE 4CP: perform the configured handshake. `AuthenticatedV6`
+        // requires a node identity and NEVER falls back to v5; a legacy peer
+        // (or any error) simply fails the session. The legacy path keeps the
+        // historical 77-byte v5 handshake untouched.
+        let handshake_result = match protocol_mode {
+            P2PProtocolMode::LegacyV5 => Self::handshake(&mut reader, &mut writer, network_id)
+                .await
+                .map(|(k, d)| (k, d, None))
+                .map_err(|e| e.to_string()),
+            P2PProtocolMode::AuthenticatedV6 => match node_identity.as_ref() {
+                Some(identity) => Self::handshake_v6_with_budget(
+                    &mut reader,
+                    &mut writer,
+                    network_id,
+                    identity,
+                    is_initiator,
+                    handshake_budget,
+                )
+                .await
+                .map(|(k, d, nid)| (k, d, Some(nid)))
+                .map_err(|e| e.to_string()),
+                None => Err(
+                    "P2P v6 mode requires a node identity; refusing to fall back to v5".to_string(),
+                ),
+            },
+        };
+
+        let (key_bytes, send_dir, peer_node_id) = match handshake_result {
             Ok(k) => {
-                info!("🔐 P2P encrypted handshake complete with {}", addr);
+                info!(
+                    "🔐 P2P handshake complete with {} (mode={:?})",
+                    addr, protocol_mode
+                );
                 k
             }
             Err(msg) => {
@@ -4111,6 +5629,10 @@ impl P2PNetwork {
                     let mut peers_lock = peers.write().await;
                     peers_lock.remove(&addr);
                 }
+                // 4CP-S: a failed handshake records NO session state at all —
+                // there is nothing to clear later, and a later reconnect gets a
+                // fresh id with no inherited provenance. The session id itself
+                // is never reused, so no stale entry can alias this one.
                 // Phase 1: do NOT drop the address from known_peers on a failed
                 // handshake — keep it for a later redial attempt. Stamping the
                 // TTL clock here is what keeps it alive to be retried.
@@ -4118,6 +5640,34 @@ impl P2PNetwork {
                 return;
             }
         };
+        // 4CP-Y (tests): park a real session at the exact point just before its
+        // registration, so a test can close the cycle and prove the late record
+        // is refused on the production code path.
+        #[cfg(test)]
+        {
+            if let Some(gate) = record_gate.as_ref() {
+                gate.arrived.notify_one();
+                gate.release.notified().await;
+            }
+        }
+        // PHASE 4CP + 4CP-W: record the verified provenance of this session,
+        // under its exact id — but ONLY if this cycle's registry is still open
+        // and still ours. A legacy session is explicitly unauthenticated; only
+        // a verified v6 signature yields `Authenticated`. A handshake that
+        // reached this point after `shutdown()` closed the cycle (or after a
+        // newer generation started) is refused and torn down here: no residual
+        // session, no half-open peer.
+        let recorded = session_auth.write().await.record_if_active(
+            generation,
+            session_id,
+            addr,
+            Self::session_auth_for(peer_node_id),
+        );
+        if !recorded {
+            let mut peers_lock = peers.write().await;
+            peers_lock.remove(&addr);
+            return;
+        }
         // Phase 2B: the encrypted handshake completed, so this address is a
         // proven reachable peer — the input to `Recent` categorisation and to
         // anchor candidacy.
@@ -4133,7 +5683,15 @@ impl P2PNetwork {
         let send_counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let send_counter_clone = Arc::clone(&send_counter);
         let send_dir_task = send_dir;
-        tokio::spawn(async move {
+        // 4CP-AA (X-4): the send task owns the socket's write half, so it must
+        // stop with the cycle. Register it through the SAME admission control
+        // as every other tracked task, so `shutdown()` aborts AND awaits it
+        // instead of leaving a detached writer behind. If the cycle is already
+        // closed (shutdown won the race), `admit_task` refuses without calling
+        // the closure, and the captured `writer`/`msg_receiver` are dropped —
+        // the socket is released and no task is created.
+        let send_admission = Arc::clone(&admission);
+        let _ = Self::admit_task(&send_admission, move |_generation| async move {
             while let Some(msg) = msg_receiver.recv().await {
                 let cipher = {
                     let key = Key::from_slice(key_enc.as_ref());
@@ -4173,18 +5731,28 @@ impl P2PNetwork {
                             Self::padded_total_len(msg.len()),
                             "padded frame length must match the declared layout"
                         );
-                        if writer
-                            .write_all(&(total_len as u32).to_be_bytes())
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                        if writer.write_all(nonce).await.is_err() {
-                            break;
-                        }
-                        if writer.write_all(&ciphertext).await.is_err() {
-                            break;
+                        // 4CP-Y (X-4): bound every write. A peer that stops
+                        // reading would otherwise pin this detached task (and
+                        // its write half) forever; on timeout the task ends and
+                        // the socket is released.
+                        let write = tokio::time::timeout(SESSION_WRITE_TIMEOUT, async {
+                            writer
+                                .write_all(&(total_len as u32).to_be_bytes())
+                                .await?;
+                            writer.write_all(nonce).await?;
+                            writer.write_all(&ciphertext).await
+                        })
+                        .await;
+                        match write {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => break,
+                            Err(_) => {
+                                warn!(
+                                    "Dropping session with {}: write timed out after {:?}",
+                                    addr, SESSION_WRITE_TIMEOUT
+                                );
+                                break;
+                            }
                         }
                     }
                     Err(e) => {
@@ -5017,6 +6585,11 @@ impl P2PNetwork {
             let mut peers_lock = peers.write().await;
             peers_lock.remove(&addr);
         }
+        // PHASE 4CP-S + 4CP-W: drop exactly THIS session's provenance, and only
+        // if it still belongs to our cycle. Keyed by id (and guarded by the
+        // generation), so a late teardown can never erase a newer session at
+        // the same address nor touch a later cycle's registry.
+        session_auth.write().await.clear_if_active(generation, session_id);
         {
             let mut mgr = addresses.write().await;
             mgr.touch(addr, Instant::now());
@@ -5067,6 +6640,18 @@ impl P2PNetwork {
 
     async fn connect_to_peer_inner(&self, addr: SocketAddr) {
         info!("Dialing peer: {}", addr);
+
+        // 4CP-Y (X-3): refuse to open a session unless a live cycle has frozen
+        // the handshake choice. Before start() (or after a failed start / a
+        // shutdown) there is no snapshot and no operational cycle, so a dial
+        // must not proceed with an implicit mode.
+        let (protocol_mode, node_identity) = match self.started_config() {
+            Some(cfg) => cfg,
+            None => {
+                debug!("Refusing dial to {}: no live network cycle", addr);
+                return;
+            }
+        };
 
         if self.outbound_dial_blocked(addr).await {
             let until = self.addresses.read().await.banned_until(addr);
@@ -5147,6 +6732,11 @@ impl P2PNetwork {
                 let is_orphan = Arc::clone(&self.is_orphan);
   let stake_hooks = self.stake_hooks.clone();
   let network_id = self.config.network_id;
+                // PHASE 4CP-U: the handshake choice comes from the frozen
+                // start snapshot captured at the top of this function, so the
+                // outbound handshake matches the accept loop.
+                let session_auth = self.session_auth.clone();
+                let session_seq = self.session_seq.clone();
                 let peer_discovery_tx = {
                     let guard = self.peer_discovery_tx.lock().await;
                     guard.clone().unwrap_or_else(|| {
@@ -5155,47 +6745,56 @@ impl P2PNetwork {
                     })
                 };
                 let outbound_sessions = self.outbound_sessions.clone();
-                // 4CB: tracked session (was detached).
-                let session_tasks = self.tasks.clone();
-                let session_shutdown = self.shutdown.clone();
-                if session_shutdown.load(Ordering::Relaxed) {
+                // 4CP-W: admit the session task and register its handle in ONE
+                // atomic step (as on the inbound path). If shutdown() already
+                // closed the cycle, `admit_task` refuses — the future is never
+                // created and the peer we optimistically inserted is removed.
+                let peers_for_session = peers.clone();
+                // 4CP-AA (X-4/Y-5): capture this cycle's admission for the
+                // per-session send task, and consume the test-only outbound
+                // registration rendezvous (`None` in production).
+                let session_admission = self.admission.clone();
+                let outbound_record_gate = self.take_outbound_record_gate();
+                let admitted = Self::admit_task(&self.admission, |generation| async move {
+                    Self::handle_peer(
+                        stream,
+                        addr,
+                        peers_for_session,
+                        local_addr,
+                        addresses,
+                        tx_channel,
+                        get_dag_hashes,
+                        get_transaction_by_hash,
+                        get_tips,
+                        seen_transactions,
+                        propagation_state,
+                        msg_sender,
+                        msg_receiver,
+                        peer_discovery_tx,
+                        sync_ctx,
+                        is_orphan,
+                        stake_hooks,
+                        network_id,
+                        protocol_mode,
+                        node_identity,
+                        true,
+                        session_auth,
+                        session_seq,
+                        generation,
+                        outbound_record_gate,
+                        session_admission,
+                        HANDSHAKE_TIMEOUT,
+                    )
+                    .await;
+                    // Phase 2C: release the reservation only once the session
+                    // is really gone. Cleaning up here rather than inside
+                    // `handle_peer` keeps `handle_peer`'s signature — and
+                    // therefore the inbound path — untouched.
+                    outbound_sessions.write().await.remove(&addr);
+                });
+                if !admitted {
                     let mut peers_lock = peers.write().await;
                     peers_lock.remove(&addr);
-                } else {
-                    let session_handle = tokio::spawn(async move {
-                        Self::handle_peer(
-                            stream,
-                            addr,
-                            peers,
-                            local_addr,
-                            addresses,
-                            tx_channel,
-                            get_dag_hashes,
-                            get_transaction_by_hash,
-                            get_tips,
-                            seen_transactions,
-                            propagation_state,
-                            msg_sender,
-                            msg_receiver,
-                            peer_discovery_tx,
-                            sync_ctx,
-                            is_orphan,
-                            stake_hooks,
-                            network_id,
-                        )
-                        .await;
-                        // Phase 2C: release the reservation only once the session
-                        // is really gone. Cleaning up here rather than inside
-                        // `handle_peer` keeps `handle_peer`'s signature — and
-                        // therefore the inbound path — untouched.
-                        outbound_sessions.write().await.remove(&addr);
-                    });
-                    match session_tasks.lock() {
-                        Ok(mut guard) => guard.push(session_handle),
-                        Err(e) => {
-                            e.into_inner().push(session_handle);
-                        }
-                    }
                 }
             }
             Ok(Err(e)) => {
@@ -5294,6 +6893,13 @@ impl P2PNetwork {
             let task_inflight = Arc::clone(&inflight);
             let task_msg = msg_bytes.clone();
             task_inflight.fetch_add(1, Ordering::Relaxed);
+            // 4CP-AA (X-4): deliberately DETACHED. A relay holds no socket, no
+            // session and no registry entry — only a clone of one peer's
+            // outbound channel plus a copy of the payload — and completes within
+            // `PROPAGATION_JITTER_MAX` (250 ms) with a single non-blocking
+            // `send`. It cannot open a connection, register a session or touch a
+            // later cycle, and tracking one handle per fan-out per broadcast
+            // would grow the teardown set without bound on a busy node.
             tokio::spawn(async move {
                 // The jitter IS the countermeasure: `relay_t - receive_t` is
                 // > 0 and differs per neighbour, so no two links show the same
@@ -5393,6 +6999,9 @@ impl P2PNetwork {
   let task_inflight = Arc::clone(&inflight);
   let task_msg = msg_bytes.clone();
   task_inflight.fetch_add(1, Ordering::Relaxed);
+        // 4CP-AA (X-4): deliberately DETACHED — same reasoning as the
+        // transaction relay above (no socket/session/registry, bounded by the
+        // jitter, non-blocking send).
         tokio::spawn(async move {
   tokio::time::sleep(delay).await;
   if sender.send(task_msg).is_err() {
@@ -8438,6 +10047,9 @@ mod phase2_self_healing_tests {
         let bootnode = addr("127.0.0.1:9"); // present in config, answers nothing
 
         let net = net_with(vec![bootnode]);
+        // 4CP-Y: this harness drives the real dial path (recovery_round), which
+        // now requires a live cycle snapshot instead of an implicit mode.
+        net.open_cycle_for_test(P2PProtocolMode::LegacyV5).await;
         {
             let mut mgr = net.addresses.write().await;
             for a in &peers_live {
@@ -8512,6 +10124,8 @@ mod phase2_self_healing_tests {
 
         // Restart: zero sessions, store and anchors on disk.
         let net = net_at(path.clone());
+        // 4CP-Y: arm a live test cycle so the real recovery dial path can run.
+        net.open_cycle_for_test(P2PProtocolMode::LegacyV5).await;
         assert_eq!(net.peer_count().await, 0);
         net.load_known_peers().await;
 
@@ -12014,6 +13628,8 @@ mod phase4ch_pex_wiring_tests {
             e.failures = MAX_DIAL_FAILURES_SLEEP * 2 + 2; // 12: asleep, room to observe a wrong double-halving (3)
             e.last_success = None;
         }
+        // 4CP-W (V-3): the protocol mode is now an explicit prerequisite.
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
         net.start()
             .await
             .expect("start must bind the loopback listener");
@@ -12167,5 +13783,2244 @@ mod phase4ch_pex_wiring_tests {
         let table_len = net.addresses.read().await.addresses().len();
         assert!(table_len <= 3, "address table bounded: {}", table_len);
         drop(net);
+    }
+
+    // =====================================================================
+    // PHASE 4CP-U (4CPT-04): real loopback lifecycle tests.
+    //
+    // These drive the production accept path (`start()` -> `accept_loop` ->
+    // `handle_peer`) over genuine TCP sockets, so the session registry is
+    // exercised end to end, not through the test-only accessors alone.
+    // =====================================================================
+
+    /// Build a real loopback network for the 4CP-U lifecycle tests.
+    fn cpu_net(port: u16) -> P2PNetwork {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
+        let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> = Arc::new(|_| None);
+        P2PNetwork::new(
+            P2PConfig {
+                listen_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
+                bootnodes: vec![],
+                dns_seeds: vec![],
+                peer_store_path: None,
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+            },
+            tx,
+            empty.clone(),
+            empty_opt,
+            empty,
+            Arc::new(SyncContext::default()),
+            Arc::new(|_| false),
+        )
+    }
+
+    /// 4CPT-04(1): a real connection whose handshake fails records no session
+    /// and keeps no peer — the failure path writes nothing to the registry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cpu_failed_handshake_leaves_no_session() {
+        const P: u16 = 44912;
+        let net = cpu_net(P);
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        net.start().await.expect("bind loopback");
+
+        // A full-length frame with broken magic: the server's v5 handshake
+        // rejects it immediately (no 10s stall waiting for more bytes).
+        let junk = vec![0u8; HANDSHAKE_FRAME_LEN];
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", P))
+            .await
+            .expect("connect");
+        sock.write_all(&junk).await.expect("write junk frame");
+        sock.flush().await.expect("flush");
+        // Drain the server's own frame so the socket never wedges, then let
+        // `handle_peer` run its failure teardown.
+        let mut sink = [0u8; HANDSHAKE_FRAME_LEN];
+        let _ = tokio::time::timeout(
+            StdDuration::from_secs(2),
+            tokio::io::AsyncReadExt::read(&mut sock, &mut sink),
+        )
+        .await;
+        tokio::time::sleep(StdDuration::from_millis(300)).await;
+
+        assert_eq!(
+            net.session_auth_len().await,
+            0,
+            "a failed handshake must record no session state"
+        );
+        assert_eq!(
+            net.peer_count().await,
+            0,
+            "no peer is kept when the handshake fails"
+        );
+        drop(sock);
+        let _ = net.shutdown().await;
+    }
+
+    /// 4CPT-04(2/3): two real concurrent sessions are independent — distinct
+    /// ids, their own state — and closing one never removes the other.
+    ///
+    /// Same-endpoint isolation is covered at the registry level by
+    /// `two_sessions_same_addr_do_not_overwrite`: two TCP connections from one
+    /// host necessarily use distinct source ports, so they are distinct
+    /// endpoints here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cpu_real_sessions_are_independent() {
+        const P: u16 = 44913;
+        let net = cpu_net(P);
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        net.start().await.expect("bind loopback");
+
+        let p1 = RawPeer::connect(P).await;
+        wait_for("first session", StdDuration::from_secs(10), || async {
+            net.session_auth_len().await == 1
+        })
+        .await;
+        let p2 = RawPeer::connect(P).await;
+        wait_for("second session", StdDuration::from_secs(10), || async {
+            net.session_auth_len().await == 2
+        })
+        .await;
+
+        let before: Vec<SocketAddr> = net.get_peers().await;
+        assert_eq!(before.len(), 2, "two live peers");
+        let mut before_ids: Vec<(SocketAddr, u64)> = Vec::new();
+        for a in &before {
+            let entries = net.session_auth_for_addr(a).await;
+            assert_eq!(entries.len(), 1, "one session per endpoint here");
+            before_ids.push((*a, entries[0].0));
+        }
+        assert_ne!(
+            before_ids[0].1, before_ids[1].1,
+            "the two sessions have distinct ids"
+        );
+
+        // Close ONE real connection and prove the other survives untouched.
+        drop(p1);
+        wait_for(
+            "one session after closing one peer",
+            StdDuration::from_secs(10),
+            || async { net.session_auth_len().await == 1 },
+        )
+        .await;
+        let mut alive: Vec<SocketAddr> = Vec::new();
+        for a in &before {
+            if !net.session_auth_for_addr(a).await.is_empty() {
+                alive.push(*a);
+            }
+        }
+        assert_eq!(alive.len(), 1, "exactly one session survives");
+        let surviving_id = net.session_auth_for_addr(&alive[0]).await[0].0;
+        let expected = before_ids
+            .iter()
+            .find(|(a, _)| *a == alive[0])
+            .map(|(_, id)| *id)
+            .expect("survivor was known before");
+        assert_eq!(
+            surviving_id, expected,
+            "closing one session never removes the other"
+        );
+
+        drop(p2);
+        let _ = net.shutdown().await;
+    }
+
+    /// 4CPT-04(4): a reconnect gets a FRESH session id and inherits no prior
+    /// provenance (a legacy session is never authenticated).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cpu_real_reconnect_does_not_inherit() {
+        const P: u16 = 44914;
+        let net = cpu_net(P);
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        net.start().await.expect("bind loopback");
+
+        let p1 = RawPeer::connect(P).await;
+        wait_for("first session", StdDuration::from_secs(10), || async {
+            net.session_auth_len().await == 1
+        })
+        .await;
+        let first_addr = net.get_peers().await[0];
+        let (id1, state1) = net.session_auth_for_addr(&first_addr).await[0].clone();
+        assert_eq!(
+            state1,
+            P2PSessionAuth::EncryptedUnauthenticated,
+            "a legacy session is never authenticated"
+        );
+        drop(p1);
+        wait_for("session released", StdDuration::from_secs(10), || async {
+            net.session_auth_len().await == 0
+        })
+        .await;
+
+        let p2 = RawPeer::connect(P).await;
+        wait_for("reconnect session", StdDuration::from_secs(10), || async {
+            net.session_auth_len().await == 1
+        })
+        .await;
+        let second_addr = net.get_peers().await[0];
+        let (id2, state2) = net.session_auth_for_addr(&second_addr).await[0].clone();
+        assert_ne!(id2, id1, "a reconnect gets a fresh session id");
+        assert_eq!(
+            state2,
+            P2PSessionAuth::EncryptedUnauthenticated,
+            "a reconnect inherits no prior provenance"
+        );
+        drop(p2);
+        let _ = net.shutdown().await;
+    }
+
+    /// 4CPT-04(5): shutdown tears down the live session and releases the port.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cpu_real_shutdown_clears_sessions() {
+        const P: u16 = 44915;
+        let net = cpu_net(P);
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        net.start().await.expect("bind loopback");
+
+        let p = RawPeer::connect(P).await;
+        wait_for("session", StdDuration::from_secs(10), || async {
+            net.session_auth_len().await == 1
+        })
+        .await;
+
+        tokio::time::timeout(StdDuration::from_secs(15), net.shutdown())
+            .await
+            .expect("shutdown must not hang")
+            .expect("shutdown must succeed");
+        assert_eq!(
+            net.session_auth_len().await,
+            0,
+            "shutdown releases every session"
+        );
+        assert_eq!(net.peer_count().await, 0, "shutdown drops every peer");
+        std::net::TcpListener::bind(format!("127.0.0.1:{}", P))
+            .expect("port must be released after shutdown");
+        drop(p);
+    }
+}
+
+/// PHASE 4CP: contract tests for the authenticated v6 handshake.
+///
+/// Every test drives the REAL handshake code (`handshake_v6` / `handshake`)
+/// over an in-memory duplex; the `fake_peer` below speaks the actual v6 wire
+/// format so a tampered frame is rejected by production verification, not by
+/// a re-implementation.
+#[cfg(test)]
+mod phase4cp_v6_tests {
+    use super::*;
+    use crate::node_identity::{IdentityOutcome, NodeIdentity};
+    use rand::rngs::OsRng;
+    use rand::RngCore;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use x25519_dalek::{EphemeralSecret, PublicKey};
+
+    #[derive(Clone, Copy)]
+    enum Tamper {
+        None,
+        BadSig,
+        WrongRole,
+        WrongNetwork,
+        WrongGenesis,
+        OtherKey,
+        Replay([u8; 64]),
+        /// Send an all-zero (low-order) X25519 ephemeral with a VALID signature
+        /// over the resulting transcript (4CP-S / F2).
+        LowOrderEph,
+    }
+
+    /// Build the exact v6 Hello bytes for chosen fields (mirrors the wire
+    /// layout asserted by `V6_HELLO_LEN`).
+    fn hello_bytes(network_id: u64, h: &super::V6Hello) -> Vec<u8> {
+        let mut v = Vec::with_capacity(V6_HELLO_LEN);
+        v.extend_from_slice(&P2PNetwork::handshake_wire_magic());
+        v.push(P2P_PROTOCOL_VERSION_V6);
+        v.extend_from_slice(&crate::genesis::GENESIS_HASH);
+        v.extend_from_slice(&network_id.to_le_bytes());
+        v.extend_from_slice(&h.eph);
+        v.extend_from_slice(&h.nonce);
+        v.extend_from_slice(&h.node_id);
+        debug_assert_eq!(v.len(), V6_HELLO_LEN);
+        v
+    }
+
+    /// A peer that speaks the real v6 wire format. Returns the 64-byte
+    /// signature it sent (used by the replay test).
+    async fn fake_peer<R, W>(
+        reader: &mut R,
+        writer: &mut W,
+        network_id: u64,
+        identity: &NodeIdentity,
+        is_initiator: bool,
+        tamper: Tamper,
+    ) -> [u8; 64]
+    where
+        R: AsyncReadExt + Unpin,
+        W: AsyncWriteExt + Unpin,
+    {
+        let secret = EphemeralSecret::random_from_rng(OsRng);
+        let pubk = PublicKey::from(&secret);
+        let mut nonce = [0u8; 32];
+        OsRng.fill_bytes(&mut nonce);
+        let nid = identity.node_id();
+        let ours = super::V6Hello {
+            eph: match tamper {
+                Tamper::LowOrderEph => [0u8; 32],
+                _ => *pubk.as_bytes(),
+            },
+            nonce,
+            node_id: *nid.as_bytes(),
+        };
+
+        let mut hello = hello_bytes(network_id, &ours);
+        match tamper {
+            Tamper::WrongNetwork => {
+                hello[37..45].copy_from_slice(&network_id.wrapping_add(1).to_le_bytes())
+            }
+            Tamper::WrongGenesis => hello[5] ^= 0xff,
+            _ => {}
+        }
+        writer.write_all(&hello).await.unwrap();
+        writer.flush().await.unwrap();
+
+        let mut inc = [0u8; V6_HELLO_LEN];
+        reader.read_exact(&mut inc).await.unwrap();
+        let theirs = super::V6Hello {
+            eph: {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&inc[45..77]);
+                a
+            },
+            nonce: {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&inc[77..109]);
+                a
+            },
+            node_id: {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&inc[109..141]);
+                a
+            },
+        };
+
+        let (initiator, responder) = if is_initiator {
+            (&ours, &theirs)
+        } else {
+            (&theirs, &ours)
+        };
+        let transcript = P2PNetwork::v6_transcript(network_id, initiator, responder);
+        let role = if is_initiator {
+            V6_ROLE_INITIATOR
+        } else {
+            V6_ROLE_RESPONDER
+        };
+        let sign_role = match tamper {
+            Tamper::WrongRole => {
+                if role == V6_ROLE_INITIATOR {
+                    V6_ROLE_RESPONDER
+                } else {
+                    V6_ROLE_INITIATOR
+                }
+            }
+            _ => role,
+        };
+        let message = P2PNetwork::v6_signed_message(sign_role, &transcript);
+
+        let sig = match tamper {
+            Tamper::Replay(s) => s,
+            Tamper::OtherKey => NodeIdentity::generate().sign_message(&message),
+            Tamper::BadSig => {
+                let mut s = identity.sign_message(&message);
+                s[0] ^= 0xff;
+                s
+            }
+            _ => identity.sign_message(&message),
+        };
+        writer.write_all(&sig).await.unwrap();
+        writer.flush().await.unwrap();
+        sig
+    }
+
+    fn duplex_pair() -> (
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+    ) {
+        let (a_r, b_w) = tokio::io::duplex(512);
+        let (b_r, a_w) = tokio::io::duplex(512);
+        (a_r, a_w, b_r, b_w)
+    }
+
+    /// Contract 1: two v6 nodes mutually authenticate and share a session key.
+    #[tokio::test]
+    async fn v6_mutual_authentication_succeeds() {
+        let a_id = NodeIdentity::generate();
+        let b_id = NodeIdentity::generate();
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+        let a = P2PNetwork::handshake_v6(&mut a_r, &mut a_w, 0, &a_id, true);
+        let b = P2PNetwork::handshake_v6(&mut b_r, &mut b_w, 0, &b_id, false);
+        let (ra, rb) = tokio::join!(a, b);
+        let (ka, da, pa) = ra.expect("A must authenticate");
+        let (kb, db, pb) = rb.expect("B must authenticate");
+        assert_eq!(ka, kb, "both ends derive the same v6 session key");
+        assert_ne!(da, db, "send directions must be opposite");
+        assert_eq!(pa, b_id.node_id(), "A learned B's real NodeId");
+        assert_eq!(pb, a_id.node_id(), "B learned A's real NodeId");
+        // The v6 key must be domain-separated from the v5 derivation.
+        let (mut c_r, mut c_w, mut d_r, mut d_w) = duplex_pair();
+        let cv5 = P2PNetwork::handshake(&mut c_r, &mut c_w, 0);
+        let dv5 = P2PNetwork::handshake(&mut d_r, &mut d_w, 0);
+        let (rc, rd) = tokio::join!(cv5, dv5);
+        let (kv5, _) = rc.expect("v5 handshake");
+        let (kv5b, _) = rd.expect("v5 handshake");
+        assert_eq!(kv5, kv5b);
+        assert_ne!(ka, kv5, "v6 and v5 keys must differ (domain separation)");
+    }
+
+    /// Contract 4: the legacy v5 path is unchanged (77-byte frame, v5 key).
+    #[tokio::test]
+    async fn v5_legacy_handshake_unchanged() {
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+        let a = P2PNetwork::handshake(&mut a_r, &mut a_w, 0);
+        let b = P2PNetwork::handshake(&mut b_r, &mut b_w, 0);
+        let (ra, rb) = tokio::join!(a, b);
+        let (ka, da) = ra.expect("v5 A");
+        let (kb, db) = rb.expect("v5 B");
+        assert_eq!(ka, kb);
+        assert_ne!(da, db);
+    }
+
+    /// Contract 5: an authenticated v6 node and a v5 peer fail BOTH sides —
+    /// no silent downgrade is possible.
+    #[tokio::test]
+    async fn v6_and_v5_peers_fail_both_ends() {
+        let a_id = NodeIdentity::generate();
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+        let six = P2PNetwork::handshake_v6(&mut a_r, &mut a_w, 0, &a_id, true);
+        let five = P2PNetwork::handshake(&mut b_r, &mut b_w, 0);
+        let (r6, r5) = tokio::join!(six, five);
+        assert!(r6.is_err(), "v6 side must reject the v5 peer");
+        assert!(r5.is_err(), "v5 side must reject the v6 frame");
+    }
+
+    /// Contract 7: a corrupted Ed25519 signature is rejected.
+    #[tokio::test]
+    async fn v6_rejects_tampered_signature() {
+        let real_id = NodeIdentity::generate();
+        let peer_id = NodeIdentity::generate();
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+        let real = P2PNetwork::handshake_v6(&mut a_r, &mut a_w, 0, &real_id, true);
+        let fake = fake_peer(&mut b_r, &mut b_w, 0, &peer_id, false, Tamper::BadSig);
+        let (rr, _) = tokio::join!(real, fake);
+        assert!(rr.is_err(), "tampered signature must be rejected");
+    }
+
+    /// Contract 7b: a signature from a different key than the advertised
+    /// NodeId is rejected (possession of the named key is required).
+    #[tokio::test]
+    async fn v6_rejects_signature_from_wrong_key() {
+        let real_id = NodeIdentity::generate();
+        let peer_id = NodeIdentity::generate();
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+        let real = P2PNetwork::handshake_v6(&mut a_r, &mut a_w, 0, &real_id, true);
+        let fake = fake_peer(&mut b_r, &mut b_w, 0, &peer_id, false, Tamper::OtherKey);
+        let (rr, _) = tokio::join!(real, fake);
+        assert!(
+            rr.is_err(),
+            "signature must verify against the advertised NodeId"
+        );
+    }
+
+    /// Contract 9: a wrong network id is rejected before any signature check.
+    #[tokio::test]
+    async fn v6_rejects_wrong_network_id() {
+        let real_id = NodeIdentity::generate();
+        let peer_id = NodeIdentity::generate();
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+        let real = P2PNetwork::handshake_v6(&mut a_r, &mut a_w, 0, &real_id, true);
+        let fake = fake_peer(&mut b_r, &mut b_w, 0, &peer_id, false, Tamper::WrongNetwork);
+        let (rr, _) = tokio::join!(real, fake);
+        assert!(rr.is_err(), "network id mismatch must fail");
+    }
+
+    /// Contract 9b: a wrong genesis hash is rejected.
+    #[tokio::test]
+    async fn v6_rejects_wrong_genesis() {
+        let real_id = NodeIdentity::generate();
+        let peer_id = NodeIdentity::generate();
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+        let real = P2PNetwork::handshake_v6(&mut a_r, &mut a_w, 0, &real_id, true);
+        let fake = fake_peer(&mut b_r, &mut b_w, 0, &peer_id, false, Tamper::WrongGenesis);
+        let (rr, _) = tokio::join!(real, fake);
+        assert!(rr.is_err(), "genesis mismatch must fail");
+    }
+
+    /// Contract 8/12: a signature bound to the WRONG role (reflection) is
+    /// rejected — the signed message pins the signer's role.
+    #[tokio::test]
+    async fn v6_rejects_reflected_signature() {
+        let real_id = NodeIdentity::generate();
+        let peer_id = NodeIdentity::generate();
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+        let real = P2PNetwork::handshake_v6(&mut a_r, &mut a_w, 0, &real_id, true);
+        let fake = fake_peer(&mut b_r, &mut b_w, 0, &peer_id, false, Tamper::WrongRole);
+        let (rr, _) = tokio::join!(real, fake);
+        assert!(rr.is_err(), "role-bound signature must reject reflection");
+    }
+
+    /// Contract 11: a signature captured from a different session (different
+    /// ephemerals/nonces) does not verify here.
+    #[tokio::test]
+    async fn v6_rejects_replayed_signature() {
+        let peer_id = NodeIdentity::generate();
+
+        // Session 1: capture a genuinely valid signature for that transcript.
+        let s1_real = NodeIdentity::generate();
+        let (mut a1_r, mut a1_w, mut b1_r, mut b1_w) = duplex_pair();
+        let real1 = P2PNetwork::handshake_v6(&mut a1_r, &mut a1_w, 0, &s1_real, true);
+        let fake1 = fake_peer(&mut b1_r, &mut b1_w, 0, &peer_id, false, Tamper::None);
+        let (r1, captured) = tokio::join!(real1, fake1);
+        assert!(r1.is_ok(), "session 1 must authenticate");
+        let captured_sig = captured;
+
+        // Session 2: replay the captured signature against a fresh transcript.
+        let s2_real = NodeIdentity::generate();
+        let (mut a2_r, mut a2_w, mut b2_r, mut b2_w) = duplex_pair();
+        let real2 = P2PNetwork::handshake_v6(&mut a2_r, &mut a2_w, 0, &s2_real, true);
+        let fake2 = fake_peer(
+            &mut b2_r,
+            &mut b2_w,
+            0,
+            &peer_id,
+            false,
+            Tamper::Replay(captured_sig),
+        );
+        let (r2, _) = tokio::join!(real2, fake2);
+        assert!(r2.is_err(), "a replayed signature must not verify");
+    }
+
+    /// Contract 12 (roles): if both ends believe they are the initiator, the
+    /// transcripts diverge and both signatures fail — roles never confuse.
+    #[tokio::test]
+    async fn v6_conflicting_roles_fail() {
+        let a_id = NodeIdentity::generate();
+        let b_id = NodeIdentity::generate();
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+        let a = P2PNetwork::handshake_v6(&mut a_r, &mut a_w, 0, &a_id, true);
+        let b = P2PNetwork::handshake_v6(&mut b_r, &mut b_w, 0, &b_id, true);
+        let (ra, rb) = tokio::join!(a, b);
+        assert!(ra.is_err(), "conflicting roles must fail on both ends");
+        assert!(rb.is_err(), "conflicting roles must fail on both ends");
+    }
+
+    /// Contract 13: a truncated Hello (peer closes early) fails cleanly.
+    #[tokio::test]
+    async fn v6_rejects_truncated_hello() {
+        let id = NodeIdentity::generate();
+        let (mut a_r, mut a_w) = tokio::io::duplex(256);
+        let (_sink_r, mut b_w) = tokio::io::duplex(256);
+        b_w.write_all(&[0u8; 20]).await.unwrap();
+        drop(b_w);
+        let r = P2PNetwork::handshake_v6(&mut a_r, &mut a_w, 0, &id, true).await;
+        assert!(r.is_err(), "truncated Hello must fail");
+    }
+
+    /// 4CP-S / F2: a low-order (non-contributory) peer ephemeral is rejected
+    /// even though the peer presents a VALID Ed25519 signature over the
+    /// transcript carrying it — the signature is not a substitute for the DH
+    /// check.
+    #[tokio::test]
+    async fn v6_rejects_non_contributory_peer_key() {
+        let real_id = NodeIdentity::generate();
+        let peer_id = NodeIdentity::generate();
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+        let real = P2PNetwork::handshake_v6(&mut a_r, &mut a_w, 0, &real_id, true);
+        let fake = fake_peer(&mut b_r, &mut b_w, 0, &peer_id, false, Tamper::LowOrderEph);
+        let (rr, _) = tokio::join!(real, fake);
+        assert!(
+            rr.is_err(),
+            "non-contributory X25519 must be rejected despite a valid signature"
+        );
+    }
+
+    /// 4CP-S / F2: the legacy v5 path also rejects a non-contributory peer key.
+    /// An ordinary v5 peer is unaffected (see `v5_legacy_handshake_unchanged`),
+    /// so only cryptographically invalid exchanges are refused.
+    #[tokio::test]
+    async fn v5_rejects_non_contributory_peer_key() {
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+        let mut frame = Vec::with_capacity(HANDSHAKE_FRAME_LEN);
+        frame.extend_from_slice(&P2PNetwork::handshake_wire_magic());
+        frame.push(P2P_PROTOCOL_VERSION);
+        frame.extend_from_slice(&crate::genesis::GENESIS_HASH);
+        frame.extend_from_slice(&0u64.to_le_bytes());
+        frame.extend_from_slice(&[0u8; 32]); // all-zero (low-order) ephemeral
+        assert_eq!(frame.len(), HANDSHAKE_FRAME_LEN);
+        b_w.write_all(&frame).await.unwrap();
+        b_w.flush().await.unwrap();
+        let r = P2PNetwork::handshake(&mut a_r, &mut a_w, 0).await;
+        // Drain the real side's outgoing frame so the duplex never wedges.
+        let mut sink = [0u8; HANDSHAKE_FRAME_LEN];
+        let _ = b_r.read_exact(&mut sink).await;
+        assert!(r.is_err(), "v5 must reject a non-contributory peer key");
+    }
+
+    /// 4CP-S / F7: a v6 node rejects a v5 peer FAST — the version is read from
+    /// the 5-byte prefix, so the failure is bounded well inside the 10s
+    /// handshake budget instead of waiting for the full Hello.
+    #[tokio::test]
+    async fn v6_rejects_v5_peer_quickly() {
+        let id = NodeIdentity::generate();
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+        let six = P2PNetwork::handshake_v6(&mut a_r, &mut a_w, 0, &id, true);
+        let five = P2PNetwork::handshake(&mut b_r, &mut b_w, 0);
+        let both = async { tokio::join!(six, five) };
+        let (r6, r5) = tokio::time::timeout(Duration::from_secs(2), both)
+            .await
+            .expect("v6<->v5 rejection must come from the prefix, not the 10s timeout");
+        assert!(r6.is_err(), "v6 side must reject the v5 peer");
+        assert!(r5.is_err(), "v5 side must reject the v6 frame");
+    }
+
+    /// Contract 15: the session classifier NEVER labels a legacy session as
+    /// authenticated, and only a verified v6 peer is `Authenticated`.
+    #[test]
+    fn legacy_never_classified_as_authenticated() {
+        match P2PNetwork::session_auth_for(None) {
+            P2PSessionAuth::EncryptedUnauthenticated => {}
+            other => panic!("legacy session must be unauthenticated, got {:?}", other),
+        }
+        let nid = NodeIdentity::generate().node_id();
+        match P2PNetwork::session_auth_for(Some(nid)) {
+            P2PSessionAuth::Authenticated { node_id } => assert_eq!(node_id, nid),
+            other => panic!("verified v6 session must be authenticated, got {:?}", other),
+        }
+    }
+
+    /// Contracts 2/3: the identity persists across a reload and distinct data
+    /// directories yield distinct identities.
+    #[test]
+    fn identity_persists_and_dirs_differ() {
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+
+        let (a, o1) = crate::node_identity::load_or_create(d1.path()).unwrap();
+        assert_eq!(o1, IdentityOutcome::Created);
+        let (a2, o2) = crate::node_identity::load_or_create(d1.path()).unwrap();
+        assert_eq!(o2, IdentityOutcome::Loaded);
+        assert_eq!(a.node_id(), a2.node_id(), "identity must survive a restart");
+
+        let (b, _) = crate::node_identity::load_or_create(d2.path()).unwrap();
+        assert_ne!(
+            a.node_id(),
+            b.node_id(),
+            "distinct data dirs must yield distinct identities"
+        );
+    }
+
+    // --- 4CP-AC (4CPT-07): the v6 handshake carries ONE global budget ---
+
+    /// Send the fixed 5-byte v6 prefix (magic + version) and flush; the caller
+    /// then stalls. Used to prove a peer cannot restart the budget per step.
+    async fn send_prefix_then_stall<W: AsyncWriteExt + Unpin>(w: &mut W) {
+        let mut pre = Vec::with_capacity(5);
+        pre.extend_from_slice(&P2PNetwork::handshake_wire_magic());
+        pre.push(P2P_PROTOCOL_VERSION_V6);
+        w.write_all(&pre).await.unwrap();
+        w.flush().await.unwrap();
+    }
+
+    fn err_string<T: std::fmt::Debug>(r: Result<T, Box<dyn std::error::Error>>) -> String {
+        match r {
+            Ok(_) => panic!("expected the handshake to fail, got success"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// Scenario 1: a peer that sends the 5-byte prefix then stops is bounded by
+    /// the GLOBAL budget, and the failure is a timeout (not a disconnect).
+    #[tokio::test]
+    async fn v6_global_budget_rejects_peer_stalling_after_prefix() {
+        let id = NodeIdentity::generate();
+        let budget = Duration::from_millis(300);
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+        let peer = tokio::spawn(async move {
+            send_prefix_then_stall(&mut b_w).await;
+            std::future::pending::<()>().await;
+            drop(b_r);
+        });
+
+        let started = tokio::time::Instant::now();
+        let r = P2PNetwork::handshake_v6_with_budget(&mut a_r, &mut a_w, 0, &id, true, budget).await;
+        let elapsed = started.elapsed();
+        let msg = err_string(r);
+
+        assert!(msg.contains("timeout"), "must be a budget expiry, got: {}", msg);
+        assert!(elapsed >= budget / 2, "must spend its budget, took {:?}", elapsed);
+        assert!(
+            elapsed < budget * 3,
+            "must NOT stack a fresh budget per step, took {:?}",
+            elapsed
+        );
+        peer.abort();
+    }
+
+    /// Scenario 2: a peer that sends the prefix plus a PARTIAL remainder then
+    /// stalls is still bounded by the same single deadline.
+    #[tokio::test]
+    async fn v6_global_budget_rejects_partial_hello_peer() {
+        let id = NodeIdentity::generate();
+        let budget = Duration::from_millis(300);
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+        let peer = tokio::spawn(async move {
+            send_prefix_then_stall(&mut b_w).await;
+            b_w.write_all(&[0u8; 40]).await.unwrap();
+            b_w.flush().await.unwrap();
+            std::future::pending::<()>().await;
+            drop(b_r);
+        });
+
+        let started = tokio::time::Instant::now();
+        let r = P2PNetwork::handshake_v6_with_budget(&mut a_r, &mut a_w, 0, &id, true, budget).await;
+        let elapsed = started.elapsed();
+        let msg = err_string(r);
+
+        assert!(msg.contains("timeout"), "must be a budget expiry, got: {}", msg);
+        assert!(elapsed >= budget / 2, "must spend its budget, took {:?}", elapsed);
+        assert!(elapsed < budget * 3, "must not stack budgets, took {:?}", elapsed);
+        peer.abort();
+    }
+
+    /// Scenario 3: a peer that progresses step by step — prefix, then the rest
+    /// of the Hello, then the signature — each gap well inside one budget but
+    /// whose TOTAL exceeds it must still fail. A per-step design would let it
+    /// succeed; the single absolute deadline does not.
+    #[tokio::test]
+    async fn v6_global_budget_bounds_stepwise_progress() {
+        let id = NodeIdentity::generate();
+        let budget = Duration::from_millis(400);
+        let step = Duration::from_millis(250); // each gap < budget, total > budget
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+
+        let peer = tokio::spawn(async move {
+            let mut local_hello = [0u8; V6_HELLO_LEN];
+            b_r.read_exact(&mut local_hello).await.unwrap(); // drain the local Hello
+            send_prefix_then_stall(&mut b_w).await;
+            tokio::time::sleep(step).await;
+            let hello = hello_bytes(
+                0,
+                &super::V6Hello {
+                    eph: [1u8; 32],
+                    nonce: [2u8; 32],
+                    node_id: [3u8; 32],
+                },
+            );
+            b_w.write_all(&hello[5..]).await.unwrap();
+            b_w.flush().await.unwrap();
+            tokio::time::sleep(step).await;
+            b_w.write_all(&[0u8; V6_SIG_LEN]).await.unwrap();
+            b_w.flush().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let started = tokio::time::Instant::now();
+        let r = P2PNetwork::handshake_v6_with_budget(&mut a_r, &mut a_w, 0, &id, true, budget).await;
+        let elapsed = started.elapsed();
+        let msg = err_string(r);
+
+        assert!(
+            msg.contains("timeout"),
+            "step-wise slow peer must fail under a global budget, got: {}",
+            msg
+        );
+        assert!(
+            elapsed < budget + Duration::from_millis(200),
+            "must fail at the shared deadline, not after each step (took {:?})",
+            elapsed
+        );
+        peer.abort();
+    }
+
+    /// Scenario 4: the budget expires during the signature exchange — the peer
+    /// sends a complete, network-valid Hello but never its signature.
+    #[tokio::test]
+    async fn v6_global_budget_rejects_peer_stalling_before_signature() {
+        let id = NodeIdentity::generate();
+        let budget = Duration::from_millis(300);
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+        let peer = tokio::spawn(async move {
+            let hello = hello_bytes(
+                0,
+                &super::V6Hello {
+                    eph: [4u8; 32],
+                    nonce: [5u8; 32],
+                    node_id: [6u8; 32],
+                },
+            );
+            b_w.write_all(&hello).await.unwrap();
+            b_w.flush().await.unwrap();
+            let mut sink = [0u8; V6_HELLO_LEN];
+            let _ = b_r.read_exact(&mut sink).await; // drain the local Hello
+            std::future::pending::<()>().await;
+        });
+
+        let started = tokio::time::Instant::now();
+        let r = P2PNetwork::handshake_v6_with_budget(&mut a_r, &mut a_w, 0, &id, true, budget).await;
+        let elapsed = started.elapsed();
+        let msg = err_string(r);
+
+        assert!(
+            msg.contains("timeout") && msg.contains("signature"),
+            "must expire during the signature step, got: {}",
+            msg
+        );
+        assert!(elapsed >= budget / 2, "must spend its budget, took {:?}", elapsed);
+        assert!(elapsed < budget * 3, "must not stack budgets, took {:?}", elapsed);
+        peer.abort();
+    }
+
+    /// Scenario 5: a normal v6 handshake completes well inside the budget and
+    /// keeps its behaviour (same key, opposite directions, real NodeIds).
+    #[tokio::test]
+    async fn v6_global_budget_allows_normal_handshake() {
+        let a_id = NodeIdentity::generate();
+        let b_id = NodeIdentity::generate();
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+        let budget = Duration::from_secs(5);
+        let a = P2PNetwork::handshake_v6_with_budget(&mut a_r, &mut a_w, 0, &a_id, true, budget);
+        let b = P2PNetwork::handshake_v6_with_budget(&mut b_r, &mut b_w, 0, &b_id, false, budget);
+        let (ra, rb) = tokio::join!(a, b);
+        let (ka, da, pa) = ra.expect("A must authenticate within budget");
+        let (kb, db, pb) = rb.expect("B must authenticate within budget");
+        assert_eq!(ka, kb, "both ends derive the same session key");
+        assert_ne!(da, db, "send directions must be opposite");
+        assert_eq!(pa, b_id.node_id(), "A learned B's real NodeId");
+        assert_eq!(pb, a_id.node_id(), "B learned A's real NodeId");
+    }
+
+    /// The global budget applies identically to the RESPONDER role.
+    #[tokio::test]
+    async fn v6_global_budget_applies_to_responder_role() {
+        let id = NodeIdentity::generate();
+        let budget = Duration::from_millis(300);
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+        let peer = tokio::spawn(async move {
+            send_prefix_then_stall(&mut b_w).await;
+            std::future::pending::<()>().await;
+            drop(b_r);
+        });
+        let r =
+            P2PNetwork::handshake_v6_with_budget(&mut a_r, &mut a_w, 0, &id, false, budget).await;
+        let msg = err_string(r);
+        assert!(
+            msg.contains("timeout"),
+            "responder must also enforce the global budget, got: {}",
+            msg
+        );
+        peer.abort();
+    }
+}
+
+/// PHASE 4CP-S: contract tests for session-scoped authentication state (F1).
+///
+/// These drive the SAME registry methods `handle_peer` uses
+/// (`next_session_id` / `record_session_auth` / `clear_session_auth`) and the
+/// same global teardown path (`shutdown`), so the invariants below hold for the
+/// real code, not a re-implementation.
+#[cfg(test)]
+mod phase4cp_session_tests {
+    use super::*;
+    use crate::node_identity::{NodeId, NodeIdentity};
+    use std::net::SocketAddr;
+
+    fn auth_net_cfg(cfg: P2PConfig) -> P2PNetwork {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
+        let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> = Arc::new(|_| None);
+        P2PNetwork::new(
+            cfg,
+            tx,
+            empty.clone(),
+            empty_opt,
+            empty,
+            Arc::new(SyncContext::default()),
+            Arc::new(|_| false),
+        )
+    }
+
+    fn auth_net() -> P2PNetwork {
+        auth_net_cfg(P2PConfig::default())
+    }
+
+    fn nid() -> NodeId {
+        NodeIdentity::generate().node_id()
+    }
+
+    fn ep() -> SocketAddr {
+        "203.0.113.9:40000".parse().unwrap()
+    }
+
+    /// Obligatory 1: two sessions sharing one endpoint keep distinct state.
+    #[tokio::test]
+    async fn two_sessions_same_addr_do_not_overwrite() {
+        let net = auth_net();
+        let x = ep();
+        let id1 = net.next_session_id();
+        let id2 = net.next_session_id();
+        assert_ne!(id1, id2, "session ids must be unique");
+        net.record_session_auth(id1, x, P2PSessionAuth::Authenticated { node_id: nid() })
+            .await;
+        net.record_session_auth(id2, x, P2PSessionAuth::EncryptedUnauthenticated)
+            .await;
+        assert!(matches!(
+            net.session_auth_by_id(id1).await,
+            Some(P2PSessionAuth::Authenticated { .. })
+        ));
+        assert_eq!(
+            net.session_auth_by_id(id2).await,
+            Some(P2PSessionAuth::EncryptedUnauthenticated)
+        );
+        assert_eq!(
+            net.session_auth_for_addr(&x).await.len(),
+            2,
+            "both sessions must be tracked at the shared endpoint"
+        );
+    }
+
+    /// Obligatory 2: closing the first session leaves the second intact.
+    #[tokio::test]
+    async fn closing_one_session_leaves_the_other() {
+        let net = auth_net();
+        let x = ep();
+        let id1 = net.next_session_id();
+        let id2 = net.next_session_id();
+        net.record_session_auth(id1, x, P2PSessionAuth::Authenticated { node_id: nid() })
+            .await;
+        net.record_session_auth(id2, x, P2PSessionAuth::EncryptedUnauthenticated)
+            .await;
+        net.clear_session_auth(id1).await;
+        assert_eq!(net.session_auth_by_id(id1).await, None);
+        assert_eq!(
+            net.session_auth_by_id(id2).await,
+            Some(P2PSessionAuth::EncryptedUnauthenticated),
+            "an older session's teardown must never erase a newer one"
+        );
+    }
+
+    /// Obligatory 3: a legacy session cannot replace another session's
+    /// authenticated identity.
+    #[tokio::test]
+    async fn legacy_session_cannot_replace_authenticated_identity() {
+        let net = auth_net();
+        let x = ep();
+        let real = nid();
+        let id_auth = net.next_session_id();
+        net.record_session_auth(id_auth, x, P2PSessionAuth::Authenticated { node_id: real })
+            .await;
+        let id_legacy = net.next_session_id();
+        net.record_session_auth(id_legacy, x, P2PSessionAuth::EncryptedUnauthenticated)
+            .await;
+        net.clear_session_auth(id_legacy).await;
+        match net.session_auth_by_id(id_auth).await {
+            Some(P2PSessionAuth::Authenticated { node_id }) => assert_eq!(node_id, real),
+            other => panic!("authenticated identity lost: {:?}", other),
+        }
+    }
+
+    /// Obligatory 4: a reconnect at the same endpoint inherits no old state.
+    #[tokio::test]
+    async fn reconnect_does_not_inherit_state() {
+        let net = auth_net();
+        let x = ep();
+        let id1 = net.next_session_id();
+        net.record_session_auth(id1, x, P2PSessionAuth::Authenticated { node_id: nid() })
+            .await;
+        net.clear_session_auth(id1).await; // old session ends
+        let id2 = net.next_session_id(); // fresh session, same endpoint
+        assert_eq!(
+            net.session_auth_by_id(id2).await,
+            None,
+            "a reconnect must not inherit the previous session's provenance"
+        );
+        assert!(net.session_auth_for_addr(&x).await.is_empty());
+        net.record_session_auth(id2, x, P2PSessionAuth::EncryptedUnauthenticated)
+            .await;
+        assert_eq!(
+            net.session_auth_by_id(id2).await,
+            Some(P2PSessionAuth::EncryptedUnauthenticated)
+        );
+    }
+
+    /// Obligatory 5: a failed handshake leaves no authenticated state, and a
+    /// torn-down session is fully removed.
+    #[tokio::test]
+    async fn failed_handshake_leaves_no_residual_state() {
+        let net = auth_net();
+        let x = ep();
+        // handle_peer's failure branch records NOTHING for the session id.
+        let failed = net.next_session_id();
+        assert_eq!(net.session_auth_by_id(failed).await, None);
+        assert!(net.session_auth_for_addr(&x).await.is_empty());
+        assert_eq!(net.session_auth_len().await, 0);
+        net.record_session_auth(failed, x, P2PSessionAuth::Authenticated { node_id: nid() })
+            .await;
+        net.clear_session_auth(failed).await;
+        assert_eq!(net.session_auth_len().await, 0, "no residual state");
+    }
+
+    /// Obligatory 6: global shutdown frees every session state.
+    #[tokio::test]
+    async fn shutdown_releases_all_session_state() {
+        let net = auth_net();
+        let x = ep();
+        for _ in 0..5 {
+            let id = net.next_session_id();
+            net.record_session_auth(id, x, P2PSessionAuth::Authenticated { node_id: nid() })
+                .await;
+        }
+        assert_eq!(net.session_auth_len().await, 5);
+        net.shutdown()
+            .await
+            .expect("shutdown of an unstarted net is Ok");
+        assert_eq!(
+            net.session_auth_len().await,
+            0,
+            "shutdown must free every session"
+        );
+        assert!(net.session_auth_for_addr(&x).await.is_empty());
+    }
+
+    /// F3: the protocol mode is immutable once the node has started.
+    /// 4CP-U (4CPT-02): v6 also requires an identity, so one is installed.
+    #[tokio::test]
+    async fn protocol_mode_is_immutable_after_start() {
+        let net = auth_net_cfg(P2PConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            ..P2PConfig::default()
+        });
+        net.set_node_identity(NodeIdentity::generate());
+        net.set_protocol_mode(P2PProtocolMode::AuthenticatedV6);
+        assert_eq!(net.protocol_mode(), P2PProtocolMode::AuthenticatedV6);
+        net.start().await.expect("bind loopback");
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        assert_eq!(
+            net.protocol_mode(),
+            P2PProtocolMode::AuthenticatedV6,
+            "mode must stay frozen after start()"
+        );
+        assert_eq!(
+            net.started_protocol_mode(),
+            Some(P2PProtocolMode::AuthenticatedV6),
+            "the live snapshot is the frozen mode"
+        );
+        let _ = net.shutdown().await;
+    }
+
+    /// 4CPT-02: `AuthenticatedV6` refuses to start without an identity, leaves
+    /// the lifecycle un-frozen, and succeeds once one is installed.
+    #[tokio::test]
+    async fn v6_start_requires_identity() {
+        let net = auth_net_cfg(P2PConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            ..P2PConfig::default()
+        });
+        net.set_protocol_mode(P2PProtocolMode::AuthenticatedV6);
+        let err = net
+            .start()
+            .await
+            .expect_err("v6 without an identity must not start");
+        assert!(
+            err.to_string().contains("identity"),
+            "the error must name the missing identity: {}",
+            err
+        );
+        // Not frozen: the operator can fix the configuration and retry.
+        assert_ne!(net.lifecycle_state(), P2PNetworkState::Started);
+        assert_eq!(net.started_protocol_mode(), None);
+        net.set_node_identity(NodeIdentity::generate());
+        net.start().await.expect("v6 with an identity must start");
+        assert_eq!(net.lifecycle_state(), P2PNetworkState::Started);
+        let _ = net.shutdown().await;
+    }
+
+    /// 4CPT-10: a bind failure must not leave the network looking started, and
+    /// the lifecycle must stay recoverable (setters accepted again).
+    #[tokio::test]
+    async fn bind_failure_does_not_leave_started() {
+        // A public address this host cannot assign: bind fails deterministically
+        // without any traffic leaving the machine.
+        let net = auth_net_cfg(P2PConfig {
+            listen_addr: "203.0.113.9:25565".parse().unwrap(),
+            ..P2PConfig::default()
+        });
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        net.start()
+            .await
+            .expect_err("binding a non-local address must fail");
+        assert_eq!(
+            net.lifecycle_state(),
+            P2PNetworkState::Failed,
+            "a failed start must not be reported as Started"
+        );
+        assert_eq!(net.started_protocol_mode(), None, "no lingering snapshot");
+        // Recoverable: the configuration can be changed and start retried.
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        assert_eq!(net.lifecycle_state(), P2PNetworkState::Configured);
+    }
+
+    /// 4CPT-01: a setter racing `start()` can never leave the live snapshot and
+    /// the reported mode disagreeing — both are decided under one lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_setters_race_start_consistently() {
+        let net = auth_net_cfg(P2PConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            ..P2PConfig::default()
+        });
+        // An identity is installed up front so both candidate modes are valid
+        // and `start()` always succeeds regardless of which setter wins.
+        net.set_node_identity(NodeIdentity::generate());
+        // 4CP-W (V-3): the network must be explicitly configured before start()
+        // can run; seed it with one of the two candidates the setters race.
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+
+        let mut handles = Vec::new();
+        for i in 0..64u32 {
+            let net = net.clone();
+            handles.push(tokio::spawn(async move {
+                let mode = if i % 2 == 0 {
+                    P2PProtocolMode::AuthenticatedV6
+                } else {
+                    P2PProtocolMode::LegacyV5
+                };
+                net.set_protocol_mode(mode);
+            }));
+        }
+        // Race the start against the setters. The error is stringified inside
+        // the task so the spawned future's output is `Send`.
+        let start = {
+            let net = net.clone();
+            tokio::spawn(async move { net.start().await.map_err(|e| e.to_string()) })
+        };
+        for h in handles {
+            h.await.unwrap();
+        }
+        start
+            .await
+            .unwrap()
+            .expect("start on loopback must succeed");
+
+        // The frozen snapshot and the reported mode are one and the same value,
+        // and it is one of the two candidates — never a torn read.
+        let started = net
+            .started_protocol_mode()
+            .expect("a started network has a snapshot");
+        assert_eq!(
+            net.protocol_mode(),
+            started,
+            "live snapshot and reported mode must agree"
+        );
+        assert!(matches!(
+            started,
+            P2PProtocolMode::LegacyV5 | P2PProtocolMode::AuthenticatedV6
+        ));
+        // And it is now frozen: a late setter cannot change it.
+        let late = if started == P2PProtocolMode::LegacyV5 {
+            P2PProtocolMode::AuthenticatedV6
+        } else {
+            P2PProtocolMode::LegacyV5
+        };
+        net.set_protocol_mode(late);
+        assert_eq!(net.protocol_mode(), started, "mode must stay frozen");
+        let _ = net.shutdown().await;
+    }
+
+    /// 4CPT-01: a clone shares the lifecycle, so a setter through one handle is
+    /// visible (and frozen) through every other.
+    #[tokio::test]
+    async fn clones_share_lifecycle() {
+        let net = auth_net();
+        let clone = net.clone();
+        clone.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        assert_eq!(net.lifecycle_state(), P2PNetworkState::Configured);
+    }
+}
+
+/// PHASE 4CP-W: deterministic tests for the start/shutdown serialisation (V-1),
+/// the atomic session admission (V-2) and the explicit-mode requirement (V-3).
+///
+/// Every test drives the REAL lifecycle and registry functions. Ordering is
+/// enforced with `Notify`/`Barrier` rendezvous, never with `sleep()`.
+#[cfg(test)]
+mod phase4cpw_cycle_tests {
+    use super::*;
+    use crate::node_identity::NodeIdentity;
+    use std::net::SocketAddr;
+
+    fn cpw_net() -> P2PNetwork {
+        cpw_net_on("127.0.0.1:0")
+    }
+
+    /// 4CP-AA (X-6): same construction as `cpw_net`, but with an explicit listen
+    /// address so a test can force a deterministic `bind()` failure.
+    fn cpw_net_on(listen_addr: &str) -> P2PNetwork {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
+        let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> = Arc::new(|_| None);
+        P2PNetwork::new(
+            P2PConfig {
+                listen_addr: listen_addr.parse().unwrap(),
+                bootnodes: vec![],
+                dns_seeds: vec![],
+                peer_store_path: None,
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+            },
+            tx,
+            empty.clone(),
+            empty_opt,
+            empty,
+            Arc::new(SyncContext::default()),
+            Arc::new(|_| false),
+        )
+    }
+
+    fn ep() -> SocketAddr {
+        "203.0.113.9:40000".parse().unwrap()
+    }
+
+    /// V-3: a freshly built network is unconfigured and refuses to start; an
+    /// explicit mode makes it start.
+    #[tokio::test]
+    async fn unconfigured_network_refuses_to_start() {
+        let net = cpw_net();
+        let err = net
+            .start()
+            .await
+            .expect_err("an unconfigured network must not start");
+        assert!(
+            err.to_string().contains("not configured"),
+            "the error must name the missing choice: {}",
+            err
+        );
+        assert_eq!(net.lifecycle_state(), P2PNetworkState::Unconfigured);
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        net.start().await.expect("explicit legacy starts");
+        assert_eq!(net.lifecycle_state(), P2PNetworkState::Started);
+        let _ = net.shutdown().await;
+    }
+
+    /// V-3: v6 still requires an identity, and the failure stays recoverable.
+    #[tokio::test]
+    async fn v6_requires_identity_on_public_start() {
+        let net = cpw_net();
+        net.set_protocol_mode(P2PProtocolMode::AuthenticatedV6);
+        assert!(net.start().await.is_err());
+        assert_eq!(net.lifecycle_state(), P2PNetworkState::Configured);
+        net.set_node_identity(NodeIdentity::generate());
+        net.start().await.expect("v6 with identity starts");
+        assert_eq!(net.lifecycle_state(), P2PNetworkState::Started);
+        let _ = net.shutdown().await;
+    }
+
+    /// V-1: a shutdown() engaged during start() wins. start() must not flip the
+    /// lifecycle back to `Started`; the state stays `Stopped` and the call
+    /// reports the supersession.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_during_start_never_reaches_started() {
+        let net = cpw_net();
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        let gate = net.install_start_gate();
+        let n2 = net.clone();
+        let start = tokio::spawn(async move { n2.start().await.map_err(|e| e.to_string()) });
+        // Wait until start() has committed `Starting` and parked at the gate.
+        gate.arrived.notified().await;
+        assert_eq!(net.lifecycle_state(), P2PNetworkState::Starting);
+        // Engage the stop while start() is parked.
+        net.shutdown().await.expect("shutdown must succeed");
+        // Release start() and collect its result.
+        gate.release.notify_one();
+        let res = start.await.unwrap();
+        assert!(
+            res.is_err(),
+            "a start superseded by shutdown must fail, got {:?}",
+            res
+        );
+        assert_eq!(net.lifecycle_state(), P2PNetworkState::Stopped);
+        assert_eq!(net.started_protocol_mode(), None, "no lingering snapshot");
+    }
+
+    /// V-1: the reachable restart path after Stopped still works.
+    #[tokio::test]
+    async fn restart_after_stopped_succeeds() {
+        let net = cpw_net();
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        net.start().await.expect("first start");
+        let gen1 = net.generation();
+        net.shutdown().await.expect("shutdown");
+        assert_eq!(net.lifecycle_state(), P2PNetworkState::Stopped);
+        net.start().await.expect("restart");
+        assert_eq!(net.lifecycle_state(), P2PNetworkState::Started);
+        assert!(net.generation() > gen1, "restart bumps the cycle generation");
+        let _ = net.shutdown().await;
+    }
+
+    /// V-1: two concurrent start() calls — exactly one wins, the other errors.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_starts_only_one_wins() {
+        let net = cpw_net();
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        let a = {
+            let net = net.clone();
+            tokio::spawn(async move { net.start().await.map_err(|e| e.to_string()) })
+        };
+        let b = {
+            let net = net.clone();
+            tokio::spawn(async move { net.start().await.map_err(|e| e.to_string()) })
+        };
+        let ra = a.await.unwrap();
+        let rb = b.await.unwrap();
+        assert!(
+            ra.is_ok() ^ rb.is_ok(),
+            "exactly one start must win: {:?} vs {:?}",
+            ra,
+            rb
+        );
+        let _ = net.shutdown().await;
+    }
+
+    /// V-1: two concurrent shutdown() calls both succeed (serialised).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_shutdowns_are_serialised() {
+        let net = cpw_net();
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        net.start().await.expect("start");
+        let a = {
+            let net = net.clone();
+            tokio::spawn(async move { net.shutdown().await })
+        };
+        let b = {
+            let net = net.clone();
+            tokio::spawn(async move { net.shutdown().await })
+        };
+        assert!(a.await.unwrap().is_ok());
+        assert!(b.await.unwrap().is_ok());
+        assert_eq!(net.lifecycle_state(), P2PNetworkState::Stopped);
+        assert_eq!(net.session_auth_len().await, 0);
+    }
+
+    /// V-2 (1): a handshake that reaches the registration point AFTER shutdown
+    /// closed the registry records nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_session_cannot_register_after_shutdown() {
+        let net = cpw_net();
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        net.start().await.expect("start");
+        let generation = net.generation();
+
+        let pre = Arc::new(tokio::sync::Barrier::new(2));
+        let go = Arc::new(tokio::sync::Barrier::new(2));
+        let id = 4242u64;
+        let addr = ep();
+        let n2 = net.clone();
+        let (pre2, go2) = (pre.clone(), go.clone());
+        let task = tokio::spawn(async move {
+            pre2.wait().await; // "handshake reached the point before record"
+            go2.wait().await; // wait for the test to finish shutdown()
+            n2.record_session_auth_if_active(
+                generation,
+                id,
+                addr,
+                P2PSessionAuth::EncryptedUnauthenticated,
+            )
+            .await
+        });
+        pre.wait().await; // rendezvous: handshake is parked before recording
+        net.shutdown().await.expect("shutdown");
+        go.wait().await; // let the late record proceed
+        let recorded = task.await.unwrap();
+        assert!(!recorded, "a late handshake must not register after shutdown");
+        assert_eq!(net.session_auth_len().await, 0, "no residual session");
+    }
+
+    /// V-2 (3): a task from an old cycle cannot register into a later one, even
+    /// after a restart with the SAME configuration.
+    #[tokio::test]
+    async fn old_generation_cannot_register_in_new_cycle() {
+        let net = cpw_net();
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        net.start().await.expect("start cycle 1");
+        let gen1 = net.generation();
+        net.shutdown().await.expect("shutdown cycle 1");
+        net.start().await.expect("start cycle 2");
+        let gen2 = net.generation();
+        assert_ne!(gen1, gen2, "a restart is a new generation");
+
+        let addr = ep();
+        // A late task belonging to cycle 1 must be rejected by the new cycle…
+        assert!(
+            !net.record_session_auth_if_active(
+                gen1,
+                7,
+                addr,
+                P2PSessionAuth::EncryptedUnauthenticated
+            )
+            .await,
+            "old-generation registration must be refused"
+        );
+        assert_eq!(net.session_auth_len().await, 0);
+        // …while the live cycle registers normally.
+        assert!(
+            net.record_session_auth_if_active(
+                gen2,
+                8,
+                addr,
+                P2PSessionAuth::EncryptedUnauthenticated
+            )
+            .await,
+            "the live cycle must register"
+        );
+        assert_eq!(net.session_auth_len().await, 1);
+        let _ = net.shutdown().await;
+    }
+
+    /// V-2 (4): closing one session (in the live generation) never removes
+    /// another, and a clear from an old generation is a no-op.
+    #[tokio::test]
+    async fn clear_is_generation_scoped_and_session_scoped() {
+        let net = cpw_net();
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        net.start().await.expect("start");
+        let generation = net.generation();
+        let addr = ep();
+        assert!(
+            net.record_session_auth_if_active(
+                generation,
+                1,
+                addr,
+                P2PSessionAuth::EncryptedUnauthenticated
+            )
+            .await
+        );
+        assert!(
+            net.record_session_auth_if_active(
+                generation,
+                2,
+                addr,
+                P2PSessionAuth::EncryptedUnauthenticated
+            )
+            .await
+        );
+        // An old generation cannot clear.
+        assert!(!net.clear_session_auth_if_active(generation + 99, 1).await);
+        assert_eq!(net.session_auth_len().await, 2);
+        // The live generation clears exactly one.
+        assert!(net.clear_session_auth_if_active(generation, 1).await);
+        assert_eq!(net.session_auth_len().await, 1);
+        assert_eq!(
+            net.session_auth_by_id(2).await,
+            Some(P2PSessionAuth::EncryptedUnauthenticated)
+        );
+        let _ = net.shutdown().await;
+    }
+
+    /// V-2 (6): once shutdown() has returned Ok, the old cycle's registry is
+    /// sealed — a registration attempt with the old generation is refused.
+    #[tokio::test]
+    async fn shutdown_ok_closes_the_registry() {
+        let net = cpw_net();
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        net.start().await.expect("start");
+        let generation = net.generation();
+        net.shutdown().await.expect("shutdown");
+        assert!(
+            !net.record_session_auth_if_active(
+                generation,
+                99,
+                ep(),
+                P2PSessionAuth::EncryptedUnauthenticated
+            )
+            .await,
+            "after a successful shutdown the old cycle must be sealed"
+        );
+        assert_eq!(net.session_auth_len().await, 0);
+    }
+
+    /// 4CP-Y (X-4/X-6, real path): a genuine `handle_peer` session — real
+    /// socket, real production handshake — that reaches its registration point
+    /// while a `shutdown()` closes the cycle must register nothing. Unlike
+    /// `late_session_cannot_register_after_shutdown`, this drives the actual
+    /// per-session function through a `record_gate` rendezvous, so it proves the
+    /// guard on the production code path rather than a mirror helper.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_session_cannot_register_after_shutdown() {
+        let net = cpw_net();
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        net.start().await.expect("start");
+        let generation = net.generation();
+
+        // A real peer endpoint this host can connect to.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        // Client side: connect, complete the production handshake, then hold the
+        // socket open for the duration of the test.
+        let client = tokio::spawn(async move {
+            let sock = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+            let (mut reader, mut writer) = sock.into_split();
+            let _ = P2PNetwork::handshake(
+                &mut reader,
+                &mut writer,
+                crate::transaction::DEFAULT_NETWORK_ID,
+            )
+            .await;
+            std::future::pending::<()>().await;
+        });
+
+        let (server_stream, peer_addr) = listener.accept().await.unwrap();
+
+        // 4CP-Y: park the real session just before its registry write.
+        let gate = Arc::new(StartGate::default());
+        let gate_for_task = gate.clone();
+        let net2 = net.clone();
+        let session = tokio::spawn(async move {
+            let (msg_sender, msg_receiver) = mpsc::unbounded_channel();
+            let (pdtx, _pdrx) = mpsc::unbounded_channel();
+            P2PNetwork::handle_peer(
+                TransportStream::Tcp(server_stream),
+                peer_addr,
+                net2.peers.clone(),
+                net2.config.listen_addr,
+                net2.addresses.clone(),
+                net2.tx_channel.clone(),
+                net2.get_dag_hashes.clone(),
+                net2.get_transaction_by_hash.clone(),
+                net2.get_tips.clone(),
+                net2.seen_transactions.clone(),
+                net2.propagation_state.clone(),
+                msg_sender,
+                msg_receiver,
+                pdtx,
+                net2.sync_ctx.clone(),
+                net2.is_orphan.clone(),
+                net2.stake_hooks.clone(),
+                net2.config.network_id,
+                P2PProtocolMode::LegacyV5,
+                None,
+                false,
+                net2.session_auth.clone(),
+                net2.session_seq.clone(),
+                generation,
+                Some(gate_for_task),
+                net2.admission.clone(),
+                HANDSHAKE_TIMEOUT,
+            )
+            .await;
+        });
+
+        // The real session has completed the handshake and is parked.
+        gate.arrived.notified().await;
+        assert_eq!(net.peer_count().await, 0, "not recorded yet");
+
+        // Close the cycle, THEN let the real session race for registration.
+        net.shutdown().await.expect("shutdown");
+        gate.release.notify_one();
+        session.await.unwrap();
+
+        assert_eq!(
+            net.session_auth_len().await,
+            0,
+            "a real session reaching registration after shutdown must register nothing"
+        );
+        assert_eq!(net.peer_count().await, 0, "no half-open peer left behind");
+        client.abort();
+    }
+
+    // ---- 4CP-AA (X-6): shutdown across every lifecycle state ----------------
+
+    /// X-6/4CP-AA: `shutdown()` on a network that was configured but never
+    /// started freezes it as `Stopped` (no live cycle existed), releases the
+    /// snapshot, closes admission and seals the registry; a later `start()` is
+    /// still permitted from `Stopped`.
+    #[tokio::test]
+    async fn shutdown_on_configured_freezes_without_a_cycle() {
+        let net = cpw_net();
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        assert_eq!(net.lifecycle_state(), P2PNetworkState::Configured);
+
+        net.shutdown()
+            .await
+            .expect("shutdown of a configured-but-unstarted network");
+        assert_eq!(
+            net.lifecycle_state(),
+            P2PNetworkState::Stopped,
+            "an engaged stop freezes a never-live cycle too (X-6)"
+        );
+        assert_eq!(net.started_protocol_mode(), None, "no snapshot survives");
+        assert!(net.is_shutting_down());
+        // Consistency: state, snapshot, admission and registry all agree.
+        assert!(
+            !net.spawn_tracked(async {}),
+            "admission must be closed after shutdown"
+        );
+        assert_eq!(net.session_auth_len().await, 0);
+
+        // A pre-start shutdown freezes the configuration but does not forbid a
+        // later start.
+        net.start().await.expect("restart after a pre-start shutdown");
+        assert_eq!(net.lifecycle_state(), P2PNetworkState::Started);
+        net.shutdown().await.expect("final shutdown");
+    }
+
+    /// X-6: `shutdown()` on a network whose `start()` failed at `bind()` (state
+    /// `Failed`) freezes it as `Stopped` and leaves no live cycle.
+    #[tokio::test]
+    async fn shutdown_on_failed_freezes() {
+        // A non-local address guarantees a deterministic bind failure without
+        // any traffic leaving the machine (same technique as 4CPT-10).
+        let net = cpw_net_on("203.0.113.9:25565");
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        net.start()
+            .await
+            .expect_err("binding a non-local address must fail");
+        assert_eq!(net.lifecycle_state(), P2PNetworkState::Failed);
+
+        net.shutdown().await.expect("shutdown on Failed");
+        assert_eq!(net.lifecycle_state(), P2PNetworkState::Stopped);
+        assert_eq!(net.started_protocol_mode(), None);
+        assert!(!net.spawn_tracked(async {}));
+        assert_eq!(net.session_auth_len().await, 0);
+    }
+
+    /// X-6: `shutdown()` on a never-configured network must not invent a
+    /// `Stopped` state — there was no cycle — and the "no implicit v5" refusal
+    /// (X-1) still holds afterwards.
+    #[tokio::test]
+    async fn shutdown_on_unconfigured_stays_unconfigured() {
+        let net = cpw_net();
+        assert_eq!(net.lifecycle_state(), P2PNetworkState::Unconfigured);
+        net.shutdown().await.expect("shutdown on Unconfigured");
+        assert_eq!(
+            net.lifecycle_state(),
+            P2PNetworkState::Unconfigured,
+            "an unconfigured network is not a live cycle"
+        );
+        assert_eq!(net.started_protocol_mode(), None);
+        assert!(!net.spawn_tracked(async {}));
+        assert!(
+            net.start().await.is_err(),
+            "still no implicit v5 after an unconfigured shutdown"
+        );
+    }
+
+    /// X-6: two sequential `shutdown()` calls are idempotent — the second is a
+    /// no-op that still reports success.
+    #[tokio::test]
+    async fn sequential_shutdown_is_idempotent() {
+        let net = cpw_net();
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        net.start().await.expect("start");
+        net.shutdown().await.expect("first shutdown");
+        net.shutdown()
+            .await
+            .expect("second shutdown must be a clean no-op");
+        assert_eq!(net.lifecycle_state(), P2PNetworkState::Stopped);
+        assert_eq!(net.session_auth_len().await, 0);
+    }
+
+    /// X-6: after `shutdown()` the four pieces of cycle state agree — frozen
+    /// lifecycle, released snapshot, closed admission and sealed+empty
+    /// registry — and a restart re-opens all four under a new generation.
+    #[tokio::test]
+    async fn shutdown_then_restart_reopens_every_guard() {
+        let net = cpw_net();
+        net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+        net.start().await.expect("start");
+        let gen1 = net.generation();
+        // Live cycle: snapshot present, admission open, registry open.
+        assert!(net.started_protocol_mode().is_some());
+        assert!(net.spawn_tracked(async {}), "live admission accepts");
+        assert!(net
+            .record_session_auth_if_active(
+                gen1,
+                1,
+                ep(),
+                P2PSessionAuth::EncryptedUnauthenticated
+            )
+            .await);
+
+        net.shutdown().await.expect("shutdown");
+        assert!(net.started_protocol_mode().is_none());
+        assert!(!net.spawn_tracked(async {}), "admission closed");
+        assert_eq!(net.session_auth_len().await, 0, "registry sealed+cleared");
+        assert!(
+            !net.record_session_auth_if_active(
+                gen1,
+                2,
+                ep(),
+                P2PSessionAuth::EncryptedUnauthenticated
+            )
+            .await,
+            "old cycle cannot register after shutdown"
+        );
+
+        net.start().await.expect("restart");
+        let gen2 = net.generation();
+        assert_ne!(gen1, gen2, "restart is a new generation");
+        assert!(net.started_protocol_mode().is_some());
+        assert!(net.spawn_tracked(async {}), "restart re-opens admission");
+        assert!(
+            net.record_session_auth_if_active(
+                gen2,
+                3,
+                ep(),
+                P2PSessionAuth::EncryptedUnauthenticated
+            )
+            .await,
+            "restart re-opens the registry under the new generation"
+        );
+        let _ = net.shutdown().await;
+    }
+
+    // ---- 4CP-AA (Y-5): the outbound registration path -----------------------
+
+    /// Y-5: a genuine OUTBOUND `handle_peer` (`is_initiator = true`) over a real
+    /// socket — the mirror of `real_session_cannot_register_after_shutdown` —
+    /// reaches the point just before registration, is released after a
+    /// concurrent `shutdown()`, and registers nothing. This is the untracked
+    /// variant, so the resumed session is refused by the registry seal itself
+    /// (not merely aborted).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outbound_session_cannot_register_after_shutdown() {
+        let net = cpw_net();
+        net.open_cycle_for_test(P2PProtocolMode::LegacyV5).await;
+        let generation = net.generation();
+
+        // Remote responder: production handshake, then hold the socket.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (mut reader, mut writer) = sock.into_split();
+            let _ = P2PNetwork::handshake(
+                &mut reader,
+                &mut writer,
+                crate::transaction::DEFAULT_NETWORK_ID,
+            )
+            .await;
+            std::future::pending::<()>().await;
+        });
+
+        let sock = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+        let peer_addr = sock.peer_addr().unwrap();
+
+        let gate = Arc::new(StartGate::default());
+        let gate_for_task = gate.clone();
+        let net2 = net.clone();
+        let session = tokio::spawn(async move {
+            let (msg_sender, msg_receiver) = mpsc::unbounded_channel();
+            let (pdtx, _pdrx) = mpsc::unbounded_channel();
+            P2PNetwork::handle_peer(
+                TransportStream::Tcp(sock),
+                peer_addr,
+                net2.peers.clone(),
+                net2.config.listen_addr,
+                net2.addresses.clone(),
+                net2.tx_channel.clone(),
+                net2.get_dag_hashes.clone(),
+                net2.get_transaction_by_hash.clone(),
+                net2.get_tips.clone(),
+                net2.seen_transactions.clone(),
+                net2.propagation_state.clone(),
+                msg_sender,
+                msg_receiver,
+                pdtx,
+                net2.sync_ctx.clone(),
+                net2.is_orphan.clone(),
+                net2.stake_hooks.clone(),
+                net2.config.network_id,
+                P2PProtocolMode::LegacyV5,
+                None,
+                true, // 4CP-AA: outbound role — this is the path under test.
+                net2.session_auth.clone(),
+                net2.session_seq.clone(),
+                generation,
+                Some(gate_for_task),
+                net2.admission.clone(),
+                HANDSHAKE_TIMEOUT,
+            )
+            .await;
+        });
+
+        gate.arrived.notified().await;
+        net.shutdown().await.expect("shutdown");
+        gate.release.notify_one();
+        session.await.unwrap();
+
+        assert_eq!(
+            net.session_auth_len().await,
+            0,
+            "an outbound session reaching registration after shutdown must register nothing"
+        );
+        assert_eq!(net.peer_count().await, 0, "no half-open peer left behind");
+        server.abort();
+    }
+
+    /// Y-5: the same guarantee through the REAL production dialer
+    /// (`connect_to_peer` -> `connect_to_peer_inner` -> `handle_peer`) with the
+    /// test-only outbound rendezvous. After `shutdown()` the parked session is
+    /// aborted, a follow-up dial is refused, and no residue (session, peer,
+    /// dial reservation, outbound reservation) survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_dial_cannot_leave_residue_across_shutdown() {
+        let net = cpw_net();
+        net.open_cycle_for_test(P2PProtocolMode::LegacyV5).await;
+        let gate = net.install_outbound_record_gate();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (mut reader, mut writer) = sock.into_split();
+                    let _ = P2PNetwork::handshake(
+                        &mut reader,
+                        &mut writer,
+                        crate::transaction::DEFAULT_NETWORK_ID,
+                    )
+                    .await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        // Real outbound dial: parks the session just before registration. The
+        // dialer has already taken its optimistic `peers` + `outbound_sessions`
+        // reservations, which the teardown must clear.
+        net.connect_to_peer(server_addr).await;
+        gate.arrived.notified().await;
+
+        net.shutdown().await.expect("shutdown");
+        gate.release.notify_one();
+        // A dial issued after shutdown must be refused outright.
+        net.connect_to_peer(server_addr).await;
+
+        assert_eq!(net.session_auth_len().await, 0, "no residual session");
+        assert_eq!(net.peer_count().await, 0, "no half-open peer");
+        assert!(net.dialing.read().await.is_empty(), "no dial reservation");
+        assert!(
+            net.outbound_sessions.read().await.is_empty(),
+            "no outbound reservation"
+        );
+        server.abort();
+    }
+
+    // --- 4CP-AC (4CPT-07): global-budget expiry tears the session down ---
+
+    /// An INBOUND v6 session whose peer stalls after the 5-byte prefix must
+    /// expire under the global budget, register NO session, and leave NO
+    /// half-open peer behind. Drives the real `handle_peer` (responder role)
+    /// with a short budget so the production teardown path runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_slow_v6_peer_expiry_leaves_no_inbound_session() {
+        let net = cpw_net();
+        net.open_cycle_for_test(P2PProtocolMode::AuthenticatedV6).await;
+        let generation = net.generation();
+        let identity = Arc::new(NodeIdentity::generate());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let sock = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+            let (_reader, mut writer) = sock.into_split();
+            let mut pre = Vec::new();
+            pre.extend_from_slice(&P2PNetwork::handshake_wire_magic());
+            pre.push(P2P_PROTOCOL_VERSION_V6);
+            writer.write_all(&pre).await.unwrap();
+            writer.flush().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let (stream, peer_addr) = listener.accept().await.unwrap();
+        // Emulate the optimistic insert the accept loop performs before the
+        // session task, so the assertion below proves `handle_peer` removes it.
+        let (ptx, _prx) = mpsc::unbounded_channel();
+        net.peers.write().await.insert(peer_addr, ptx);
+
+        let (msg_sender, msg_receiver) = mpsc::unbounded_channel();
+        let (pdtx, _pdrx) = mpsc::unbounded_channel();
+        let started = tokio::time::Instant::now();
+        P2PNetwork::handle_peer(
+            TransportStream::Tcp(stream),
+            peer_addr,
+            net.peers.clone(),
+            net.config.listen_addr,
+            net.addresses.clone(),
+            net.tx_channel.clone(),
+            net.get_dag_hashes.clone(),
+            net.get_transaction_by_hash.clone(),
+            net.get_tips.clone(),
+            net.seen_transactions.clone(),
+            net.propagation_state.clone(),
+            msg_sender,
+            msg_receiver,
+            pdtx,
+            net.sync_ctx.clone(),
+            net.is_orphan.clone(),
+            net.stake_hooks.clone(),
+            net.config.network_id,
+            P2PProtocolMode::AuthenticatedV6,
+            Some(identity),
+            false,
+            net.session_auth.clone(),
+            net.session_seq.clone(),
+            generation,
+            None,
+            net.admission.clone(),
+            Duration::from_millis(300),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(elapsed >= Duration::from_millis(150), "must spend the budget");
+        assert_eq!(net.session_auth_len().await, 0, "no session on budget expiry");
+        assert_eq!(net.peer_count().await, 0, "no half-open peer after expiry");
+        peer.abort();
+    }
+
+    /// The OUTBOUND (initiator) role under the same expiry: no session, no
+    /// half-open peer, no dial/outbound residue left by the session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_slow_v6_peer_expiry_leaves_no_outbound_session() {
+        let net = cpw_net();
+        net.open_cycle_for_test(P2PProtocolMode::AuthenticatedV6).await;
+        let generation = net.generation();
+        let identity = Arc::new(NodeIdentity::generate());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let remote = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (_reader, mut writer) = sock.into_split();
+            let mut pre = Vec::new();
+            pre.extend_from_slice(&P2PNetwork::handshake_wire_magic());
+            pre.push(P2P_PROTOCOL_VERSION_V6);
+            writer.write_all(&pre).await.unwrap();
+            writer.flush().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let sock = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+        let peer_addr = sock.peer_addr().unwrap();
+        let (ptx, _prx) = mpsc::unbounded_channel();
+        net.peers.write().await.insert(peer_addr, ptx);
+
+        let (msg_sender, msg_receiver) = mpsc::unbounded_channel();
+        let (pdtx, _pdrx) = mpsc::unbounded_channel();
+        let started = tokio::time::Instant::now();
+        P2PNetwork::handle_peer(
+            TransportStream::Tcp(sock),
+            peer_addr,
+            net.peers.clone(),
+            net.config.listen_addr,
+            net.addresses.clone(),
+            net.tx_channel.clone(),
+            net.get_dag_hashes.clone(),
+            net.get_transaction_by_hash.clone(),
+            net.get_tips.clone(),
+            net.seen_transactions.clone(),
+            net.propagation_state.clone(),
+            msg_sender,
+            msg_receiver,
+            pdtx,
+            net.sync_ctx.clone(),
+            net.is_orphan.clone(),
+            net.stake_hooks.clone(),
+            net.config.network_id,
+            P2PProtocolMode::AuthenticatedV6,
+            Some(identity),
+            true,
+            net.session_auth.clone(),
+            net.session_seq.clone(),
+            generation,
+            None,
+            net.admission.clone(),
+            Duration::from_millis(300),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(elapsed >= Duration::from_millis(150), "must spend the budget");
+        assert_eq!(net.session_auth_len().await, 0, "no outbound session on expiry");
+        assert_eq!(net.peer_count().await, 0, "no half-open peer after expiry");
+        remote.abort();
+    }
+}
+
+#[cfg(test)]
+mod phase4ak_peer_store_save_tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn net_at(path: std::path::PathBuf) -> P2PNetwork {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
+        let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> = Arc::new(|_| None);
+        let sync_ctx = Arc::new(SyncContext::default());
+        let is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync> = Arc::new(|_| false);
+        P2PNetwork::new(
+            P2PConfig {
+                listen_addr: addr("127.0.0.1:31001"),
+                bootnodes: vec![],
+                dns_seeds: vec![],
+                peer_store_path: Some(path),
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+            },
+            tx,
+            empty.clone(),
+            empty_opt,
+            empty,
+            sync_ctx,
+            is_orphan,
+        )
+    }
+
+    fn read(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    fn no_staging_left(dir: &std::path::Path) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(!name.ends_with(".tmp"), "leftover staging file: {name}");
+        }
+    }
+
+    fn hook_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        L.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set_peer_store_hook(hook: Option<Arc<dyn Fn(u64) + Send + Sync>>) {
+        *PEER_STORE_TEST_HOOK.lock().unwrap_or_else(|e| e.into_inner()) = hook;
+    }
+
+    struct HookScope;
+    impl Drop for HookScope {
+        fn drop(&mut self) {
+            set_peer_store_hook(None);
+        }
+    }
+
+    /// A staging path is unique per save, a hidden sibling of the destination,
+    /// and never the destination itself.
+    #[test]
+    fn staging_paths_are_unique_and_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_peers.json");
+        let a = peer_store_staging_path(&path, 1);
+        let b = peer_store_staging_path(&path, 2);
+        let c = peer_store_staging_path(&path, 1);
+        assert_ne!(a, path);
+        assert_ne!(a, b);
+        assert_ne!(a, c, "same generation, different save: still unique");
+        assert_eq!(a.parent(), path.parent());
+        let name = a.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with('.'), "staging is hidden: {name}");
+        assert!(name.ends_with(".tmp"));
+    }
+
+    /// The staging file is created exclusively, so two saves can never truncate
+    /// the same staging file, and it carries owner-only permissions on Unix.
+    #[test]
+    fn staging_write_is_exclusive_and_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmp = dir.path().join(".peers.tmp");
+        write_private_file_new(&tmp, "first").unwrap();
+        let err = write_private_file_new(&tmp, "second").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(read(&tmp), "first", "the first write is never truncated");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&tmp).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "staging must be owner-only");
+        }
+    }
+
+    /// Concurrent saves to one path: distinct staging files, the newest
+    /// generation wins, and no staging file is left behind.
+    #[test]
+    fn concurrent_saves_keep_newest_and_never_share_a_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_peers.json");
+        let n = 8usize;
+        let gens: Vec<u64> = (0..n)
+            .map(|_| PEER_STORE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1)
+            .collect();
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let p = path.clone();
+            let g = gens[i];
+            let body = format!("{{\"save\":{}}}", i);
+            handles.push(std::thread::spawn(move || {
+                save_peer_store_blocking(&p, &body, g).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let winner = (0..n).max_by_key(|i| gens[*i]).unwrap();
+        assert_eq!(read(&path), format!("{{\"save\":{}}}", winner));
+        no_staging_left(dir.path());
+    }
+
+    /// AB-1 core: a save carrying an OLDER generation that runs AFTER a newer
+    /// snapshot was published must be discarded, never allowed to replace it.
+    /// This is the shape of a `spawn_blocking` survivor resuming after the
+    /// `shutdown()` deadline expired.
+    #[test]
+    fn stale_generation_cannot_replace_a_newer_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_peers.json");
+
+        let stale_gen = PEER_STORE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        let new_gen = PEER_STORE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        assert!(new_gen > stale_gen);
+
+        save_peer_store_blocking(&path, "NEW", new_gen).unwrap();
+        assert_eq!(read(&path), "NEW");
+
+        save_peer_store_blocking(&path, "OLD", stale_gen).unwrap();
+        assert_eq!(read(&path), "NEW", "stale save must not overwrite newer");
+        no_staging_left(dir.path());
+    }
+
+    /// The same guarantee with the older write genuinely held before it takes
+    /// the slot, then released after the newer save completed. Order is pinned
+    /// with an internal test hook, so the assertion is deterministic.
+    #[test]
+    fn held_older_write_is_discarded_on_resume() {
+        let _lock = hook_lock();
+        let _scope = HookScope;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_peers.json");
+
+        let old_gen = PEER_STORE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        set_peer_store_hook(Some({
+            let gate = gate.clone();
+            Arc::new(move |g| {
+                if g == old_gen {
+                    parked_tx.send(()).unwrap();
+                    let (m, cv) = &*gate;
+                    let mut released = m.lock().unwrap_or_else(|e| e.into_inner());
+                    while !*released {
+                        released = cv.wait(released).unwrap_or_else(|e| e.into_inner());
+                    }
+                }
+            })
+        }));
+
+        let p = path.clone();
+        let survivor = std::thread::spawn(move || save_peer_store_blocking(&p, "OLD", old_gen));
+        parked_rx.recv().unwrap();
+
+        let new_gen = PEER_STORE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        save_peer_store_blocking(&path, "NEW", new_gen).unwrap();
+        assert_eq!(read(&path), "NEW");
+
+        {
+            let (m, cv) = &*gate;
+            *m.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            cv.notify_all();
+        }
+        survivor.join().unwrap().unwrap();
+        assert_eq!(read(&path), "NEW", "resumed older write must not win");
+        no_staging_left(dir.path());
+    }
+
+    /// A fresh instance started after a timed-out shutdown shares the same slot
+    /// as the survivor, so the new instance's snapshot survives the survivor
+    /// resuming later. This models the restart / `P2PNetwork` boundary.
+    #[tokio::test]
+    async fn new_instance_snapshot_survives_older_survivor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_peers.json");
+
+        let stale_gen = PEER_STORE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+
+        let net = net_at(path.clone());
+        {
+            let mut mgr = net.addresses.write().await;
+            mgr.observe(
+                addr("203.0.113.77:25565"),
+                PeerSource::Pex,
+                1,
+                Instant::now(),
+            );
+        }
+        net.try_save_known_peers().await.unwrap();
+        let after_new = read(&path);
+        assert!(after_new.contains("203.0.113.77"));
+
+        save_peer_store_blocking(&path, "OLD", stale_gen).unwrap();
+        assert_eq!(read(&path), after_new, "older survivor must not win");
+        no_staging_left(dir.path());
+    }
+
+    /// Two concurrent flushes through the async entry point settle on one valid
+    /// document and leave no staging file behind.
+    #[tokio::test]
+    async fn concurrent_try_save_settles_on_one_valid_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_peers.json");
+        let net = net_at(path.clone());
+        {
+            let mut mgr = net.addresses.write().await;
+            mgr.observe(
+                addr("203.0.113.88:25565"),
+                PeerSource::Pex,
+                1,
+                Instant::now(),
+            );
+        }
+        let (a, b) = tokio::join!(net.try_save_known_peers(), net.try_save_known_peers());
+        a.unwrap();
+        b.unwrap();
+        let file: PeerStoreFile = serde_json::from_str(&read(&path)).unwrap();
+        assert_eq!(file.version, PEER_STORE_VERSION);
+        assert_eq!(file.entries.len(), 1);
+        no_staging_left(dir.path());
+    }
+
+    /// A publish failure is reported, and the staging file is cleaned up.
+    #[test]
+    fn failed_publish_is_reported_and_leaves_no_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_peers.json");
+        // A directory where the destination file should be makes `rename` fail.
+        // The staging write itself succeeds, so this exercises the publish
+        // error path and its cleanup.
+        std::fs::create_dir(&path).unwrap();
+
+        let gen = PEER_STORE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        let err = save_peer_store_blocking(&path, "{}", gen).unwrap_err();
+        assert!(err.contains("replace peer store"), "got: {err}");
+        no_staging_left(dir.path());
+    }
+
+    /// A missing parent directory is created, not treated as a failure.
+    #[test]
+    fn missing_parent_is_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("known_peers.json");
+        let gen = PEER_STORE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        save_peer_store_blocking(&path, "{}", gen).unwrap();
+        assert_eq!(read(&path), "{}");
+        no_staging_left(&dir.path().join("nested"));
     }
 }

@@ -5,3 +5,5 @@ rpc_port = 9936
 reset = true
 bootnodes = ["127.0.0.1:25565"]
 dns_seeds = []
+# Explicit P2P handshake choice (required; see config.example.toml).
+p2p_protocol = "legacy_v5"

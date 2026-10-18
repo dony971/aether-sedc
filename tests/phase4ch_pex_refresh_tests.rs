@@ -34,7 +34,7 @@
 //!   fuzzing beyond PEX remains out of scope.
 
 use aether_unified::genesis::GENESIS_HASH;
-use aether_unified::p2p::{P2PConfig, P2PMessage, P2PNetwork, P2P_PROTOCOL_VERSION};
+use aether_unified::p2p::{P2PConfig, P2PMessage, P2PNetwork, P2PProtocolMode, P2P_PROTOCOL_VERSION};
 use aether_unified::sync_stats::SyncContext;
 use aether_unified::transaction::{Transaction, DEFAULT_NETWORK_ID};
 use aether_unified::transport::{
@@ -278,6 +278,8 @@ async fn ch01_foreign_sealed_peers_frame_exercises_real_receive_path() {
         log: Arc::clone(&dial_log),
     });
     let net = boot_node(PORT, transport);
+    // 4CP-W: the P2P protocol mode is an explicit prerequisite for start().
+    net.set_protocol_mode(P2PProtocolMode::LegacyV5);
     tokio::time::timeout(START_TIMEOUT, net.start())
         .await
         .expect("TIMEOUT: start hung")

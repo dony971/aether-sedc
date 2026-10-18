@@ -14,3 +14,11 @@ dns_seeds = ["seed1.aether.network", "seed2.aether.network"]
 
 # Miner address (hex, required for mining rewards)
 # miner_address = "abcd1234..."
+
+# P2P handshake protocol — an EXPLICIT choice. The node REFUSES to start if
+# this is omitted (there is no implicit legacy fallback).
+#   "legacy_v5"        = historical encrypted-but-UNAUTHENTICATED handshake
+#   "authenticated_v6" = authenticated handshake (requires a node identity,
+#                        loaded or created in data_dir at boot)
+# Overridden by the CLI flag `--p2p-protocol <MODE>`.
+p2p_protocol = "legacy_v5"

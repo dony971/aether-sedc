@@ -95,6 +95,13 @@ fn parse_bootnode_address(addr_str: &str) -> Result<SocketAddr, Box<dyn std::err
 }
 
 pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error::Error>> {
+    // PHASE 4CP-S: the P2P handshake is an EXPLICIT configuration choice,
+    // resolved before any field is moved out of `cfg`. Fails closed if unset
+    // (there is NO implicit legacy fallback).
+    let protocol_mode = cfg.resolve_p2p_protocol().map_err(|e| {
+        tracing::error!("⛔ {}", e);
+        e
+    })?;
     let node_type = cfg.node_type;
     let data_dir = cfg.data_dir;
     let p2p_port = cfg.p2p_port;
@@ -757,9 +764,9 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
         dns_seeds: cfg.dns_seeds.clone(),
         // Phase 1: persist known peers under the node data directory.
         peer_store_path: Some(data_dir.join("known_peers.json")),
-        // PHASE 4V: handshake network gate (0 = legacy default).
-        // PHASE 4X: effective mapping (None -> legacy 0); explicitness is
-        // enforced by the V6 gate above, not by the handshake itself.
+        // PHASE 4V: handshake network gate (0 = legacy default). This is a pure
+        // network IDENTIFIER, still exact-match checked in the handshake, and
+        // it is DECOUPLED from the handshake protocol choice (4CP-S).
         network_id,
     };
 
@@ -774,6 +781,40 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
         is_orphan,
     ));
     tracing::info!("✅ P2P network initialized");
+
+    // PHASE 4CP-S: select the P2P handshake protocol from the EXPLICIT config
+    // choice (`resolve_p2p_protocol` refused to start if it was unset). The
+    // choice is independent of `network_id`:
+    //   * AuthenticatedV6 -> requires the persistent node identity; the node
+    //     refuses to start if it cannot be loaded. There is NO v6 -> v5
+    //     fallback on any error.
+    //   * LegacyV5 -> the unauthenticated 77-byte v5 handshake, unchanged.
+    match protocol_mode {
+        crate::p2p::P2PProtocolMode::AuthenticatedV6 => {
+            let (identity, outcome) =
+                crate::node_identity::load_or_create(&data_dir).map_err(|e| {
+                    format!(
+                        "Refusing to start authenticated P2P: node identity unavailable: {}",
+                        e
+                    )
+                })?;
+            tracing::info!(
+                "🔐 P2P protocol: AuthenticatedV6 (node_id={}, identity={:?})",
+                identity.node_id(),
+                outcome
+            );
+            p2p_network.set_node_identity(identity);
+            p2p_network.set_protocol_mode(crate::p2p::P2PProtocolMode::AuthenticatedV6);
+        }
+        crate::p2p::P2PProtocolMode::LegacyV5 => {
+            tracing::warn!(
+                "🔓 P2P protocol: LegacyV5 (explicitly selected; encrypted but UNAUTHENTICATED)"
+            );
+            // 4CP-U: record the explicit choice so the network's lifecycle is
+            // `Configured` (never an implicit default) before `start()`.
+            p2p_network.set_protocol_mode(crate::p2p::P2PProtocolMode::LegacyV5);
+        }
+    }
 
   // PHASE 4G: wire stake gossip. The vote-serving lookup reads the Sled
   // vote tree with try_read (GetData retries cover contention  -  serving

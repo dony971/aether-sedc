@@ -42,6 +42,11 @@ struct Cli {
     /// Rebuild the ledger (balances) from genesis + DAG replay on startup
     #[arg(long)]
     repair_ledger: bool,
+    /// P2P handshake protocol: `legacy_v5` or `authenticated_v6`.
+    /// 4CP-U: an EXPLICIT choice (overrides the TOML `p2p_protocol`). The node
+    /// refuses to start unless a value is provided here or in the config file.
+    #[arg(long, value_name = "MODE")]
+    p2p_protocol: Option<aether_unified::p2p::P2PProtocolMode>,
 }
 
 #[derive(Subcommand)]
@@ -806,6 +811,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if cli.repair_ledger {
         cfg.repair_ledger = true;
+    }
+    // 4CP-U (4CPT-03): explicit P2P handshake choice; CLI overrides TOML.
+    // Without one (here or in the file) `run_node` fails closed and the node
+    // never starts on an implicit handshake.
+    if let Some(mode) = cli.p2p_protocol {
+        cfg.p2p_protocol = Some(mode);
     }
 
     if cli.daemon

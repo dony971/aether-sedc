@@ -26,7 +26,7 @@
 
 use aether_unified::genesis::{initialize_genesis, GenesisConfig, GENESIS_HASH};
 use aether_unified::ledger::Ledger;
-use aether_unified::p2p::{P2PConfig, P2PNetwork, P2P_PROTOCOL_VERSION};
+use aether_unified::p2p::{P2PConfig, P2PNetwork, P2PProtocolMode, P2P_PROTOCOL_VERSION};
 use aether_unified::parent_selection::DAG;
 use aether_unified::stake::{current_epoch, StakeRegistry};
 use aether_unified::storage::Storage;
@@ -236,6 +236,8 @@ async fn boot_node(
         Arc::new(aether_unified::sync_stats::SyncContext::default()),
         Arc::new(|_| false),
     ));
+    // 4CP-W: the P2P protocol mode is an explicit prerequisite for start().
+    p2p.set_protocol_mode(P2PProtocolMode::LegacyV5);
     tokio::time::timeout(ADVERSITY_TIMEOUT, p2p.start())
         .await
         .expect("P2P start must not hang")
