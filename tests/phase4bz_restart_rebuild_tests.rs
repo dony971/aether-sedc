@@ -23,19 +23,76 @@ use aether_unified::stake::{current_epoch, StakeRegistry};
 use aether_unified::storage::Storage;
 use aether_unified::transaction::Transaction;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 const WATCHDOG_SECS: u64 = 120;
 
+/// Process-wide monotonic counter that makes each fixture directory unique even
+/// when two tests pass the same `tag` or the OS reuses a PID.
+static DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A genuinely unique, isolated store directory.
+///
+/// sled takes an EXCLUSIVE OS lock on the store directory for the lifetime of
+/// the database handle. The previous fixture derived the path from the PID and
+/// deleted it up front, so two tests could be handed the same path and one
+/// would fail to acquire the still-held lock (`WouldBlock`). Deriving the name
+/// from a process-wide counter plus a monotonic timestamp guarantees no
+/// collision, and no pre-existing directory is ever deleted.
 fn unique_dir(tag: &str) -> PathBuf {
+    let seq = DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!(
-        "aether-4bz-{}-{}",
+        "aether-4bz-{}-{}-{}-{}",
         tag,
-        std::process::id()
+        std::process::id(),
+        seq,
+        nanos
     ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::create_dir_all(&dir).expect("mkdir unique store dir");
     dir
+}
+
+/// Open a store, tolerating sled's **transient** release of its exclusive
+/// directory lock, and otherwise failing loudly with a step-specific context.
+///
+/// sled holds an exclusive OS lock on the store directory while the database
+/// handle is alive: opening the SAME directory concurrently always fails with
+/// "could not acquire lock" (observed on a live second handle), whereas
+/// distinct directories never collide. The lock is released on `drop`, but that
+/// release is not guaranteed to be synchronous with `drop` (sled's flusher
+/// thread can outlive the handle briefly), which is what makes an immediate
+/// same-directory reopen intermittently fail with `WouldBlock`/`code 11`.
+///
+/// Only that specific, recognized lock error is retried, with a bounded number
+/// of short backoffs; any other error, or a lock that persists past the bound,
+/// is reported as a real failure. A persistent lock is never masked.
+fn open_store(dir: &Path, context: &str) -> Storage {
+    const MAX_ATTEMPTS: u32 = 50;
+    const BACKOFF: Duration = Duration::from_millis(100);
+    for attempt in 1..=MAX_ATTEMPTS {
+        match Storage::open(dir) {
+            Ok(store) => return store,
+            Err(e) => {
+                let msg = e.to_string();
+                let lock_held = msg.contains("could not acquire lock")
+                    || msg.contains("Resource temporarily unavailable");
+                if lock_held && attempt < MAX_ATTEMPTS {
+                    std::thread::sleep(BACKOFF);
+                    continue;
+                }
+                panic!(
+                    "{context}: could not open sled store at {} after {attempt} attempt(s): {e}",
+                    dir.display()
+                );
+            }
+        }
+    }
+    unreachable!("bounded open loop always returns or panics")
 }
 
 /// Small deterministic ladder (mirrors inc01 fixtures, fewer txs for speed).
@@ -120,7 +177,7 @@ fn rebuild_watched(dag: &mut DAG, txs: Vec<Transaction>) -> (u64, u64, Vec<Trans
 fn boot_like_rebuild(store_dir: &Path) -> (DAG, Ledger, Vec<Transaction>, Vec<Transaction>) {
     // Mirrors node.rs boot: read persisted txs + orphans (dedup), rebuild
     // into a FRESH genesis DAG, rebuild tips, rebuild ledger like boot.
-    let store = Storage::open(store_dir).expect("reopen store");
+    let store = open_store(store_dir, "boot_like_rebuild: reopen persisted store");
     let mut all = store.get_all_transactions().expect("read txs");
     for orphan in store.get_all_orphans().expect("read orphans") {
         if !all.iter().any(|tx| tx.id == orphan.id) {
@@ -156,7 +213,7 @@ fn zb01_restart_orphans_survive_and_resolve() {
     }
     // Persist txs + orphans, flush, FULL close (drop everything).
     {
-        let store = Storage::open(&dir).expect("open store");
+        let store = open_store(&dir, "zb01: persist txs and orphans");
         for tx in present {
             store.put_transaction(tx).expect("persist tx");
         }
@@ -174,7 +231,7 @@ fn zb01_restart_orphans_survive_and_resolve() {
     // (boot never deletes; the runtime drainer removes them on success,
     // TTL purges them otherwise) -- the test mirrors that exactly.
     {
-        let store = Storage::open(&dir).expect("reopen store");
+        let store = open_store(&dir, "zb01: persist arriving parents");
         for m in missing {
             store.put_transaction(m).expect("persist parent");
         }
@@ -202,13 +259,13 @@ fn zb01_restart_orphans_survive_and_resolve() {
     // success (rpc.rs success arm); replicate that and prove the store is
     // clean afterwards -- no stale entries survive a healed reboot.
     {
-        let store = Storage::open(&dir).expect("reopen store");
+        let store = open_store(&dir, "zb01: drain resolved orphans");
         for o in &orphans {
             store.remove_orphan(o.id).expect("drainer removes on success");
         }
         store.flush().expect("flush");
         drop(store);
-        let store = Storage::open(&dir).expect("reopen store");
+        let store = open_store(&dir, "zb01: verify store has no stale orphans");
         assert!(
             store.get_all_orphans().expect("read orphans").is_empty(),
             "no stale orphan entries after healing"
@@ -223,7 +280,7 @@ fn zb02_repeated_restarts_stable() {
     let dir = unique_dir("repeat-restart");
     let txs = build_ladder(faucet(), 150, 3_000_000);
     {
-        let store = Storage::open(&dir).expect("open");
+        let store = open_store(&dir, "zb02: initial persist");
         for tx in &txs {
             store.put_transaction(tx).expect("persist");
         }
@@ -236,7 +293,7 @@ fn zb02_repeated_restarts_stable() {
         assert_eq!(dag.transaction_count(), 150, "cycle {}: full DAG", cycle);
         fps.push(fingerprint(&dag, &ledger));
         // Full close between cycles (drop everything; reopen next loop).
-        let store = Storage::open(&dir).expect("reopen");
+        let store = open_store(&dir, "zb02: close/reopen between cycles");
         drop(store);
     }
     assert_eq!(fps[0], fps[1]);
@@ -275,7 +332,7 @@ fn zb04_partial_store_guard_inputs() {
     let dir = unique_dir("partial-guard");
     let txs = build_ladder(faucet(), 200, 5_000_000);
     {
-        let store = Storage::open(&dir).expect("open");
+        let store = open_store(&dir, "zb04: initial persist");
         for tx in &txs {
             store.put_transaction(tx).expect("persist");
         }
@@ -283,7 +340,7 @@ fn zb04_partial_store_guard_inputs() {
     }
     // Simulate crash-truncation INSIDE the store: reopen and delete the tail.
     {
-        let store = Storage::open(&dir).expect("reopen");
+        let store = open_store(&dir, "zb04: truncate store tail");
         for tx in txs.iter().skip(20) {
             store.delete_transaction(tx.id).expect("truncate");
         }
@@ -291,7 +348,7 @@ fn zb04_partial_store_guard_inputs() {
     }
     // Reboot sees 20 txs, 0 orphans, 0 skips -- the incident trap.
     let (mut dag, _b, _o, _m) = initialize_genesis(GenesisConfig::default());
-    let store = Storage::open(&dir).expect("reopen2");
+    let store = open_store(&dir, "zb04: read truncated store");
     let persisted = store.get_all_transactions().expect("read");
     drop(store);
     assert_eq!(persisted.len(), 20);
