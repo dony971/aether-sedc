@@ -333,6 +333,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.network_id.is_some() {
         cfg.network_id = cli.network_id;
     }
+    // 4CP-AI (AH-2): secure the data directory at the FIRST point it is needed.
+    // The file-logging bootstrap below creates it (via `logs/`), before the
+    // node's own startup (`ensure_data_dir`) would, so without this the
+    // directory would first exist with ordinary permissions. This uses the same
+    // single strategy as the node startup and identity loading: owner-only,
+    // created restrictively at creation, unsafe paths refused.
+    aether_unified::node_identity::ensure_secure_data_dir(&cfg.data_dir)
+        .map_err(|e| format!("Failed to secure the node data directory: {}", e))?;
 
     // OBSERVABILITY-ONLY (n°4): node file logging. Tag = data-dir name
     // (node1, node2, …) so every line attributes its node.

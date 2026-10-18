@@ -103,10 +103,15 @@ pub async fn load_dag_from_json(path: &PathBuf) -> Result<DagStore, Box<dyn std:
     Ok(store)
 }
 
-/// Ensure data directory exists
+/// Ensure the node data directory exists and is owner-only.
+///
+/// 4CP-AI (AH-2): this is the node startup's first creation point, so it must
+/// not create the directory with ordinary permissions and harden it afterwards.
+/// It delegates to the single secure-creation strategy in
+/// [`crate::node_identity::ensure_secure_data_dir`], which validates the path,
+/// creates any missing component owner-only at creation and refuses an unsafe
+/// or unsecurable configuration.
 pub async fn ensure_data_dir(data_dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    if !data_dir.exists() {
-        fs::create_dir_all(data_dir).await?;
-    }
+    crate::node_identity::ensure_secure_data_dir(data_dir)?;
     Ok(())
 }

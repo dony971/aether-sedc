@@ -15,6 +15,7 @@ pub mod json_storage;
 pub mod ledger;
 pub mod log_privacy;
 pub mod node;
+pub mod node_identity;
 pub mod node_logging;
 pub mod p2p;
 pub mod parent_selection;

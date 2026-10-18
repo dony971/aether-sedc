@@ -66,4 +66,9 @@ tempfile = "3.8"
 # Foundation HANDLE type). No new vendor: windows-sys is already in the
 # locked transitive supply chain (tokio/mio/tempfile/eframe).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.61.2", default-features = false, features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+# PHASE 4CO-K: explicit protected DACL for the network identity key file.
+# Additional features added to the SAME pinned version (no new crate, no new
+# version): Win32_Security (token query), Win32_Security_Authorization
+# (SDDL<->security descriptor), Win32_System_Threading
+# (OpenProcessToken/GetCurrentProcess).
+windows-sys = { version = "=0.61.2", default-features = false, features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading"] }
