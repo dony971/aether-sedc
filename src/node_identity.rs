@@ -2064,19 +2064,58 @@ mod tests {
         assert!(dir.is_file(), "the path must not be replaced");
     }
 
-    /// An over-permissive existing directory is hardened to owner-only by
-    /// `load_or_create` (AF-2).
+    /// An existing directory that is traversable but not writable by group or
+    /// other (0755) passes the unsafe-path policy and is then hardened to
+    /// owner-only by `load_or_create` (AF-2). A directory that IS writable by
+    /// group or other (0777) without the sticky bit is refused instead, see
+    /// `refuses_group_writable_identity_directory_without_sticky_on_unix`.
     #[test]
     #[cfg(unix)]
     fn identity_directory_is_hardened_to_owner_only_on_unix() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let _ = load_or_create(dir.path()).unwrap();
 
         let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "identity directory must be 0700, got {:o}", mode);
+    }
+
+    /// A group/world-writable directory without the sticky bit (0777) is refused
+    /// **before** any secret is written or read (fail-closed policy, 4CP-AG /
+    /// AF-2): no staging or identity file is created, and a pre-existing
+    /// identity is neither read, replaced nor altered.
+    #[test]
+    #[cfg(unix)]
+    fn refuses_group_writable_identity_directory_without_sticky_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = identity_path(dir.path());
+        // A pre-existing artifact at the identity path that must survive the
+        // refused attempt byte-for-byte.
+        let sentinel = b"pre-existing-identity-must-not-be-touched";
+        std::fs::write(&path, sentinel).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let err = load_or_create(dir.path()).unwrap_err();
+        assert!(matches!(err, IdentityError::Io(_)), "got {:?}", err);
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            sentinel,
+            "a refused directory must not alter an existing identity"
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from(NODE_IDENTITY_FILE_NAME)],
+            "a refused directory must not gain any file, got {:?}",
+            entries
+        );
     }
 
     /// `load` also refuses an unsecurable (here: symlinked) directory and never
