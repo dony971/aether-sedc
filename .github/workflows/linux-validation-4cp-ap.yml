@@ -92,14 +92,30 @@ jobs:
           if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
           exit "$c"
 
-      - name: integration phase4bz_restart_rebuild_tests
+      # 4CP-AR: repeat the restart/rebuild suite 20x. A single pass cannot
+      # distinguish a fixed flake from a lucky one; any one of the 20 failing
+      # fails the step (no continue-on-error, no masking).
+      - name: integration phase4bz_restart_rebuild_tests (x20)
         if: always()
         run: |
-          n=phase4bz; log=/tmp/$n.log; set +e
-          cargo test --test phase4bz_restart_rebuild_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
-          c=${PIPESTATUS[0]}
-          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
-          exit "$c"
+          n=phase4bz; log=/tmp/$n.log; : > "$log"; set +e
+          fails=0
+          for i in $(seq 1 20); do
+            echo "=== phase4bz run $i/20 ===" | tee -a "$log"
+            cargo test --test phase4bz_restart_rebuild_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee -a "$log"
+            c=${PIPESTATUS[0]}
+            if [ "$c" -ne 0 ]; then
+              fails=$((fails + 1))
+              echo "::error::phase4bz run $i/20 failed on Linux (exit $c)"
+            fi
+          done
+          if [ "$fails" -ne 0 ]; then
+            echo "::error::phase4bz failed $fails/20 runs on Linux"
+            grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 12 | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          fi
+          echo "phase4bz: 20/20 runs passed"
+          exit 0
 
       - name: integration phase4ca_twonode_sync_restart_tests
         if: always()
