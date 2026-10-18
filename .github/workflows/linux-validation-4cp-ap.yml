@@ -4,6 +4,8 @@ name: Linux Validation (temporary, 4CP-AQ)
 # the targeted Linux test matrix against the exact pushed commit. It performs
 # NO deployment, NO release, NO publication, and references NO secrets.
 # Least privilege: contents:read. Delete the temporary branch once validated.
+# Failure output is surfaced as check-run annotations (::error::) so results
+# are readable without authentication. Tests themselves are NOT modified.
 
 on:
   push:
@@ -31,7 +33,6 @@ jobs:
         with:
           toolchain: 1.97.1
           target: x86_64-unknown-linux-gnu
-          override: true
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -44,15 +45,23 @@ jobs:
 
       - name: node_identity unit tests
         if: always()
-        run: "cargo test --lib node_identity::"
+        run: |
+          set +e
+          cargo test --lib node_identity:: 2>&1 | tee /tmp/01_node_identity.log
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            echo "::error::node_identity:: failed on Linux (exit $code)"
+            grep -nE "panicked at|assertion|FAILED|test result:|left ==|right ==|Error|error" /tmp/01_node_identity.log | tail -n 40 | while IFS= read -r l; do echo "::error::$l"; done
+          fi
+          exit "$code"
 
       - name: peer store tests
         if: always()
-        run: cargo test --lib phase4ak_peer_store_save_tests
+        run: "cargo test --lib phase4ak_peer_store_save_tests"
 
       - name: p2p suite
         if: always()
-        run: cargo test --lib "p2p::"
+        run: 'cargo test --lib "p2p::"'
 
       - name: compile lib tests
         if: always()
@@ -72,7 +81,15 @@ jobs:
 
       - name: integration phase4bz_restart_rebuild_tests
         if: always()
-        run: cargo test --test phase4bz_restart_rebuild_tests
+        run: |
+          set +e
+          cargo test --test phase4bz_restart_rebuild_tests -- --nocapture 2>&1 | tee /tmp/13_phase4bz.log
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            echo "::error::phase4bz_restart_rebuild_tests failed on Linux (exit $code)"
+            grep -nE "panicked at|assertion|FAILED|test result:|left ==|right ==|Error|error" /tmp/13_phase4bz.log | tail -n 40 | while IFS= read -r l; do echo "::error::$l"; done
+          fi
+          exit "$code"
 
       - name: integration phase4ca_twonode_sync_restart_tests
         if: always()
