@@ -50,7 +50,7 @@ jobs:
           n=node_identity; log=/tmp/$n.log; set +e
           cargo test --lib node_identity:: 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
           c=${PIPESTATUS[0]}
-          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
           exit "$c"
 
       - name: peer store tests
@@ -59,7 +59,7 @@ jobs:
           n=peer_store; log=/tmp/$n.log; set +e
           cargo test --lib phase4ak_peer_store_save_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
           c=${PIPESTATUS[0]}
-          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
           exit "$c"
 
       - name: p2p suite
@@ -68,7 +68,7 @@ jobs:
           n=p2p; log=/tmp/$n.log; set +e
           cargo test --lib "p2p::" 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
           c=${PIPESTATUS[0]}
-          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
           exit "$c"
 
       - name: compile lib tests
@@ -89,7 +89,7 @@ jobs:
           n=phase4aq; log=/tmp/$n.log; set +e
           cargo test --test phase4aq_inventory_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
           c=${PIPESTATUS[0]}
-          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
           exit "$c"
 
       - name: integration phase4bz_restart_rebuild_tests
@@ -98,7 +98,7 @@ jobs:
           n=phase4bz; log=/tmp/$n.log; set +e
           cargo test --test phase4bz_restart_rebuild_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
           c=${PIPESTATUS[0]}
-          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
           exit "$c"
 
       - name: integration phase4ca_twonode_sync_restart_tests
@@ -107,7 +107,7 @@ jobs:
           n=phase4ca; log=/tmp/$n.log; set +e
           cargo test --test phase4ca_twonode_sync_restart_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
           c=${PIPESTATUS[0]}
-          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
           exit "$c"
 
       - name: integration phase4cb_lifecycle_restart_tests
@@ -116,7 +116,7 @@ jobs:
           n=phase4cb; log=/tmp/$n.log; set +e
           cargo test --test phase4cb_lifecycle_restart_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
           c=${PIPESTATUS[0]}
-          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
           exit "$c"
 
       - name: integration phase4cc_adversarial_robustness_tests
@@ -125,7 +125,7 @@ jobs:
           n=phase4cc; log=/tmp/$n.log; set +e
           cargo test --test phase4cc_adversarial_robustness_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
           c=${PIPESTATUS[0]}
-          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
           exit "$c"
 
       - name: integration phase4cd_peer_discovery_tests
@@ -134,7 +134,7 @@ jobs:
           n=phase4cd; log=/tmp/$n.log; set +e
           cargo test --test phase4cd_peer_discovery_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
           c=${PIPESTATUS[0]}
-          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
           exit "$c"
 
       - name: integration phase4ce_peer_hygiene_tests
@@ -143,7 +143,7 @@ jobs:
           n=phase4ce; log=/tmp/$n.log; set +e
           cargo test --test phase4ce_peer_hygiene_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
           c=${PIPESTATUS[0]}
-          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
           exit "$c"
 
       - name: integration phase4ch_pex_refresh_tests
@@ -152,7 +152,7 @@ jobs:
           n=phase4ch; log=/tmp/$n.log; set +e
           cargo test --test phase4ch_pex_refresh_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
           c=${PIPESTATUS[0]}
-          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
           exit "$c"
 
       - name: integration v6_preflight_manifest
@@ -161,7 +161,7 @@ jobs:
           n=v6_preflight_manifest; log=/tmp/$n.log; set +e
           cargo test --test v6_preflight_manifest 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
           c=${PIPESTATUS[0]}
-          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
           exit "$c"
 
       - name: Upload test logs
