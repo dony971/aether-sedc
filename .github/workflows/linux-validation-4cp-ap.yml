@@ -227,6 +227,23 @@ jobs:
           if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
           exit "$c"
 
+      # 4CP-AY: partition/catch-up resilience in real multi-node sessions.
+      # ay01: 3-node partition+heal with pure-sync backfill, restart churn and
+      # final rebuild==live fingerprints. ay02: isolated node catch-up through
+      # a non-origin relay after peer loss. ay03: client crash mid-catch-up
+      # and server kill mid-serve, then resume to exact convergence, plus
+      # duplicate delivery rejected by the ingestion funnel. ay04: 110-tx
+      # catch-up across the MAX_SYNC_PAGE=100 boundary, measured, idempotent,
+      # restart-stable. No continue-on-error: any failure fails the step.
+      - name: integration phase4ay_partition_catchup_tests
+        if: always()
+        run: |
+          n=phase4ay; log=/tmp/$n.log; set +e
+          cargo test --test phase4ay_partition_catchup_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          exit "$c"
+
       - name: integration v6_preflight_manifest
         if: always()
         run: |
