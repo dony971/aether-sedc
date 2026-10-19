@@ -210,59 +210,73 @@ impl Ledger {
         if let Some(storage) = &self.storage {
             let storage_read = storage.read().await;
 
-            // --- Balances: write only dirty entries (O(K)) ---
-            let dirty_bal = std::mem::take(&mut self.dirty_balances);
-            for addr_hex in &dirty_bal {
+            // PHASE 4CP-AU: build the delta FIRST. Decode failures return
+            // before any write and keep the dirty sets intact — the caller
+            // still owns them for a retry (the old take-then-write order
+            // cleared them even when the write loop aborted).
+            let mut balances: Vec<(Address, u64)> = Vec::with_capacity(self.dirty_balances.len());
+            for addr_hex in &self.dirty_balances {
                 let addr_bytes = hex::decode(addr_hex)?;
                 let address: Address = addr_bytes
                     .as_slice()
                     .try_into()
                     .map_err(|e| format!("Invalid address length: {}", e))?;
-                let balance = *self.balances.get(addr_hex).unwrap_or(&0);
-                storage_read.put_balance(address, balance)?;
+                balances.push((address, *self.balances.get(addr_hex).unwrap_or(&0)));
             }
-
-            // --- Nonces: write only dirty entries (O(K)) ---
-            let dirty_non = std::mem::take(&mut self.dirty_nonces);
-            for addr_hex in &dirty_non {
+            let mut nonces: Vec<(Address, u64)> = Vec::with_capacity(self.dirty_nonces.len());
+            for addr_hex in &self.dirty_nonces {
                 let addr_bytes = hex::decode(addr_hex)?;
                 let address: Address = addr_bytes
                     .as_slice()
                     .try_into()
                     .map_err(|e| format!("Invalid address length: {}", e))?;
-                let nonce = *self.nonces.get(addr_hex).unwrap_or(&0);
-                storage_read.put_nonce(address, nonce)?;
+                nonces.push((address, *self.nonces.get(addr_hex).unwrap_or(&0)));
             }
-
-            // --- Locks: write only dirty entries (O(K)) ---
-            let dirty_lock = std::mem::take(&mut self.dirty_locked);
-            for addr_hex in &dirty_lock {
+            let mut locked: Vec<(Address, u64)> = Vec::with_capacity(self.dirty_locked.len());
+            for addr_hex in &self.dirty_locked {
                 let addr_bytes = hex::decode(addr_hex)?;
                 let address: Address = addr_bytes
                     .as_slice()
                     .try_into()
                     .map_err(|e| format!("Invalid address length: {}", e))?;
-                let locked = *self.locked.get(addr_hex).unwrap_or(&0);
-                storage_read.put_locked(address, locked)?;
+                locked.push((address, *self.locked.get(addr_hex).unwrap_or(&0)));
             }
+            let applied_added: Vec<TransactionId> =
+                self.dirty_applied_added.iter().copied().collect();
+            let applied_removed: Vec<TransactionId> =
+                self.dirty_applied_removed.iter().copied().collect();
 
-            // --- Applied set: incremental (O(delta)) ---
-            let added = std::mem::take(&mut self.dirty_applied_added);
-            let removed = std::mem::take(&mut self.dirty_applied_removed);
-            for id in &removed {
-                storage_read.unmark_applied(*id)?;
-            }
-            for id in &added {
-                storage_read.mark_applied(*id)?;
-            }
+            // PHASE 4CP-AU: ONE atomic Sled transaction for the whole delta.
+            // A failure now leaves the durable ledger exactly as it was —
+            // never a partially written prefix while the processor reports
+            // failure and rolls memory back (see Storage::apply_ledger_delta).
+            storage_read.apply_ledger_delta(
+                &balances,
+                &nonces,
+                &locked,
+                &applied_added,
+                &applied_removed,
+            )?;
+
+            // Commit succeeded: the delta is durable, drop the dirty sets.
+            let (n_bal, n_non, n_lock) = (
+                self.dirty_balances.len(),
+                self.dirty_nonces.len(),
+                self.dirty_locked.len(),
+            );
+            self.dirty_balances.clear();
+            self.dirty_nonces.clear();
+            self.dirty_locked.clear();
+            self.dirty_applied_added.clear();
+            self.dirty_applied_removed.clear();
 
             tracing::debug!(
                 "💾 Ledger delta saved ({} bal, {} non, {} app+ {} app-, {} lock)",
-                dirty_bal.len(),
-                dirty_non.len(),
-                added.len(),
-                removed.len(),
-                dirty_lock.len()
+                n_bal,
+                n_non,
+                applied_added.len(),
+                applied_removed.len(),
+                n_lock
             );
         }
         Ok(())

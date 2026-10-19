@@ -13,6 +13,31 @@ use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
 
+/// PHASE 4CP-AU: test-only fault injection for the persistence layer.
+/// Deterministic, per-instance (no global state — parallel tests each own
+/// their `Storage` and its own FIFO queue) and compiled ONLY under
+/// `#[cfg(test)]`: production builds contain no injection code and no
+/// switch that could arm one. `arm_fault` enqueues; a queued fault fires
+/// exactly once, and only when the FRONT of the queue matches the
+/// operation attempted (strict FIFO), so unrelated operations never
+/// consume it.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageFault {
+    PutTransaction,
+    PutBalance,
+    PutNonce,
+    MarkApplied,
+    Flush,
+}
+
+/// Error returned by an injected fault. Mirrors a Sled-level failure
+/// closely enough that every caller takes its real error path.
+#[cfg(test)]
+fn injected_fault(op: StorageFault) -> StorageError {
+    StorageError::DatabaseError(format!("injected test fault: {:?}", op))
+}
+
 /// Storage error types
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -102,6 +127,11 @@ pub struct Storage {
     evidence: Tree,
     // PHASE 4I (F-L1) bonded-stake locks.
     locked_balances: Tree,
+    /// PHASE 4CP-AU: test-only fault queue (see `StorageFault`). Empty in
+    /// every non-test build (field absent) and inert unless a test armed
+    /// it on this exact instance.
+    #[cfg(test)]
+    faults: std::sync::Mutex<std::collections::VecDeque<StorageFault>>,
 }
 
 impl Storage {
@@ -139,7 +169,29 @@ impl Storage {
   finalized,
   evidence,
   locked_balances,
+            #[cfg(test)]
+            faults: std::sync::Mutex::new(std::collections::VecDeque::new()),
         })
+    }
+
+    /// PHASE 4CP-AU: arm one fault on this instance (test-only). The fault
+    /// fires once, in FIFO order, only for its matching operation.
+    #[cfg(test)]
+    pub fn arm_fault(&self, fault: StorageFault) {
+        self.faults.lock().unwrap().push_back(fault);
+    }
+
+    /// PHASE 4CP-AU: consume the head fault iff it matches `op` (strict
+    /// FIFO). An operation never consumes a fault armed for another op.
+    #[cfg(test)]
+    fn take_fault(&self, op: StorageFault) -> bool {
+        let mut q = self.faults.lock().unwrap();
+        if q.front() == Some(&op) {
+            q.pop_front();
+            true
+        } else {
+            false
+        }
     }
 
     /// Get a tree by name
@@ -165,6 +217,10 @@ impl Storage {
     /// Together with `is_applied` this replaces the nonce-only STEP-1c
     /// heuristic with positive evidence (see transaction_processor).
     pub fn mark_applied(&self, id: TransactionId) -> Result<(), StorageError> {
+        #[cfg(test)]
+        if self.take_fault(StorageFault::MarkApplied) {
+            return Err(injected_fault(StorageFault::MarkApplied));
+        }
         self.tree(TreeName::AppliedTx).insert(id, &[])?;
         Ok(())
     }
@@ -199,6 +255,10 @@ impl Storage {
 
     /// Store a transaction
     pub fn put_transaction(&self, tx: &Transaction) -> Result<(), StorageError> {
+        #[cfg(test)]
+        if self.take_fault(StorageFault::PutTransaction) {
+            return Err(injected_fault(StorageFault::PutTransaction));
+        }
         let tree = self.tree(TreeName::Transactions);
         let key = tx.id;
         let value = bincode::serialize(tx)?;
@@ -307,6 +367,10 @@ impl Storage {
 
     /// Store a wallet balance
     pub fn put_balance(&self, address: Address, balance: u64) -> Result<(), StorageError> {
+        #[cfg(test)]
+        if self.take_fault(StorageFault::PutBalance) {
+            return Err(injected_fault(StorageFault::PutBalance));
+        }
         let tree = self.tree(TreeName::Balances);
         let value = balance.to_le_bytes().to_vec();
         tree.insert(address, value)?;
@@ -476,6 +540,72 @@ impl Storage {
         Ok(())
     }
 
+    /// PHASE 4CP-AU: commit a whole ledger delta (balances + nonces + locks
+    /// + applied adds/removes) in ONE Sled transaction. Before this, STEP-8
+    /// persistence wrote each entry independently: a failure mid-way left a
+    /// PREFIX of the delta durably written (e.g. debited sender + credited
+    /// receiver + burned fee) while the processor rolled the in-memory
+    /// ledger back and reported failure — a durable state the DAG could
+    /// never explain. One atomic commit makes the question moot: either the
+    /// whole delta is durable or none of it is. No flush here: same
+    /// durability discipline as the previous per-entry writes (Sled
+    /// auto-flush + the INC-01 drain-batch flush + boot rebuild).
+    pub fn apply_ledger_delta(
+        &self,
+        balances: &[(Address, u64)],
+        nonces: &[(Address, u64)],
+        locked: &[(Address, u64)],
+        applied_added: &[TransactionId],
+        applied_removed: &[TransactionId],
+    ) -> Result<(), StorageError> {
+        // PHASE 4CP-AU: fault-injection taps, checked BEFORE the transaction
+        // starts — an armed fault aborts the whole delta (nothing written),
+        // exactly the guarantee a failed Sled transaction provides.
+        #[cfg(test)]
+        {
+            if !balances.is_empty() && self.take_fault(StorageFault::PutBalance) {
+                return Err(injected_fault(StorageFault::PutBalance));
+            }
+            if !nonces.is_empty() && self.take_fault(StorageFault::PutNonce) {
+                return Err(injected_fault(StorageFault::PutNonce));
+            }
+            if (!applied_added.is_empty() || !applied_removed.is_empty())
+                && self.take_fault(StorageFault::MarkApplied)
+            {
+                return Err(injected_fault(StorageFault::MarkApplied));
+            }
+        }
+        let balance_tree = self.balances.clone();
+        let nonce_tree = self.nonces.clone();
+        let locked_tree = self.locked_balances.clone();
+        let applied_tree = self.applied_tx.clone();
+
+        (&balance_tree, &nonce_tree, &locked_tree, &applied_tree)
+            .transaction(|(balance_tree, nonce_tree, locked_tree, applied_tree)| {
+                for (address, balance) in balances {
+                    balance_tree.insert(address.as_ref(), balance.to_le_bytes().to_vec())?;
+                }
+                for (address, nonce) in nonces {
+                    nonce_tree.insert(address.as_ref(), nonce.to_le_bytes().to_vec())?;
+                }
+                for (address, amount) in locked {
+                    locked_tree.insert(address.as_ref(), amount.to_le_bytes().to_vec())?;
+                }
+                for id in applied_removed {
+                    applied_tree.remove(id.as_ref())?;
+                }
+                for id in applied_added {
+                    applied_tree.insert(id.as_ref(), Vec::<u8>::new())?;
+                }
+                Ok::<(), sled::transaction::ConflictableTransactionError<StorageError>>(())
+            })
+            .map_err(|e| {
+                StorageError::DatabaseError(format!("Sled transaction failed: {:?}", e))
+            })?;
+
+        Ok(())
+    }
+
     /// Get transaction count
     pub fn transaction_count(&self) -> Result<usize, StorageError> {
         let tree = self.tree(TreeName::Transactions);
@@ -484,6 +614,10 @@ impl Storage {
 
     /// Flush database to disk (atomic write)
     pub fn flush(&self) -> Result<(), StorageError> {
+        #[cfg(test)]
+        if self.take_fault(StorageFault::Flush) {
+            return Err(injected_fault(StorageFault::Flush));
+        }
         self.db.flush()?;
         Ok(())
     }
@@ -611,6 +745,10 @@ impl Storage {
 
     /// Store account nonce for replay protection
     pub fn put_nonce(&self, address: Address, nonce: u64) -> Result<(), StorageError> {
+        #[cfg(test)]
+        if self.take_fault(StorageFault::PutNonce) {
+            return Err(injected_fault(StorageFault::PutNonce));
+        }
         let tree = self.tree(TreeName::Nonces);
         let value = nonce.to_le_bytes().to_vec();
         tree.insert(address, value)?;
