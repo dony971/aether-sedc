@@ -16384,3 +16384,581 @@ mod phase4ak_peer_store_save_tests {
         no_staging_left(&dir.path().join("nested"));
     }
 }
+
+/// PHASE 4CAT (4CP-AT): end-to-end integrity over a REAL authenticated v6
+/// session — wire -> accept funnel -> mempool -> drainer -> DAG -> Sled ->
+/// ledger, plus the adversarial counterpart: an authenticated peer is
+/// AUTHENTICATED, never TRUSTED. Nothing is faked in the production path:
+///
+/// - real loopback TCP socket, real v6 handshake (ephemeral X25519 +
+///   transcript signature), real `handle_peer` receive loop, real raw-byte
+///   dedup (`accept_inbound_transaction`), real ingress-mode record
+///   (`note_ingress_mode`), real tx channel;
+/// - consumer = the production node wiring (node.rs:858-913):
+///   `take_ingress_mode` -> `AetherRpcImpl::process_transaction(tx, "P2P",
+///   mode)` with the same Ok-arm bookkeeping; drainer = the production
+///   `drain_mempool` entry point;
+/// - real `DAG`, real `Ledger` (storage attached, like node.rs:189), real
+///   `Mempool`, real `Storage` (real Sled directory), real `SyncContext`.
+///
+/// The 24-bit PoW of the shared fixture is CURRENT live policy (a timestamp
+/// >= DIFFICULTY_MIGRATION_TS requires 24 bits), so mining it once costs a
+/// few seconds — paid once per test process via `OnceLock`.
+#[cfg(test)]
+mod phase4cat_e2e_integrity_tests {
+    use super::*;
+    use crate::ledger::Ledger;
+    use crate::node_identity::NodeIdentity;
+    use crate::parent_selection::DAG;
+    use crate::rpc::{AetherRpcImpl, Mempool};
+    use crate::storage::Storage;
+    use crate::sync_stats::SyncContext;
+    use crate::transaction_processor::TransactionProcessor;
+    use crate::validation::{ValidationError, ValidationMode};
+    use crate::wallet::Wallet;
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+    use tokio::sync::{mpsc, RwLock};
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as u64
+    }
+
+    /// One shared, fully-valid LIVE transaction: real 24-bit PoW, real
+    /// Ed25519 signature, current timestamp (Fresh-valid under the current
+    /// wall clock). The adversarial variants in cat01 derive from it.
+    fn valid_live_tx() -> &'static Transaction {
+        static ONCE: std::sync::OnceLock<Transaction> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            let wallet = Wallet::from_secret_key(
+                "4ca74b2e10d940f2b3c4d5e6f708192a3b4c5d6e7f80912a3b4c5d6e7f8091a2",
+            )
+            .expect("fixed test key");
+            let mut tx = Transaction::new(
+                [[0u8; 32]; 2],
+                wallet.address(),
+                [0xA7u8; 32],
+                1000,
+                1,
+                now_ms(),
+                0,
+                1,
+                vec![0u8; 64],
+                wallet.public_key_bytes(),
+            );
+            tx.nonce = tx.mine_nonce(24);
+            tx.signature = wallet.sign_transaction(&tx).expect("sign");
+            tx.id = tx.compute_hash();
+            TransactionProcessor::new()
+                .validate_pure(&tx, ValidationMode::Fresh)
+                .expect("the shared fixture must pass the REAL live accept gate");
+            tx
+        })
+    }
+
+    /// A peer that has COMPLETED the real v6 handshake and therefore holds
+    /// the session key. It encrypts/frames exactly like the production send
+    /// task (pad -> ChaCha20-Poly1305 -> u32 BE length + 12-byte nonce), with
+    /// a strictly increasing per-direction counter. It can write ANY frame —
+    /// which is exactly the threat model: authentication proves WHO sent the
+    /// bytes, it never makes the bytes valid.
+    struct WirePeer {
+        reader: OwnedReadHalf,
+        writer: OwnedWriteHalf,
+        key: [u8; 32],
+        dir: u8,
+        counter: u64,
+    }
+
+    impl WirePeer {
+        async fn connect(addr: SocketAddr) -> Self {
+            let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            let (mut reader, mut writer) = stream.into_split();
+            let identity = NodeIdentity::generate();
+            let (key, dir, _peer_id) = P2PNetwork::handshake_v6(
+                &mut reader,
+                &mut writer,
+                crate::transaction::DEFAULT_NETWORK_ID,
+                &identity,
+                true,
+            )
+            .await
+            .expect("authenticated v6 handshake must succeed");
+            Self {
+                reader,
+                writer,
+                key,
+                dir,
+                counter: 0,
+            }
+        }
+
+        async fn send(&mut self, msg: &P2PMessage) {
+            let bytes = bincode::serialize(msg).expect("serialize");
+            let padded = P2PNetwork::pad_message(&bytes).expect("padded frame");
+            self.counter += 1;
+            let nonce_bytes = P2PNetwork::build_nonce(self.counter, self.dir);
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
+            let ciphertext = cipher
+                .encrypt(Nonce::from_slice(&nonce_bytes), padded.as_ref())
+                .expect("encrypt");
+            let total_len = 12 + ciphertext.len();
+            self.writer
+                .write_all(&(total_len as u32).to_be_bytes())
+                .await
+                .expect("write len");
+            self.writer
+                .write_all(&nonce_bytes)
+                .await
+                .expect("write nonce");
+            self.writer
+                .write_all(&ciphertext)
+                .await
+                .expect("write ciphertext");
+            self.writer.flush().await.expect("flush");
+        }
+
+        async fn send_tx(&mut self, tx: &Transaction) {
+            let tx_bytes = bincode::serialize(tx).expect("tx bytes");
+            self.send(&P2PMessage::Transaction(tx_bytes)).await;
+        }
+
+        async fn recv(&mut self) -> P2PMessage {
+            let mut len_buf = [0u8; 4];
+            self.reader
+                .read_exact(&mut len_buf)
+                .await
+                .expect("frame len");
+            let total_len = u32::from_be_bytes(len_buf) as usize;
+            let mut nonce_buf = [0u8; 12];
+            self.reader
+                .read_exact(&mut nonce_buf)
+                .await
+                .expect("frame nonce");
+            let mut ciphertext = vec![0u8; total_len - 12];
+            self.reader
+                .read_exact(&mut ciphertext)
+                .await
+                .expect("frame ciphertext");
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(&self.key));
+            let plaintext = cipher
+                .decrypt(Nonce::from_slice(&nonce_buf), ciphertext.as_ref())
+                .expect("decrypt");
+            let plain = P2PNetwork::unpad_message(&plaintext).expect("unpad");
+            bincode::deserialize(&plain).expect("deserialize")
+        }
+    }
+
+    struct CatNode {
+        net: Arc<P2PNetwork>,
+        dag: Arc<RwLock<DAG>>,
+        ledger: Arc<RwLock<Ledger>>,
+        storage: Arc<RwLock<Storage>>,
+        mempool: Arc<RwLock<Mempool>>,
+        sync_ctx: Arc<SyncContext>,
+        rpc: Arc<AetherRpcImpl>,
+    }
+
+    /// Boot the minimal production-shaped node: real state, real P2P network
+    /// in AuthenticatedV6 mode, and the node.rs P2P-consumer wiring on the
+    /// REAL funnel. `AetherRpcImpl` owns no per-tx state, so one instance is
+    /// equivalent to node.rs's per-tx construction over the same Arcs.
+    async fn boot_cat_node(dir: &std::path::Path) -> CatNode {
+        let storage = Arc::new(RwLock::new(
+            Storage::open(dir.join("sled")).expect("open sled"),
+        ));
+        let dag = Arc::new(RwLock::new(DAG::new()));
+        let ledger = Arc::new(RwLock::new(
+            Ledger::new_with_storage(storage.clone())
+                .await
+                .expect("ledger"),
+        ));
+        let mempool = Arc::new(RwLock::new(Mempool::new(1000, 10)));
+        let orphans: Arc<RwLock<HashMap<[u8; 32], Transaction>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let sync_ctx = Arc::new(SyncContext::default());
+        let (tx_sender, mut tx_receiver) = mpsc::unbounded_channel::<Transaction>();
+
+        let dag_hashes = dag.clone();
+        let get_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(move || {
+            dag_hashes
+                .try_read()
+                .map(|g| {
+                    g.transactions()
+                        .keys()
+                        .map(|id| id.to_vec())
+                        .collect::<Vec<Vec<u8>>>()
+                })
+                .unwrap_or_default()
+        });
+        let dag_tx = dag.clone();
+        let get_tx: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
+            Arc::new(move |hash: &[u8]| {
+                let id = <[u8; 32]>::try_from(hash).ok()?;
+                dag_tx.try_read().ok()?.transactions().get(&id).cloned()
+            });
+        let empty_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
+        let net = Arc::new(P2PNetwork::new(
+            P2PConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                bootnodes: vec![],
+                dns_seeds: vec![],
+                peer_store_path: None,
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+            },
+            tx_sender,
+            get_hashes,
+            get_tx,
+            empty_hashes,
+            sync_ctx.clone(),
+            Arc::new(|_| false),
+        ));
+        net.open_cycle_for_test(P2PProtocolMode::AuthenticatedV6)
+            .await;
+
+        let rpc = Arc::new(AetherRpcImpl::new(
+            dag.clone(),
+            ledger.clone(),
+            storage.clone(),
+            dir.join("ledger.json"),
+            mempool.clone(),
+            net.clone(),
+            Arc::new(RwLock::new(true)),
+            orphans.clone(),
+            sync_ctx.clone(),
+        ));
+
+        // node.rs:856-913, replicated on the shared Arcs.
+        {
+            let rpc = rpc.clone();
+            let sync_ctx = sync_ctx.clone();
+            let dag = dag.clone();
+            tokio::spawn(async move {
+                while let Some(tx) = tx_receiver.recv().await {
+                    let ingress_mode = sync_ctx.take_ingress_mode(tx.id).await;
+                    match rpc.process_transaction(tx, "P2P", ingress_mode).await {
+                        Ok(_) => {
+                            sync_ctx.stats.sync_progress.fetch_add(1, Ordering::Relaxed);
+                            let total_now = dag.read().await.transaction_count() as u64;
+                            let prev = sync_ctx.stats.sync_frontier.load(Ordering::Relaxed);
+                            if total_now > prev {
+                                sync_ctx
+                                    .stats
+                                    .sync_frontier
+                                    .fetch_max(total_now, Ordering::Relaxed);
+                            }
+                            rpc.process_orphans().await;
+                        }
+                        Err(_) => {}
+                    }
+                }
+            });
+        }
+
+        CatNode {
+            net,
+            dag,
+            ledger,
+            storage,
+            mempool,
+            sync_ctx,
+            rpc,
+        }
+    }
+
+    /// Take one inbound authenticated session (accepted socket = responder,
+    /// the production role for an inbound connection) and drive the REAL
+    /// receive loop with the production call shape.
+    fn spawn_session(
+        net: Arc<P2PNetwork>,
+        listener: tokio::net::TcpListener,
+        node_identity: Arc<NodeIdentity>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.expect("accept");
+            let peer_addr = sock.peer_addr().expect("peer addr");
+            let (own_sender, own_receiver) = mpsc::unbounded_channel();
+            let (pdtx, _pdrx) = mpsc::unbounded_channel();
+            P2PNetwork::handle_peer(
+                crate::transport::TransportStream::Tcp(sock),
+                peer_addr,
+                net.peers.clone(),
+                net.config.listen_addr,
+                net.addresses.clone(),
+                net.tx_channel.clone(),
+                net.get_dag_hashes.clone(),
+                net.get_transaction_by_hash.clone(),
+                net.get_tips.clone(),
+                net.seen_transactions.clone(),
+                net.propagation_state.clone(),
+                own_sender,
+                own_receiver,
+                pdtx,
+                net.sync_ctx.clone(),
+                net.is_orphan.clone(),
+                net.stake_hooks.clone(),
+                net.config.network_id,
+                P2PProtocolMode::AuthenticatedV6,
+                Some(node_identity),
+                false,
+                net.session_auth.clone(),
+                net.session_seq.clone(),
+                net.generation(),
+                None,
+                net.admission.clone(),
+                HANDSHAKE_TIMEOUT,
+            )
+            .await;
+        })
+    }
+
+    async fn wait_for<F, Fut>(what: &str, timeout: Duration, mut cond: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if cond().await {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("TIMEOUT waiting for: {}", what));
+    }
+
+    /// 4CP-AT/01: a fully authenticated v6 peer cannot push invalid state.
+    /// It sends three well-formed `P2PMessage::Transaction` frames on its real
+    /// session: (a) the shared valid fixture with one signature byte flipped
+    /// (PoW intact, fails the signature gate), (b) the same fixture with a
+    /// receiver byte flipped after signing (fails PoW first, then signature),
+    /// (c) a cheap backdated 20-bit fixture that is INVALID under live policy
+    /// and VALID under Historical policy. (c) is the live-provenance
+    /// detector: if the receive arm ever stopped recording Fresh (or the
+    /// wiring stopped consuming it), (c) would be admitted as sync history —
+    /// the counters below would catch it. All three must die in the REAL
+    /// accept funnel: nothing queued, parked, persisted or inserted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cat01_authenticated_peer_invalid_txs_rejected_end_to_end() {
+        let dir = tempfile::tempdir().expect("dir");
+        let node = boot_cat_node(dir.path()).await;
+
+        // Preconditions: both fixtures fail the REAL gates for the STATED
+        // reason (deterministic, checked before any byte hits the wire).
+        let mut sig_tampered = valid_live_tx().clone();
+        sig_tampered.signature[0] ^= 0xff;
+        sig_tampered.id = sig_tampered.compute_hash();
+        assert!(
+            sig_tampered.verify_pow(24),
+            "signature tampering must NOT disturb the PoW proof"
+        );
+        assert!(matches!(
+            TransactionProcessor::new().validate_pure(&sig_tampered, ValidationMode::Fresh),
+            Err(ValidationError::InvalidSignature)
+        ));
+        let mut body_tampered = valid_live_tx().clone();
+        body_tampered.receiver[0] ^= 0x01;
+        body_tampered.id = body_tampered.compute_hash();
+        assert!(
+            TransactionProcessor::new()
+                .validate_pure(&body_tampered, ValidationMode::Fresh)
+                .is_err(),
+            "tampering an economic field after signing must not validate"
+        );
+
+        // (c) Backdated: rejected by POLICY, never by cryptography — it is
+        // PoW-valid (20 bits, its era) and signature-valid (Historical OK).
+        let backdated = {
+            let wallet = Wallet::from_secret_key(
+                "4ca74b2e10d940f2b3c4d5e6f708192a3b4c5d6e7f80912a3b4c5d6e7f8091a3",
+            )
+            .expect("fixed test key");
+            let mut tx = Transaction::new(
+                [[0u8; 32]; 2],
+                wallet.address(),
+                [0xA8u8; 32],
+                1000,
+                1,
+                Transaction::DIFFICULTY_MIGRATION_TS - 3_600_000,
+                0,
+                1,
+                vec![0u8; 64],
+                wallet.public_key_bytes(),
+            );
+            tx.nonce = tx.mine_nonce(20);
+            tx.signature = wallet.sign_transaction(&tx).expect("sign");
+            tx.id = tx.compute_hash();
+            let processor = TransactionProcessor::new();
+            assert!(
+                matches!(
+                    processor.validate_pure(&tx, ValidationMode::Fresh),
+                    Err(ValidationError::BackdatedTimestamp { .. })
+                ),
+                "the backdated probe must be rejected by live policy, not by crypto"
+            );
+            assert!(
+                processor
+                    .validate_pure(&tx, ValidationMode::Historical)
+                    .is_ok(),
+                "the backdated probe must be valid under Historical policy"
+            );
+            tx
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let _session = spawn_session(
+            node.net.clone(),
+            listener,
+            Arc::new(NodeIdentity::generate()),
+        );
+
+        let mut peer = WirePeer::connect(addr).await;
+        peer.send_tx(&sig_tampered).await;
+        peer.send_tx(&body_tampered).await;
+        peer.send_tx(&backdated).await;
+
+        wait_for(
+            "all three invalid frames rejected by the accept funnel",
+            Duration::from_secs(30),
+            || async { node.rpc.mempool_stats().await.rejected >= 3 },
+        )
+        .await;
+
+        let stats = node.rpc.mempool_stats().await;
+        assert_eq!(
+            stats.rejected, 3,
+            "exactly the three invalid frames rejected"
+        );
+        assert_eq!(stats.size, 0, "nothing queued");
+        assert_eq!(stats.added, 0, "nothing admitted");
+        assert_eq!(stats.duplicate, 0);
+        assert_eq!(stats.orphan_parked, 0, "invalid data never parks");
+        assert_eq!(
+            node.sync_ctx.stats.sync_progress.load(Ordering::Relaxed),
+            0,
+            "no acceptance event"
+        );
+        {
+            let dag = node.dag.read().await;
+            assert!(dag.get_transaction(sig_tampered.id).is_none());
+            assert!(dag.get_transaction(body_tampered.id).is_none());
+            assert!(dag.get_transaction(backdated.id).is_none());
+            assert_eq!(dag.transaction_count(), 0, "DAG untouched");
+        }
+        {
+            let storage = node.storage.read().await;
+            assert!(storage.get_transaction(sig_tampered.id).is_err());
+            assert!(storage.get_transaction(body_tampered.id).is_err());
+            assert!(storage.get_transaction(backdated.id).is_err());
+            assert!(storage.get_all_transactions().expect("read all").is_empty());
+        }
+    }
+
+    /// 4CP-AT/02: the SAME authenticated session that cannot push invalid
+    /// state DOES deliver valid state exactly once: the fixture is accepted
+    /// into the mempool, drained by the production entry point into the real
+    /// DAG + Sled + Ledger, and a byte-identical RE-SEND on the same session
+    /// is dropped by the wire-level dedup. The duplicate is observed without
+    /// timing assumptions: it is sent BEFORE a SyncRequest whose reply can
+    /// only be written after the sequential receive loop has consumed it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cat02_valid_tx_flows_once_and_duplicate_is_deduped() {
+        let dir = tempfile::tempdir().expect("dir");
+        let node = boot_cat_node(dir.path()).await;
+        let tx = valid_live_tx().clone();
+
+        // Fund the sender in the REAL ledger (the Faucet's role).
+        node.ledger.write().await.set_balance(&tx.sender, 1_000_000);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let _session = spawn_session(
+            node.net.clone(),
+            listener,
+            Arc::new(NodeIdentity::generate()),
+        );
+
+        let mut peer = WirePeer::connect(addr).await;
+        peer.send_tx(&tx).await;
+        peer.send_tx(&tx).await; // byte-identical duplicate, same session
+        peer.send(&P2PMessage::SyncRequest).await;
+
+        // Ordering witness: the reply is written after the receive loop has
+        // consumed the duplicate (TCP order + sequential read loop). The
+        // GetInventory/SyncRequest the node sends on connect are skipped.
+        let _reply = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let P2PMessage::Inventory(hashes) = peer.recv().await {
+                    return hashes;
+                }
+            }
+        })
+        .await
+        .expect("node answers SyncRequest within timeout");
+
+        wait_for(
+            "the single accepted copy to reach the mempool",
+            Duration::from_secs(30),
+            || async { node.rpc.mempool_stats().await.added >= 1 },
+        )
+        .await;
+
+        let stats = node.rpc.mempool_stats().await;
+        assert_eq!(stats.added, 1, "the duplicate must not be re-admitted");
+        assert_eq!(
+            stats.duplicate, 0,
+            "the duplicate was dropped at the wire dedup, not re-processed"
+        );
+        assert_eq!(stats.rejected, 0);
+        assert_eq!(stats.size, 1);
+        assert_eq!(
+            node.sync_ctx.stats.sync_progress.load(Ordering::Relaxed),
+            1,
+            "exactly one acceptance event"
+        );
+
+        // Drain through the production entry point (node.rs:1023).
+        node.rpc.drain_mempool().await;
+
+        {
+            let dag = node.dag.read().await;
+            assert_eq!(dag.transaction_count(), 1, "exactly one DAG insertion");
+            assert!(
+                dag.get_transaction(tx.id).is_some(),
+                "the valid tx reached the DAG"
+            );
+        }
+        let stats = node.rpc.mempool_stats().await;
+        assert_eq!(stats.size, 0, "queue emptied by inclusion");
+        assert_eq!(stats.included, 1);
+        {
+            let ledger = node.ledger.read().await;
+            assert_eq!(
+                ledger.get_balance(&tx.receiver),
+                tx.amount,
+                "real transfer applied to the receiver"
+            );
+            assert_eq!(
+                ledger.get_balance(&tx.sender),
+                1_000_000 - tx.amount - tx.fee,
+                "sender debited amount + burned fee"
+            );
+        }
+        let persisted = node.storage.read().await.get_transaction(tx.id);
+        assert!(persisted.is_ok(), "accepted tx persisted to Sled");
+    }
+}
