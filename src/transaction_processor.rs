@@ -388,35 +388,30 @@ impl TransactionProcessor {
         // transient requeue then replays cleanly. PHASE 4CP-AU makes that
         // replay SOUND, not merely non-double-applying: the ledger delta
         // commits atomically (Storage::apply_ledger_delta — all balance/
-        // nonce/lock/applied writes or none), and every failure arm below
-        // deletes the partially persisted tx row (best-effort). STEP-1c
-        // rule #3 ("row present ⟹ effects present") then only ever sees
-        // rows whose effects are durable, so the retry re-applies through
-        // the NORMAL path and the crash image is pre-apply, with the
-        // accepted tx still in the persisted mempool tree (the boot reload
-        // replays it). If the compensating delete itself fails (disk still
-        // broken) the row survives and the boot rebuild applies it FROM the
-        // row — consistent-applied instead of consistent-older, never
-        // partially applied.
+        // nonce/lock/applied writes or none), and the tx row write itself
+        // is ONE multi-tree Sled transaction (PHASE 4CP-AV), so a failed
+        // persist leaves NO residue and nothing to clean. The window-B
+        // failure (row durable, ledger save failed) branches on the
+        // compensation outcome below: cleanup OK ⇒ roll back + Err (the
+        // retry replays the normal path — rule #3 sees no row); cleanup
+        // FAILED ⇒ KEEP the applied state + Ok (the surviving row is the
+        // durable recovery source; boot rebuilds the effects FROM it —
+        // consistent-applied instead of consistent-older, never
+        // half-applied).
         if let Some(storage) = ledger.storage() {
             let storage_read = storage.read().await;
             if let Err(e) = storage_read.put_transaction(&tx) {
                 tracing::error!("❌ Failed to persist transaction to Sled: {}", e);
                 Self::rollback_apply(&mut dag, &mut ledger, &ledger_snapshot, &tx.id);
-                // PHASE 4CP-AU: put_transaction is three independent inserts
-                // (tx row + sender/receiver index keys). A failure can leave
-                // the row behind while the ledger rolled back — a leftover
-                // row is STEP-1c rule #3's "effects present" evidence, so
-                // the retry would DAG-only heal the tx and the live ledger
-                // would never apply its effects. Delete the partial write;
-                // the retry replays the normal path (see the helper).
-                if let Err(de) = storage_read.delete_transaction(tx.id) {
-                    tracing::error!(
-                        "❌ 4CP-AU: partial put cleanup failed for {}: {}",
-                        hex::encode(&tx.id[..8]),
-                        de
-                    );
-                }
+                // PHASE 4CP-AV: no compensating delete here. The 4CP-AU
+                // cleanup existed because put_transaction was three
+                // independent inserts and could leave a row (rule #3's
+                // "effects present" evidence) behind its own failure. The
+                // write is now ONE multi-tree Sled transaction: a failure
+                // aborts the whole write, so there is provably no residue
+                // to clean — and a delete here could only ever destroy a
+                // PRE-EXISTING row (legacy evidence the routing already
+                // classified) that this path did not write.
                 drop(ledger);
                 drop(dag);
                 drop(mempool);
@@ -444,17 +439,38 @@ impl TransactionProcessor {
             .map_err(|e| format!("Save failed: {}", e));
         if let Err(save_err_msg) = save_result {
             tracing::error!("❌ Persistence failed: {}", save_err_msg);
-            // PHASE 3E (M1): same rollback as above (see comment at STEP 8).
-            Self::rollback_apply(&mut dag, &mut ledger, &ledger_snapshot, &tx.id);
-            // PHASE 4CP-AU: the ledger delta is atomic (apply_ledger_delta),
-            // so the only durable residue the failed save can leave is the
-            // tx row written just above. Delete it: rule #3's premise
-            // (row present ⟺ effects durable) must hold for the retry.
-            Self::compensate_rolled_back_persist(&ledger, &tx.id).await;
+            // PHASE 4CP-AV (window-B two-outcome rule): probe the durable
+            // residue FIRST and branch on the exact compensation result.
+            let compensated = Self::compensate_rolled_back_persist(&ledger, &tx.id).await;
+            if compensated {
+                // Residue gone ⇒ durable image is pre-apply ⇒ roll the
+                // memory back and report failure; the retry (mempool is
+                // still holding the tx) replays the normal path and
+                // re-applies fully.
+                // PHASE 3E (M1): same rollback as above (see STEP 8).
+                Self::rollback_apply(&mut dag, &mut ledger, &ledger_snapshot, &tx.id);
+                drop(ledger);
+                drop(dag);
+                drop(mempool);
+                return Err(ProcessingError::PersistenceError(save_err_msg));
+            }
+            // Compensation FAILED: the row survived and is the durable
+            // recovery source. KEEP the applied state — rolling back here
+            // would recreate the double-fault misroute (rule #3 sees the
+            // row, the retry DAG-only heals, and the live ledger never
+            // applies what boot WILL apply from the row). The ledger delta
+            // stays dirty and persists on the next successful save; the
+            // accept is coherent and complete (row ⟺ effects in memory,
+            // durable replay source present), so it reports success — the
+            // cleanup failure was logged loudly above.
+            tracing::error!(
+                "❌ 4CP-AV: tx row for {} survived the failed save (compensation failed); KEEPING applied state — row is the durable recovery source, ledger delta stays dirty and persists on the next successful save",
+                hex::encode(&tx.id[..8])
+            );
             drop(ledger);
             drop(dag);
             drop(mempool);
-            return Err(ProcessingError::PersistenceError(save_err_msg));
+            return Ok(());
         }
 
         tracing::info!(
@@ -573,16 +589,10 @@ impl TransactionProcessor {
             if let Err(e) = storage_read.put_transaction(&tx) {
                 tracing::error!("❌ Failed to persist conflict tx to Sled: {}", e);
                 Self::rollback_apply(&mut dag, &mut ledger, &ledger_snapshot, &tx.id);
-                // PHASE 4CP-AU: same partial-put cleanup as the normal path
-                // (see the STEP-8 comment): a rolled-back conflict tx must
-                // not leave rule #3's "effects present" evidence behind.
-                if let Err(de) = storage_read.delete_transaction(tx.id) {
-                    tracing::error!(
-                        "❌ 4CP-AU: partial put cleanup failed for {}: {}",
-                        hex::encode(&tx.id[..8]),
-                        de
-                    );
-                }
+                // PHASE 4CP-AV: no compensating delete — same argument as
+                // the normal path's put-fail arm (atomic multi-tree write,
+                // nothing to clean; a delete could only destroy
+                // pre-existing legacy evidence).
                 drop(ledger);
                 drop(dag);
                 drop(mempool);
@@ -599,15 +609,27 @@ impl TransactionProcessor {
             .map_err(|e| format!("Save failed: {}", e));
         if let Err(save_err_msg) = save_result {
             tracing::error!("❌ Conflict persistence failed: {}", save_err_msg);
-            Self::rollback_apply(&mut dag, &mut ledger, &ledger_snapshot, &tx.id);
-            // PHASE 4CP-AU: mirror of the normal-path compensation — the
-            // atomic delta guarantees no partial ledger writes, so deleting
-            // the row restores rule #3's premise for any retry.
-            Self::compensate_rolled_back_persist(&ledger, &tx.id).await;
+            // PHASE 4CP-AV: mirror of the normal-path two-outcome rule (see
+            // the STEP-8 arm): cleanup OK ⇒ rollback + Err; compensation
+            // failed ⇒ the row survives as the durable recovery source, so
+            // KEEP the post-rebuild ledger state + Ok instead of rolling
+            // back into the double-fault misroute.
+            let compensated = Self::compensate_rolled_back_persist(&ledger, &tx.id).await;
+            if compensated {
+                Self::rollback_apply(&mut dag, &mut ledger, &ledger_snapshot, &tx.id);
+                drop(ledger);
+                drop(dag);
+                drop(mempool);
+                return Err(ProcessingError::PersistenceError(save_err_msg));
+            }
+            tracing::error!(
+                "❌ 4CP-AV: conflict tx row for {} survived the failed save (compensation failed); KEEPING rebuilt ledger state — row is the durable recovery source",
+                hex::encode(&tx.id[..8])
+            );
             drop(ledger);
             drop(dag);
             drop(mempool);
-            return Err(ProcessingError::PersistenceError(save_err_msg));
+            return Ok(());
         }
         tracing::info!(
             "✅ Conflict tx processed (retained): {}",
@@ -1131,28 +1153,37 @@ impl TransactionProcessor {
         *ledger = snapshot.clone();
     }
 
-    /// PHASE 4CP-AU: remove the transaction row that STEP 8 wrote before the
-    /// ledger save failed (M1 window B). The ledger delta is atomic
-    /// (`Storage::apply_ledger_delta`) so the row is the ONLY durable residue
-    /// of the failed accept — and a leftover row is exactly STEP-1c rule
-    /// #3's evidence ("id persisted in store ⟹ effects present"): without
-    /// this delete, the drainer's retry reads the row, takes the DAG-only
-    /// recovery route and the live ledger never applies the transfer. With
-    /// it, the retry replays the normal path and re-applies fully.
-    /// Best-effort: if the delete also fails (disk still broken) the row
-    /// survives and the next boot rebuilds the ledger FROM the row
-    /// (consistent-applied instead of consistent-older); never half-applied.
-    async fn compensate_rolled_back_persist(ledger: &Ledger, tx_id: &TransactionId) {
+    /// PHASE 4CP-AU/4CP-AV: remove the transaction row that STEP 8 wrote
+    /// before the ledger save failed (M1 window B). The ledger delta is
+    /// atomic (`Storage::apply_ledger_delta`) so the row is the ONLY durable
+    /// residue of the failed accept — and a leftover row is exactly STEP-1c
+    /// rule #3's evidence ("id persisted in store ⟹ effects present"):
+    /// without this delete, the drainer's retry reads the row, takes the
+    /// DAG-only recovery route and the live ledger never applies the
+    /// transfer. With it, the retry replays the normal path and re-applies
+    /// fully.
+    ///
+    /// PHASE 4CP-AV: returns the cleanup OUTCOME the caller must branch on.
+    /// `true` = durable image is clean (row+index+mark removed atomically,
+    /// or no storage configured): roll back + Err as before. `false` = the
+    /// row SURVIVED (second storage fault): the caller must KEEP the
+    /// applied state — the row is the durable recovery source and boot
+    /// rebuilds the effects FROM it; rolling back would strand the accept
+    /// in the double-fault misroute (DAG-only heal, effects never applied
+    /// live, false "included" confirmation).
+    async fn compensate_rolled_back_persist(ledger: &Ledger, tx_id: &TransactionId) -> bool {
         if let Some(storage) = ledger.storage() {
             let storage_read = storage.read().await;
             if let Err(e) = storage_read.delete_transaction(*tx_id) {
                 tracing::error!(
-                    "❌ 4CP-AU: could not delete rolled-back tx row {}: {}",
+                    "❌ 4CP-AV: could not delete rolled-back tx row {}: {}",
                     hex::encode(&tx_id[..8]),
                     e
                 );
+                return false;
             }
         }
+        true
     }
 
     /// INC-01 crash recovery: DAG-only insertion of a transaction whose

@@ -29,6 +29,10 @@ pub enum StorageFault {
     PutNonce,
     MarkApplied,
     Flush,
+    /// PHASE 4CP-AV: fail the compensating delete (M1 window-B double fault).
+    DeleteTransaction,
+    /// PHASE 4CP-AV: fail the atomic JSON-migration batch.
+    BatchWrite,
 }
 
 /// Error returned by an injected fault. Mirrors a Sled-level failure
@@ -254,28 +258,45 @@ impl Storage {
     }
 
     /// Store a transaction
+    ///
+    /// PHASE 4CP-AV: the tx row and BOTH AddressIndex keys are committed in
+    /// ONE Sled transaction spanning `transactions` + `address_index`.
+    /// Before this the three inserts ran independently: a stop between any
+    /// two left a durable image the DAG cannot explain (row without index,
+    /// index without row, or a single index) that rule #3 and address scans
+    /// would each misread differently. One multi-tree commit makes every
+    /// such intermediate state unreachable — readers of either tree observe
+    /// the complete write or none of it, so the injected fault (top of fn)
+    /// now aborts the WHOLE write, never a prefix.
     pub fn put_transaction(&self, tx: &Transaction) -> Result<(), StorageError> {
         #[cfg(test)]
         if self.take_fault(StorageFault::PutTransaction) {
             return Err(injected_fault(StorageFault::PutTransaction));
         }
-        let tree = self.tree(TreeName::Transactions);
-        let key = tx.id;
         let value = bincode::serialize(tx)?;
-        tree.insert(key, value)?;
 
         // Index by sender address for O(1) lookup
-        let index_tree = self.tree(TreeName::AddressIndex);
         let mut sender_key = Vec::with_capacity(64);
         sender_key.extend_from_slice(&tx.sender);
         sender_key.extend_from_slice(&tx.id);
-        index_tree.insert(sender_key, tx.id.to_vec())?;
 
         // Index by receiver address for O(1) lookup
         let mut receiver_key = Vec::with_capacity(64);
         receiver_key.extend_from_slice(&tx.receiver);
         receiver_key.extend_from_slice(&tx.id);
-        index_tree.insert(receiver_key, tx.id.to_vec())?;
+
+        let tx_tree = self.transactions.clone();
+        let index_tree = self.address_index.clone();
+        (&tx_tree, &index_tree)
+            .transaction(|(tx_tree, index_tree)| {
+                tx_tree.insert(tx.id.as_ref(), value.as_slice())?;
+                index_tree.insert(sender_key.as_slice(), tx.id.as_ref())?;
+                index_tree.insert(receiver_key.as_slice(), tx.id.as_ref())?;
+                Ok::<(), sled::transaction::ConflictableTransactionError<StorageError>>(())
+            })
+            .map_err(|e| {
+                StorageError::DatabaseError(format!("Sled transaction failed: {:?}", e))
+            })?;
 
         Ok(())
     }
@@ -303,29 +324,48 @@ impl Storage {
     /// and -- worse -- resurrect through any future reader that trusts the
     /// index. The tx is looked up first so both index keys are known; a
     /// missing tx still removes the main entry (idempotent).
+    ///
+    /// PHASE 4CP-AV: the three removals (both AddressIndex keys, the row,
+    /// the applied mark) commit in ONE Sled transaction. This is the
+    /// compensation primitive for the M1 window-B failure arm, and its
+    /// caller must distinguish exactly two outcomes — "residue gone" vs
+    /// "residue intact" (see the processor's keep-applied rule). A
+    /// half-applied delete would be neither: e.g. the row surviving while
+    /// the applied mark vanished. Atomic removal makes the branch exact.
     pub fn delete_transaction(&self, id: TransactionId) -> Result<(), StorageError> {
-        let tree = self.tree(TreeName::Transactions);
-        let index_tree = self.tree(TreeName::AddressIndex);
-        if let Ok(value) = tree.get(id) {
-            if let Some(value) = value {
-                if let Ok(tx) = bincode::deserialize::<Transaction>(&value) {
-                    let mut sender_key = Vec::with_capacity(64);
-                    sender_key.extend_from_slice(&tx.sender);
-                    sender_key.extend_from_slice(&tx.id);
-                    index_tree.remove(sender_key)?;
-                    let mut receiver_key = Vec::with_capacity(64);
-                    receiver_key.extend_from_slice(&tx.receiver);
-                    receiver_key.extend_from_slice(&tx.id);
-                    index_tree.remove(receiver_key)?;
-                }
-            }
+        #[cfg(test)]
+        if self.take_fault(StorageFault::DeleteTransaction) {
+            return Err(injected_fault(StorageFault::DeleteTransaction));
         }
-        tree.remove(id)?;
-        // C2 P3: a deleted tx is no longer applied. Without this, a later
-        // re-arrival of the same id would take the recovery-insert path and
-        // skip its transfer (fossilization). Prune callers additionally
-        // rebuild the whole applied set from the surviving DAG.
-        self.tree(TreeName::AppliedTx).remove(id)?;
+        let tx_tree = self.transactions.clone();
+        let index_tree = self.address_index.clone();
+        let applied_tree = self.applied_tx.clone();
+        (&tx_tree, &index_tree, &applied_tree)
+            .transaction(|(tx_tree, index_tree, applied_tree)| {
+                if let Ok(Some(value)) = tx_tree.get(id.as_ref()) {
+                    if let Ok(tx) = bincode::deserialize::<Transaction>(&value) {
+                        let mut sender_key = Vec::with_capacity(64);
+                        sender_key.extend_from_slice(&tx.sender);
+                        sender_key.extend_from_slice(&tx.id);
+                        index_tree.remove(sender_key.as_slice())?;
+                        let mut receiver_key = Vec::with_capacity(64);
+                        receiver_key.extend_from_slice(&tx.receiver);
+                        receiver_key.extend_from_slice(&tx.id);
+                        index_tree.remove(receiver_key.as_slice())?;
+                    }
+                }
+                tx_tree.remove(id.as_ref())?;
+                // C2 P3: a deleted tx is no longer applied. Without this, a
+                // later re-arrival of the same id would take the
+                // recovery-insert path and skip its transfer
+                // (fossilization). Prune callers additionally rebuild the
+                // whole applied set from the surviving DAG.
+                applied_tree.remove(id.as_ref())?;
+                Ok::<(), sled::transaction::ConflictableTransactionError<StorageError>>(())
+            })
+            .map_err(|e| {
+                StorageError::DatabaseError(format!("Sled transaction failed: {:?}", e))
+            })?;
         Ok(())
     }
     pub fn get_all_transactions(&self) -> Result<Vec<Transaction>, StorageError> {
@@ -363,6 +403,52 @@ impl Storage {
         }
 
         Ok(transactions)
+    }
+
+    /// PHASE 4CP-AV (test-only): count AddressIndex entries under an address
+    /// prefix. The public scan hides index residue (it skips entries whose
+    /// tx row is missing), so recovery tests need the raw count to assert
+    /// "nothing was indexed" / "exactly the two expected index keys" after
+    /// injected faults and on crafted historical images.
+    #[cfg(test)]
+    pub fn address_index_len_for(&self, address: &Address) -> Result<usize, StorageError> {
+        let index_tree = self.tree(TreeName::AddressIndex);
+        Ok(index_tree.scan_prefix(address.as_ref()).count())
+    }
+
+    /// PHASE 4CP-AV (test-only): craft a legacy-shaped partial image — the
+    /// exact states a pre-4CP-AV stop could leave between the three
+    /// independent inserts of the old `put_transaction`. Used ONLY to
+    /// verify boot/recovery behavior on historical data (§5 of the phase):
+    /// the atomic writer can no longer produce these states, and nothing
+    /// here runs in production. Flushes so a reopen sees the image.
+    #[cfg(test)]
+    pub fn craft_partial_tx_for_test(
+        &self,
+        tx: &Transaction,
+        row: bool,
+        sender_index: bool,
+        receiver_index: bool,
+    ) -> Result<(), StorageError> {
+        if row {
+            let value = bincode::serialize(tx)?;
+            self.tree(TreeName::Transactions).insert(tx.id, value)?;
+        }
+        let index_tree = self.tree(TreeName::AddressIndex);
+        if sender_index {
+            let mut sender_key = Vec::with_capacity(64);
+            sender_key.extend_from_slice(&tx.sender);
+            sender_key.extend_from_slice(&tx.id);
+            index_tree.insert(sender_key, tx.id.to_vec())?;
+        }
+        if receiver_index {
+            let mut receiver_key = Vec::with_capacity(64);
+            receiver_key.extend_from_slice(&tx.receiver);
+            receiver_key.extend_from_slice(&tx.id);
+            index_tree.insert(receiver_key, tx.id.to_vec())?;
+        }
+        self.flush()?;
+        Ok(())
     }
 
     /// Store a wallet balance
@@ -454,6 +540,10 @@ impl Storage {
     /// All operations are wrapped in a single Sled transaction to guarantee
     /// that a crash cannot leave partial data
     pub fn batch_write(&self, operations: Vec<BatchOperation>) -> Result<(), StorageError> {
+        #[cfg(test)]
+        if self.take_fault(StorageFault::BatchWrite) {
+            return Err(injected_fault(StorageFault::BatchWrite));
+        }
         // Prepare data for transaction closure
         let mut tx_inserts: Vec<(TransactionId, Vec<u8>)> = Vec::new();
         let mut tx_deletes: Vec<TransactionId> = Vec::new();
@@ -639,11 +729,25 @@ impl Storage {
     }
 
     /// Migrate from JSON storage to Sled
+    ///
+    /// PHASE 4CP-AV: the whole import (every transaction with both index
+    /// keys, then every balance) commits in ONE `batch_write` — one
+    /// multi-tree Sled transaction. Before this, each entry was written
+    /// independently: a stop mid-import left a durable PREFIX that
+    /// `needs_migration` could no longer detect (non-empty DB ⇒ false) and
+    /// that boot would silently adopt as the whole history. With the batch,
+    /// a failed import leaves the DB untouched and the next boot re-runs
+    /// the import from the intact JSON (idempotent rewrite). The
+    /// "migration_complete" flag stays a separate write AFTER the batch:
+    /// a stop between the two re-imports harmlessly on next boot (and the
+    /// flag is not consulted for that decision — `needs_migration` is).
     pub async fn migrate_from_json<P: AsRef<Path>>(
         &self,
         json_path: P,
     ) -> Result<(), StorageError> {
         tracing::info!("🔄 Starting migration from JSON to Sled...");
+
+        let mut ops: Vec<BatchOperation> = Vec::new();
 
         // Load JSON DAG
         let dag_path = json_path.as_ref().join("dag.json");
@@ -696,7 +800,7 @@ impl Storage {
                 );
                 tx.weight = stored_tx.weight;
 
-                self.put_transaction(&tx)?;
+                ops.push(BatchOperation::PutTransaction(tx));
             }
         }
 
@@ -729,8 +833,13 @@ impl Storage {
                 let address: Address = addr_bytes.as_slice().try_into().map_err(|_| {
                     StorageError::DatabaseError("Invalid address length".to_string())
                 })?;
-                self.put_balance(address, balance)?;
+                ops.push(BatchOperation::PutBalance(address, balance));
             }
+        }
+
+        // PHASE 4CP-AV: single atomic commit for the whole import (see doc).
+        if !ops.is_empty() {
+            self.batch_write(ops)?;
         }
 
         // Mark migration as complete
