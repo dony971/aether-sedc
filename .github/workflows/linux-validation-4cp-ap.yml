@@ -110,6 +110,23 @@ jobs:
           if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
           exit "$c"
 
+      # 4CP-AX: consensus-DAG selection robustness — activation-boundary
+      # triples (CDW-1 / CDW / CDW+1, ts 0 and u64::MAX), 3+ candidate
+      # conflicts, exact-work ties, incremental `tx.weight` vs independent
+      # subtree-size reference, subtree-work vs independent closure
+      # reference, winner independence from the weight field, persisted
+      # rebuild (two deterministic orders) vs live state, loser-child
+      # economics, multi-group permutations and restart fingerprints. No
+      # continue-on-error: any failure fails the step.
+      - name: phase4ax selection boundary tests
+        if: always()
+        run: |
+          n=phase4ax; log=/tmp/$n.log; set +e
+          cargo test --lib phase4ax 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r line; do echo "::error::$line"; done; fi
+          exit "$c"
+
       - name: compile lib tests
         if: always()
         run: cargo test --lib --no-run
