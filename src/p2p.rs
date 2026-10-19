@@ -3176,7 +3176,8 @@ pub struct P2PNetwork {
     /// same address concurrently; without this guard a peer gets two sessions
     /// and the `peers` map silently drops one of them.
     dialing: Arc<RwLock<HashSet<SocketAddr>>>,
-    /// Phase 2C: the subset of `peers` sessions this node itself initiated.
+    /// Phase 2C: the subset of `peers` sessions this node itself initiated,
+    /// each carrying the sender of the session that reserved it.
     ///
     /// Session *direction* lives with the sessions, not with the address book:
     /// an address's `PeerSource` records how we first learned it and is
@@ -3184,7 +3185,12 @@ pub struct P2PNetwork {
   /// ours?". Exactly two writers  -  the dial path inserts, the task wrapping
     /// `handle_peer` removes — so it cannot drift from `peers` without `peers`
     /// drifting too. Never held together with `peers` or `addresses`.
-    outbound_sessions: Arc<RwLock<HashSet<SocketAddr>>>,
+    ///
+    /// 4CP-AS (F1): the value is the reserving session's own sender, so the
+    /// release is ownership-scoped exactly like the `peers` entry: a stale
+    /// session must not free a newer session's reservation at the same addr.
+    outbound_sessions: Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
+
     /// Phase 2B: the single owner of everything the node knows about
     /// addresses — membership, metadata, TTL clock, PEX origins and scores.
     /// Supersedes the former `known_peers` / `peer_last_seen` / `peer_meta` /
@@ -3286,7 +3292,7 @@ impl P2PNetwork {
             transport: Arc::new(TcpTransport::new()),
             peers: Arc::new(RwLock::new(HashMap::new())),
             dialing: Arc::new(RwLock::new(HashSet::new())),
-            outbound_sessions: Arc::new(RwLock::new(HashSet::new())),
+            outbound_sessions: Arc::new(RwLock::new(HashMap::new())),
             addresses: Arc::new(RwLock::new(AddressManager::new())),
             recovery: Arc::new(RwLock::new(PeerRecoveryController::new())),
             tx_channel,
@@ -4839,7 +4845,7 @@ impl P2PNetwork {
         peers: Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
         local_addr: SocketAddr,
         addresses: Arc<RwLock<AddressManager>>,
-        outbound_sessions: Arc<RwLock<HashSet<SocketAddr>>>,
+        outbound_sessions: Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
         tx_channel: mpsc::UnboundedSender<Transaction>,
         get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
@@ -4966,6 +4972,10 @@ impl P2PNetwork {
                     // optimistically inserted. There is no separate
                     // check-then-spawn window any more.
                     let session_admission = admission.clone();
+                    // 4CP-AS (F1): this session's own sender, kept OUTSIDE the
+                    // closure so a refused admission removes the entry only if
+                    // it is still the one this acceptor registered.
+                    let admission_sender = msg_sender.clone();
                     let admitted = Self::admit_task(&admission, |generation| async move {
                         Self::handle_peer(
                             stream,
@@ -5000,7 +5010,7 @@ impl P2PNetwork {
                     });
                     if !admitted {
                         let mut peers_lock = peers.write().await;
-                        peers_lock.remove(&addr);
+                        Self::remove_peer_if_ours(&mut peers_lock, &addr, &admission_sender);
                         continue;
                     }
                 }
@@ -5535,6 +5545,28 @@ impl P2PNetwork {
         Ok((key, send_dir, peer_node_id))
     }
 
+    /// 4CP-AS (F1): ownership-scoped removal for the two addr-keyed session
+    /// maps (`peers`, `outbound_sessions`). A session may erase ONLY the entry
+    /// it registered itself: if a newer session has since replaced the entry at
+    /// the same endpoint (a reconnect admitted before the older session
+    /// finished tearing down), a stale failure/teardown must leave it intact.
+    /// This mirrors the session registry's id/generation-scoped cleanup; the
+    /// `dialing` set needs no guard because its entry is owned by the one dial
+    /// that inserted it (a concurrent dial to the same addr is refused).
+    fn remove_peer_if_ours(
+        map: &mut HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>,
+        addr: &SocketAddr,
+        ours: &mpsc::UnboundedSender<Vec<u8>>,
+    ) -> bool {
+        match map.get(addr) {
+            Some(existing) if existing.same_channel(ours) => {
+                map.remove(addr);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Handle a peer connection
     async fn handle_peer(
         stream: TransportStream,
@@ -5626,8 +5658,10 @@ impl P2PNetwork {
             Err(msg) => {
                 warn!("❌ P2P handshake failed with {}: {}", addr, msg);
                 {
+                    // 4CP-AS (F1): drop the entry only if it is still OURS — a
+                    // reconnect may have replaced it while we were failing.
                     let mut peers_lock = peers.write().await;
-                    peers_lock.remove(&addr);
+                    Self::remove_peer_if_ours(&mut peers_lock, &addr, &msg_sender);
                 }
                 // 4CP-S: a failed handshake records NO session state at all —
                 // there is nothing to clear later, and a later reconnect gets a
@@ -5664,8 +5698,9 @@ impl P2PNetwork {
             Self::session_auth_for(peer_node_id),
         );
         if !recorded {
+            // 4CP-AS (F1): ownership-scoped, exactly like the failure path.
             let mut peers_lock = peers.write().await;
-            peers_lock.remove(&addr);
+            Self::remove_peer_if_ours(&mut peers_lock, &addr, &msg_sender);
             return;
         }
         // Phase 2B: the encrypted handshake completed, so this address is a
@@ -6581,9 +6616,11 @@ impl P2PNetwork {
         // Remove peer from active map on disconnect.
         // Phase 1 TTL: keep the address in known_peers so general redial / PEX
         // can re-establish the session; the TTL task expires it later.
+        // 4CP-AS (F1): ownership-scoped — a newer session at the same endpoint
+        // must survive this (possibly stale) teardown.
         {
             let mut peers_lock = peers.write().await;
-            peers_lock.remove(&addr);
+            Self::remove_peer_if_ours(&mut peers_lock, &addr, &msg_sender);
         }
         // PHASE 4CP-S + 4CP-W: drop exactly THIS session's provenance, and only
         // if it still belongs to our cycle. Keyed by id (and guarded by the
@@ -6703,9 +6740,11 @@ impl P2PNetwork {
                 }
                 // Phase 2C: record that *we* opened this session, so the
                 // inbound admission gate can keep its reservation intact.
+                // 4CP-AS (F1): the reserving session's own sender is stored so
+                // the release is ownership-scoped, like the `peers` entry.
                 {
                     let mut outbound = self.outbound_sessions.write().await;
-                    outbound.insert(addr);
+                    outbound.insert(addr, msg_sender.clone());
                 }
 
                 // Phase 2B (D7/D8): an address we chose to dial is an outbound
@@ -6750,6 +6789,12 @@ impl P2PNetwork {
                 // closed the cycle, `admit_task` refuses — the future is never
                 // created and the peer we optimistically inserted is removed.
                 let peers_for_session = peers.clone();
+                // 4CP-AS (F1): this session's own sender. One clone stays
+                // outside the closure (refused-admission cleanup), one moves
+                // into it so the session's release targets only its OWN
+                // `outbound_sessions` reservation.
+                let admission_sender = msg_sender.clone();
+                let session_sender = admission_sender.clone();
                 // 4CP-AA (X-4/Y-5): capture this cycle's admission for the
                 // per-session send task, and consume the test-only outbound
                 // registration rendezvous (`None` in production).
@@ -6790,11 +6835,17 @@ impl P2PNetwork {
                     // is really gone. Cleaning up here rather than inside
                     // `handle_peer` keeps `handle_peer`'s signature — and
                     // therefore the inbound path — untouched.
-                    outbound_sessions.write().await.remove(&addr);
+                    // 4CP-AS (F1): and only if the reservation is still OURS:
+                    // a newer session at the same addr must survive this (pos-
+                    // sibly stale) teardown, like the `peers` entry.
+                    let mut outbound = outbound_sessions.write().await;
+                    Self::remove_peer_if_ours(&mut outbound, &addr, &session_sender);
                 });
                 if !admitted {
                     let mut peers_lock = peers.write().await;
-                    peers_lock.remove(&addr);
+                    Self::remove_peer_if_ours(&mut peers_lock, &addr, &admission_sender);
+                    let mut outbound = self.outbound_sessions.write().await;
+                    Self::remove_peer_if_ours(&mut outbound, &addr, &admission_sender);
                 }
             }
             Ok(Err(e)) => {
@@ -15640,11 +15691,15 @@ mod phase4cpw_cycle_tests {
 
         let (stream, peer_addr) = listener.accept().await.unwrap();
         // Emulate the optimistic insert the accept loop performs before the
-        // session task, so the assertion below proves `handle_peer` removes it.
-        let (ptx, _prx) = mpsc::unbounded_channel();
-        net.peers.write().await.insert(peer_addr, ptx);
-
+        // session task — with the session's OWN sender (4CP-AS F1: the removal
+        // is ownership-scoped) — so the assertion below proves `handle_peer`
+        // removes its entry.
         let (msg_sender, msg_receiver) = mpsc::unbounded_channel();
+        net.peers
+            .write()
+            .await
+            .insert(peer_addr, msg_sender.clone());
+
         let (pdtx, _pdrx) = mpsc::unbounded_channel();
         let started = tokio::time::Instant::now();
         P2PNetwork::handle_peer(
@@ -15709,10 +15764,14 @@ mod phase4cpw_cycle_tests {
 
         let sock = tokio::net::TcpStream::connect(server_addr).await.unwrap();
         let peer_addr = sock.peer_addr().unwrap();
-        let (ptx, _prx) = mpsc::unbounded_channel();
-        net.peers.write().await.insert(peer_addr, ptx);
-
+        // 4CP-AS (F1): the optimistic insert carries the session's own sender,
+        // exactly like the production dial path.
         let (msg_sender, msg_receiver) = mpsc::unbounded_channel();
+        net.peers
+            .write()
+            .await
+            .insert(peer_addr, msg_sender.clone());
+
         let (pdtx, _pdrx) = mpsc::unbounded_channel();
         let started = tokio::time::Instant::now();
         P2PNetwork::handle_peer(
@@ -15751,6 +15810,307 @@ mod phase4cpw_cycle_tests {
         assert_eq!(net.session_auth_len().await, 0, "no outbound session on expiry");
         assert_eq!(net.peer_count().await, 0, "no half-open peer after expiry");
         remote.abort();
+    }
+}
+
+/// PHASE 4CP-AS (F1): ownership-scoped cleanup of the addr-keyed session maps.
+///
+/// A session's failure/teardown must erase ONLY the `peers` entry it
+/// registered: a newer session that replaced the entry at the same endpoint
+/// (reconnect admitted while the older session was still tearing down) must
+/// survive the stale cleanup — the same guarantee the session registry has
+/// carried since 4CP-R, now applied to `peers`/`outbound_sessions`.
+#[cfg(test)]
+mod phase4cpas_stale_cleanup_tests {
+    use super::*;
+    use crate::node_identity::NodeIdentity;
+    use std::net::SocketAddr;
+
+    fn as_net() -> P2PNetwork {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
+        let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> = Arc::new(|_| None);
+        P2PNetwork::new(
+            P2PConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                bootnodes: vec![],
+                dns_seeds: vec![],
+                peer_store_path: None,
+                network_id: crate::transaction::DEFAULT_NETWORK_ID,
+            },
+            tx,
+            empty.clone(),
+            empty_opt,
+            empty,
+            Arc::new(SyncContext::default()),
+            Arc::new(|_| false),
+        )
+    }
+
+    /// Drive one REAL `handle_peer` to completion on a live loopback socket,
+    /// with the production call shape. `own_sender`/`own_receiver` are the
+    /// channel pair owned by this session; whether the `peers` map holds it
+    /// (production) or a newer sender (stale-cleanup scenario) is up to the
+    /// caller.
+    async fn drive_session(
+        net: &P2PNetwork,
+        stream: TransportStream,
+        peer_addr: SocketAddr,
+        mode: P2PProtocolMode,
+        identity: Option<Arc<NodeIdentity>>,
+        is_initiator: bool,
+        own_sender: mpsc::UnboundedSender<Vec<u8>>,
+        own_receiver: mpsc::UnboundedReceiver<Vec<u8>>,
+    ) {
+        let (pdtx, _pdrx) = mpsc::unbounded_channel();
+        P2PNetwork::handle_peer(
+            stream,
+            peer_addr,
+            net.peers.clone(),
+            net.config.listen_addr,
+            net.addresses.clone(),
+            net.tx_channel.clone(),
+            net.get_dag_hashes.clone(),
+            net.get_transaction_by_hash.clone(),
+            net.get_tips.clone(),
+            net.seen_transactions.clone(),
+            net.propagation_state.clone(),
+            own_sender,
+            own_receiver,
+            pdtx,
+            net.sync_ctx.clone(),
+            net.is_orphan.clone(),
+            net.stake_hooks.clone(),
+            net.config.network_id,
+            mode,
+            identity,
+            is_initiator,
+            net.session_auth.clone(),
+            net.session_seq.clone(),
+            net.generation(),
+            None,
+            net.admission.clone(),
+            HANDSHAKE_TIMEOUT,
+        )
+        .await;
+    }
+
+    /// F1 negative-control for the pure helper: it removes our own channel,
+    /// refuses a foreign one, and is a no-op on a missing entry.
+    #[test]
+    fn remove_peer_if_ours_is_channel_scoped() {
+        let addr: SocketAddr = "203.0.113.9:40000".parse().unwrap();
+        let (ours, _ours_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (newer, _newer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let mut map: HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>> = HashMap::new();
+
+        assert!(
+            !P2PNetwork::remove_peer_if_ours(&mut map, &addr, &ours),
+            "a missing entry is a no-op"
+        );
+        // A replacement (newer session) survives our cleanup untouched.
+        map.insert(addr, newer.clone());
+        assert!(!P2PNetwork::remove_peer_if_ours(&mut map, &addr, &ours));
+        assert!(map.get(&addr).unwrap().same_channel(&newer));
+        // Our own entry is removed.
+        map.insert(addr, ours.clone());
+        assert!(P2PNetwork::remove_peer_if_ours(&mut map, &addr, &ours));
+        assert!(map.is_empty());
+    }
+
+    /// F1: the REAL teardown of a legacy session must not erase a newer
+    /// session's `peers` entry at the same endpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_teardown_does_not_erase_a_newer_peers_entry() {
+        let net = as_net();
+        net.open_cycle_for_test(P2PProtocolMode::LegacyV5).await;
+
+        // Remote: production handshake, then close — the client's read loop
+        // sees EOF and runs the production teardown.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (mut reader, mut writer) = sock.into_split();
+            let _ = P2PNetwork::handshake(
+                &mut reader,
+                &mut writer,
+                crate::transaction::DEFAULT_NETWORK_ID,
+            )
+            .await;
+        });
+
+        let sock = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+        let peer_addr = sock.peer_addr().unwrap();
+        // Scenario: a newer session replaced the endpoint while the older
+        // session was finishing. The map must keep the NEWER sender.
+        let (newer_sender, mut newer_rx) = mpsc::unbounded_channel();
+        net.peers
+            .write()
+            .await
+            .insert(peer_addr, newer_sender.clone());
+
+        let (own_sender, own_receiver) = mpsc::unbounded_channel();
+        drive_session(
+            &net,
+            TransportStream::Tcp(sock),
+            peer_addr,
+            P2PProtocolMode::LegacyV5,
+            None,
+            false,
+            own_sender,
+            own_receiver,
+        )
+        .await;
+
+        assert_eq!(net.session_auth_len().await, 0, "its own session is gone");
+        let guard = net.peers.read().await;
+        let entry = guard
+            .get(&peer_addr)
+            .expect("the newer session's entry must survive a stale teardown");
+        assert!(
+            entry.same_channel(&newer_sender),
+            "the newer sender must not be replaced or erased"
+        );
+        entry.send(vec![9]).unwrap();
+        drop(guard);
+        assert_eq!(
+            newer_rx.try_recv().unwrap(),
+            vec![9],
+            "the surviving channel is still live"
+        );
+        server.abort();
+    }
+
+    /// F1: a REAL failed v6 handshake must not erase a newer session's entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_handshake_failure_does_not_erase_a_newer_peers_entry() {
+        let net = as_net();
+        net.open_cycle_for_test(P2PProtocolMode::AuthenticatedV6).await;
+        let identity = Arc::new(NodeIdentity::generate());
+
+        // Remote connects and drops without sending anything: the v6
+        // handshake fails on its first read, deterministically.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let sock = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+        let peer_addr = sock.peer_addr().unwrap();
+        let (newer_sender, mut newer_rx) = mpsc::unbounded_channel();
+        net.peers
+            .write()
+            .await
+            .insert(peer_addr, newer_sender.clone());
+
+        let (own_sender, own_receiver) = mpsc::unbounded_channel();
+        drive_session(
+            &net,
+            TransportStream::Tcp(sock),
+            peer_addr,
+            P2PProtocolMode::AuthenticatedV6,
+            Some(identity),
+            false,
+            own_sender,
+            own_receiver,
+        )
+        .await;
+
+        assert_eq!(net.session_auth_len().await, 0, "no session recorded");
+        let guard = net.peers.read().await;
+        let entry = guard
+            .get(&peer_addr)
+            .expect("the newer session's entry must survive a stale failure");
+        assert!(entry.same_channel(&newer_sender));
+        entry.send(vec![7]).unwrap();
+        drop(guard);
+        assert_eq!(newer_rx.try_recv().unwrap(), vec![7]);
+        server.abort();
+    }
+
+    /// F1 positive-control: with its OWN sender in the map (production shape),
+    /// the real teardown still releases it — no entry is leaked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_removes_its_own_peers_entry() {
+        let net = as_net();
+        net.open_cycle_for_test(P2PProtocolMode::LegacyV5).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (mut reader, mut writer) = sock.into_split();
+            let _ = P2PNetwork::handshake(
+                &mut reader,
+                &mut writer,
+                crate::transaction::DEFAULT_NETWORK_ID,
+            )
+            .await;
+        });
+
+        let sock = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+        let peer_addr = sock.peer_addr().unwrap();
+        let (own_sender, own_receiver) = mpsc::unbounded_channel();
+        net.peers
+            .write()
+            .await
+            .insert(peer_addr, own_sender.clone());
+
+        drive_session(
+            &net,
+            TransportStream::Tcp(sock),
+            peer_addr,
+            P2PProtocolMode::LegacyV5,
+            None,
+            false,
+            own_sender,
+            own_receiver,
+        )
+        .await;
+
+        assert_eq!(net.peer_count().await, 0, "its own entry must be released");
+        server.abort();
+    }
+
+    /// F1 positive-control for the failure path: a failed v6 handshake removes
+    /// the entry it owns, and records nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handshake_failure_removes_its_own_peers_entry() {
+        let net = as_net();
+        net.open_cycle_for_test(P2PProtocolMode::AuthenticatedV6).await;
+        let identity = Arc::new(NodeIdentity::generate());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let sock = tokio::net::TcpStream::connect(server_addr).await.unwrap();
+        let peer_addr = sock.peer_addr().unwrap();
+        let (own_sender, own_receiver) = mpsc::unbounded_channel();
+        net.peers
+            .write()
+            .await
+            .insert(peer_addr, own_sender.clone());
+
+        drive_session(
+            &net,
+            TransportStream::Tcp(sock),
+            peer_addr,
+            P2PProtocolMode::AuthenticatedV6,
+            Some(identity),
+            false,
+            own_sender,
+            own_receiver,
+        )
+        .await;
+
+        assert_eq!(net.session_auth_len().await, 0, "no session recorded");
+        assert_eq!(net.peer_count().await, 0, "its own entry must be released");
+        server.abort();
     }
 }
 
