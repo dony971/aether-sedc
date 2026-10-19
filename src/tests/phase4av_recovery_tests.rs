@@ -69,12 +69,12 @@ const FUND_AMOUNT: u64 = 10_000;
 const TX_AMOUNT: u64 = 100;
 const TX_FEE: u64 = 10;
 
-struct AvNode {
-    rpc: AetherRpcImpl,
-    storage: Arc<RwLock<Storage>>,
-    ledger: Arc<RwLock<Ledger>>,
-    dag: Arc<RwLock<DAG>>,
-    mempool: Arc<RwLock<Mempool>>,
+pub(crate) struct AvNode {
+    pub(crate) rpc: AetherRpcImpl,
+    pub(crate) storage: Arc<RwLock<Storage>>,
+    pub(crate) ledger: Arc<RwLock<Ledger>>,
+    pub(crate) dag: Arc<RwLock<DAG>>,
+    pub(crate) mempool: Arc<RwLock<Mempool>>,
 }
 
 fn av_wallet() -> Wallet {
@@ -82,7 +82,7 @@ fn av_wallet() -> Wallet {
         .expect("fixed test key")
 }
 
-fn faucet_bytes() -> [u8; 32] {
+pub(crate) fn faucet_bytes() -> [u8; 32] {
     hex::decode(FAUCET_ADDRESS)
         .expect("faucet hex")
         .try_into()
@@ -251,7 +251,7 @@ async fn boot_recovery_like_node(dir: &Path) -> (DAG, Ledger, Arc<RwLock<Storage
 
 /// Live node wired around the REAL recovery path (above) + RPC, so every
 /// test starts from a state a real node would have after boot.
-async fn boot_av_node(dir: &Path) -> AvNode {
+pub(crate) async fn boot_av_node(dir: &Path) -> AvNode {
     let (dag, ledger, storage, mempool) = boot_recovery_like_node(dir).await;
     let dag = Arc::new(RwLock::new(dag));
     let ledger = Arc::new(RwLock::new(ledger));

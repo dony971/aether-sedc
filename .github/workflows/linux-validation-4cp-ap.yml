@@ -96,6 +96,20 @@ jobs:
           if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
           exit "$c"
 
+      # 4CP-AW: DAG determinism and conflict convergence through the real
+      # acceptance funnel (arrival-order permutations, orphan ordering,
+      # multi-source duplicates, conflict flips, cumulative overspend,
+      # retained-loser descendants; all restart-stable). No
+      # continue-on-error: any failure fails the step.
+      - name: phase4aw convergence tests
+        if: always()
+        run: |
+          n=phase4aw; log=/tmp/$n.log; set +e
+          cargo test --lib phase4aw 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          exit "$c"
+
       - name: compile lib tests
         if: always()
         run: cargo test --lib --no-run

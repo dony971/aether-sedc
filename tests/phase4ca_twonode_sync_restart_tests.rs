@@ -454,6 +454,192 @@ async fn ca02_restart_from_persisted_stores() {
     let _ = std::fs::remove_dir_all(&dir_b);
 }
 
+// 11-14. 4CP-AW: the SAME transaction set reaches the two nodes in DIFFERENT
+// arrival orders (including a same-key conflict pair) and both converge to an
+// identical canonical state over the REAL transport; each node's persisted
+// bytes rebuild to its exact live fingerprint (fresh-dir restart, per the
+// lifecycle finding).
+//
+// Boundary (see file header): senders stay unfunded, so this scenario pins
+// transport + order independence of DAG retention (both conflict members
+// coexisting in both orders) and deterministic canonicalization in the
+// derived ledger; funded conflict economics through the real funnel are
+// pinned in-process by the phase4aw unit suite.
+const PORT_C: u16 = 44733;
+const PORT_D: u16 = 44734;
+
+fn short_id(id: &[u8; 32]) -> String {
+    format!("{:02x?}", &id[..4])
+}
+
+/// Weight-exact DAG view: ids + weights (subtree sizes maintained
+/// incrementally on validated insert must equal the boot recomputation).
+fn dag_weight_fp(dag: &DAG) -> String {
+    let mut items: Vec<String> = dag
+        .transactions()
+        .iter()
+        .map(|(id, tx)| format!("{}|{}", short_id(id), tx.weight.to_bits()))
+        .collect();
+    items.sort();
+    items.join(" ")
+}
+
+#[tokio::test]
+async fn ca03_conflicts_and_permuted_arrival_converge_with_restart() {
+    let dir_a = tempfile::tempdir().expect("dirA");
+    let dir_b = tempfile::tempdir().expect("dirB");
+    let pc: std::net::SocketAddr = format!("127.0.0.1:{}", PORT_C).parse().unwrap();
+
+    let node_a = boot_node(dir_a, PORT_C, vec![]).await;
+    let mut node_b = boot_node(dir_b, PORT_D, vec![pc]).await;
+    wait_for("A<->B peering", CONNECT_TIMEOUT, || async {
+        node_a.p2p.peer_count().await >= 1 && node_b.p2p.peer_count().await >= 1
+    })
+    .await;
+
+    let wallet = wallet_n(909090);
+    let processor = TransactionProcessor::new();
+    let ts0: u64 = 1_750_300_000_000;
+    // t0 -> t1 chain; t2/t3 a same-(sender, account_nonce) conflict pair;
+    // t4 independent. All real: 20-bit PoW + Ed25519 signature.
+    let t0 = make_valid_tx(&wallet, [[0u8; 32]; 2], 1, ts0);
+    let t1 = make_valid_tx(&wallet, [t0.id, [0u8; 32]], 2, ts0 + 1);
+    let t2 = make_valid_tx(&wallet, [[0u8; 32]; 2], 3, ts0 + 2);
+    let t3 = make_valid_tx(&wallet, [[0u8; 32]; 2], 3, ts0 + 3);
+    let t4 = make_valid_tx(&wallet, [[0u8; 32]; 2], 4, ts0 + 4);
+    let wire = [&t0, &t1, &t2, &t3, &t4];
+
+    // A broadcasts in wire order; B's real TCP arrival order is that order.
+    for tx in wire {
+        node_a.p2p.broadcast_transaction((*tx).clone()).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let mut received: Vec<Transaction> = Vec::new();
+    for _ in 0..wire.len() {
+        let tx = tokio::time::timeout(PROPAGATE_TIMEOUT, node_b.rx.recv())
+            .await
+            .expect("B receives within timeout")
+            .expect("channel live");
+        received.push(tx);
+    }
+    for (s, r) in wire.iter().zip(received.iter()) {
+        assert_eq!(s.id, r.id, "byte-identical remote delivery");
+    }
+
+    // DIFFERENT local arrival orders: A records the conflict pair in REVERSE
+    // order (t3 before t2) and the chain last (still parents-first); B
+    // records in its wire arrival order (t2 before t3).
+    for tx in [&t3, &t2, &t4, &t0, &t1] {
+        let mut dag = node_a.dag.write().await;
+        let store = node_a.storage.read().await;
+        record_tx(&mut dag, &store, &processor, tx).expect("A records");
+    }
+    for tx in &received {
+        let mut done = false;
+        for _ in 0..20 {
+            let r = {
+                let mut dag = node_b.dag.write().await;
+                let store = node_b.storage.read().await;
+                record_tx(&mut dag, &store, &processor, tx)
+            };
+            if r.is_ok() {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(done, "B records {:?}", tx.id);
+    }
+
+    // Explicit retention: every member (both conflict candidates included)
+    // coexists in BOTH DAGs, with the incremental weight bookkeeping exact.
+    for node in [&node_a, &node_b] {
+        let dag = node.dag.read().await;
+        for tx in [&t0, &t1, &t2, &t3, &t4] {
+            assert!(
+                dag.transactions().contains_key(&tx.id),
+                "retained {}",
+                short_id(&tx.id)
+            );
+        }
+        assert_eq!(dag.transaction_count(), 5);
+        assert_eq!(
+            dag.get_transaction(t0.id).unwrap().weight,
+            2.0,
+            "t0 subtree = {{t0, t1}}"
+        );
+        assert_eq!(dag.get_transaction(t1.id).unwrap().weight, 1.0);
+    }
+
+    // Live convergence across different arrival orders: relations, frontier,
+    // derived-ledger canonicalization and the weight view.
+    let live_a = {
+        let da = node_a.dag.read().await;
+        let la = rebuild_ledger_like_boot(&da);
+        (fingerprint(&da, &la), dag_weight_fp(&da))
+    };
+    let live_b = {
+        let db = node_b.dag.read().await;
+        let lb = rebuild_ledger_like_boot(&db);
+        (fingerprint(&db, &lb), dag_weight_fp(&db))
+    };
+    assert_eq!(live_a.0, live_b.0, "A==B canonical state");
+    assert_eq!(live_a.1, live_b.1, "A==B weight view");
+    assert!(
+        live_a.0.starts_with("n=5 "),
+        "wire set fully admitted: {}",
+        live_a.0
+    );
+
+    // Persist + fresh-dir restart: each node's stored bytes must rebuild to
+    // its own live fingerprint (order-independent reconstruction).
+    for n in [&node_a, &node_b] {
+        n.storage.read().await.flush().expect("flush");
+    }
+    for (tag, node, live) in [
+        ("a", &node_a, live_a.clone()),
+        ("b", &node_b, live_b.clone()),
+    ] {
+        let bytes = node
+            .storage
+            .read()
+            .await
+            .get_all_transactions()
+            .expect("read persisted");
+        let dir = unique_dir(&format!("ca03-{}", tag));
+        {
+            let store = Storage::open(&dir).expect("seed open");
+            for tx in &bytes {
+                store.put_transaction(tx).expect("seed tx");
+            }
+            store.flush().expect("seed flush");
+        }
+        let rebuilt = tokio::time::timeout(RESTART_TIMEOUT, async {
+            let store = Storage::open(&dir).expect("reopen");
+            let all = store.get_all_transactions().expect("read");
+            drop(store);
+            let (mut dag, _b, _o, _m) = initialize_genesis(GenesisConfig::default());
+            let (ins, sk, orph) =
+                aether_unified::parent_selection::rebuild_dag_topological(&mut dag, all);
+            assert_eq!((ins, sk, orph.len()), (5, 0, 0), "no skips, no orphans");
+            dag.rebuild_tips();
+            let ledger = rebuild_ledger_like_boot(&dag);
+            (fingerprint(&dag, &ledger), dag_weight_fp(&dag))
+        })
+        .await
+        .unwrap_or_else(|_| panic!("TIMEOUT: ca03 restart {} hung", tag));
+        assert_eq!(rebuilt.0, live.0, "restart {}: canonical fingerprint", tag);
+        assert_eq!(rebuilt.1, live.1, "restart {}: weight view", tag);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    for n in [&node_a, &node_b] {
+        n.storage.read().await.flush().expect("flush");
+    }
+    drop(node_a);
+    drop(node_b);
+}
+
 fn unique_dir_unused() -> PathBuf {
     unique_dir("unused")
 }
