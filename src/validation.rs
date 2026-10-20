@@ -20,6 +20,11 @@ pub enum ValidationError {
     InvalidPoW { difficulty: u8 },
     /// Signature verification failed
     InvalidSignature,
+    /// Declared transaction id is not the content hash (id malleability).
+    TransactionIdMismatch {
+        declared: TransactionId,
+        computed: TransactionId,
+    },
     /// Sender address does not match public key
     SenderPublicKeyMismatch,
     /// Duplicate transaction already exists
@@ -107,6 +112,14 @@ impl std::fmt::Display for ValidationError {
             }
             ValidationError::InvalidSignature => {
                 write!(f, "Invalid signature")
+            }
+            ValidationError::TransactionIdMismatch { declared, computed } => {
+                write!(
+                    f,
+                    "Transaction id mismatch: declared {} but content hash is {}",
+                    hex::encode(declared),
+                    hex::encode(computed)
+                )
             }
             ValidationError::SenderPublicKeyMismatch => {
                 write!(f, "Sender address does not match public key")
@@ -438,6 +451,16 @@ impl TransactionValidator {
         // Signature verification (always)
         if !crate::wallet::Wallet::verify_transaction(tx) {
             return Err(ValidationError::InvalidSignature);
+        }
+
+        // 4CP-BB: the id is NOT covered by the signature, so it must be
+        // recomputed and compared here. Without this, a validly signed tx can
+        // be re-identified at will (sync frontier / DAG keyed on a forged id).
+        if !tx.verify_hash() {
+            return Err(ValidationError::TransactionIdMismatch {
+                declared: tx.id,
+                computed: tx.compute_hash(),
+            });
         }
 
         // Sender public key match (always)

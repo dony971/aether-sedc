@@ -1593,6 +1593,7 @@ impl AetherRpcImpl {
                     // any path (kept defined for API stability).
                     ValidationError::InvalidPoW { .. }
                     | ValidationError::InvalidSignature
+                    | ValidationError::TransactionIdMismatch { .. }
                     | ValidationError::SenderPublicKeyMismatch
                     | ValidationError::DoubleSpend
                     | ValidationError::Overflow

@@ -1967,6 +1967,13 @@ async fn accept_inbound_transaction(
             return false;
         }
     };
+    // 4CP-BB: reject a forged identity before it can be marked seen/queued.
+    // The signature does not cover `id`, so a peer can otherwise rename any
+    // validly signed transaction.
+    if !tx.verify_hash() {
+        warn!("Rejecting transaction with mismatched id from {}", source);
+        return false;
+    }
 
     // 4CP-BA: ADMISSION before receipt. Reserve the byte budget, then
     // enqueue. On either refusal NOTHING is recorded — the payload is not
@@ -6578,6 +6585,17 @@ impl P2PNetwork {
                             );
                             for tx_bytes in tx_bytes_list.into_iter().take(MAX_INV_ITEMS) {
                                 if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
+                                    // 4CP-BB: a forged id must never reach the
+                                    // frontier marks below (those are keyed on
+                                    // `tx.id` and would present the item as
+                                    // applied before any validation).
+                                    if !tx.verify_hash() {
+                                        tracing::debug!(
+                                            "SyncResponse: dropping forged transaction id from {}",
+                                            addr
+                                        );
+                                        continue;
+                                    }
                                     if get_transaction_by_hash(&tx.id).is_some()
                                         || is_orphan(&tx.id)
                                     {
@@ -6950,6 +6968,11 @@ impl P2PNetwork {
                             warn!("Peer {} banned (deser fail, score={})", addr, score);
                         }
                     }
+                    // 4CP-BB: an authenticated frame whose plaintext is not a
+                    // complete P2PMessage is a protocol violation. Close it
+                    // like decrypt/padding failures (fail closed) instead of
+                    // silently continuing on a half-understood session.
+                    break;
                 }
             }
         }
@@ -11425,6 +11448,46 @@ mod phase2_privacy_tests {
         // (returns None) rather than emitted mis-aligned.
         assert!(P2PNetwork::padded_total_len(FRAME_MAX_EMIT - FRAME_FIXED_OVERHEAD).is_some());
         assert!(P2PNetwork::padded_total_len(FRAME_MAX_EMIT - FRAME_FIXED_OVERHEAD + 1).is_none());
+    }
+
+    /// 4CP-BB: dense property sweep. Every payload length up to 4096
+    /// round-trips exactly through the padder/unpadder, every emitted frame
+    /// lands on a bucket, and every oversized or impossible tail is rejected
+    /// (never interpreted).
+    #[test]
+    fn test_phase4bb_padding_property_sweep() {
+        for len in 0..=4096usize {
+            let msg: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let padded = P2PNetwork::pad_message(&msg).expect("must pad");
+            assert_eq!(
+                (NONCE_LEN + AEAD_TAG_LEN + padded.len()) % FRAME_PAD_BUCKET,
+                0,
+                "len={len} must land on a bucket"
+            );
+            assert_eq!(
+                P2PNetwork::unpad_message(&padded).expect("must unpad"),
+                msg,
+                "len={len} roundtrip"
+            );
+        }
+        assert!(P2PNetwork::unpad_message(&[]).is_err(), "empty tail");
+        assert!(P2PNetwork::unpad_message(&[0]).is_err(), "short tail");
+        for body in 0..=512usize {
+            for pad in [256u16, 300, 511, u16::MAX] {
+                let mut pt = vec![0xCDu8; body];
+                pt.extend_from_slice(&pad.to_le_bytes());
+                assert!(
+                    P2PNetwork::unpad_message(&pt).is_err(),
+                    "body={body} pad={pad} must be refused"
+                );
+            }
+            let mut pt = vec![0xCDu8; body];
+            pt.extend_from_slice(&((body as u16).saturating_add(1)).to_le_bytes());
+            assert!(
+                P2PNetwork::unpad_message(&pt).is_err(),
+                "body={body} pad > body must be refused"
+            );
+        }
     }
 
     /// A.3: an unaligned (v3 / forged) length is refused before any
