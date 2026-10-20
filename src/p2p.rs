@@ -618,9 +618,9 @@ const BACKPRESSURE_BASE_MS: u64 = 5;
 
 // --- 4CP-BA: hard memory bounds for the three queues that were unbounded ---
 //
-// Policy (documented in `docs/AETHER_4CP_BA_QUEUE_BOUNDS.md` — the phase
-// report): every queue between the wire and the node, and between the node
-// and one peer's socket, is bounded in BOTH messages and bytes. A bounded
+// Policy (4CP-BA phase report): every queue between the wire and the node,
+// and between the node and one peer's socket, is bounded in BOTH messages
+// and bytes. A bounded
 // count alone is not a memory bound (one frame may be 16 MiB); a byte budget
 // alone is not a scheduling bound. Refusal is always explicit, never a
 // silent lie: a refused payload is NOT marked as seen, so the native
