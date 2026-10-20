@@ -6589,7 +6589,7 @@ impl P2PNetwork {
                                     // frontier marks below (those are keyed on
                                     // `tx.id` and would present the item as
                                     // applied before any validation).
-                                    if !tx.verify_hash() {
+                                    if !tx.verify_hash_compatible() {
                                         tracing::debug!(
                                             "SyncResponse: dropping forged transaction id from {}",
                                             addr

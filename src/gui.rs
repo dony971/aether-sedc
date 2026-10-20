@@ -571,9 +571,9 @@ async fn send_transaction_client(
     );
     let mut signed_tx = tx.clone();
     signed_tx.nonce = nonce;
-    signed_tx.id = signed_tx.compute_hash();
     let signature = wallet.sign_transaction(&signed_tx)?;
     signed_tx.signature = signature.clone();
+    signed_tx.id = signed_tx.compute_hash();
     let send_resp = client.post(rpc_url).json(&serde_json::json!({"jsonrpc":"2.0","method":"aether_sendTransaction","params":[hex::encode(bincode::serialize(&signed_tx)?)],"id":1})).send().await?;
     if let Ok(body) = send_resp.text().await {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {

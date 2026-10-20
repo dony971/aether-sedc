@@ -1033,6 +1033,15 @@ pub fn rebuild_dag_topological(
         progress = false;
         let mut still_pending = Vec::new();
         for tx in remaining {
+            if !tx.verify_hash_compatible() {
+                tracing::warn!(
+                    "INC-01 rebuild skipped transaction (identity mismatch): declared={} computed={}",
+                    hex::encode(tx.id),
+                    hex::encode(tx.compute_hash())
+                );
+                skipped += 1;
+                continue;
+            }
             let parent0_ok =
                 tx.parents[0] == [0u8; 32] || dag.transactions().contains_key(&tx.parents[0]);
             let parent1_ok =

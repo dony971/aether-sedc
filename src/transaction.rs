@@ -129,8 +129,7 @@ impl Transaction {
         tx
     }
 
-    /// Compute the transaction hash using BLAKE3 (includes signature and public_key)
-    pub fn compute_hash(&self) -> TransactionId {
+    fn compute_hash_with_signature(&self, signature: &[u8]) -> TransactionId {
         let mut hasher = blake3::Hasher::new();
 
         // Hash all fields except id and weight (computed fields)
@@ -143,10 +142,19 @@ impl Transaction {
         hasher.update(&self.timestamp.to_le_bytes());
         hasher.update(&self.nonce.to_le_bytes());
         hasher.update(&self.account_nonce.to_le_bytes());
-        hasher.update(&self.signature);
+        hasher.update(signature);
         hasher.update(&self.public_key);
 
         hasher.finalize().into()
+    }
+
+    /// Compute the transaction hash using BLAKE3 (includes signature and public_key)
+    pub fn compute_hash(&self) -> TransactionId {
+        self.compute_hash_with_signature(&self.signature)
+    }
+
+    pub fn compute_legacy_hash(&self) -> TransactionId {
+        self.compute_hash_with_signature(&[0u8; 64])
     }
 
     /// Compute the signing hash (excludes only the signature and public_key,
@@ -183,6 +191,10 @@ impl Transaction {
     /// Verify that the transaction hash is valid
     pub fn verify_hash(&self) -> bool {
         self.compute_hash() == self.id
+    }
+
+    pub fn verify_hash_compatible(&self) -> bool {
+        self.verify_hash() || self.compute_legacy_hash() == self.id
     }
 
     /// Check if this transaction is a genesis transaction (no parents)

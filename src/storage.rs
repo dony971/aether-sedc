@@ -762,6 +762,20 @@ impl Storage {
 
             // Migrate transactions
             for stored_tx in store.transactions {
+                let declared_id: TransactionId = hex::decode(&stored_tx.id)
+                    .map_err(|e| {
+                        StorageError::DatabaseError(format!(
+                            "Invalid transaction id {}: {}",
+                            stored_tx.id, e
+                        ))
+                    })?
+                    .try_into()
+                    .map_err(|_| {
+                        StorageError::DatabaseError(format!(
+                            "Invalid transaction id length: {}",
+                            stored_tx.id
+                        ))
+                    })?;
                 let signature = if let Some(sig) = stored_tx.signature {
                     hex::decode(&sig).unwrap_or_else(|_| vec![0u8; 64])
                 } else {
@@ -798,6 +812,13 @@ impl Storage {
                     signature,
                     public_key,
                 );
+                tx.id = declared_id;
+                if !tx.verify_hash_compatible() {
+                    return Err(StorageError::DatabaseError(format!(
+                        "JSON transaction id does not match its content: {}",
+                        stored_tx.id
+                    )));
+                }
                 tx.weight = stored_tx.weight;
 
                 ops.push(BatchOperation::PutTransaction(tx));

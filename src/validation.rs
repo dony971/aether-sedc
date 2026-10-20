@@ -456,7 +456,9 @@ impl TransactionValidator {
         // 4CP-BB: the id is NOT covered by the signature, so it must be
         // recomputed and compared here. Without this, a validly signed tx can
         // be re-identified at will (sync frontier / DAG keyed on a forged id).
-        if !tx.verify_hash() {
+        let historical_legacy_id =
+            mode == ValidationMode::Historical && tx.compute_legacy_hash() == tx.id;
+        if !tx.verify_hash() && !historical_legacy_id {
             return Err(ValidationError::TransactionIdMismatch {
                 declared: tx.id,
                 computed: tx.compute_hash(),

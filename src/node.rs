@@ -8,7 +8,7 @@ use crate::{
     rpc::{start_rpc_server, AetherRpcImpl, Mempool},
   stake::StakeRegistry,
     storage::Storage,
-    transaction::{Address, Transaction},
+    transaction::{Address, Transaction, TransactionId},
   transaction_processor::TransactionProcessor,
 };
 use std::collections::HashMap;
@@ -228,6 +228,19 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                 store.transactions.len()
             );
             for stored_tx in store.transactions {
+                let declared_id: TransactionId = match hex::decode(&stored_tx.id)
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                {
+                    Some(id) => id,
+                    None => {
+                        tracing::warn!(
+                            "Skipping transaction with invalid declared id: {}",
+                            stored_tx.id
+                        );
+                        continue;
+                    }
+                };
                 let signature = if let Some(sig) = stored_tx.signature {
                     hex::decode(&sig).unwrap_or_else(|_| {
                         tracing::warn!("Failed to decode signature for transaction, skipping");
@@ -293,7 +306,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                     continue;
                 }
 
-                let tx = Transaction::new(
+                let mut tx = Transaction::new(
                     [parent0, parent1],
                     sender,
                     receiver,
@@ -305,6 +318,14 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                     signature,
                     public_key,
                 );
+                tx.id = declared_id;
+                if !tx.verify_hash_compatible() {
+                    tracing::warn!(
+                        "Skipping transaction with mismatched id: {}",
+                        stored_tx.id
+                    );
+                    continue;
+                }
                 if !all_txs.iter().any(|existing| existing.id == tx.id) {
                     all_txs.push(tx);
                 }

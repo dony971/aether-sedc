@@ -582,13 +582,12 @@ async fn send_transaction_client(
     let mut signed_tx = tx.clone();
     signed_tx.nonce = nonce;
 
-    // Re-compute hash with mined nonce (this will be the final tx.id)
-    signed_tx.id = signed_tx.compute_hash();
-
     // Sign transaction with the signing hash (excludes signature and public_key)
     let _signing_hash = signed_tx.compute_signing_hash();
     let signature = wallet.sign_transaction(&signed_tx)?;
     signed_tx.signature = signature.clone();
+
+    signed_tx.id = signed_tx.compute_hash();
 
     // Prepare RPC request
     let client = reqwest::Client::new();
