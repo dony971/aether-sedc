@@ -256,7 +256,8 @@ pub(crate) async fn boot_av_node(dir: &Path) -> AvNode {
     let dag = Arc::new(RwLock::new(dag));
     let ledger = Arc::new(RwLock::new(ledger));
     let mempool = Arc::new(RwLock::new(mempool));
-    let (tx_channel, _rx) = tokio::sync::mpsc::unbounded_channel::<Transaction>();
+    let (tx_channel, _rx) =
+        tokio::sync::mpsc::channel::<crate::p2p::IngressTx>(crate::p2p::TX_INGRESS_CAPACITY_MSGS);
     let p2p = Arc::new(crate::P2PNetwork::new(
         crate::p2p::P2PConfig {
             listen_addr: "0.0.0.0:0".parse().unwrap(),

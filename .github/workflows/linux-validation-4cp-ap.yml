@@ -263,6 +263,24 @@ jobs:
           if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
           exit "$c"
 
+      # 4CP-BA: strict memory bounds on every queue feeding the node and on
+      # every peer session. ba01 saturates the bounded ingress channel and
+      # proves visible refusals, byte-budget recovery, sync re-delivery and
+      # funnel idempotence; ba02 stalls a peer read side and proves the
+      # per-session bound holds and the survivor keeps serving; ba03 fills the
+      # stake queue and proves back-pressure with zero loss; ba04 repeats
+      # saturation cycles and proves deterministic refusals with no leaked
+      # permits or reservations. No continue-on-error: any failure fails the
+      # step.
+      - name: integration phase4ba_bounded_queue_tests
+        if: always()
+        run: |
+          n=phase4ba; log=/tmp/$n.log; set +e
+          cargo test --test phase4ba_bounded_queue_tests 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          exit "$c"
+
       - name: integration v6_preflight_manifest
         if: always()
         run: |

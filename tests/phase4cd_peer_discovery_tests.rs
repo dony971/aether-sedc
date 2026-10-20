@@ -27,7 +27,9 @@
 
 use aether_unified::genesis::{initialize_genesis, GenesisConfig};
 use aether_unified::ledger::Ledger;
-use aether_unified::p2p::{P2PConfig, P2PNetwork, P2PProtocolMode};
+use aether_unified::p2p::{
+    IngressTx, P2PConfig, P2PNetwork, P2PProtocolMode, TX_INGRESS_CAPACITY_MSGS,
+};
 use aether_unified::parent_selection::DAG;
 use aether_unified::stake::{current_epoch, StakeRegistry};
 use aether_unified::storage::Storage;
@@ -164,7 +166,7 @@ struct TestNode {
     storage: Arc<RwLock<Storage>>,
     dag: Arc<RwLock<DAG>>,
     p2p: Arc<P2PNetwork>,
-    rx: mpsc::UnboundedReceiver<Transaction>,
+    rx: mpsc::Receiver<IngressTx>,
 }
 
 async fn boot_node(
@@ -173,7 +175,7 @@ async fn boot_node(
     dag: Arc<RwLock<DAG>>,
     storage: Arc<RwLock<Storage>>,
 ) -> TestNode {
-    let (tx_sender, rx) = mpsc::unbounded_channel::<Transaction>();
+    let (tx_sender, rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
     let dag_c = dag.clone();
     let get_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(move || {
         block_on_sync(async {
@@ -267,7 +269,7 @@ async fn peers_of(node: &TestNode) -> HashSet<std::net::SocketAddr> {
 /// Collect rx until `want` ids are covered (dedup by id; sources and order
 /// unspecified). Returns the covered transactions.
 async fn collect_cover(
-    rx: &mut mpsc::UnboundedReceiver<Transaction>,
+    rx: &mut mpsc::Receiver<IngressTx>,
     want: &HashSet<[u8; 32]>,
     what: &str,
 ) -> HashMap<[u8; 32], Transaction> {
@@ -275,7 +277,7 @@ async fn collect_cover(
     let mut got: HashMap<[u8; 32], Transaction> = HashMap::new();
     tokio::time::timeout(PROPAGATE_TIMEOUT, async {
         while !want.is_subset(&seen) {
-            let r = rx.recv().await.expect("live");
+            let r = rx.recv().await.expect("live").into_tx();
             seen.insert(r.id);
             got.entry(r.id).or_insert(r);
         }
@@ -488,7 +490,8 @@ async fn cd01_pex_gate_inbound_then_redial_reconnect() {
     let r = tokio::time::timeout(PROPAGATE_TIMEOUT, node_c2.rx.recv())
         .await
         .expect("C delivery after rediscovery")
-        .expect("live");
+        .expect("live")
+        .into_tx();
     assert_eq!(tx.id, r.id, "gossip intact after PEX/redial churn");
 
     // Shutdown stays clean after full PEX exposure (§5 discovery×shutdown).
@@ -588,7 +591,8 @@ async fn cd02_partition_heal_frontier_converges_measured() {
         let r = tokio::time::timeout(PROPAGATE_TIMEOUT, node.rx.recv())
             .await
             .unwrap_or_else(|_| panic!("{} gets tx0", name))
-            .expect("live");
+            .expect("live")
+            .into_tx();
         assert_eq!(tx0.id, r.id);
         let mut dag = node.dag.write().await;
         let store = node.storage.read().await;
@@ -641,7 +645,8 @@ async fn cd02_partition_heal_frontier_converges_measured() {
         let r = tokio::time::timeout(PROPAGATE_TIMEOUT, node_c.rx.recv())
             .await
             .unwrap_or_else(|_| panic!("cycle {}: C gets partition tx", cycle))
-            .expect("live");
+            .expect("live")
+            .into_tx();
         assert_eq!(tx.id, r.id);
         {
             let mut dag = node_c.dag.write().await;

@@ -74,7 +74,8 @@ async fn boot_au_node(dir: &std::path::Path) -> AuNode {
     ));
     let dag = Arc::new(RwLock::new(DAG::new()));
     let mempool = Arc::new(RwLock::new(Mempool::new(1000, 10)));
-    let (tx_channel, _rx) = tokio::sync::mpsc::unbounded_channel::<Transaction>();
+    let (tx_channel, _rx) =
+        tokio::sync::mpsc::channel::<crate::p2p::IngressTx>(crate::p2p::TX_INGRESS_CAPACITY_MSGS);
     let p2p = Arc::new(crate::P2PNetwork::new(
         crate::p2p::P2PConfig {
             listen_addr: "0.0.0.0:0".parse().unwrap(),

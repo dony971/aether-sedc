@@ -24,7 +24,9 @@
 
 use aether_unified::genesis::{initialize_genesis, GenesisConfig};
 use aether_unified::ledger::Ledger;
-use aether_unified::p2p::{P2PConfig, P2PNetwork, P2PProtocolMode};
+use aether_unified::p2p::{
+    IngressTx, P2PConfig, P2PNetwork, P2PProtocolMode, TX_INGRESS_CAPACITY_MSGS,
+};
 use aether_unified::parent_selection::DAG;
 use aether_unified::stake::{current_epoch, StakeRegistry};
 use aether_unified::storage::Storage;
@@ -182,7 +184,7 @@ struct TestNode {
     storage: Arc<RwLock<Storage>>,
     dag: Arc<RwLock<DAG>>,
     p2p: Arc<P2PNetwork>,
-    rx: mpsc::UnboundedReceiver<Transaction>,
+    rx: mpsc::Receiver<IngressTx>,
 }
 
 async fn boot_node_on_dir(
@@ -192,7 +194,7 @@ async fn boot_node_on_dir(
     dag: Arc<RwLock<DAG>>,
     storage: Arc<RwLock<Storage>>,
 ) -> TestNode {
-    let (tx_sender, rx) = mpsc::unbounded_channel::<Transaction>();
+    let (tx_sender, rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
     let dag_c = dag.clone();
     let get_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(move || {
         block_on_sync(async {
@@ -361,7 +363,8 @@ async fn cb01_shutdown_restart_same_storage_two_cycles() {
             let tx = tokio::time::timeout(PROPAGATE_TIMEOUT, node_b.rx.recv())
                 .await
                 .expect("B receives c1")
-                .expect("channel live");
+                .expect("channel live")
+                .into_tx();
             received.push(tx);
         }
         for (s, r) in chained.iter().zip(received.iter()) {
@@ -468,7 +471,8 @@ async fn cb01_shutdown_restart_same_storage_two_cycles() {
             let tx = tokio::time::timeout(PROPAGATE_TIMEOUT, node_b.rx.recv())
                 .await
                 .expect("B receives c2")
-                .expect("channel live");
+                .expect("channel live")
+                .into_tx();
             received.push(tx);
         }
         for (s, r) in new_txs.iter().zip(received.iter()) {

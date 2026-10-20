@@ -10,12 +10,13 @@
 //! live session table (`peer_count`), the authenticated session registry
 //! (`session_auth_len`) and `propagation_inflight`.
 //!
-//! WHAT THE CODE ACTUALLY BOUNDS (measured here, not assumed):
-//! - `tx_channel` (node.rs:678) and every session's outbound queue
-//!   (p2p.rs:4935/6736) are UNBOUNDED mpsc channels. `send` never blocks and
-//!   never fails while the receiver lives: there is NO write-side
-//!   backpressure; the only bound is memory. az01/az05 measure the queue
-//!   length directly and prove exact drain (no silent loss).
+//! WHAT THE CODE BOUNDS (measured here, not assumed):
+//! - At the time this suite was written, `tx_channel` (node.rs) and every
+//!   session's outbound queue (p2p.rs) were UNBOUNDED mpsc channels. 4CP-BA
+//!   has since bounded them (256 msgs / 32 MiB ingress; 64 msgs / 32 MiB per
+//!   session). This suite stays below those capacities, so its backlog
+//!   assertions (az01/az05) still measure the real queue length and prove
+//!   exact drain (no silent loss).
 //! - Session I/O is bounded in TIME, not by queue size: FRAME_TIMEOUT=30s,
 //!   HANDSHAKE_TIMEOUT=10s, SESSION_WRITE_TIMEOUT=15s (p2p.rs:1718-1735).
 //! - Per-session ingress is rate-limited at MAX_MSGS_PER_SEC=400 frames and
@@ -50,7 +51,9 @@
 //!   can run in parallel threads.
 
 use aether_unified::genesis::{initialize_genesis, GenesisConfig};
-use aether_unified::p2p::{P2PConfig, P2PNetwork, P2PProtocolMode};
+use aether_unified::p2p::{
+    IngressTx, P2PConfig, P2PNetwork, P2PProtocolMode, TX_INGRESS_CAPACITY_MSGS,
+};
 use aether_unified::parent_selection::{rebuild_dag_topological, DAG};
 use aether_unified::storage::Storage;
 use aether_unified::sync_stats::SyncContext;
@@ -250,7 +253,7 @@ struct TestNode {
     p2p: Arc<P2PNetwork>,
     /// Consumer side; `None` once moved into a recorder task. Its `len()` is
     /// the REAL ingestion backlog (unbounded channel).
-    rx: Option<mpsc::UnboundedReceiver<Transaction>>,
+    rx: Option<mpsc::Receiver<IngressTx>>,
     /// The same SyncContext handed to P2P; exposes frontier/stats snapshots.
     sync: Arc<SyncContext>,
     /// Tx count rebuilt from this node's store at boot.
@@ -261,7 +264,7 @@ async fn boot_node(dir: PathBuf, port: u16, bootnodes: Vec<SocketAddr>) -> TestN
     let (dag, rebuilt_n) = rebuild_dag_from_disk(&dir);
     let dag = Arc::new(RwLock::new(dag));
     let storage = Arc::new(RwLock::new(Storage::open(&dir).expect("open store")));
-    let (tx_sender, rx) = mpsc::unbounded_channel::<Transaction>();
+    let (tx_sender, rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
     let sync = Arc::new(SyncContext::default());
 
     let dag_c = dag.clone();
@@ -418,7 +421,7 @@ struct Counters {
 /// delivery is classified: known id -> duplicate refusal; pure-invalid or
 /// parent-missing -> rejected; otherwise applied.
 fn spawn_recorder(
-    mut rx: mpsc::UnboundedReceiver<Transaction>,
+    mut rx: mpsc::Receiver<IngressTx>,
     dag: Arc<RwLock<DAG>>,
     storage: Arc<RwLock<Storage>>,
 ) -> (tokio::task::JoinHandle<()>, Arc<Counters>) {
@@ -426,7 +429,8 @@ fn spawn_recorder(
     let stats_c = stats.clone();
     let handle = tokio::spawn(async move {
         let processor = TransactionProcessor::new();
-        while let Some(tx) = rx.recv().await {
+        while let Some(item) = rx.recv().await {
+            let tx = item.into_tx();
             let known = dag.read().await.transactions().contains_key(&tx.id);
             if known {
                 stats_c.duplicate.fetch_add(1, Ordering::Relaxed);
@@ -444,7 +448,7 @@ fn spawn_recorder(
 }
 
 async fn drain_n(
-    rx: &mut mpsc::UnboundedReceiver<Transaction>,
+    rx: &mut mpsc::Receiver<IngressTx>,
     n: usize,
     timeout: Duration,
     what: &str,
@@ -452,7 +456,7 @@ async fn drain_n(
     let mut out = Vec::with_capacity(n);
     tokio::time::timeout(timeout, async {
         while out.len() < n {
-            out.push(rx.recv().await.expect("channel live"));
+            out.push(rx.recv().await.expect("channel live").into_tx());
         }
     })
     .await
@@ -464,7 +468,7 @@ async fn drain_n(
 /// while waiting (the production maintenance loop's mechanism, driven
 /// explicitly so the test stays event-based).
 async fn collect_cover_with_resync(
-    rx: &mut mpsc::UnboundedReceiver<Transaction>,
+    rx: &mut mpsc::Receiver<IngressTx>,
     want: &HashSet<[u8; 32]>,
     p2p: &Arc<P2PNetwork>,
     every: Duration,
@@ -477,7 +481,7 @@ async fn collect_cover_with_resync(
         loop {
             tokio::select! {
                 r = rx.recv() => {
-                    let tx = r.expect("channel live");
+                    let tx = r.expect("channel live").into_tx();
                     got.entry(tx.id).or_insert(tx);
                     if want.is_subset(&got.keys().copied().collect()) {
                         return;
@@ -531,7 +535,7 @@ async fn record_covered(
 /// every delivery must be an ALREADY-KNOWN id and its record attempt must be
 /// rejected by the funnel. Any new id or successful insert is a hard failure.
 async fn drain_verify_known_only(
-    rx: &mut mpsc::UnboundedReceiver<Transaction>,
+    rx: &mut mpsc::Receiver<IngressTx>,
     dag: &Arc<RwLock<DAG>>,
     storage: &Arc<RwLock<Storage>>,
     processor: &TransactionProcessor,
@@ -548,7 +552,8 @@ async fn drain_verify_known_only(
         match tokio::time::timeout(left, rx.recv()).await {
             Err(_) => break,
             Ok(None) => panic!("{}: channel closed", ctx),
-            Ok(Some(tx)) => {
+            Ok(Some(item)) => {
+                let tx = item.into_tx();
                 extra += 1;
                 assert!(
                     dag.read().await.transactions().contains_key(&tx.id),
@@ -820,8 +825,8 @@ async fn az02_duplicate_invalid_storm_never_applies() {
     tokio::time::sleep(Duration::from_millis(1200)).await;
     let mut rx = node_c.rx.take().unwrap();
     let mut delivered = Vec::new();
-    while let Ok(tx) = rx.try_recv() {
-        delivered.push(tx);
+    while let Ok(item) = rx.try_recv() {
+        delivered.push(item.into_tx());
     }
     let delivered_known = delivered
         .iter()
@@ -1215,16 +1220,16 @@ async fn az05_waiting_retry_loop_is_bounded_and_converges() {
     let converged = tokio::time::timeout(CATCHUP_TIMEOUT, async {
         loop {
             peak_backlog = peak_backlog.max(rx_b.len());
-            while let Ok(candidate) = rx_b.try_recv() {
-                record_classified(candidate, &node_b, &processor, &mut counters).await;
+            while let Ok(item) = rx_b.try_recv() {
+                record_classified(item.into_tx(), &node_b, &processor, &mut counters).await;
             }
             if dag_count(&node_b).await == 40 {
                 break;
             }
             match tokio::time::timeout(Duration::from_millis(20), rx_b.recv()).await {
-                Ok(Some(candidate)) => {
+                Ok(Some(item)) => {
                     peak_backlog = peak_backlog.max(rx_b.len() + 1);
-                    record_classified(candidate, &node_b, &processor, &mut counters).await;
+                    record_classified(item.into_tx(), &node_b, &processor, &mut counters).await;
                 }
                 Ok(None) => panic!("AZ05: tx channel closed unexpectedly"),
                 Err(_) => {}
@@ -1236,8 +1241,8 @@ async fn az05_waiting_retry_loop_is_bounded_and_converges() {
     let t_converge = t_start.elapsed();
     tokio::time::sleep(Duration::from_millis(500)).await;
     peak_backlog = peak_backlog.max(rx_b.len());
-    while let Ok(candidate) = rx_b.try_recv() {
-        record_classified(candidate, &node_b, &processor, &mut counters).await;
+    while let Ok(item) = rx_b.try_recv() {
+        record_classified(item.into_tx(), &node_b, &processor, &mut counters).await;
     }
     assert_eq!(rx_b.len(), 0, "channel quiescent after settle");
     assert_eq!(dag_count(&node_b).await, 40);

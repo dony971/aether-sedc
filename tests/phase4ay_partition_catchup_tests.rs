@@ -60,7 +60,9 @@
 
 use aether_unified::genesis::{initialize_genesis, GenesisConfig};
 use aether_unified::ledger::Ledger;
-use aether_unified::p2p::{P2PConfig, P2PNetwork, P2PProtocolMode};
+use aether_unified::p2p::{
+    IngressTx, P2PConfig, P2PNetwork, P2PProtocolMode, TX_INGRESS_CAPACITY_MSGS,
+};
 use aether_unified::parent_selection::{rebuild_dag_topological, DAG};
 use aether_unified::stake::{current_epoch, StakeRegistry};
 use aether_unified::storage::Storage;
@@ -264,7 +266,7 @@ struct TestNode {
     storage: Arc<RwLock<Storage>>,
     dag: Arc<RwLock<DAG>>,
     p2p: Arc<P2PNetwork>,
-    rx: mpsc::UnboundedReceiver<Transaction>,
+    rx: mpsc::Receiver<IngressTx>,
     maintenance: tokio::task::JoinHandle<()>,
     /// Tx count rebuilt from this node's store at boot (proof of staleness).
     rebuilt_n: usize,
@@ -279,7 +281,7 @@ async fn boot_node(
     let (dag, rebuilt_n) = rebuild_dag_from_disk(&dir);
     let dag = Arc::new(RwLock::new(dag));
     let storage = Arc::new(RwLock::new(Storage::open(&dir).expect("open store")));
-    let (tx_sender, rx) = mpsc::unbounded_channel::<Transaction>();
+    let (tx_sender, rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
     let dag_c = dag.clone();
     let get_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(move || {
         block_on_sync(async {
@@ -405,7 +407,7 @@ async fn store_count(node: &TestNode) -> usize {
 /// `want.len()` if an id OUTSIDE `want` is delivered - callers assert the
 /// exact set by comparing lengths where the universe of live ids is known.
 async fn collect_cover(
-    rx: &mut mpsc::UnboundedReceiver<Transaction>,
+    rx: &mut mpsc::Receiver<IngressTx>,
     want: &HashSet<[u8; 32]>,
     timeout: Duration,
     what: &str,
@@ -414,7 +416,7 @@ async fn collect_cover(
     let mut got: HashMap<[u8; 32], Transaction> = HashMap::new();
     tokio::time::timeout(timeout, async {
         while !want.is_subset(&seen) {
-            let r = rx.recv().await.expect("channel live");
+            let r = rx.recv().await.expect("channel live").into_tx();
             seen.insert(r.id);
             got.entry(r.id).or_insert(r);
         }
@@ -478,7 +480,7 @@ async fn record_covered(
 /// be REJECTED by the funnel. Returns how many extras were drained. Any new
 /// id or any successful insert is a hard failure.
 async fn drain_verify_no_double_apply(
-    rx: &mut mpsc::UnboundedReceiver<Transaction>,
+    rx: &mut mpsc::Receiver<IngressTx>,
     dag_arc: &Arc<RwLock<DAG>>,
     storage_arc: &Arc<RwLock<Storage>>,
     processor: &TransactionProcessor,
@@ -495,7 +497,8 @@ async fn drain_verify_no_double_apply(
         match tokio::time::timeout(left, rx.recv()).await {
             Err(_) => break,
             Ok(None) => panic!("{}: channel closed", ctx),
-            Ok(Some(tx)) => {
+            Ok(Some(item)) => {
+                let tx = item.into_tx();
                 extra += 1;
                 assert!(
                     dag_arc.read().await.transactions().contains_key(&tx.id),
@@ -987,7 +990,8 @@ async fn ay03_interrupted_transfer_and_no_double_apply() {
     let first = tokio::time::timeout(PROPAGATE_TIMEOUT, node_b.rx.recv())
         .await
         .expect("B receives first catch-up tx")
-        .expect("live");
+        .expect("live")
+        .into_tx();
     assert_eq!(first.id, base[0].id, "parents-first chain order");
     let one: HashMap<[u8; 32], Transaction> = HashMap::from([(first.id, first.clone())]);
     assert_eq!(
@@ -1084,9 +1088,10 @@ async fn ay03_interrupted_transfer_and_no_double_apply() {
 
     // Record whatever honestly survived the interruption.
     let mut partial_map: HashMap<[u8; 32], Transaction> = HashMap::new();
-    while let Ok(Some(tx)) =
+    while let Ok(Some(item)) =
         tokio::time::timeout(Duration::from_millis(500), node_b.rx.recv()).await
     {
+        let tx = item.into_tx();
         if extra_ids.contains(&tx.id) {
             partial_map.entry(tx.id).or_insert(tx);
         } else {
@@ -1264,7 +1269,8 @@ async fn ay04_paginated_catchup_sized_by_limits() {
     let first = tokio::time::timeout(CATCHUP_TIMEOUT, node_b.rx.recv())
         .await
         .expect("B receives first backfilled tx")
-        .expect("live");
+        .expect("live")
+        .into_tx();
     let t_first = t_boot.elapsed();
     let first_id = first.id;
     let mut got: HashMap<[u8; 32], Transaction> = HashMap::from([(first_id, first)]);

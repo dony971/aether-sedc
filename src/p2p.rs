@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
@@ -616,6 +616,48 @@ const MAX_CLOSURE_PAGES: usize = 10;
 /// Scales with batch size instead of fixed 50ms per tx.
 const BACKPRESSURE_BASE_MS: u64 = 5;
 
+// --- 4CP-BA: hard memory bounds for the three queues that were unbounded ---
+//
+// Policy (documented in `docs/AETHER_4CP_BA_QUEUE_BOUNDS.md` — the phase
+// report): every queue between the wire and the node, and between the node
+// and one peer's socket, is bounded in BOTH messages and bytes. A bounded
+// count alone is not a memory bound (one frame may be 16 MiB); a byte budget
+// alone is not a scheduling bound. Refusal is always explicit, never a
+// silent lie: a refused payload is NOT marked as seen, so the native
+// recovery path (inventory diff / orphan re-request / periodic sync) can
+// fetch it again, and the funnel (DAG dedup + validation) keeps duplicate
+// delivery idempotent.
+/// Ingress transaction queue: max queued messages (count bound).
+pub const TX_INGRESS_CAPACITY_MSGS: usize = 256;
+/// Ingress transaction queue: max reserved wire bytes (memory bound).
+/// Worst case resident ingress memory = this value + one decoded consumer
+/// item. Chosen as 2× the largest single frame: a slow consumer can always
+/// be handed at least one maximum-size transaction before refusal begins.
+pub const TX_INGRESS_CAPACITY_BYTES: usize = 32 * 1024 * 1024;
+/// Stake ingress queue: max queued payloads (count bound). Stake payloads
+/// are fixed-size canonical encodings (Vote 265 B / Bond 121 B /
+/// Unbond 113 B), so the count bound IS the byte bound (≤ 68 KiB).
+pub const STAKE_CHANNEL_CAPACITY_MSGS: usize = 256;
+/// Per-session outbound queue: max queued messages (count bound).
+/// Bounds scheduling/Wait cost per peer; small enough that one stalled peer
+/// can never make the writer task expensive to abort.
+pub const SESSION_QUEUE_CAPACITY_MSGS: usize = 64;
+/// Per-session outbound queue: max reserved wire bytes (memory bound).
+/// ≥ one maximum frame (16 MiB + bucket slack), so a single legitimate
+/// large sync page is never refused for lack of budget on an idle queue.
+pub const SESSION_QUEUE_CAPACITY_BYTES: usize = 32 * 1024 * 1024;
+
+/// 4CP-BA: the effective queue bounds, exposed for diagnostics and tests
+/// (single source of truth: the constants above).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueLimits {
+    pub tx_ingress_msgs: usize,
+    pub tx_ingress_bytes: usize,
+    pub session_msgs: usize,
+    pub session_bytes: usize,
+    pub stake_msgs: usize,
+}
+
 // --- Peer Scoring ---
 /// Initial score for new peers
 const PEER_SCORE_INITIAL: i32 = 100;
@@ -809,7 +851,7 @@ impl TransportGroupKey {
 /// Count how many connected peers share the same /24 subnet as `addr`.
 async fn count_subnet_peers(
     addr: SocketAddr,
-    peers: &HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>,
+    peers: &HashMap<SocketAddr, PeerSink>,
 ) -> usize {
     let target = match subnet_24(addr) {
         Some(s) => s,
@@ -825,7 +867,7 @@ async fn count_subnet_peers(
 /// excluding `addr` itself (for checking before adding).
 async fn count_subnet_peers_excluding(
     addr: SocketAddr,
-    peers: &HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>,
+    peers: &HashMap<SocketAddr, PeerSink>,
 ) -> usize {
     let target = match subnet_24(addr) {
         Some(s) => s,
@@ -1669,7 +1711,7 @@ fn plan_recovery(
 /// already full. Returns true when the address ended up known.
 async fn ingress_address(
     addresses: &Arc<RwLock<AddressManager>>,
-    sessions: &Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
+    sessions: &Arc<RwLock<HashMap<SocketAddr, PeerSink>>>,
     local: SocketAddr,
     addr: SocketAddr,
     source: PeerSource,
@@ -1909,7 +1951,9 @@ async fn accept_inbound_transaction(
     source: SocketAddr,
     seen: &RwLock<HashMap<Vec<u8>, SeenTxEntry>>,
     propagation_state: &RwLock<PropagationState>,
-    tx_channel: &mpsc::UnboundedSender<Transaction>,
+    tx_channel: &mpsc::Sender<IngressTx>,
+    tx_budget: &Arc<Semaphore>,
+    tx_drops: &AtomicU64,
 ) -> bool {
     // DEDUPE, ahead of anything that could schedule a relay.
     if seen.read().await.contains_key(&tx_bytes) {
@@ -1924,6 +1968,46 @@ async fn accept_inbound_transaction(
         }
     };
 
+    // 4CP-BA: ADMISSION before receipt. Reserve the byte budget, then
+    // enqueue. On either refusal NOTHING is recorded — the payload is not
+    // marked seen and no upstream source is recorded — so the native
+    // recovery path (inventory diff / orphan re-request) can fetch it
+    // again: a refused message is never presented as accepted. Double
+    // delivery stays idempotent because the funnel (DAG dedup +
+    // validation) is what decides application, not this cache.
+    let wire_len = tx_bytes.len();
+    let tx_id = tx.id;
+    let permit = match tx_budget.clone().try_acquire_many_owned(wire_len as u32) {
+        Ok(p) => p,
+        Err(_) => {
+            tx_drops.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                "Ingress byte budget full: refused {} byte transaction from {}",
+                wire_len,
+                source
+            );
+            return false;
+        }
+    };
+    match tx_channel.try_send(IngressTx {
+        tx,
+        wire_len,
+        _permit: permit,
+    }) {
+        Ok(()) => {}
+        Err(_) => {
+            // Full (count cap) or Closed (node shutting down): the item —
+            // and with it the byte reservation — is released by the drop.
+            tx_drops.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                "Ingress queue full/closed: refused {} byte transaction from {}",
+                wire_len,
+                source
+            );
+            return false;
+        }
+    }
+
     insert_seen(seen, tx_bytes.clone()).await;
     // The upstream peer must be recorded at ingress, while `source` is still
     // in scope; the relay wave consults it later in `broadcast_transaction`.
@@ -1934,9 +2018,9 @@ async fn accept_inbound_transaction(
     // `node.log` should not get for free. Dropped from DEBUG (where it sat)
     // to TRACE: still reachable for a targeted investigation, not written at
     // the default level.
-    tracing::trace!("received transaction from {}: {}", source, hex::encode(tx.id));
+    tracing::trace!("received transaction from {}: {}", source, hex::encode(tx_id));
 
-    tx_channel.send(tx).is_ok()
+    true
 }
 
 /// PHASE 4I (F-D3): pure vote-inventory diff used by the VoteInventory
@@ -1979,7 +2063,7 @@ async fn accept_inbound_stake(
   source: SocketAddr,
   seen: &RwLock<HashMap<Vec<u8>, SeenTxEntry>>,
   propagation_state: &RwLock<PropagationState>,
-  stake_channel: &mpsc::UnboundedSender<StakePayload>,
+  stake_channel: &mpsc::Sender<StakePayload>,
 ) -> bool {
   // DEDUPE, ahead of anything that could schedule a relay.
   if seen.read().await.contains_key(&payload_bytes) {
@@ -2011,10 +2095,23 @@ async fn accept_inbound_stake(
   _ => return false,
             };
 
+  // 4CP-BA: the stake queue is bounded and the receive stage applies
+  // BACK-PRESSURE rather than refusal: `send()` awaits a free slot. This is
+  // the one ingress where no loss is acceptable (a dropped vote/bond is not
+  // re-derivable by sync — vote backfill needs the peer to re-announce), and
+  // the awaited cost is small: payloads are fixed-size (≤ 265 B) and the
+  // consumer is a cheap process_vote/bond/unbond. Receipt state (seen +
+  // upstream source) is recorded only AFTER the payload is really queued;
+  // on a closed queue nothing is recorded and the session treats the vote
+  // as not delivered.
+  if stake_channel.send(payload).await.is_err() {
+    return false;
+  }
+
   insert_seen(seen, payload_bytes.clone()).await;
   record_propagation_source(propagation_state, &payload_bytes, source).await;
   tracing::trace!("received {} from {}", kind, source);
-  stake_channel.send(payload).is_ok()
+  true
 }
 
 /// P2P network configuration
@@ -2902,6 +2999,120 @@ pub enum StakePayload {
   Unbond(Unbond),
 }
 
+/// 4CP-BA: one admitted transaction travelling node-ward on the bounded
+/// ingress queue (`tx_channel`).
+///
+/// The item carries the reservation for its own wire length, so the byte
+/// budget is released at the exact moment the node takes the transaction —
+/// and also if the item is dropped without being consumed (receiver closed,
+/// task aborted). There is no side table to keep in sync and no leak: the
+/// reservation is owned by the message, not by a counter someone must
+/// remember to decrement.
+pub struct IngressTx {
+    tx: Transaction,
+    wire_len: usize,
+    // Released when this item drops: on successful dequeue into the node
+    // (`into_tx`) and on queue teardown alike.
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl IngressTx {
+    /// Wire length this item's reservation accounts for.
+    pub fn wire_len(&self) -> usize {
+        self.wire_len
+    }
+
+    /// Consume the item, releasing its byte reservation, and hand the
+    /// transaction to the node.
+    pub fn into_tx(self) -> Transaction {
+        self.tx
+    }
+}
+
+/// 4CP-BA: the send half of one peer session's outbound queue, together
+/// with that session's byte budget.
+///
+/// Every producer that used to hold a bare `mpsc::UnboundedSender<Vec<u8>>`
+/// now holds this: `try_send` reserves the message's bytes against the
+/// session budget (and refuses when the queue is full in count OR bytes),
+/// the session's writer task releases them after the write attempt through
+/// its own budget/reservation handles. Saturation is therefore a property of
+/// the *refusing producer*; the writer stays a plain bounded-channel
+/// consumer.
+///
+/// What happens on refusal is each producer's policy (see the send sites):
+/// gossip, sync responses/requests and PEX are droppable because the native
+/// recovery path (inventory diff, orphan re-request, periodic sync/pex)
+/// re-derives them; nothing that is refused is recorded as delivered.
+#[derive(Clone)]
+pub struct PeerSink {
+    tx: mpsc::Sender<Vec<u8>>,
+    budget: Arc<Semaphore>,
+    reserved: Arc<AtomicUsize>,
+    drops: Arc<AtomicU64>,
+    addr: SocketAddr,
+}
+
+impl PeerSink {
+    /// Create one session's sink plus its receiver. The shared `drops`
+    /// counter is the node-wide session-refusal gauge (diagnostics only).
+    fn pair(addr: SocketAddr, drops: Arc<AtomicU64>) -> (PeerSink, mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = mpsc::channel(SESSION_QUEUE_CAPACITY_MSGS);
+        (
+            PeerSink {
+                tx,
+                budget: Arc::new(Semaphore::new(SESSION_QUEUE_CAPACITY_BYTES)),
+                reserved: Arc::new(AtomicUsize::new(0)),
+                drops,
+                addr,
+            },
+            rx,
+        )
+    }
+
+    /// Address this session belongs to (diagnostics + tests).
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Bytes currently reserved for queued (not yet written-out) messages.
+    pub fn queued_bytes(&self) -> usize {
+        self.reserved.load(Ordering::Relaxed)
+    }
+
+    /// 4CP-AS (F1): identity-scoped ownership check for `peers` /
+    /// `outbound_sessions` entries (replaces `same_channel` on the raw
+    /// sender).
+    fn same_channel(&self, other: &PeerSink) -> bool {
+        self.tx.same_channel(&other.tx)
+    }
+
+    /// Non-blocking handoff to this session's writer. Reserves the byte
+    /// budget first; on any refusal the reservation is released and the
+    /// caller decides the recovery story. Never blocks, never awaits.
+    fn try_send(&self, bytes: Vec<u8>) -> Result<(), ()> {
+        let n = bytes.len();
+        let permit = match self.budget.clone().try_acquire_many_owned(n as u32) {
+            Ok(p) => p,
+            Err(_) => {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+                return Err(());
+            }
+        };
+        match self.tx.try_send(bytes) {
+            Ok(()) => {
+                permit.forget();
+                self.reserved.fetch_add(n, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(_) => {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+                Err(())
+            }
+        }
+    }
+}
+
 /// PHASE 4G: node-supplied stake hooks for the P2P layer. Both behind
 /// set-once Arcs so P2PNetwork::new (15 call sites) keeps its signature:
 /// the node wires these after construction via the setters below.
@@ -2910,8 +3121,11 @@ pub enum StakePayload {
 #[derive(Clone, Default)]
 pub struct StakeHooks {
   /// Admit decoded stake payloads (node vote/bond receiver task).
+  /// 4CP-BA: bounded — a full queue applies back-pressure to the sending
+  /// session (the receive stage awaits `send()`; nothing is dropped and
+  /// nothing is marked seen before the payload is actually queued).
   pub stake_channel: std::sync::Arc<
-  std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<StakePayload>>>,
+  std::sync::Mutex<Option<tokio::sync::mpsc::Sender<StakePayload>>>,
   >,
   /// Serve vote encodings by vote id (GetData fallback; backed by the
   /// stake_votes storage tree). None = tx-only serving (as before).
@@ -3170,7 +3384,12 @@ pub struct P2PNetwork {
     /// type: dial and accept go through this, everything else (session keys,
     /// address book, PEX, sync) stays on `SocketAddr`.
     transport: Arc<dyn Transport>,
-    peers: Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
+    /// 4CP-BA: per-session outbound queues, bounded in messages AND bytes
+    /// (see [`PeerSink`]).
+    peers: Arc<RwLock<HashMap<SocketAddr, PeerSink>>>,
+    /// 4CP-BA: node-wide count of session-queue refusals (all sessions).
+    /// Diagnostics only — never drives a decision.
+    session_drops: Arc<AtomicU64>,
     /// Phase 2A: addresses with an outbound dial in flight. The initial sweep,
     /// heartbeat, redial loop and PEX can all reach `connect_to_peer` for the
     /// same address concurrently; without this guard a peer gets two sessions
@@ -3186,10 +3405,10 @@ pub struct P2PNetwork {
     /// `handle_peer` removes — so it cannot drift from `peers` without `peers`
     /// drifting too. Never held together with `peers` or `addresses`.
     ///
-    /// 4CP-AS (F1): the value is the reserving session's own sender, so the
+    /// 4CP-AS (F1): the value is the reserving session's own sink, so the
     /// release is ownership-scoped exactly like the `peers` entry: a stale
     /// session must not free a newer session's reservation at the same addr.
-    outbound_sessions: Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
+    outbound_sessions: Arc<RwLock<HashMap<SocketAddr, PeerSink>>>,
 
     /// Phase 2B: the single owner of everything the node knows about
     /// addresses — membership, metadata, TTL clock, PEX origins and scores.
@@ -3206,7 +3425,15 @@ pub struct P2PNetwork {
     /// by the recovery task, which is also the sole dialer it drives, so there
     /// is exactly one writer.
     recovery: Arc<RwLock<PeerRecoveryController>>,
-    tx_channel: mpsc::UnboundedSender<Transaction>,
+    /// 4CP-BA: bounded ingress transaction queue (see [`IngressTx`]).
+    tx_channel: mpsc::Sender<IngressTx>,
+    /// 4CP-BA: byte budget backing `tx_channel`. A producer reserves
+    /// `wire_len` permits before enqueueing; the reservation rides INSIDE
+    /// the queued item and is released when the node takes it.
+    tx_budget: Arc<Semaphore>,
+    /// 4CP-BA: count of ingress refusals (queue count-full or budget-full).
+    /// Diagnostics only.
+    ingress_drops: Arc<AtomicU64>,
     peer_discovery_tx: Arc<tokio::sync::Mutex<Option<mpsc::UnboundedSender<SocketAddr>>>>,
     get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
     get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
@@ -3280,7 +3507,7 @@ impl P2PNetwork {
     /// Create a new P2P network manager
     pub fn new(
         config: P2PConfig,
-        tx_channel: mpsc::UnboundedSender<Transaction>,
+        tx_channel: mpsc::Sender<IngressTx>,
         get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
         get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
@@ -3291,11 +3518,14 @@ impl P2PNetwork {
             config,
             transport: Arc::new(TcpTransport::new()),
             peers: Arc::new(RwLock::new(HashMap::new())),
+            session_drops: Arc::new(AtomicU64::new(0)),
             dialing: Arc::new(RwLock::new(HashSet::new())),
             outbound_sessions: Arc::new(RwLock::new(HashMap::new())),
             addresses: Arc::new(RwLock::new(AddressManager::new())),
             recovery: Arc::new(RwLock::new(PeerRecoveryController::new())),
             tx_channel,
+            tx_budget: Arc::new(Semaphore::new(TX_INGRESS_CAPACITY_BYTES)),
+            ingress_drops: Arc::new(AtomicU64::new(0)),
             peer_discovery_tx: Arc::new(tokio::sync::Mutex::new(None)),
             get_dag_hashes,
             get_transaction_by_hash,
@@ -3583,7 +3813,7 @@ impl P2PNetwork {
     /// the test needs real inbound sockets.
     pub fn new_with_transport(
         config: P2PConfig,
-        tx_channel: mpsc::UnboundedSender<Transaction>,
+        tx_channel: mpsc::Sender<IngressTx>,
         get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
         get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
@@ -3806,7 +4036,7 @@ impl P2PNetwork {
 
   /// PHASE 4G: wire the node stake receiver (called once at boot, before
   /// or after start  -  the hooks are resolved per message, never cached).
-  pub fn set_stake_channel(&self, tx: mpsc::UnboundedSender<StakePayload>) {
+  pub fn set_stake_channel(&self, tx: mpsc::Sender<StakePayload>) {
   if let Ok(mut guard) = self.stake_hooks.stake_channel.lock() {
   *guard = Some(tx);
             }
@@ -3956,6 +4186,9 @@ impl P2PNetwork {
         let peers = self.peers.clone();
         let outbound_sessions = self.outbound_sessions.clone();
         let tx_channel = self.tx_channel.clone();
+        let tx_budget = Arc::clone(&self.tx_budget);
+        let tx_drops = Arc::clone(&self.ingress_drops);
+        let session_drops = Arc::clone(&self.session_drops);
         let get_dag_hashes = Arc::clone(&self.get_dag_hashes);
         let get_transaction_by_hash = Arc::clone(&self.get_transaction_by_hash);
         let get_tips = Arc::clone(&self.get_tips);
@@ -3998,6 +4231,9 @@ impl P2PNetwork {
                 addresses,
                 outbound_sessions,
                 tx_channel,
+                tx_budget,
+                tx_drops,
+                session_drops,
                 get_dag_hashes,
                 get_transaction_by_hash,
                 get_tips,
@@ -4810,7 +5046,7 @@ impl P2PNetwork {
 
                 // Snapshot senders first and release, so no session lock is held
                 // while the address manager is acquired.
-                let targets: Vec<(SocketAddr, mpsc::UnboundedSender<Vec<u8>>)> = {
+                let targets: Vec<(SocketAddr, PeerSink)> = {
                     let guard = peers.read().await;
                     guard.iter().map(|(a, s)| (*a, s.clone())).collect()
                 };
@@ -4827,7 +5063,8 @@ impl P2PNetwork {
                         continue;
                     }
                     if let Ok(bytes) = bincode::serialize(&P2PMessage::Peers(list)) {
-                        let _ = sender.send(bytes);
+                        // 4CP-BA: droppable — PEX re-samples every interval.
+                        let _ = sender.try_send(bytes);
                     }
                 }
             }
@@ -4842,11 +5079,14 @@ impl P2PNetwork {
     /// Accept loop for incoming connections
     async fn accept_loop(
         listener: TransportListener,
-        peers: Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
+        peers: Arc<RwLock<HashMap<SocketAddr, PeerSink>>>,
         local_addr: SocketAddr,
         addresses: Arc<RwLock<AddressManager>>,
-        outbound_sessions: Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
-        tx_channel: mpsc::UnboundedSender<Transaction>,
+        outbound_sessions: Arc<RwLock<HashMap<SocketAddr, PeerSink>>>,
+        tx_channel: mpsc::Sender<IngressTx>,
+        tx_budget: Arc<Semaphore>,
+        tx_drops: Arc<AtomicU64>,
+        session_drops: Arc<AtomicU64>,
         get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
         get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
@@ -4932,7 +5172,8 @@ impl P2PNetwork {
                         }
                     }
                     info!("New peer connected: {}", addr);
-                    let (msg_sender, msg_receiver) = mpsc::unbounded_channel::<Vec<u8>>();
+                    let (msg_sender, msg_receiver) =
+                        PeerSink::pair(addr, Arc::clone(&session_drops));
                     {
                         let mut peers = peers.write().await;
                         peers.insert(addr, msg_sender.clone());
@@ -4951,6 +5192,8 @@ impl P2PNetwork {
 
                     let peers_clone = peers.clone();
                     let tx_channel = tx_channel.clone();
+                    let tx_budget = Arc::clone(&tx_budget);
+                    let tx_drops = Arc::clone(&tx_drops);
                     let get_dag_hashes = Arc::clone(&get_dag_hashes);
                     let get_transaction_by_hash = Arc::clone(&get_transaction_by_hash);
                     let get_tips = Arc::clone(&get_tips);
@@ -4984,6 +5227,8 @@ impl P2PNetwork {
                             local_addr,
                             addresses,
                             tx_channel,
+                            tx_budget,
+                            tx_drops,
                             get_dag_hashes,
                             get_transaction_by_hash,
                             get_tips,
@@ -5554,9 +5799,9 @@ impl P2PNetwork {
     /// `dialing` set needs no guard because its entry is owned by the one dial
     /// that inserted it (a concurrent dial to the same addr is refused).
     fn remove_peer_if_ours(
-        map: &mut HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>,
+        map: &mut HashMap<SocketAddr, PeerSink>,
         addr: &SocketAddr,
-        ours: &mpsc::UnboundedSender<Vec<u8>>,
+        ours: &PeerSink,
     ) -> bool {
         match map.get(addr) {
             Some(existing) if existing.same_channel(ours) => {
@@ -5571,17 +5816,19 @@ impl P2PNetwork {
     async fn handle_peer(
         stream: TransportStream,
         addr: SocketAddr,
-        peers: Arc<RwLock<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>,
+        peers: Arc<RwLock<HashMap<SocketAddr, PeerSink>>>,
         local_addr: SocketAddr,
         addresses: Arc<RwLock<AddressManager>>,
-        tx_channel: mpsc::UnboundedSender<Transaction>,
+        tx_channel: mpsc::Sender<IngressTx>,
+        tx_budget: Arc<Semaphore>,
+        tx_drops: Arc<AtomicU64>,
         get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
         get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         seen_transactions: Arc<RwLock<HashMap<Vec<u8>, SeenTxEntry>>>,
         propagation_state: Arc<RwLock<PropagationState>>,
-        msg_sender: mpsc::UnboundedSender<Vec<u8>>,
-        msg_receiver: mpsc::UnboundedReceiver<Vec<u8>>,
+        msg_sender: PeerSink,
+        msg_receiver: mpsc::Receiver<Vec<u8>>,
         peer_discovery_tx: mpsc::UnboundedSender<SocketAddr>,
         sync_ctx: Arc<SyncContext>,
         is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
@@ -5726,8 +5973,21 @@ impl P2PNetwork {
         // the closure, and the captured `writer`/`msg_receiver` are dropped —
         // the socket is released and no task is created.
         let send_admission = Arc::clone(&admission);
+        // 4CP-BA: the writer is the sole RELEASER of this session's byte
+        // budget. Every message taken out of the queue (whatever its fate)
+        // returns its reservation, so `queued_bytes` measures real memory.
+        // It must NOT hold a clone of the Sender: that self-reference would
+        // keep the channel open forever, so a read-loop teardown (EOF,
+        // protocol violation) would never close the socket's write half.
+        let release_budget = Arc::clone(&msg_sender.budget);
+        let release_reserved = Arc::clone(&msg_sender.reserved);
+        let release = move |n: usize| {
+            release_reserved.fetch_sub(n, Ordering::Relaxed);
+            release_budget.add_permits(n);
+        };
         let _ = Self::admit_task(&send_admission, move |_generation| async move {
             while let Some(msg) = msg_receiver.recv().await {
+                let msg_len = msg.len();
                 let cipher = {
                     let key = Key::from_slice(key_enc.as_ref());
                     ChaCha20Poly1305::new(key)
@@ -5746,6 +6006,7 @@ impl P2PNetwork {
                             msg.len(),
                             addr
                         );
+                        release(msg_len);
                         continue;
                     }
                 };
@@ -5780,21 +6041,27 @@ impl P2PNetwork {
                         .await;
                         match write {
                             Ok(Ok(())) => {}
-                            Ok(Err(_)) => break,
+                            Ok(Err(_)) => {
+                                release(msg_len);
+                                break;
+                            }
                             Err(_) => {
                                 warn!(
                                     "Dropping session with {}: write timed out after {:?}",
                                     addr, SESSION_WRITE_TIMEOUT
                                 );
+                                release(msg_len);
                                 break;
                             }
                         }
                     }
                     Err(e) => {
                         warn!("Encryption failed for {}: {:?}", addr, e);
+                        release(msg_len);
                         break;
                     }
                 }
+                release(msg_len);
             }
         });
 
@@ -5808,13 +6075,17 @@ impl P2PNetwork {
                 our_tips.len(),
                 addr
             );
-            let _ = msg_sender.send(getinv_msg);
+            // 4CP-BA: droppable (control handshake chatter; the periodic
+            // reconciliation below re-derives the intent).
+            let _ = msg_sender.try_send(getinv_msg);
         }
 
         // Also request the full inventory: tip-based sync can miss unconfirmed
         // (weight-0) tips, so fetch the peer's complete hash set to reconcile.
         if let Ok(sync_req) = bincode::serialize(&P2PMessage::SyncRequest) {
-            let _ = msg_sender.send(sync_req);
+            // 4CP-BA: droppable — the node's periodic sync loop re-requests
+            // the inventory window every cycle.
+            let _ = msg_sender.try_send(sync_req);
         }
 
         // Mark peer as known (Phase 1: refresh TTL clock too)
@@ -5996,23 +6267,32 @@ impl P2PNetwork {
                             // a duplicate arriving via the other path keeps
                             // the ORIGINAL mode. Insert-then-send ordering is
                             // load-bearing (see note_ingress_mode).
-                            if let Ok(live_tx) =
-                                bincode::deserialize::<Transaction>(&tx_bytes)
-                            {
-                                sync_ctx
-                                    .note_ingress_mode(live_tx.id, ValidationMode::Fresh)
-                                    .await;
-                            }
+                            // 4CP-BA: the Fresh ingress-mode note must follow
+                            // ADMISSION, not precede it. `note_ingress_mode`
+                            // is first-delivery-wins, so recording Fresh for
+                            // a payload the bounded queue then refuses would
+                            // poison a later Historical re-delivery of an old
+                            // transaction (sync) into failing the live policy.
+                            let live_id = bincode::deserialize::<Transaction>(&tx_bytes)
+                                .ok()
+                                .map(|t| t.id);
                             if !accept_inbound_transaction(
                                 tx_bytes,
                                 addr,
                                 &seen_transactions,
                                 &propagation_state,
                                 &tx_channel,
+                                &tx_budget,
+                                &tx_drops,
                             )
                             .await
                             {
                                 continue;
+                            }
+                            if let Some(id) = live_id {
+                                sync_ctx
+                                    .note_ingress_mode(id, ValidationMode::Fresh)
+                                    .await;
                             }
                         }
                         P2PMessage::Inventory(hashes) => {
@@ -6081,7 +6361,10 @@ impl P2PNetwork {
                                 if let Ok(getdata_msg) =
                                     bincode::serialize(&P2PMessage::GetData(missing_hashes.clone()))
                                 {
-                                    let _ = msg_sender.send(getdata_msg);
+                                    // 4CP-BA: droppable — the frontier keeps
+                                    // the hash pending and the next
+                                    // inventory diff re-requests it.
+                                    let _ = msg_sender.try_send(getdata_msg);
                                 }
                                 // DEEP SYNC: mark hashes as requested in frontier
                                 {
@@ -6137,7 +6420,10 @@ impl P2PNetwork {
                                     if let Ok(sync_resp_msg) =
                                         bincode::serialize(&P2PMessage::SyncResponse(tx_bytes_list))
                                     {
-                                        let _ = msg_sender.send(sync_resp_msg);
+                                        // 4CP-BA: droppable — the requester
+                                        // leaves the closure unmarked and
+                                        // re-requests it on the next diff.
+                                        let _ = msg_sender.try_send(sync_resp_msg);
                                     }
                                 }
                             }
@@ -6147,7 +6433,10 @@ impl P2PNetwork {
                                 if let Ok(getdata_msg) =
                                     bincode::serialize(&P2PMessage::GetData(missing_for_us))
                                 {
-                                    let _ = msg_sender.send(getdata_msg);
+                                    // 4CP-BA: droppable — the frontier keeps
+                                    // the hash pending and the next
+                                    // inventory diff re-requests it.
+                                    let _ = msg_sender.try_send(getdata_msg);
                                 }
                             }
                         }
@@ -6173,7 +6462,9 @@ impl P2PNetwork {
   if let Ok(vote_msg) = bincode::serialize(
   &P2PMessage::Vote(enc),
         ) {
-  let _ = msg_sender.send(vote_msg);
+  // 4CP-BA: droppable — vote ids are re-announced by the periodic vote
+  // backfill inventory; admission is idempotent.
+  let _ = msg_sender.try_send(vote_msg);
                                     }
                                 }
                             }
@@ -6230,7 +6521,10 @@ impl P2PNetwork {
                                     if let Ok(sync_resp_msg) =
                                         bincode::serialize(&P2PMessage::SyncResponse(tx_bytes_list))
                                     {
-                                        let _ = msg_sender.send(sync_resp_msg);
+                                        // 4CP-BA: droppable — the requester
+                                        // leaves the closure unmarked and
+                                        // re-requests it on the next diff.
+                                        let _ = msg_sender.try_send(sync_resp_msg);
                                     }
                                 }
                             }
@@ -6255,7 +6549,9 @@ impl P2PNetwork {
                             if let Ok(inv_msg) =
                                 bincode::serialize(&P2PMessage::Inventory(our_hashes))
                             {
-                                let _ = msg_sender.send(inv_msg);
+                                // 4CP-BA: droppable — the peer's periodic
+                                // SyncRequest re-derives the window.
+                                let _ = msg_sender.try_send(inv_msg);
                             }
                         }
                         P2PMessage::SyncResponse(tx_bytes_list) => {
@@ -6349,20 +6645,63 @@ impl P2PNetwork {
                                 // Waiting txs (parents missing) are NOT marked, so the
                                 // next inventory diff re-requests them.
                                 //
+                                // 4CP-BA: ADMISSION FIRST, then the marks. The
+                                // bounded ingress queue may refuse an item under
+                                // saturation; only a payload that was really
+                                // queued may be marked received/applied or
+                                // recorded as seen. A refused item stays
+                                // unmarked, so the next inventory diff
+                                // re-requests it — a refused message is never
+                                // presented as delivered, and duplicate
+                                // re-delivery stays idempotent at the funnel.
+                                let tx_id = tx.id;
+                                let wire_len = tx_bytes.len();
+                                let permit = match tx_budget
+                                    .clone()
+                                    .try_acquire_many_owned(wire_len as u32)
+                                {
+                                    Ok(p) => p,
+                                    Err(_) => {
+                                        tx_drops.fetch_add(1, Ordering::Relaxed);
+                                        tracing::debug!(
+                                            "Ingress byte budget full: refused {} byte sync tx from {}",
+                                            wire_len,
+                                            addr
+                                        );
+                                        continue;
+                                    }
+                                };
+                                if tx_channel
+                                    .try_send(IngressTx {
+                                        tx,
+                                        wire_len,
+                                        _permit: permit,
+                                    })
+                                    .is_err()
+                                {
+                                    tx_drops.fetch_add(1, Ordering::Relaxed);
+                                    tracing::debug!(
+                                        "Ingress queue full/closed: refused {} byte sync tx from {}",
+                                        wire_len,
+                                        addr
+                                    );
+                                    continue;
+                                }
                                 // PHASE 3B (H1): this is the SYNC backfill path
                                 // (inventory diffs, GetData closures, healing).
-                                // Record Historical provenance BEFORE queueing:
-                                // backfill carries genuinely-old txs that live
-                                // policy (Fresh) must not reject. Live gossip
-                                // singles record Fresh at the Transaction arm
-                                // above; first-delivery-wins on duplicates.
+                                // Record Historical provenance now that the
+                                // payload is queued: backfill carries
+                                // genuinely-old txs that live policy (Fresh)
+                                // must not reject. Live gossip singles record
+                                // Fresh at the Transaction arm above;
+                                // first-delivery-wins on duplicates.
                                 sync_ctx
-                                    .note_ingress_mode(tx.id, ValidationMode::Historical)
+                                    .note_ingress_mode(tx_id, ValidationMode::Historical)
                                     .await;
                                 {
                                     let mut frontier = sync_ctx.frontier.write().await;
-                                    frontier.mark_received(&tx.id);
-                                    frontier.mark_applied(&tx.id);
+                                    frontier.mark_received(&tx_id);
+                                    frontier.mark_applied(&tx_id);
                                     frontier.record_progress();
                                 }
                                 // 2E-D: the deep-sync ingress has to record its
@@ -6379,7 +6718,6 @@ impl P2PNetwork {
                                 )
                                 .await;
                                 insert_seen(&seen_transactions, tx_bytes).await;
-                                let _ = tx_channel.send(tx);
                                 if delay_ms > 0 {
                                     tokio::time::sleep(tokio::time::Duration::from_millis(
                                         delay_ms,
@@ -6576,7 +6914,8 @@ impl P2PNetwork {
   // Re-cap to page size for the request itself.
   let page: Vec<Vec<u8>> = missing.into_iter().take(MAX_SYNC_PAGE).collect();
   if let Ok(req) = bincode::serialize(&P2PMessage::GetVotes(page)) {
-  let _ = msg_sender.send(req);
+  // 4CP-BA: droppable — the next vote inventory cycle re-announces.
+  let _ = msg_sender.try_send(req);
                     }
                 }
             }
@@ -6592,7 +6931,9 @@ impl P2PNetwork {
   for id in ids.into_iter().take(MAX_SYNC_PAGE) {
   if let Some(enc) = lookup(&id) {
   if let Ok(vote_msg) = bincode::serialize(&P2PMessage::Vote(enc)) {
-  let _ = msg_sender.send(vote_msg);
+  // 4CP-BA: droppable — vote ids are re-announced by the periodic vote
+  // backfill inventory; admission is idempotent.
+  let _ = msg_sender.try_send(vote_msg);
                             }
                         }
                     }
@@ -6733,7 +7074,8 @@ impl P2PNetwork {
         {
             Ok(Ok(stream)) => {
                 info!("Connected to peer: {}", addr);
-                let (msg_sender, msg_receiver) = mpsc::unbounded_channel::<Vec<u8>>();
+                let (msg_sender, msg_receiver) =
+                    PeerSink::pair(addr, Arc::clone(&self.session_drops));
                 {
                     let mut peers = self.peers.write().await;
                     peers.insert(addr, msg_sender.clone());
@@ -6762,6 +7104,8 @@ impl P2PNetwork {
                 let addresses = self.addresses.clone();
                 let local_addr = self.config.listen_addr;
                 let tx_channel = self.tx_channel.clone();
+                let tx_budget = Arc::clone(&self.tx_budget);
+                let tx_drops = Arc::clone(&self.ingress_drops);
                 let get_dag_hashes = Arc::clone(&self.get_dag_hashes);
                 let get_transaction_by_hash = Arc::clone(&self.get_transaction_by_hash);
                 let get_tips = Arc::clone(&self.get_tips);
@@ -6808,6 +7152,8 @@ impl P2PNetwork {
                         local_addr,
                         addresses,
                         tx_channel,
+                        tx_budget,
+                        tx_drops,
                         get_dag_hashes,
                         get_transaction_by_hash,
                         get_tips,
@@ -6924,7 +7270,7 @@ impl P2PNetwork {
         // Select the targets and draw each peer's delay under ONE rng lock
         // (short, never held across an `.await`), then drop every guard before
         // spawning so no lock is live while tasks are created.
-        let wave: Vec<(mpsc::UnboundedSender<Vec<u8>>, Duration)> = {
+        let wave: Vec<(PeerSink, Duration)> = {
             let peers_guard = self.peers.read().await;
             let addrs: Vec<SocketAddr> = peers_guard.keys().copied().collect();
             let mut rng = self.propagation_rng.lock().unwrap_or_else(|e| e.into_inner());
@@ -6957,11 +7303,11 @@ impl P2PNetwork {
                 // instant. It is not — and 2E-D does not claim it is — a
                 // defence against an observer holding both endpoints.
                 tokio::time::sleep(delay).await;
-                if sender.send(task_msg).is_err() {
-                    // LOG REVIEW (2E-D §11): no address, no hash, no relay
-                    // timestamp — a peer dropping out is not a correlation
-                    // event worth a line at the default level.
-                    tracing::trace!("relay peer channel closed");
+                if sender.try_send(task_msg).is_err() {
+                    // 4CP-BA: droppable relay to ONE peer (either the
+                    // session queue is saturated or the channel closed);
+                    // sync heals the miss. Log review (2E-D §11) unchanged.
+                    tracing::trace!("relay peer channel closed or saturated");
                 }
                 task_inflight.fetch_sub(1, Ordering::Relaxed);
             });
@@ -7030,7 +7376,7 @@ impl P2PNetwork {
                 }
         };
 
-  let wave: Vec<(mpsc::UnboundedSender<Vec<u8>>, Duration)> = {
+  let wave: Vec<(PeerSink, Duration)> = {
   let peers_guard = self.peers.read().await;
   let addrs: Vec<SocketAddr> = peers_guard.keys().copied().collect();
   let mut rng = self.propagation_rng.lock().unwrap_or_else(|e| e.into_inner());
@@ -7055,8 +7401,8 @@ impl P2PNetwork {
         // jitter, non-blocking send).
         tokio::spawn(async move {
   tokio::time::sleep(delay).await;
-  if sender.send(task_msg).is_err() {
-  tracing::trace!("relay peer channel closed");
+  if sender.try_send(task_msg).is_err() {
+  tracing::trace!("relay peer channel closed or saturated");
             }
   task_inflight.fetch_sub(1, Ordering::Relaxed);
                         });
@@ -7071,8 +7417,50 @@ impl P2PNetwork {
     /// Get the list of connected peers
     pub async fn get_peers(&self) -> Vec<SocketAddr> {
         let peers = self.peers.read().await;
-        let peers: &std::collections::HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>> = &*peers;
         peers.keys().copied().collect()
+    }
+
+    // --- 4CP-BA: queue-pressure diagnostics (read-only, never decisions) ---
+
+    /// Ingress transactions refused because the bounded queue was full in
+    /// count or bytes (or the node was shutting down).
+    pub fn ingress_drops(&self) -> u64 {
+        self.ingress_drops.load(Ordering::Relaxed)
+    }
+
+    /// Outbound messages refused because a session queue was full in count
+    /// or bytes (all sessions, since construction).
+    pub fn session_drops(&self) -> u64 {
+        self.session_drops.load(Ordering::Relaxed)
+    }
+
+    /// Bytes currently reserved by queued-but-not-yet-consumed ingress
+    /// transactions. Never exceeds [`TX_INGRESS_CAPACITY_BYTES`].
+    pub fn ingress_reserved_bytes(&self) -> usize {
+        TX_INGRESS_CAPACITY_BYTES.saturating_sub(self.tx_budget.available_permits())
+    }
+
+    /// Bytes currently reserved by queued-but-not-yet-written messages for
+    /// one session. `None` if no session is registered at `addr`. Never
+    /// exceeds [`SESSION_QUEUE_CAPACITY_BYTES`].
+    pub async fn session_queued_bytes(&self, addr: SocketAddr) -> Option<usize> {
+        self.peers
+            .read()
+            .await
+            .get(&addr)
+            .map(|sink| sink.queued_bytes())
+    }
+
+    /// The configured bounds, exposed so tests and operators assert the real
+    /// constants instead of duplicating them.
+    pub fn queue_limits(&self) -> QueueLimits {
+        QueueLimits {
+            tx_ingress_msgs: TX_INGRESS_CAPACITY_MSGS,
+            tx_ingress_bytes: TX_INGRESS_CAPACITY_BYTES,
+            session_msgs: SESSION_QUEUE_CAPACITY_MSGS,
+            session_bytes: SESSION_QUEUE_CAPACITY_BYTES,
+            stake_msgs: STAKE_CHANNEL_CAPACITY_MSGS,
+        }
     }
 
     /// C2-004: cached topological serving order, keyed by DAG length.
@@ -7384,8 +7772,13 @@ impl P2PNetwork {
 
         let peers = self.peers.read().await;
         for (addr, sender) in peers.iter() {
-            if sender.send(msg_bytes.clone()).is_err() {
-                warn!("Failed to send GetData request to {}: channel closed", addr);
+            // 4CP-BA: droppable — parent requests are retried with backoff
+            // (or re-derived from the orphan flow).
+            if sender.try_send(msg_bytes.clone()).is_err() {
+                debug!(
+                    "GetData parent request to {} deferred (session queue saturated)",
+                    addr
+                );
             }
         }
     }
@@ -7414,7 +7807,9 @@ impl P2PNetwork {
         let peers = self.peers.read().await;
         for (addr, sender) in peers.iter() {
             debug!("[Sync] Requesting full inventory from {}", addr);
-            if sender.send(msg.clone()).is_err() {
+            // 4CP-BA: droppable — both requests are re-issued every sync
+            // cycle; a saturated session queue must not stall the loop.
+            if sender.try_send(msg.clone()).is_err() {
                 warn!("Failed to send SyncRequest to {}: channel closed", addr);
             }
         }
@@ -7439,7 +7834,9 @@ impl P2PNetwork {
         let peers = self.peers.read().await;
         for (addr, sender) in peers.iter() {
             debug!("[Sync] Announcing vote inventory to {}", addr);
-            if sender.send(msg.clone()).is_err() {
+            // 4CP-BA: droppable — both requests are re-issued every sync
+            // cycle; a saturated session queue must not stall the loop.
+            if sender.try_send(msg.clone()).is_err() {
                 warn!("Failed to send VoteInventory to {}: channel closed", addr);
             }
         }
@@ -7477,7 +7874,7 @@ mod phase2_decentralized_tests {
     }
 
     fn net_at_config(cfg: P2PConfig) -> P2PNetwork {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
         let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
             Arc::new(|_| None);
@@ -7617,7 +8014,7 @@ mod phase2_decentralized_tests {
         }
 
         // A live session exists for `live` only.
-        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, _rx) = PeerSink::pair(live, Arc::new(AtomicU64::new(0)));
         net.peers.write().await.insert(live, tx);
 
         let idle_clock = net
@@ -9528,7 +9925,7 @@ mod phase2_self_healing_tests {
     }
 
     fn net_at_config(cfg: P2PConfig) -> P2PNetwork {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
         let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
             Arc::new(|_| None);
@@ -9579,7 +9976,7 @@ mod phase2_self_healing_tests {
     /// only has loopback, and loopback is one `/24`, so no more than
     /// `MAX_PEERS_PER_SUBNET` real sockets can ever be opened here.
     async fn insert_session(net: &P2PNetwork, a: SocketAddr) {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = PeerSink::pair(a, Arc::new(AtomicU64::new(0)));
         net.peers.write().await.insert(a, tx);
     }
 
@@ -10220,7 +10617,7 @@ mod bootstrap_phase1_tests {
             peer_store_path: Some(path.clone()),
                 network_id: crate::transaction::DEFAULT_NETWORK_ID,
 };
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
         let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
             Arc::new(|_| None);
@@ -10255,7 +10652,7 @@ mod bootstrap_phase1_tests {
             peer_store_path: Some(path),
                 network_id: crate::transaction::DEFAULT_NETWORK_ID,
 };
-        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let sync_ctx2 = Arc::new(SyncContext::default());
         let net2 = P2PNetwork::new(
             cfg2,
@@ -10277,7 +10674,7 @@ mod bootstrap_phase1_tests {
     /// PEER_TTL: disconnect path keeps the address in known_peers (TTL, not remove).
     #[tokio::test]
     async fn test_peer_ttl_keeps_address_after_disconnect() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
         let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
             Arc::new(|_| None);
@@ -10359,7 +10756,7 @@ mod bootstrap_phase1_tests {
     /// GENERAL_REDIAL: heartbeat/reconnection candidate set includes non-bootnode peers.
     #[tokio::test]
     async fn test_general_redial_includes_known_peers() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
         let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
             Arc::new(|_| None);
@@ -10425,7 +10822,7 @@ mod bootstrap_phase1_tests {
         let peer = addr("203.0.113.10:25565");
         std::fs::write(&path, format!("[\"{}\"]", peer)).unwrap();
 
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
         let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
             Arc::new(|_| None);
@@ -10741,7 +11138,7 @@ mod bootstrap_phase1_tests {
     /// PARTITION/RECONNECT: known_peers survives an active-map wipe (partition).
     #[tokio::test]
     async fn test_partition_keeps_known_peers_for_reconnect() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
         let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
             Arc::new(|_| None);
@@ -10787,7 +11184,7 @@ mod bootstrap_phase1_tests {
     /// the pair as mutual redial candidates (logic-level scenario).
     #[tokio::test]
     async fn test_bootnode_loss_pair_stays_connected() {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
         let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> =
             Arc::new(|_| None);
@@ -11523,7 +11920,7 @@ mod tests {
   use crate::transaction::VOTE_FORMAT_VERSION;
         let seen = Arc::new(RwLock::new(HashMap::new()));
   let prop = Arc::new(RwLock::new(HashMap::new()));
-  let (tx, mut rx) = mpsc::unbounded_channel::<StakePayload>();
+  let (tx, mut rx) = mpsc::channel::<StakePayload>(STAKE_CHANNEL_CAPACITY_MSGS);
   let source: SocketAddr = "127.0.0.1:30333".parse().unwrap();
 
   let vote = Vote {
@@ -11775,7 +12172,7 @@ mod tests {
     #[tokio::test]
     async fn test_broadcast_marks_as_local() {
         // Test that broadcast_transaction marks tx as Local before sending
-        let (tx_channel, _tx_receiver) = mpsc::unbounded_channel::<Transaction>();
+        let (tx_channel, _tx_receiver) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let p2p = P2PNetwork::new(
             P2PConfig::default(),
             tx_channel,
@@ -11951,7 +12348,7 @@ mod tests {
     /// already-known (backoff).
     #[tokio::test]
     async fn test_request_transaction_dedup() {
-        let (tx_channel, _tx_receiver) = mpsc::unbounded_channel::<Transaction>();
+        let (tx_channel, _tx_receiver) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let ctx = Arc::new(crate::sync_stats::SyncContext::default());
         let p2p = P2PNetwork::new(
             P2PConfig::default(),
@@ -12123,7 +12520,7 @@ mod tests {
 
     #[test]
     fn test_count_subnet_peers() {
-        let peers: HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>> = HashMap::new();
+        let peers: HashMap<SocketAddr, PeerSink> = HashMap::new();
         let addr: SocketAddr = "10.0.0.1:30333".parse().unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
         let count = rt.block_on(count_subnet_peers(addr, &peers));
@@ -12502,8 +12899,8 @@ mod phase2_privacy_propagation_tests {
     /// what actually went on the wire.
     async fn network_with_peers(
         addrs: &[SocketAddr],
-    ) -> (P2PNetwork, Vec<mpsc::UnboundedReceiver<Vec<u8>>>) {
-        let (tx_channel, _rx) = mpsc::unbounded_channel::<Transaction>();
+    ) -> (P2PNetwork, Vec<mpsc::Receiver<Vec<u8>>>) {
+        let (tx_channel, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let p2p = P2PNetwork::new(
             P2PConfig::default(),
             tx_channel,
@@ -12515,7 +12912,7 @@ mod phase2_privacy_propagation_tests {
         );
         let mut rxs = Vec::with_capacity(addrs.len());
         for a in addrs {
-            let (sx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            let (sx, rx) = PeerSink::pair(*a, Arc::new(AtomicU64::new(0)));
             p2p.peers.write().await.insert(*a, sx);
             rxs.push(rx);
         }
@@ -12523,7 +12920,7 @@ mod phase2_privacy_propagation_tests {
     }
 
     /// Drain everything a peer received since the last call.
-    fn drain(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) -> usize {
+    fn drain(rx: &mut mpsc::Receiver<Vec<u8>>) -> usize {
         let mut n = 0;
         while rx.try_recv().is_ok() {
             n += 1;
@@ -12705,7 +13102,9 @@ mod phase2_privacy_propagation_tests {
     async fn test_receive_stage_schedules_no_relay() {
         let seen: RwLock<HashMap<Vec<u8>, SeenTxEntry>> = RwLock::new(HashMap::new());
         let state: RwLock<PropagationState> = RwLock::new(HashMap::new());
-        let (tx_channel, mut rx) = mpsc::unbounded_channel::<Transaction>();
+        let (tx_channel, mut rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
+        let tx_budget = Arc::new(Semaphore::new(TX_INGRESS_CAPACITY_BYTES));
+        let tx_drops = AtomicU64::new(0);
 
         let tx = make_tx(1);
         let bytes = bincode::serialize(&tx).unwrap();
@@ -12717,6 +13116,8 @@ mod phase2_privacy_propagation_tests {
             &seen,
             &state,
             &tx_channel,
+            &tx_budget,
+            &tx_drops,
         )
         .await;
         assert!(accepted, "a well-formed payload must reach the validator");
@@ -12951,7 +13352,9 @@ mod phase2_privacy_propagation_tests {
         // enter the pipeline — but nothing downstream can have scheduled it.
         let seen: RwLock<HashMap<Vec<u8>, SeenTxEntry>> = RwLock::new(HashMap::new());
         let state: RwLock<PropagationState> = RwLock::new(HashMap::new());
-        let (tx_channel, _rx) = mpsc::unbounded_channel::<Transaction>();
+        let (tx_channel, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
+        let tx_budget = Arc::new(Semaphore::new(TX_INGRESS_CAPACITY_BYTES));
+        let tx_drops = AtomicU64::new(0);
         let bytes = bincode::serialize(&junk).unwrap();
         accept_inbound_transaction(
             bytes.clone(),
@@ -12959,6 +13362,8 @@ mod phase2_privacy_propagation_tests {
             &seen,
             &state,
             &tx_channel,
+            &tx_budget,
+            &tx_drops,
         )
         .await;
 
@@ -13176,7 +13581,7 @@ mod phase4ce_hygiene_tests {
     }
 
     fn net_seeded(seeds: Vec<SocketAddr>) -> P2PNetwork {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
         let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> = Arc::new(|_| None);
         P2PNetwork::new(
@@ -13649,7 +14054,7 @@ mod phase4ch_pex_wiring_tests {
         let transport = Arc::new(RejectAllTransport {
             log: Arc::clone(&dial_log),
         });
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
         let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> = Arc::new(|_| None);
         let net = P2PNetwork::new_with_transport(
@@ -13846,7 +14251,7 @@ mod phase4ch_pex_wiring_tests {
 
     /// Build a real loopback network for the 4CP-U lifecycle tests.
     fn cpu_net(port: u16) -> P2PNetwork {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
         let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> = Arc::new(|_| None);
         P2PNetwork::new(
@@ -14684,7 +15089,7 @@ mod phase4cp_session_tests {
     use std::net::SocketAddr;
 
     fn auth_net_cfg(cfg: P2PConfig) -> P2PNetwork {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
         let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> = Arc::new(|_| None);
         P2PNetwork::new(
@@ -15013,7 +15418,7 @@ mod phase4cpw_cycle_tests {
     /// 4CP-AA (X-6): same construction as `cpw_net`, but with an explicit listen
     /// address so a test can force a deterministic `bind()` failure.
     fn cpw_net_on(listen_addr: &str) -> P2PNetwork {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
         let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> = Arc::new(|_| None);
         P2PNetwork::new(
@@ -15332,7 +15737,7 @@ mod phase4cpw_cycle_tests {
         let gate_for_task = gate.clone();
         let net2 = net.clone();
         let session = tokio::spawn(async move {
-            let (msg_sender, msg_receiver) = mpsc::unbounded_channel();
+            let (msg_sender, msg_receiver) = PeerSink::pair(peer_addr, Arc::new(AtomicU64::new(0)));
             let (pdtx, _pdrx) = mpsc::unbounded_channel();
             P2PNetwork::handle_peer(
                 TransportStream::Tcp(server_stream),
@@ -15341,6 +15746,8 @@ mod phase4cpw_cycle_tests {
                 net2.config.listen_addr,
                 net2.addresses.clone(),
                 net2.tx_channel.clone(),
+                net2.tx_budget.clone(),
+                net2.ingress_drops.clone(),
                 net2.get_dag_hashes.clone(),
                 net2.get_transaction_by_hash.clone(),
                 net2.get_tips.clone(),
@@ -15566,7 +15973,7 @@ mod phase4cpw_cycle_tests {
         let gate_for_task = gate.clone();
         let net2 = net.clone();
         let session = tokio::spawn(async move {
-            let (msg_sender, msg_receiver) = mpsc::unbounded_channel();
+            let (msg_sender, msg_receiver) = PeerSink::pair(peer_addr, Arc::new(AtomicU64::new(0)));
             let (pdtx, _pdrx) = mpsc::unbounded_channel();
             P2PNetwork::handle_peer(
                 TransportStream::Tcp(sock),
@@ -15575,6 +15982,8 @@ mod phase4cpw_cycle_tests {
                 net2.config.listen_addr,
                 net2.addresses.clone(),
                 net2.tx_channel.clone(),
+                net2.tx_budget.clone(),
+                net2.ingress_drops.clone(),
                 net2.get_dag_hashes.clone(),
                 net2.get_transaction_by_hash.clone(),
                 net2.get_tips.clone(),
@@ -15694,7 +16103,7 @@ mod phase4cpw_cycle_tests {
         // session task — with the session's OWN sender (4CP-AS F1: the removal
         // is ownership-scoped) — so the assertion below proves `handle_peer`
         // removes its entry.
-        let (msg_sender, msg_receiver) = mpsc::unbounded_channel();
+        let (msg_sender, msg_receiver) = PeerSink::pair(peer_addr, Arc::new(AtomicU64::new(0)));
         net.peers
             .write()
             .await
@@ -15709,6 +16118,8 @@ mod phase4cpw_cycle_tests {
             net.config.listen_addr,
             net.addresses.clone(),
             net.tx_channel.clone(),
+            net.tx_budget.clone(),
+            net.ingress_drops.clone(),
             net.get_dag_hashes.clone(),
             net.get_transaction_by_hash.clone(),
             net.get_tips.clone(),
@@ -15766,7 +16177,7 @@ mod phase4cpw_cycle_tests {
         let peer_addr = sock.peer_addr().unwrap();
         // 4CP-AS (F1): the optimistic insert carries the session's own sender,
         // exactly like the production dial path.
-        let (msg_sender, msg_receiver) = mpsc::unbounded_channel();
+        let (msg_sender, msg_receiver) = PeerSink::pair(peer_addr, Arc::new(AtomicU64::new(0)));
         net.peers
             .write()
             .await
@@ -15781,6 +16192,8 @@ mod phase4cpw_cycle_tests {
             net.config.listen_addr,
             net.addresses.clone(),
             net.tx_channel.clone(),
+            net.tx_budget.clone(),
+            net.ingress_drops.clone(),
             net.get_dag_hashes.clone(),
             net.get_transaction_by_hash.clone(),
             net.get_tips.clone(),
@@ -15827,7 +16240,7 @@ mod phase4cpas_stale_cleanup_tests {
     use std::net::SocketAddr;
 
     fn as_net() -> P2PNetwork {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
         let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> = Arc::new(|_| None);
         P2PNetwork::new(
@@ -15859,8 +16272,8 @@ mod phase4cpas_stale_cleanup_tests {
         mode: P2PProtocolMode,
         identity: Option<Arc<NodeIdentity>>,
         is_initiator: bool,
-        own_sender: mpsc::UnboundedSender<Vec<u8>>,
-        own_receiver: mpsc::UnboundedReceiver<Vec<u8>>,
+        own_sender: PeerSink,
+        own_receiver: mpsc::Receiver<Vec<u8>>,
     ) {
         let (pdtx, _pdrx) = mpsc::unbounded_channel();
         P2PNetwork::handle_peer(
@@ -15870,6 +16283,8 @@ mod phase4cpas_stale_cleanup_tests {
             net.config.listen_addr,
             net.addresses.clone(),
             net.tx_channel.clone(),
+            net.tx_budget.clone(),
+            net.ingress_drops.clone(),
             net.get_dag_hashes.clone(),
             net.get_transaction_by_hash.clone(),
             net.get_tips.clone(),
@@ -15900,9 +16315,9 @@ mod phase4cpas_stale_cleanup_tests {
     #[test]
     fn remove_peer_if_ours_is_channel_scoped() {
         let addr: SocketAddr = "203.0.113.9:40000".parse().unwrap();
-        let (ours, _ours_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (newer, _newer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let mut map: HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>> = HashMap::new();
+        let (ours, _ours_rx) = PeerSink::pair(addr, Arc::new(AtomicU64::new(0)));
+        let (newer, _newer_rx) = PeerSink::pair(addr, Arc::new(AtomicU64::new(0)));
+        let mut map: HashMap<SocketAddr, PeerSink> = HashMap::new();
 
         assert!(
             !P2PNetwork::remove_peer_if_ours(&mut map, &addr, &ours),
@@ -15944,13 +16359,13 @@ mod phase4cpas_stale_cleanup_tests {
         let peer_addr = sock.peer_addr().unwrap();
         // Scenario: a newer session replaced the endpoint while the older
         // session was finishing. The map must keep the NEWER sender.
-        let (newer_sender, mut newer_rx) = mpsc::unbounded_channel();
+        let (newer_sender, mut newer_rx) = PeerSink::pair(peer_addr, Arc::new(AtomicU64::new(0)));
         net.peers
             .write()
             .await
             .insert(peer_addr, newer_sender.clone());
 
-        let (own_sender, own_receiver) = mpsc::unbounded_channel();
+        let (own_sender, own_receiver) = PeerSink::pair(peer_addr, Arc::new(AtomicU64::new(0)));
         drive_session(
             &net,
             TransportStream::Tcp(sock),
@@ -15972,7 +16387,7 @@ mod phase4cpas_stale_cleanup_tests {
             entry.same_channel(&newer_sender),
             "the newer sender must not be replaced or erased"
         );
-        entry.send(vec![9]).unwrap();
+        entry.try_send(vec![9]).unwrap();
         drop(guard);
         assert_eq!(
             newer_rx.try_recv().unwrap(),
@@ -15999,13 +16414,13 @@ mod phase4cpas_stale_cleanup_tests {
 
         let sock = tokio::net::TcpStream::connect(server_addr).await.unwrap();
         let peer_addr = sock.peer_addr().unwrap();
-        let (newer_sender, mut newer_rx) = mpsc::unbounded_channel();
+        let (newer_sender, mut newer_rx) = PeerSink::pair(peer_addr, Arc::new(AtomicU64::new(0)));
         net.peers
             .write()
             .await
             .insert(peer_addr, newer_sender.clone());
 
-        let (own_sender, own_receiver) = mpsc::unbounded_channel();
+        let (own_sender, own_receiver) = PeerSink::pair(peer_addr, Arc::new(AtomicU64::new(0)));
         drive_session(
             &net,
             TransportStream::Tcp(sock),
@@ -16024,7 +16439,7 @@ mod phase4cpas_stale_cleanup_tests {
             .get(&peer_addr)
             .expect("the newer session's entry must survive a stale failure");
         assert!(entry.same_channel(&newer_sender));
-        entry.send(vec![7]).unwrap();
+        entry.try_send(vec![7]).unwrap();
         drop(guard);
         assert_eq!(newer_rx.try_recv().unwrap(), vec![7]);
         server.abort();
@@ -16052,7 +16467,7 @@ mod phase4cpas_stale_cleanup_tests {
 
         let sock = tokio::net::TcpStream::connect(server_addr).await.unwrap();
         let peer_addr = sock.peer_addr().unwrap();
-        let (own_sender, own_receiver) = mpsc::unbounded_channel();
+        let (own_sender, own_receiver) = PeerSink::pair(peer_addr, Arc::new(AtomicU64::new(0)));
         net.peers
             .write()
             .await
@@ -16090,7 +16505,7 @@ mod phase4cpas_stale_cleanup_tests {
 
         let sock = tokio::net::TcpStream::connect(server_addr).await.unwrap();
         let peer_addr = sock.peer_addr().unwrap();
-        let (own_sender, own_receiver) = mpsc::unbounded_channel();
+        let (own_sender, own_receiver) = PeerSink::pair(peer_addr, Arc::new(AtomicU64::new(0)));
         net.peers
             .write()
             .await
@@ -16124,7 +16539,7 @@ mod phase4ak_peer_store_save_tests {
     }
 
     fn net_at(path: std::path::PathBuf) -> P2PNetwork {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
         let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> = Arc::new(|_| None);
         let sync_ctx = Arc::new(SyncContext::default());
@@ -16584,7 +16999,7 @@ mod phase4cat_e2e_integrity_tests {
         let orphans: Arc<RwLock<HashMap<[u8; 32], Transaction>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let sync_ctx = Arc::new(SyncContext::default());
-        let (tx_sender, mut tx_receiver) = mpsc::unbounded_channel::<Transaction>();
+        let (tx_sender, mut tx_receiver) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
 
         let dag_hashes = dag.clone();
         let get_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(move || {
@@ -16641,7 +17056,8 @@ mod phase4cat_e2e_integrity_tests {
             let sync_ctx = sync_ctx.clone();
             let dag = dag.clone();
             tokio::spawn(async move {
-                while let Some(tx) = tx_receiver.recv().await {
+                while let Some(item) = tx_receiver.recv().await {
+                    let tx = item.into_tx();
                     let ingress_mode = sync_ctx.take_ingress_mode(tx.id).await;
                     match rpc.process_transaction(tx, "P2P", ingress_mode).await {
                         Ok(_) => {
@@ -16684,7 +17100,7 @@ mod phase4cat_e2e_integrity_tests {
         tokio::spawn(async move {
             let (sock, _) = listener.accept().await.expect("accept");
             let peer_addr = sock.peer_addr().expect("peer addr");
-            let (own_sender, own_receiver) = mpsc::unbounded_channel();
+            let (own_sender, own_receiver) = PeerSink::pair(peer_addr, Arc::new(AtomicU64::new(0)));
             let (pdtx, _pdrx) = mpsc::unbounded_channel();
             P2PNetwork::handle_peer(
                 crate::transport::TransportStream::Tcp(sock),
@@ -16693,6 +17109,8 @@ mod phase4cat_e2e_integrity_tests {
                 net.config.listen_addr,
                 net.addresses.clone(),
                 net.tx_channel.clone(),
+                net.tx_budget.clone(),
+                net.ingress_drops.clone(),
                 net.get_dag_hashes.clone(),
                 net.get_transaction_by_hash.clone(),
                 net.get_tips.clone(),

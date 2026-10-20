@@ -26,7 +26,10 @@
 
 use aether_unified::genesis::{initialize_genesis, GenesisConfig, GENESIS_HASH};
 use aether_unified::ledger::Ledger;
-use aether_unified::p2p::{P2PConfig, P2PNetwork, P2PProtocolMode, P2P_PROTOCOL_VERSION};
+use aether_unified::p2p::{
+    IngressTx, P2PConfig, P2PNetwork, P2PProtocolMode, P2P_PROTOCOL_VERSION,
+    TX_INGRESS_CAPACITY_MSGS,
+};
 use aether_unified::parent_selection::DAG;
 use aether_unified::stake::{current_epoch, StakeRegistry};
 use aether_unified::storage::Storage;
@@ -169,7 +172,7 @@ struct TestNode {
     storage: Arc<RwLock<Storage>>,
     dag: Arc<RwLock<DAG>>,
     p2p: Arc<P2PNetwork>,
-    rx: mpsc::UnboundedReceiver<Transaction>,
+    rx: mpsc::Receiver<IngressTx>,
 }
 
 async fn boot_node(
@@ -178,7 +181,7 @@ async fn boot_node(
     dag: Arc<RwLock<DAG>>,
     storage: Arc<RwLock<Storage>>,
 ) -> TestNode {
-    let (tx_sender, rx) = mpsc::unbounded_channel::<Transaction>();
+    let (tx_sender, rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
     let dag_c = dag.clone();
     let get_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(move || {
         block_on_sync(async {
@@ -392,7 +395,8 @@ async fn cc01_slow_peer_times_out_honest_pair_keeps_syncing() {
         let r = tokio::time::timeout(PROPAGATE_TIMEOUT, node_b.rx.recv())
             .await
             .expect("honest delivery during stall")
-            .expect("live");
+            .expect("live")
+            .into_tx();
         assert_eq!(s.id, r.id, "honest TCP delivery despite stalled peer");
         let mut dag = node_b.dag.write().await;
         let store = node_b.storage.read().await;
@@ -536,7 +540,8 @@ async fn cc02_invalid_inputs_rejected_honest_unaffected() {
     let r = tokio::time::timeout(PROPAGATE_TIMEOUT, node_b.rx.recv())
         .await
         .expect("honest delivery after attacks")
-        .expect("live");
+        .expect("live")
+        .into_tx();
     assert_eq!(tx.id, r.id);
     {
         let mut dag = node_b.dag.write().await;
@@ -641,7 +646,7 @@ async fn cc03_source_dies_alternate_completes_sync() {
         std::collections::HashMap::new();
     tokio::time::timeout(PROPAGATE_TIMEOUT, async {
         while !want_pre.is_subset(&seen_pre) {
-            let r = node_y.rx.recv().await.expect("live pre-kill");
+            let r = node_y.rx.recv().await.expect("live pre-kill").into_tx();
             seen_pre.insert(r.id);
             pre_txs.entry(r.id).or_insert(r);
         }
@@ -718,7 +723,7 @@ async fn cc03_source_dies_alternate_completes_sync() {
         std::collections::HashMap::new();
     tokio::time::timeout(PROPAGATE_TIMEOUT, async {
         while !want_post.is_subset(&seen_post) {
-            let r = node_y.rx.recv().await.expect("live post-kill");
+            let r = node_y.rx.recv().await.expect("live post-kill").into_tx();
             seen_post.insert(r.id);
             post_txs.entry(r.id).or_insert(r);
         }
@@ -838,7 +843,8 @@ async fn cc04_churn_three_cycles_same_storage_ports() {
         let r = tokio::time::timeout(PROPAGATE_TIMEOUT, node_b.rx.recv())
             .await
             .unwrap_or_else(|_| panic!("cycle {}: B receives", cycle))
-            .expect("live");
+            .expect("live")
+            .into_tx();
         assert_eq!(tx.id, r.id, "cycle {}: byte-identical", cycle);
         {
             let mut dag = node_b.dag.write().await;
@@ -934,7 +940,8 @@ async fn cc05_shutdown_with_idle_partial_and_live_sessions() {
         let r = tokio::time::timeout(PROPAGATE_TIMEOUT, node_b.rx.recv())
             .await
             .expect("delivery under adversity")
-            .expect("live");
+            .expect("live")
+            .into_tx();
         assert_eq!(tx.id, r.id);
         // Shutdown WITH all three hostile sockets still open: must be Ok and
         // bounded (a test timeout here is FAILURE, never proof).

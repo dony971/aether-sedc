@@ -3287,7 +3287,9 @@ mod tests {
             crate::storage::Storage::open(dir.join("sled")).unwrap(),
         ));
         let mempool = Arc::new(RwLock::new(Mempool::new(1000, 10)));
-        let (tx_channel, _rx) = tokio::sync::mpsc::unbounded_channel::<Transaction>();
+        let (tx_channel, _rx) = tokio::sync::mpsc::channel::<crate::p2p::IngressTx>(
+            crate::p2p::TX_INGRESS_CAPACITY_MSGS,
+        );
         let p2p = Arc::new(P2PNetwork::new(
             P2PConfig {
                 listen_addr: "0.0.0.0:0".parse().unwrap(),

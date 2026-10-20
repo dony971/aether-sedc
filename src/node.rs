@@ -675,11 +675,20 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     tracing::info!("✓ Mempool initialized");
 
     tracing::info!("📡 Creating P2P channel...");
-    let (tx_channel, mut tx_receiver) = tokio::sync::mpsc::unbounded_channel::<Transaction>();
+    // 4CP-BA: bounded ingress. Count (scheduling) AND byte budget (memory)
+    // are enforced by the P2P layer; a refused payload is not marked seen,
+    // so sync re-supplies it (see p2p::accept_inbound_transaction).
+    let (tx_channel, mut tx_receiver) = tokio::sync::mpsc::channel::<crate::p2p::IngressTx>(
+        crate::p2p::TX_INGRESS_CAPACITY_MSGS,
+    );
     tracing::info!("✓ P2P channel created");
   // PHASE 4G: stake gossip channel (P2P Vote/Bond/Unbond ingress).
+  // 4CP-BA: bounded count — payloads are fixed-size canonical encodings
+  // (≤ 265 B), so the count cap is the byte cap. The receive stage applies
+  // back-pressure rather than dropping (votes are not re-derivable by
+  // tx-sync).
   let (stake_channel, mut stake_receiver) =
-  tokio::sync::mpsc::unbounded_channel::<StakePayload>();
+  tokio::sync::mpsc::channel::<StakePayload>(crate::p2p::STAKE_CHANNEL_CAPACITY_MSGS);
 
     let p2p_dag_for_tips = dag.clone();
     let get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(move || {
@@ -855,7 +864,10 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
 
     tokio::spawn(async move {
         tracing::info!("✅ P2P transaction receiver task spawned");
-        while let Some(tx) = tx_receiver.recv().await {
+        while let Some(item) = tx_receiver.recv().await {
+            // 4CP-BA: taking the item releases its ingress byte reservation
+            // (the permit rides inside the queued item).
+            let tx = item.into_tx();
             // PHASE 3B (C1/H1): consume the ingress provenance recorded by
             // the P2P layer (live relay = Fresh, sync backfill = Historical;
             // absent = Historical = pre-3B behavior) and forward it as THE

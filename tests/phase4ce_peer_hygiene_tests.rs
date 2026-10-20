@@ -16,7 +16,9 @@
 
 use aether_unified::genesis::{initialize_genesis, GenesisConfig};
 use aether_unified::ledger::Ledger;
-use aether_unified::p2p::{P2PConfig, P2PNetwork, P2PProtocolMode};
+use aether_unified::p2p::{
+    IngressTx, P2PConfig, P2PNetwork, P2PProtocolMode, TX_INGRESS_CAPACITY_MSGS,
+};
 use aether_unified::parent_selection::DAG;
 use aether_unified::stake::{current_epoch, StakeRegistry};
 use aether_unified::storage::Storage;
@@ -105,7 +107,7 @@ struct TestNode {
     storage: Arc<RwLock<Storage>>,
     dag: Arc<RwLock<DAG>>,
     p2p: Arc<P2PNetwork>,
-    rx: mpsc::UnboundedReceiver<Transaction>,
+    rx: mpsc::Receiver<IngressTx>,
 }
 
 async fn boot_node(
@@ -114,7 +116,7 @@ async fn boot_node(
     dag: Arc<RwLock<DAG>>,
     storage: Arc<RwLock<Storage>>,
 ) -> TestNode {
-    let (tx_sender, rx) = mpsc::unbounded_channel::<Transaction>();
+    let (tx_sender, rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
     let dag_c = dag.clone();
     let get_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(move || {
         block_on_sync(async {
@@ -352,7 +354,8 @@ async fn ce02_flaky_peer_returns_before_threshold() {
     let r = tokio::time::timeout(PROPAGATE_TIMEOUT, node_b2.rx.recv())
         .await
         .expect("B2 delivery after flaky return")
-        .expect("live");
+        .expect("live")
+        .into_tx();
     assert_eq!(tx.id, r.id, "gossip intact after sub-threshold outage");
     shutdown_node(node_a, "A-ce02").await;
     shutdown_node(node_b2, "B-ce02").await;

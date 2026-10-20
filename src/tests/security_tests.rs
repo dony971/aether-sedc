@@ -738,7 +738,10 @@ mod malleability_tests {
             Arc::new(RwLock::new(Mempool::new(1000, 10))),
             Arc::new(crate::p2p::P2PNetwork::new(
                 crate::p2p::P2PConfig::default(),
-                tokio::sync::mpsc::unbounded_channel::<Transaction>().0,
+                tokio::sync::mpsc::channel::<crate::p2p::IngressTx>(
+                    crate::p2p::TX_INGRESS_CAPACITY_MSGS,
+                )
+                .0,
                 Arc::new(|| vec![]),
                 Arc::new(|_| None),
                 Arc::new(|| vec![]),

@@ -724,7 +724,8 @@ async fn h12_rpc_rejects_unsigned_tampered_replayed() {
         Storage::open(dir.path().join("sled")).expect("open"),
     ));
     let mempool = Arc::new(RwLock::new(Mempool::new(1000, 10)));
-    let (tx_channel, _rx) = tokio::sync::mpsc::unbounded_channel::<Transaction>();
+    let (tx_channel, _rx) =
+        tokio::sync::mpsc::channel::<crate::p2p::IngressTx>(crate::p2p::TX_INGRESS_CAPACITY_MSGS);
     let p2p = Arc::new(crate::p2p::P2PNetwork::new(
         P2PConfig {
             listen_addr: "0.0.0.0:0".parse().unwrap(),

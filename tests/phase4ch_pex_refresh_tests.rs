@@ -34,7 +34,10 @@
 //!   fuzzing beyond PEX remains out of scope.
 
 use aether_unified::genesis::GENESIS_HASH;
-use aether_unified::p2p::{P2PConfig, P2PMessage, P2PNetwork, P2PProtocolMode, P2P_PROTOCOL_VERSION};
+use aether_unified::p2p::{
+    IngressTx, P2PConfig, P2PMessage, P2PNetwork, P2PProtocolMode, P2P_PROTOCOL_VERSION,
+    TX_INGRESS_CAPACITY_MSGS,
+};
 use aether_unified::sync_stats::SyncContext;
 use aether_unified::transaction::{Transaction, DEFAULT_NETWORK_ID};
 use aether_unified::transport::{
@@ -237,7 +240,7 @@ impl RawPeer {
 }
 
 fn boot_node(port: u16, transport: Arc<dyn Transport>) -> P2PNetwork {
-    let (tx, _rx) = mpsc::unbounded_channel::<Transaction>();
+    let (tx, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
     let empty: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync> = Arc::new(|| vec![]);
     let empty_opt: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync> = Arc::new(|_| None);
     P2PNetwork::new_with_transport(
