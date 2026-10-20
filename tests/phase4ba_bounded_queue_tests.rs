@@ -636,20 +636,32 @@ async fn ba02_slow_peer_outbound_queue_is_bounded_and_recovers() {
         ))
         .await;
 
-    // Storm: 200 identical GetData requests, peer reading NOTHING.
-    let requests = 200usize;
+    // Storm: identical GetData requests, peer reading NOTHING. The volume
+    // must exceed the largest plausible kernel buffering (Linux loopback
+    // autotuning can absorb ~10 MiB across send+receive buffers), so the
+    // writer blocks and the bounded queue itself must refuse; Windows fills
+    // its much smaller buffers long before this. Batches stay below the
+    // 400 msgs/s read-path flood limit (a burst is a ban, not a drop) while
+    // still pushing ~19 MiB, and complete well inside the 15s write timeout.
+    const BATCH: usize = 390;
+    const BATCHES: usize = 3;
+    let requests = BATCH * BATCHES;
     let mut max_slow_queue = 0usize;
-    for _ in 0..requests {
-        slow.send(&P2PMessage::GetData(vec![tip.to_vec()])).await;
-        tokio::time::sleep(Duration::from_millis(3)).await;
-        if let Some(q) = h.net.session_queued_bytes(sock_of(&slow)).await {
-            max_slow_queue = max_slow_queue.max(q);
-            assert!(
-                q <= limits.session_bytes,
-                "session queue bytes {} exceed bound {}",
-                q,
-                limits.session_bytes
-            );
+    for batch in 0..BATCHES {
+        for _ in 0..BATCH {
+            slow.send(&P2PMessage::GetData(vec![tip.to_vec()])).await;
+            if let Some(q) = h.net.session_queued_bytes(sock_of(&slow)).await {
+                max_slow_queue = max_slow_queue.max(q);
+                assert!(
+                    q <= limits.session_bytes,
+                    "session queue bytes {} exceed bound {}",
+                    q,
+                    limits.session_bytes
+                );
+            }
+        }
+        if batch + 1 < BATCHES {
+            tokio::time::sleep(Duration::from_millis(1050)).await;
         }
     }
     // Keep not reading: the writer blocks on TCP and the bounded queue fills.

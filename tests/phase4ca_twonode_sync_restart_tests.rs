@@ -512,7 +512,9 @@ async fn ca03_conflicts_and_permuted_arrival_converge_with_restart() {
     let t4 = make_valid_tx(&wallet, [[0u8; 32]; 2], 4, ts0 + 4);
     let wire = [&t0, &t1, &t2, &t3, &t4];
 
-    // A broadcasts in wire order; B's real TCP arrival order is that order.
+    // A broadcasts in wire order. Per-peer relay jitter is 20-250ms, so
+    // adjacent payloads may legitimately reach B in a different order;
+    // delivery itself is byte-identical and must be a set match.
     for tx in wire {
         node_a.p2p.broadcast_transaction((*tx).clone()).await;
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -526,13 +528,16 @@ async fn ca03_conflicts_and_permuted_arrival_converge_with_restart() {
             .into_tx();
         received.push(tx);
     }
-    for (s, r) in wire.iter().zip(received.iter()) {
-        assert_eq!(s.id, r.id, "byte-identical remote delivery");
-    }
+    let mut sent_ids: Vec<[u8; 32]> = wire.iter().map(|t| t.id).collect();
+    let mut recv_ids: Vec<[u8; 32]> = received.iter().map(|t| t.id).collect();
+    sent_ids.sort_unstable();
+    recv_ids.sort_unstable();
+    assert_eq!(sent_ids, recv_ids, "byte-identical remote delivery");
 
     // DIFFERENT local arrival orders: A records the conflict pair in REVERSE
     // order (t3 before t2) and the chain last (still parents-first); B
-    // records in its wire arrival order (t2 before t3).
+    // records in its own wire arrival order, which may itself invert the
+    // conflict pair under relay jitter. Convergence must not depend on it.
     for tx in [&t3, &t2, &t4, &t0, &t1] {
         let mut dag = node_a.dag.write().await;
         let store = node_a.storage.read().await;
@@ -619,7 +624,20 @@ async fn ca03_conflicts_and_permuted_arrival_converge_with_restart() {
             store.flush().expect("seed flush");
         }
         let rebuilt = tokio::time::timeout(RESTART_TIMEOUT, async {
-            let store = Storage::open(&dir).expect("reopen");
+            // Sled releases its lock on drop, but the release can trail the
+            // close by a few scheduler ticks under load; retry briefly rather
+            // than turning a timing artifact into a restart failure.
+            let mut reopened = None;
+            for _ in 0..20 {
+                match Storage::open(&dir) {
+                    Ok(store) => {
+                        reopened = Some(store);
+                        break;
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+                }
+            }
+            let store = reopened.expect("reopen");
             let all = store.get_all_transactions().expect("read");
             drop(store);
             let (mut dag, _b, _o, _m) = initialize_genesis(GenesisConfig::default());
