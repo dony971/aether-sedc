@@ -11,7 +11,8 @@
 //!    exclusion allowlist (no implicit skips).
 //! 2. Deterministic order: records sorted by byte-wise lexicographic order
 //!    of the UTF-8 normalized path. Walk order cannot affect output.
-//! 3. Relative paths normalized with `/` on Windows and Linux.
+//! 3. Relative paths are normalized with host path semantics and `/`
+//!    separators; a literal backslash in a Unix filename is preserved.
 //! 4. Symlinks are NEVER followed for content. Each symlink is recorded
 //!    with its stored target string; targets escaping the root are flagged
 //!    `external-link`. Dereferencing through a symlink is forbidden here.
@@ -66,8 +67,8 @@
 //!   (TOCTOU, subject of F4AN-2, not F4AN-1).
 //! - Authenticity/provenance (hashes prove WHAT, not WHO; no signature here).
 
-use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Component, Path, PathBuf};
 
 /// Entry kind, serialized as `file|dir|symlink|special|unreadable`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,7 +122,8 @@ pub struct WalkWarnings {
     pub specials: Vec<String>,
     pub unreadables: Vec<String>,
     pub hardlink_groups: Vec<String>,
-    /// 4BB: system link counts above in-scope references. Entries are
+    /// System link counts above in-scope references (Unix metadata and
+    /// Windows native identity). Entries are
     /// `exterior:<id>:links=<n>:found=<m>` (no exclusions: the surplus is
     /// necessarily outside the scope) or
     /// `ambiguous:<id>:links=<n>:found=<m>:exclusions-present` (excluded
@@ -167,19 +169,79 @@ pub fn matches_exclusion(pattern: &str, path: &str) -> bool {
 }
 
 fn normalize_relative(rel: &Path) -> Result<String, String> {
-    let s = rel.to_str().ok_or_else(|| "non-utf8-path".to_string())?;
-    let mut out = s.replace('\\', "/");
-    // Strip leading "./" segments for stability.
-    while out.starts_with("./") {
-        out = out[3..].to_string();
+    // Use the host path parser instead of a blind `\` -> `/` replacement:
+    // on Unix a backslash is a legal literal filename character, so rewriting
+    // it would invent a different path and could collide with `a/b`.
+    let mut parts: Vec<&str> = Vec::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(part) => {
+                let part = part
+                    .to_str()
+                    .ok_or_else(|| "non-utf8-path".to_string())?;
+                if part.is_empty() {
+                    return Err("empty-component".to_string());
+                }
+                parts.push(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir => return Err("parent-traversal".to_string()),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("absolute-path".to_string())
+            }
+        }
     }
+    if parts.is_empty() {
+        return Err("empty-path".to_string());
+    }
+    let out = parts.join("/");
     if out.contains('\n') || out.contains('\r') {
         return Err("unsupported-newline-in-path".to_string());
     }
-    if out.is_empty() {
-        return Err("empty-path".to_string());
-    }
     Ok(out)
+}
+
+/// Public form of the inventory path normalizer. Manifest paths are lexical
+/// strings; consumers that compare them with walked entries must apply the
+/// same host semantics (`.`, repeated separators, Windows separators) first.
+pub fn normalize_relative_path(path: &str) -> Result<String, String> {
+    normalize_relative(Path::new(path))
+}
+
+/// Stable text binding for a symlink's stored target. On Unix a backslash is
+/// a literal target character and must not be rewritten; on Windows it is a
+/// separator and is normalized to `/` for a host-stable representation.
+fn link_target_text(target: &Path) -> String {
+    #[cfg(windows)]
+    {
+        target.to_string_lossy().replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        target.to_string_lossy().into_owned()
+    }
+}
+
+/// Deterministic, newline-free placeholder for a path that cannot enter the
+/// canonical stream. The raw OS bytes are hashed so non-UTF-8 names do not
+/// collapse to the same lossy string; the result never contains LF/CR.
+fn unreadable_placeholder(rel: &Path) -> String {
+    #[cfg(unix)]
+    let raw = {
+        use std::os::unix::ffi::OsStrExt;
+        rel.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(windows)]
+    let raw = {
+        use std::os::windows::ffi::OsStrExt;
+        rel.as_os_str()
+            .encode_wide()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect::<Vec<u8>>()
+    };
+    #[cfg(not(any(unix, windows)))]
+    let raw = rel.to_string_lossy().as_bytes().to_vec();
+    format!("unreadable:{}", sha_hex(&raw))
 }
 
 fn case_fold_key(s: &str) -> String {
@@ -488,7 +550,7 @@ pub fn walk_release_root(
             let norm = match normalize_relative(&rel) {
                 Ok(n) => n,
                 Err(reason) => {
-                    let p = rel.to_string_lossy().replace('\\', "/");
+                    let p = unreadable_placeholder(&rel);
                     entries.push(InventoryEntry {
                         normalized_path: p.clone(),
                         kind: EntryKind::Unreadable,
@@ -498,6 +560,9 @@ pub fn walk_release_root(
                         flags: vec![format!("unreadable:{}", reason)],
                         diagnostic: reason.clone(),
                     });
+                    if seen.insert(p.clone(), entries.len() - 1).is_some() {
+                        return Err(format!("duplicate-path: {}", p));
+                    }
                     warnings.unreadables.push(p.clone());
                     diagnostics.push(format!("{}: {}", p, reason));
                     continue;
@@ -509,11 +574,11 @@ pub fn walk_release_root(
             let ft = meta.file_type();
             if ft.is_symlink() {
                 // Keep the native PathBuf for resolution; target_str is only
-                // the stable, slash-normalized diagnostic/hash representation.
+                // the stable diagnostic/hash representation.
                 let target = std::fs::read_link(&abs);
                 let target_str = target
                     .as_ref()
-                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .map(|p| link_target_text(p))
                     .unwrap_or_else(|e| format!("<read-link-failed:{}>", e));
                 let hex = sha_hex(target_str.as_bytes());
                 // Classify by the resolved destination, not lexical spelling:
@@ -644,6 +709,7 @@ pub fn walk_release_root(
                     use std::os::unix::fs::MetadataExt;
                     let id = format!("{}:{}", meta.dev(), meta.ino());
                     flags.push(format!("hardlink-id:{}", id));
+                    flags.push(format!("hardlink-nlinks:{}", meta.nlink()));
                 }
                 #[cfg(windows)]
                 {
@@ -792,19 +858,18 @@ pub fn walk_release_root(
                 }
             }
         }
-        // 4BB: exterior-reference detection from native link counts
-        // (Windows `hardlink-nlinks` flags; unix behavior unchanged: no
-        // nlinks flags exist there, so no surplus is ever computed).
-        // A link count above the in-scope member count is either an
+        // Exterior-reference detection from native link counts. Unix and
+        // Windows both expose a link count on the same handle/metadata used
+        // for identity. A count above the in-scope member count is either an
         // excluded path (ambiguous, exclusions present) or necessarily
-        // exterior (no exclusions: same-volume links cannot hide inside
-        // an exclusion-free scope). Exterior is NEVER silently resolved.
+        // exterior (no exclusions). A singleton group is NOT skipped: a file
+        // with nlink=2 and no second in-scope path is exactly the external
+        // hardlink case this check must surface. Exterior is NEVER silently
+        // resolved.
         let mut refs: Vec<String> = Vec::new();
         let mut exterior_ids: Vec<String> = Vec::new();
+        let mut ambiguous_ids: Vec<String> = Vec::new();
         for (id, paths) in &groups {
-            if paths.len() <= 1 {
-                continue;
-            }
             let mut nlinks: Option<u32> = None;
             for e in &entries {
                 let is_member = e.flags.iter().any(|f| f == &format!("hardlink-id:{}", id));
@@ -831,6 +896,7 @@ pub fn walk_release_root(
                             n,
                             paths.len()
                         ));
+                        ambiguous_ids.push(id.clone());
                     }
                 }
             }
@@ -842,6 +908,8 @@ pub fn walk_release_root(
             if let Some(id) = hid {
                 if exterior_ids.contains(&id) {
                     e.flags.push(format!("unexplained-link-ref:{}", id));
+                } else if ambiguous_ids.contains(&id) {
+                    e.flags.push(format!("unresolved-link-ref:{}", id));
                 }
             }
         }
@@ -866,9 +934,17 @@ pub fn canonical_line(e: &InventoryEntry) -> String {
 
 /// Canonical byte stream: sorted lines joined with LF, final LF included.
 /// Empty set yields an empty stream (caller decides allow_empty policy).
+/// Sorting is enforced here (not only in the walk) so a caller-provided
+/// slice cannot make the digest depend on insertion order.
 pub fn canonical_bytes(entries: &[InventoryEntry]) -> Vec<u8> {
+    let mut sorted: Vec<&InventoryEntry> = entries.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.normalized_path
+            .as_bytes()
+            .cmp(b.normalized_path.as_bytes())
+    });
     let mut v = Vec::new();
-    for e in entries {
+    for e in sorted {
         v.extend_from_slice(canonical_line(e).as_bytes());
         v.push(b'\n');
     }
@@ -911,8 +987,17 @@ impl InventoryDiff {
     }
 }
 
+fn sorted_flags(e: &InventoryEntry) -> Vec<&str> {
+    let mut flags: Vec<&str> = e.flags.iter().map(String::as_str).collect();
+    flags.sort_unstable();
+    flags.dedup();
+    flags
+}
+
 /// T0/T1 comparison by normalized path. Changed = any of hash/kind/size/
-/// mode differs. Conservative: every unexpected is also an
+/// mode/flags differs. Flags are compared because topology and security
+/// metadata (hardlink groups, external references, collisions) are not in
+/// the content digest. Conservative: every unexpected is also an
 /// added-after-freeze candidate when birth time is unavailable.
 pub fn diff_inventories(t0: &[InventoryEntry], t1: &[InventoryEntry]) -> InventoryDiff {
     let m0: BTreeMap<&str, &InventoryEntry> = t0.iter().map(|e| (e.normalized_path.as_str(), e)).collect();
@@ -926,6 +1011,7 @@ pub fn diff_inventories(t0: &[InventoryEntry], t1: &[InventoryEntry]) -> Invento
                     || e0.kind != e1.kind
                     || e0.size != e1.size
                     || e0.mode != e1.mode
+                    || sorted_flags(e0) != sorted_flags(e1)
                 {
                     d.changed.push(p.to_string());
                 }
@@ -981,35 +1067,126 @@ impl PackageBinding {
     }
 }
 
+fn hardlink_violation(e: &InventoryEntry) -> Option<String> {
+    for flag in &e.flags {
+        if flag.starts_with("hardlink-group:")
+            || flag.starts_with("unexplained-link-ref:")
+            || flag.starts_with("unresolved-link-ref:")
+            || flag.starts_with("hardlink-detection=unavailable")
+        {
+            return Some(flag.clone());
+        }
+        if let Some(n) = flag.strip_prefix("hardlink-nlinks:") {
+            match n.parse::<u32>() {
+                Ok(1) => {}
+                _ => return Some(flag.clone()),
+            }
+        }
+    }
+    None
+}
+
+fn validate_release_entry(e: &InventoryEntry) -> Result<(), String> {
+    if e.flags
+        .iter()
+        .any(|f| f.starts_with("case-collision:"))
+    {
+        return Err(format!("manifest-case-collision: {}", e.normalized_path));
+    }
+    if let Some(flag) = hardlink_violation(e) {
+        return Err(format!(
+            "manifest-hardlink: {} ({})",
+            e.normalized_path, flag
+        ));
+    }
+    match e.kind {
+        EntryKind::File | EntryKind::Dir => Ok(()),
+        EntryKind::Symlink => Err(format!("manifest-symlink: {}", e.normalized_path)),
+        EntryKind::Special => Err(format!("manifest-special: {}", e.normalized_path)),
+        EntryKind::Unreadable => Err(format!("manifest-unreadable: {}", e.normalized_path)),
+    }
+}
+
 /// Verify an inventory against an expected manifest file set.
 /// `expected`: (normalized_path, expected_hex) pairs from the manifest.
 /// `allow_generated`: inventory paths allowed beyond the manifest (declared
-/// generated files). Anything else unexpected fails.
+/// generated files). Directories are structural and allowed; symlinks,
+/// special files, unreadables, hardlink groups/external references and case
+/// collisions are refused for every path, declared or generated.
 pub fn verify_against_manifest(
     inventory: &[InventoryEntry],
     expected: &[(String, String)],
     allow_generated: &[String],
 ) -> Result<(), String> {
-    let inv_files: BTreeMap<&str, &InventoryEntry> =
-        inventory.iter().filter(|e| e.kind == EntryKind::File).map(|e| (e.normalized_path.as_str(), e)).collect();
+    let mut inv_by_path: BTreeMap<&str, &InventoryEntry> = BTreeMap::new();
+    for e in inventory {
+        validate_release_entry(e)?;
+        if inv_by_path
+            .insert(e.normalized_path.as_str(), e)
+            .is_some()
+        {
+            return Err(format!("inventory-duplicate-path: {}", e.normalized_path));
+        }
+    }
+    let mut expected_paths: BTreeSet<&str> = BTreeSet::new();
     for (p, h) in expected {
-        match inv_files.get(p.as_str()) {
+        if !expected_paths.insert(p.as_str()) {
+            return Err(format!("manifest-duplicate: {}", p));
+        }
+        match inv_by_path.get(p.as_str()) {
             None => return Err(format!("manifest-missing: {}", p)),
+            Some(e) if e.kind != EntryKind::File => {
+                return Err(format!("manifest-not-file: {}", p));
+            }
             Some(e) => {
-                if e.content_hash.to_lowercase() != h.to_lowercase() {
+                if !e.content_hash.eq_ignore_ascii_case(h) {
                     return Err(format!("manifest-changed: {}", p));
                 }
             }
         }
     }
-    for (p, _) in &inv_files {
-        let in_manifest = expected.iter().any(|(ep, _)| ep == p);
+    for e in inventory {
+        if e.kind != EntryKind::File {
+            continue;
+        }
+        let p = e.normalized_path.as_str();
+        let in_manifest = expected_paths.contains(p);
         let allowed = allow_generated.iter().any(|g| matches_exclusion(g, p));
         if !in_manifest && !allowed {
             return Err(format!("manifest-unexpected: {}", p));
         }
     }
     Ok(())
+}
+
+/// Full release inventory verification: walk-level topology warnings are
+/// refused before the per-entry manifest binding. This is the strict gate
+/// contract: a clean file set is necessary but not sufficient; the tree must
+/// also be free of links, collisions, specials and unreadables.
+pub fn verify_release_inventory(
+    inventory: &Inventory,
+    expected: &[(String, String)],
+    allow_generated: &[String],
+) -> Result<(), String> {
+    if let Some(p) = inventory.warnings.unreadables.first() {
+        return Err(format!("inventory-unreadable: {}", p));
+    }
+    if let Some(p) = inventory.warnings.external_links.first() {
+        return Err(format!("inventory-external-link: {}", p));
+    }
+    if let Some(line) = inventory.warnings.hardlink_groups.first() {
+        return Err(format!("inventory-hardlink-group: {}", line));
+    }
+    if let Some(line) = inventory.warnings.external_link_refs.first() {
+        return Err(format!("inventory-link-reference: {}", line));
+    }
+    if let Some(p) = inventory.warnings.case_collisions.first() {
+        return Err(format!("inventory-case-collision: {}", p));
+    }
+    if let Some(p) = inventory.warnings.specials.first() {
+        return Err(format!("inventory-special: {}", p));
+    }
+    verify_against_manifest(&inventory.entries, expected, allow_generated)
 }
 
 #[cfg(test)]
@@ -1023,6 +1200,26 @@ mod unit_tests {
         assert!(!matches_exclusion("tmp/*", "other/a"));
         assert!(matches_exclusion("exact", "exact"));
         assert!(!matches_exclusion("exact", "exact2"));
+    }
+
+    #[test]
+    fn normalize_rejects_escape_and_absolute_forms() {
+        assert!(normalize_relative(Path::new("../x")).is_err());
+        assert!(normalize_relative(Path::new("a/../../x")).is_err());
+        assert!(normalize_relative(Path::new("/x")).is_err());
+        assert!(normalize_relative(Path::new("")).is_err());
+        assert!(normalize_relative(Path::new("a\nb")).is_err());
+        assert_eq!(normalize_relative(Path::new("./a//b")).unwrap(), "a/b");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn normalize_preserves_unix_backslash_literals() {
+        assert_eq!(normalize_relative(Path::new("a\\b")).unwrap(), "a\\b");
+        assert_ne!(
+            normalize_relative(Path::new("a\\b")).unwrap(),
+            normalize_relative(Path::new("a/b")).unwrap()
+        );
     }
 
     #[test]
