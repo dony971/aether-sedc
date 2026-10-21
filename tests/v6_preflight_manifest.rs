@@ -132,16 +132,17 @@ fn manifest_text(ctx: &Ctx, patch: impl FnOnce(&mut serde_json::Value)) -> Strin
 }
 
 fn run_tool(ctx: &Ctx, manifest: &str) -> (i32, String) {
+    run_tool_with_args(ctx, manifest, &[])
+}
+
+fn run_tool_with_args(ctx: &Ctx, manifest: &str, extra: &[&str]) -> (i32, String) {
     let path = ctx.dir.path().join("manifest.json");
     std::fs::write(&path, manifest).expect("write manifest");
     let bin = env!("CARGO_BIN_EXE_v6_preflight");
-    let out = std::process::Command::new(bin)
-        .arg("--manifest")
-        .arg(&path)
-        .arg("--repo")
-        .arg(&ctx.repo)
-        .output()
-        .expect("run preflight binary");
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("--manifest").arg(&path).arg("--repo").arg(&ctx.repo);
+    cmd.args(extra);
+    let out = cmd.output().expect("run preflight binary");
     let code = out.status.code().unwrap_or(99);
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
@@ -774,6 +775,145 @@ fn g10_symlink_missing_target_refused() {
             not_run_or_fail("dangling symlink creation", &e);
         }
     }
+}
+
+// --- PHASE 4CP-BH: opt-in inventory gate (C-01) ---
+
+fn release_dir(ctx: &Ctx) -> PathBuf {
+    let release = ctx.dir.path().join("release");
+    std::fs::create_dir_all(&release).expect("mkdir release");
+    release
+}
+
+#[test]
+fn h01_inventory_absent_is_explicitly_not_run() {
+    let ctx = setup();
+    let (code, out) = run_tool(&ctx, &valid_manifest(&ctx));
+    assert_eq!(code, 0, "out: {}", out);
+    assert!(out.contains("H INVENTORY_CHECKS: NOT_RUN"), "out: {}", out);
+    assert!(
+        !out.contains("E_INVENTORY"),
+        "absence is not a failure unless required. out: {}",
+        out
+    );
+}
+
+#[test]
+fn h02_inventory_gate_passes_against_declared_artifact() {
+    let ctx = setup();
+    let release = release_dir(&ctx);
+    std::fs::copy(ctx.repo.join(&ctx.artifact), release.join(&ctx.artifact)).expect("copy");
+    let path = release.to_str().expect("utf8 temp path");
+    let (code, out) = run_tool_with_args(
+        &ctx,
+        &valid_manifest(&ctx),
+        &["--inventory-root", path],
+    );
+    assert_eq!(code, 0, "clean inventory must PASS. out: {}", out);
+    assert!(out.contains("H INVENTORY_CHECKS: PASS"), "out: {}", out);
+}
+
+#[test]
+fn h03_inventory_extra_file_fails() {
+    let ctx = setup();
+    let release = release_dir(&ctx);
+    std::fs::copy(ctx.repo.join(&ctx.artifact), release.join(&ctx.artifact)).expect("copy");
+    std::fs::write(release.join("extra.bin"), b"unexpected").expect("write");
+    let path = release.to_str().expect("utf8 temp path");
+    let (code, out) = run_tool_with_args(
+        &ctx,
+        &valid_manifest(&ctx),
+        &["--inventory-root", path],
+    );
+    assert_eq!(code, 1, "extra file must fail. out: {}", out);
+    assert!(out.contains("E_INVENTORY_VERIFY"), "out: {}", out);
+    assert!(out.contains("H INVENTORY_CHECKS: FAIL"), "out: {}", out);
+}
+
+#[test]
+fn h04_inventory_missing_artifact_fails() {
+    let ctx = setup();
+    let release = release_dir(&ctx);
+    let path = release.to_str().expect("utf8 temp path");
+    let (code, out) = run_tool_with_args(
+        &ctx,
+        &valid_manifest(&ctx),
+        &["--inventory-root", path],
+    );
+    assert_eq!(code, 1, "missing artifact must fail. out: {}", out);
+    assert!(out.contains("manifest-missing"), "out: {}", out);
+}
+
+#[test]
+fn h05_inventory_symlink_is_refused() {
+    let ctx = setup();
+    let release = release_dir(&ctx);
+    let target = ctx.repo.join(&ctx.artifact);
+    let link = release.join(&ctx.artifact);
+    if let Err(e) = try_link(&target, &link) {
+        not_run_or_fail("inventory symlink creation", &e);
+        return;
+    }
+    let path = release.to_str().expect("utf8 temp path");
+    let (code, out) = run_tool_with_args(
+        &ctx,
+        &valid_manifest(&ctx),
+        &["--inventory-root", path],
+    );
+    assert_eq!(code, 1, "symlink inventory must fail. out: {}", out);
+    assert!(
+        out.contains("inventory-external-link") || out.contains("manifest-symlink"),
+        "out: {}",
+        out
+    );
+}
+
+#[test]
+fn h06_require_inventory_without_root_fails() {
+    let ctx = setup();
+    let (code, out) = run_tool_with_args(&ctx, &valid_manifest(&ctx), &["--require-inventory"]);
+    assert_eq!(code, 1, "required inventory without root must fail. out: {}", out);
+    assert!(out.contains("E_INVENTORY_CONFIG"), "out: {}", out);
+    assert!(out.contains("H INVENTORY_CHECKS: FAIL"), "out: {}", out);
+}
+
+#[test]
+fn h07_explicit_exclusion_is_honored() {
+    let ctx = setup();
+    let release = release_dir(&ctx);
+    std::fs::copy(ctx.repo.join(&ctx.artifact), release.join(&ctx.artifact)).expect("copy");
+    std::fs::write(release.join("generated.log"), b"generated").expect("write");
+    let path = release.to_str().expect("utf8 temp path");
+    let (code, out) = run_tool_with_args(
+        &ctx,
+        &valid_manifest(&ctx),
+        &[
+            "--inventory-root",
+            path,
+            "--inventory-exclude",
+            "generated.log",
+        ],
+    );
+    assert_eq!(code, 0, "excluded generated file must pass. out: {}", out);
+    assert!(out.contains("H INVENTORY_CHECKS: PASS"), "out: {}", out);
+}
+
+#[test]
+fn h08_inventory_normalizes_dot_components_in_manifest_paths() {
+    let ctx = setup();
+    let release = release_dir(&ctx);
+    std::fs::copy(ctx.repo.join(&ctx.artifact), release.join(&ctx.artifact)).expect("copy");
+    let text = manifest_text(&ctx, |m| {
+        m["artifacts"][0]["path"] = serde_json::json!("./artifact.bin");
+    });
+    let path = release.to_str().expect("utf8 temp path");
+    let (code, out) = run_tool_with_args(
+        &ctx,
+        &text,
+        &["--inventory-root", path],
+    );
+    assert_eq!(code, 0, "dot component must normalize. out: {}", out);
+    assert!(out.contains("H INVENTORY_CHECKS: PASS"), "out: {}", out);
 }
 
 #[test]
