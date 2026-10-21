@@ -1177,11 +1177,25 @@ fn test_invariant_i11_dag_fingerprint_match() {
 #[test]
 fn test_invariant_i12_ledger_fingerprint_match() {
     for n in [100, 1000, 10_000] {
+        let started = Instant::now();
         let (source_dag, source_ledger, source_txs, dir) = build_source(n);
+        let built = started.elapsed();
         let fp_src = state_fingerprint(&source_dag, &source_ledger);
+        let fingerprinted_source = started.elapsed();
         let (fresh_dag, fresh_ledger, _) =
             simulate_sync(&source_dag, &source_ledger, &source_txs, 100);
+        let synced = started.elapsed();
         let fp_fresh = state_fingerprint(&fresh_dag, &fresh_ledger);
+        let fingerprinted_fresh = started.elapsed();
+        eprintln!(
+            "[I12] n={} build_ms={} source_fp_ms={} sync_ms={} fresh_fp_ms={} total_ms={}",
+            n,
+            built.as_millis(),
+            (fingerprinted_source - built).as_millis(),
+            (synced - fingerprinted_source).as_millis(),
+            (fingerprinted_fresh - synced).as_millis(),
+            fingerprinted_fresh.as_millis()
+        );
         assert_eq!(
             fp_src, fp_fresh,
             "I12: Ledger fingerprint must match for N={}",

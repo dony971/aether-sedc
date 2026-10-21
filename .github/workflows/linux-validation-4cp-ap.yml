@@ -131,6 +131,15 @@ jobs:
         if: always()
         run: cargo test --lib --no-run
 
+      - name: unit deep_sync_harness i12
+        if: always()
+        run: |
+          n=deep_sync_i12; log=/tmp/$n.log; set +e
+          cargo test --lib tests::deep_sync_harness::test_invariant_i12_ledger_fingerprint_match -- --exact --nocapture --test-threads=1 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then echo "::error::$n failed on Linux (exit $c)"; grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done; fi
+          exit "$c"
+
       - name: build lib
         if: always()
         run: cargo build --lib

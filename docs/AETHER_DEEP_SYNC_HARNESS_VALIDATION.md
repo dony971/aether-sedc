@@ -47,12 +47,17 @@ The comparison `fp_src == fp_fresh` ensures byte-identical state.
 - `simulate_sync()` tracks `orphans` count and asserts it is 0
 - No error is silently swallowed — any assertion failure aborts the test
 
-## Timeout Handling
+## Runtime and Timeout Handling
 
-- No artificial timeouts in the harness
-- Tests run in release mode for realistic performance
-- The 10K test completes in ~7 seconds (release)
-- If the system deadlocks, the test framework timeout (600s) catches it
+- No artificial timeouts in the harness; libtest has no default per-test timeout
+- The historical 10K timing (~7s) is release mode. A debug-mode Windows run of
+  I12 measured ~178s in isolation, dominated by the 10K source build (~89s)
+  and the 10K simulated sync (~88s)
+- Run I12 through an exact filter when isolating it. A serial run of the whole
+  invariant group can exceed an external 600s command cap even though each
+  test completes
+- A real deadlock must be established from process/job state, not inferred
+  from a command cap expiring while the test is still computing
 
 ## Invariant Verification
 
