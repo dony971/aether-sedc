@@ -683,11 +683,11 @@ async fn ba02_slow_peer_outbound_queue_is_bounded_and_recovers() {
     // must exceed the largest plausible kernel buffering (Linux loopback
     // autotuning can absorb ~10 MiB across send+receive buffers), so the
     // writer blocks and the bounded queue itself must refuse; Windows fills
-    // its much smaller buffers long before this. Batches stay below the
-    // 400 msgs/s read-path flood limit (a burst is a ban, not a drop) while
-    // still pushing ~19 MiB, and complete well inside the 15s write timeout.
-    const BATCH: usize = 390;
-    const BATCHES: usize = 3;
+    // its much smaller buffers long before this. Batches stay well below the
+    // 400 msgs/s read-path flood limit (a burst is a ban, not a drop), and
+    // the ~19 MiB volume still finishes inside the 15s write timeout.
+    const BATCH: usize = 200;
+    const BATCHES: usize = 6;
     let requests = BATCH * BATCHES;
     let mut max_slow_queue = 0usize;
     for batch in 0..BATCHES {
@@ -740,7 +740,7 @@ async fn ba02_slow_peer_outbound_queue_is_bounded_and_recovers() {
     assert_eq!(h.net.peer_count().await, 2);
 
     // The slow peer resumes reading: it gets SOME pages (the ones whose bytes
-    // were already accepted) but strictly fewer than the 200 requested —
+    // were already accepted) but strictly fewer than the requests sent —
     // the rest were refused, not silently buffered.
     let first_pages = slow.collect_pages(Duration::from_secs(10)).await;
     let first_ids: HashSet<[u8; 32]> = first_pages
