@@ -6483,10 +6483,6 @@ impl P2PNetwork {
 
                             // Request missing transactions via GetData
                             if !missing_hashes.is_empty() {
-                                sync_ctx.stats.sync_requested.fetch_add(
-                                    missing_hashes.len() as u64,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
                                 // DEEP SYNC: register missing hashes in the frontier
                                 {
                                     let mut frontier = sync_ctx.frontier.write().await;
@@ -6502,16 +6498,26 @@ impl P2PNetwork {
                                 if let Ok(getdata_msg) =
                                     bincode::serialize(&P2PMessage::GetData(missing_hashes.clone()))
                                 {
-                                    // 4CP-BA: droppable — the frontier keeps
-                                    // the hash pending and the next
-                                    // inventory diff re-requests it.
-                                    let _ = msg_sender.try_send(getdata_msg);
-                                }
-                                // DEEP SYNC: mark hashes as requested in frontier
-                                {
-                                    let mut frontier = sync_ctx.frontier.write().await;
-                                    for h in &missing_hashes {
-                                        frontier.mark_requested(h, addr);
+                                    // A frame may be refused by either the
+                                    // session or node-wide egress budget. Only
+                                    // an admitted frame is an in-flight
+                                    // request: otherwise the frontier must stay
+                                    // Pending so the next inventory round can
+                                    // retry it immediately.
+                                    if msg_sender.try_send(getdata_msg).is_ok() {
+                                        sync_ctx.stats.sync_requested.fetch_add(
+                                            missing_hashes.len() as u64,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        );
+                                        let mut frontier = sync_ctx.frontier.write().await;
+                                        for h in &missing_hashes {
+                                            frontier.mark_requested(h, addr);
+                                        }
+                                    } else {
+                                        tracing::debug!(
+                                            "GetData request to {} deferred: outbound queue or global budget saturated",
+                                            addr
+                                        );
                                     }
                                 }
                             }
@@ -17739,6 +17745,58 @@ mod phase4cpbk_outbound_budget_tests {
         assert!(
             OutboundBudget::charge(MAX_MESSAGE_SIZE).is_none(),
             "a payload that cannot be emitted is never charged"
+        );
+    }
+
+    #[test]
+    fn bk04_128_concurrent_sessions_cannot_exceed_global_budget() {
+        const SESSIONS: usize = 128;
+        let payload = vec![0xC3; 4096];
+        let charge = OutboundBudget::charge(payload.len()).expect("charge");
+        // Keep the cap deliberately below the sum of the 128 independent
+        // queues. This makes every successful admission contend for the same
+        // permits rather than relying on per-session limits.
+        let permits = 16usize;
+        let global = OutboundBudget::new(charge * permits);
+        let mut sinks = Vec::with_capacity(SESSIONS);
+        let mut receivers = Vec::with_capacity(SESSIONS);
+        for n in 0..SESSIONS {
+            let (sink, receiver) = PeerSink::pair_with_budget(
+                SocketAddr::from(([127, 0, 0, 1], 10_000 + n as u16)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::clone(&global),
+            );
+            sinks.push(sink);
+            receivers.push(receiver);
+        }
+
+        let gate = Arc::new(std::sync::Barrier::new(SESSIONS));
+        let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for sink in &sinks {
+                let gate = Arc::clone(&gate);
+                let admitted = Arc::clone(&admitted);
+                let payload = payload.clone();
+                scope.spawn(move || {
+                    gate.wait();
+                    if sink.try_send(payload).is_ok() {
+                        admitted.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        let admitted = admitted.load(Ordering::Relaxed);
+        assert_eq!(admitted, permits, "exactly the global capacity is admitted");
+        assert_eq!(global.reserved_bytes(), admitted * charge);
+        assert!(global.reserved_bytes() <= global.capacity);
+        assert_eq!(global.refusals(), (SESSIONS - permits) as u64);
+
+        drop(receivers);
+        assert_eq!(
+            global.reserved_bytes(),
+            0,
+            "receiver teardown releases every globally reserved frame"
         );
     }
 }
