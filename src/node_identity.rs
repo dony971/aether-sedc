@@ -118,7 +118,7 @@
 //!   (see path preconditions), not rewritten. Only the data directory itself is
 //!   enforced owner-only.
 
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -268,12 +268,17 @@ impl NodeIdentity {
 
 /// Verify a signature produced by [`NodeIdentity::sign_message`] against the
 /// public key named by `node_id`.
+///
+/// Strict Ed25519 verification is required here: a `NodeId` is a durable
+/// identity, not merely a proof-of-possession nonce. Rejecting low-order
+/// public keys and low-order `R` components prevents a weak-key forgery from
+/// being accepted as a stable peer identity.
 pub fn verify_message(node_id: &NodeId, message: &[u8], signature: &[u8; 64]) -> bool {
     let Ok(verifying_key) = VerifyingKey::from_bytes(node_id.as_bytes()) else {
         return false;
     };
     let sig = Signature::from_bytes(signature);
-    verifying_key.verify(message, &sig).is_ok()
+    verifying_key.verify_strict(message, &sig).is_ok()
 }
 
 /// Whether an identity was found on disk or freshly created.
@@ -1433,6 +1438,17 @@ mod tests {
         std::fs::read_to_string(identity_path(dir)).expect("identity file must exist")
     }
 
+    /// The compressed identity point is a low-order ("weak") Ed25519 public
+    /// key. With `R` set to the same point and `S = 0`, the legacy
+    /// `VerifyingKey::verify` equation holds for every message.
+    fn weak_key_identity() -> (NodeId, [u8; 64]) {
+        let mut node_id = [0u8; 32];
+        node_id[0] = 1;
+        let mut signature = [0u8; 64];
+        signature[0] = 1;
+        (NodeId::from_bytes(node_id), signature)
+    }
+
     #[test]
     fn creates_identity_in_empty_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -1494,6 +1510,44 @@ mod tests {
         // Wrong key.
         let other = NodeIdentity::generate();
         assert!(!verify_message(&other.node_id(), b"alpha", &sig));
+    }
+
+    #[test]
+    fn rejects_weak_key_signature_for_any_message() {
+        use ed25519_dalek::Verifier;
+
+        let (node_id, signature) = weak_key_identity();
+        let key = VerifyingKey::from_bytes(node_id.as_bytes()).unwrap();
+        let sig = Signature::from_bytes(&signature);
+
+        // Control: the vector really is a weak-key forgery accepted by the
+        // non-strict API, for distinct messages.
+        assert!(key.is_weak(), "test vector must use a low-order key");
+        assert!(key.verify(b"first message", &sig).is_ok());
+        assert!(key.verify(b"second message", &sig).is_ok());
+
+        // The identity verifier must reject it.
+        assert!(!verify_message(&node_id, b"first message", &signature));
+        assert!(!verify_message(&node_id, b"second message", &signature));
+    }
+
+    #[test]
+    fn rejects_malformed_public_key() {
+        let node_id = NodeId::from_bytes([0xff; 32]);
+        assert!(!verify_message(&node_id, b"message", &[0u8; 64]));
+    }
+
+    #[test]
+    fn persisted_identity_still_verifies_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let (identity, _) = load_or_create(dir.path()).unwrap();
+        let node_id = identity.node_id();
+        let signature = identity.sign_message(b"persisted identity");
+        drop(identity);
+
+        let reloaded = load(dir.path()).unwrap();
+        assert_eq!(reloaded.node_id(), node_id);
+        assert!(verify_message(&node_id, b"persisted identity", &signature));
     }
 
     #[test]

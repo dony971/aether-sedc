@@ -14544,6 +14544,9 @@ mod phase4cp_v6_tests {
         WrongGenesis,
         OtherKey,
         Replay([u8; 64]),
+        /// Advertise a low-order Ed25519 NodeId and send the weak-key forgery
+        /// accepted by non-strict verification.
+        WeakKey,
         /// Send an all-zero (low-order) X25519 ephemeral with a VALID signature
         /// over the resulting transcript (4CP-S / F2).
         LowOrderEph,
@@ -14582,7 +14585,14 @@ mod phase4cp_v6_tests {
         let pubk = PublicKey::from(&secret);
         let mut nonce = [0u8; 32];
         OsRng.fill_bytes(&mut nonce);
-        let nid = identity.node_id();
+        let nid = match tamper {
+            Tamper::WeakKey => {
+                let mut bytes = [0u8; 32];
+                bytes[0] = 1;
+                crate::node_identity::NodeId::from_bytes(bytes)
+            }
+            _ => identity.node_id(),
+        };
         let ours = super::V6Hello {
             eph: match tamper {
                 Tamper::LowOrderEph => [0u8; 32],
@@ -14652,6 +14662,11 @@ mod phase4cp_v6_tests {
             Tamper::BadSig => {
                 let mut s = identity.sign_message(&message);
                 s[0] ^= 0xff;
+                s
+            }
+            Tamper::WeakKey => {
+                let mut s = [0u8; 64];
+                s[0] = 1;
                 s
             }
             _ => identity.sign_message(&message),
@@ -14749,6 +14764,22 @@ mod phase4cp_v6_tests {
         assert!(
             rr.is_err(),
             "signature must verify against the advertised NodeId"
+        );
+    }
+
+    /// Contract 7c: a low-order Ed25519 NodeId with its universal weak-key
+    /// forgery is rejected by the production handshake path.
+    #[tokio::test]
+    async fn v6_rejects_weak_ed25519_identity() {
+        let real_id = NodeIdentity::generate();
+        let peer_id = NodeIdentity::generate();
+        let (mut a_r, mut a_w, mut b_r, mut b_w) = duplex_pair();
+        let real = P2PNetwork::handshake_v6(&mut a_r, &mut a_w, 0, &real_id, true);
+        let fake = fake_peer(&mut b_r, &mut b_w, 0, &peer_id, false, Tamper::WeakKey);
+        let (rr, _) = tokio::join!(real, fake);
+        assert!(
+            rr.is_err(),
+            "weak Ed25519 identity must be rejected by the v6 handshake"
         );
     }
 
