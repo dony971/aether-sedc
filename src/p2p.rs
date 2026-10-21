@@ -6596,18 +6596,22 @@ impl P2PNetwork {
                                         );
                                         continue;
                                     }
-                                    if get_transaction_by_hash(&tx.id).is_some()
-                                        || is_orphan(&tx.id)
-                                    {
+                                    let in_dag =
+                                        get_transaction_by_hash(&tx.id).is_some();
+                                    if in_dag || is_orphan(&tx.id) {
                                         sync_ctx
                                             .stats
                                             .duplicate_ignored
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        // DEEP SYNC: mark duplicate as applied in frontier (already resolved)
+                                        // A DAG duplicate is a terminal success, but it
+                                        // is not new growth. A duplicate parked in the
+                                        // orphan store has not been applied and must
+                                        // not be presented as such.
                                         {
                                             let mut frontier = sync_ctx.frontier.write().await;
-                                            frontier.mark_received(&tx.id);
-                                            frontier.mark_applied(&tx.id);
+                                            if frontier.mark_received(&tx.id) && in_dag {
+                                                frontier.mark_applied_existing(&tx.id);
+                                            }
                                         }
                                         continue;
                                     }
@@ -6658,19 +6662,19 @@ impl P2PNetwork {
                             // waiting txs will be re-requested by process_orphans() on
                             // subsequent cycles when their parents arrive.
                             for (tx_bytes, tx) in deliverable.into_iter() {
-                                // DEEP SYNC: mark as received + applied in frontier AFTER
-                                // partition_batch confirmed this tx is deliverable.
-                                // Waiting txs (parents missing) are NOT marked, so the
-                                // next inventory diff re-requests them.
+                                // 4CP-BD: queue admission is NOT DAG insertion.
+                                // Mark the page received only; Applied is recorded
+                                // by the drainer after the processor really inserts
+                                // it. Waiting txs (parents missing) are NOT marked,
+                                // so the next inventory diff re-requests them.
                                 //
                                 // 4CP-BA: ADMISSION FIRST, then the marks. The
                                 // bounded ingress queue may refuse an item under
                                 // saturation; only a payload that was really
-                                // queued may be marked received/applied or
-                                // recorded as seen. A refused item stays
-                                // unmarked, so the next inventory diff
-                                // re-requests it — a refused message is never
-                                // presented as delivered, and duplicate
+                                // queued may be marked received or recorded as
+                                // seen. A refused item stays unmarked, so the next
+                                // inventory diff re-requests it — a refused message
+                                // is never presented as delivered, and duplicate
                                 // re-delivery stays idempotent at the funnel.
                                 let tx_id = tx.id;
                                 let wire_len = tx_bytes.len();
@@ -6716,12 +6720,11 @@ impl P2PNetwork {
                                 sync_ctx
                                     .note_ingress_mode(tx_id, ValidationMode::Historical)
                                     .await;
-                                {
-                                    let mut frontier = sync_ctx.frontier.write().await;
-                                    frontier.mark_received(&tx_id);
-                                    frontier.mark_applied(&tx_id);
-                                    frontier.record_progress();
-                                }
+                                sync_ctx
+                                    .frontier
+                                    .write()
+                                    .await
+                                    .mark_received(&tx_id);
                                 // 2E-D: the deep-sync ingress has to record its
                                 // upstream peer too, otherwise a payload that
                                 // arrives here is later re-sent to the very
@@ -17117,25 +17120,20 @@ mod phase4cat_e2e_integrity_tests {
         {
             let rpc = rpc.clone();
             let sync_ctx = sync_ctx.clone();
-            let dag = dag.clone();
             tokio::spawn(async move {
                 while let Some(item) = tx_receiver.recv().await {
                     let tx = item.into_tx();
+                    let tx_id = tx.id;
                     let ingress_mode = sync_ctx.take_ingress_mode(tx.id).await;
                     match rpc.process_transaction(tx, "P2P", ingress_mode).await {
-                        Ok(_) => {
-                            sync_ctx.stats.sync_progress.fetch_add(1, Ordering::Relaxed);
-                            let total_now = dag.read().await.transaction_count() as u64;
-                            let prev = sync_ctx.stats.sync_frontier.load(Ordering::Relaxed);
-                            if total_now > prev {
-                                sync_ctx
-                                    .stats
-                                    .sync_frontier
-                                    .fetch_max(total_now, Ordering::Relaxed);
-                            }
-                            rpc.process_orphans().await;
+                        Ok(_) => rpc.process_orphans().await,
+                        Err(_) => {
+                            sync_ctx
+                                .frontier
+                                .write()
+                                .await
+                                .mark_rejected(&tx_id);
                         }
-                        Err(_) => {}
                     }
                 }
             });
@@ -17408,8 +17406,8 @@ mod phase4cat_e2e_integrity_tests {
         assert_eq!(stats.size, 1);
         assert_eq!(
             node.sync_ctx.stats.sync_progress.load(Ordering::Relaxed),
-            1,
-            "exactly one acceptance event"
+            0,
+            "live gossip is not SyncResponse backfill progress"
         );
 
         // Drain through the production entry point (node.rs:1023).
@@ -17426,6 +17424,11 @@ mod phase4cat_e2e_integrity_tests {
         let stats = node.rpc.mempool_stats().await;
         assert_eq!(stats.size, 0, "queue emptied by inclusion");
         assert_eq!(stats.included, 1);
+        assert_eq!(
+            node.sync_ctx.stats.sync_progress.load(Ordering::Relaxed),
+            0,
+            "a live-gossip insertion must not be counted as sync progress"
+        );
         {
             let ledger = node.ledger.read().await;
             assert_eq!(

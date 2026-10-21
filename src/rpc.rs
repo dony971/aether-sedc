@@ -1545,6 +1545,8 @@ impl AetherRpcImpl {
                 Ok(_) => {
                     // INCLUDE: the tx reached the DAG and leaves the queue
                     // (processor STEP 7 also removed it; dispose is idempotent).
+                    // 4CP-BD: only a real DAG insertion may become Applied.
+                    self.mark_sync_applied(&tx.id).await;
                     self.dispose_mempool_tx(&tx.id, MempoolDisposition::Included)
                         .await;
                 }
@@ -1558,6 +1560,7 @@ impl AetherRpcImpl {
                     } else {
                         // Orphan store full: the tx is dropped from the queue
                         // (bounded — it cannot live in the queue forever).
+                        self.mark_sync_rejected(&tx.id).await;
                         self.dispose_mempool_tx(&tx.id, MempoolDisposition::Rejected)
                             .await;
                     }
@@ -1573,6 +1576,7 @@ impl AetherRpcImpl {
                         self.dispose_mempool_tx(&tx.id, MempoolDisposition::OrphanParked)
                             .await;
                     } else {
+                        self.mark_sync_rejected(&tx.id).await;
                         self.dispose_mempool_tx(&tx.id, MempoolDisposition::Rejected)
                             .await;
                     }
@@ -1583,6 +1587,8 @@ impl AetherRpcImpl {
                     // Already in the DAG: its final state IS the DAG — count it
                     // as included (a duplicate of an accepted tx is not a
                     // failure, and re-inclusion is impossible by definition).
+                    // It is terminal success without new growth.
+                    self.mark_sync_applied_existing(&tx.id).await;
                     self.dispose_mempool_tx(&tx.id, MempoolDisposition::Included)
                         .await;
                 }
@@ -1606,6 +1612,7 @@ impl AetherRpcImpl {
                         "🗑️ Mempool tx {} permanently rejected",
                         hex::encode(&tx.id[..4])
                     );
+                    self.mark_sync_rejected(&tx.id).await;
                     self.dispose_mempool_tx(&tx.id, MempoolDisposition::Rejected)
                         .await;
                 }
@@ -1630,6 +1637,37 @@ impl AetherRpcImpl {
                 tracing::error!("❌ INC-01: drain batch flush failed: {}", e);
             }
         }
+    }
+
+    /// 4CP-BD: terminal success only after the processor really inserted the
+    /// tx. Advances the sync counters exactly once per frontier entry.
+    async fn mark_sync_applied(&self, tx_id: &TransactionId) {
+        let marked = self.sync_ctx.frontier.write().await.mark_applied(tx_id);
+        if !marked {
+            return;
+        }
+        self.sync_ctx
+            .stats
+            .sync_progress
+            .fetch_add(1, Ordering::Relaxed);
+        let total_now = self.dag.read().await.transaction_count() as u64;
+        self.sync_ctx
+            .stats
+            .sync_frontier
+            .fetch_max(total_now, Ordering::Relaxed);
+    }
+
+    /// A DAG duplicate is resolved but did not grow the DAG.
+    async fn mark_sync_applied_existing(&self, tx_id: &TransactionId) {
+        self.sync_ctx
+            .frontier
+            .write()
+            .await
+            .mark_applied_existing(tx_id);
+    }
+
+    async fn mark_sync_rejected(&self, tx_id: &TransactionId) {
+        self.sync_ctx.frontier.write().await.mark_rejected(tx_id);
     }
 
     /// PHASE D: remove a drained tx from the queue, persist the removal and

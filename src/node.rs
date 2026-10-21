@@ -889,6 +889,7 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             // 4CP-BA: taking the item releases its ingress byte reservation
             // (the permit rides inside the queued item).
             let tx = item.into_tx();
+            let tx_id = tx.id;
             // PHASE 3B (C1/H1): consume the ingress provenance recorded by
             // the P2P layer (live relay = Fresh, sync backfill = Historical;
             // absent = Historical = pre-3B behavior) and forward it as THE
@@ -915,31 +916,17 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                 .await
             {
                 Ok(_) => {
-                    tracing::info!("✅ P2P transaction accepted and processed");
-                    // B4: count DAG growth through the sync path and resolve
-                    // newly applicable orphans in the same cycle (fixpoint).
-                    sync_ctx_for_p2p
-                        .stats
-                        .sync_progress
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    // VPS-2 §6: monotone frontier = max DAG total observed
-                    // on P2P success. progress(t+1) >= progress(t) BY
-                    // CONSTRUCTION (max-update); a flat frontier alongside
-                    // pending orphans/requests is stall evidence.
-                    let total_now = dag_for_p2p.read().await.transaction_count() as u64;
-                    let prev = sync_ctx_for_p2p
-                        .stats
-                        .sync_frontier
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    if total_now > prev {
-                        sync_ctx_for_p2p
-                            .stats
-                            .sync_frontier
-                            .fetch_max(total_now, std::sync::atomic::Ordering::Relaxed);
-                    }
-            rpc_impl.process_orphans().await;
+                    // 4CP-BD: admission only. sync_progress/frontier advance
+                    // when the drainer inserts the tx into the DAG.
+                    tracing::info!("✅ P2P transaction accepted into the mempool");
+                    rpc_impl.process_orphans().await;
                 }
                 Err(e) => {
+                    sync_ctx_for_p2p
+                        .frontier
+                        .write()
+                        .await
+                        .mark_rejected(&tx_id);
                     tracing::warn!("❌ P2P transaction rejected: {}", e);
                 }
             }

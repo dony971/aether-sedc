@@ -60,7 +60,7 @@ pub struct SyncStatsSnapshot {
     pub sync_requested: u64,
     /// Transactions received through SyncResponse (post-dedup)
     pub sync_received: u64,
-    /// Transactions accepted into the DAG through the P2P path
+    /// SyncResponse transactions successfully applied to the DAG
     pub sync_progress: u64,
     /// SyncResponse batches processed
     pub sync_batches: u64,
@@ -97,9 +97,10 @@ pub struct SyncStatsSnapshot {
     /// VPS-2 §5: missing-parent sets collected per orphan-solver cycle
     /// (before backoff dedup). Compares against parent_requested (sent).
     pub parent_missing: u64,
-    /// VPS-2 §6: monotone sync frontier = max DAG total observed on the
-    /// P2P path. progress(t+1) >= progress(t) BY CONSTRUCTION (max-update);
-    /// a flat frontier with pending orphans/requests = stall evidence.
+    /// VPS-2 §6: monotone sync frontier = max DAG total observed after a
+    /// SyncResponse transaction was really applied. progress(t+1) >=
+    /// progress(t) BY CONSTRUCTION (max-update); a flat frontier alongside
+    /// pending requests = stall evidence.
     pub sync_frontier: u64,
     /// INC-01: persisted transactions loaded at boot (Sled + JSON)
     pub rebuild_total: u64,
@@ -454,6 +455,23 @@ impl SyncFrontier {
         true
     }
 
+    /// Mark a received hash as already resident in the DAG (a duplicate
+    /// response). The terminal state is true, but no new DAG growth happened,
+    /// so the progress timestamp is deliberately not advanced.
+    pub fn mark_applied_existing(&mut self, hash: &[u8]) -> bool {
+        let entry = match self.entries.get_mut(hash) {
+            Some(e) => e,
+            None => return false,
+        };
+        if entry.state != PageState::Received {
+            return false;
+        }
+        entry.state = PageState::Applied;
+        entry.last_updated = Instant::now();
+        self.pages_applied += 1;
+        true
+    }
+
     /// Mark a request as rejected (bad data, peer error, timeout).
     /// The hash goes back to Pending if retries remain, otherwise stays Rejected.
     pub fn mark_rejected(&mut self, hash: &[u8]) -> bool {
@@ -643,8 +661,7 @@ impl SyncFrontier {
         self.started_at = t;
     }
 
-    /// TEST-ONLY: check state of a specific entry.
-    #[cfg(test)]
+    /// Read-only state of a specific tracked hash.
     pub fn entry_state(&self, hash: &[u8]) -> Option<PageState> {
         self.entries.get(hash).map(|e| e.state)
     }
@@ -836,6 +853,21 @@ mod tests {
         assert!(f.mark_applied(&h));
         assert_eq!(f.applied_count(), 1);
         assert!(f.last_progress().is_some());
+    }
+
+    #[test]
+    fn test_frontier_applied_existing_preserves_progress_timestamp() {
+        let mut f = SyncFrontier::new();
+        let h = vec![9u8; 32];
+        f.add_pending(h.clone());
+        assert!(f.mark_requested(&h, addr(1)));
+        assert!(f.mark_received(&h));
+        assert!(f.mark_applied_existing(&h));
+        assert_eq!(f.applied_count(), 1);
+        assert!(
+            f.last_progress().is_none(),
+            "a duplicate already in the DAG is not new progress"
+        );
     }
 
     #[test]
