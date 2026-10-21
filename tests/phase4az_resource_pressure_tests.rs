@@ -382,14 +382,21 @@ async fn record_classified(
 ) {
     if dag_contains(node, &tx.id).await {
         counters.duplicate.fetch_add(1, Ordering::Relaxed);
+        node.sync
+            .frontier
+            .write()
+            .await
+            .mark_applied_existing(&tx.id);
         return;
     }
     match record_now(&node.dag, &node.storage, processor, &tx).await {
         Ok(()) => {
             counters.applied.fetch_add(1, Ordering::Relaxed);
+            node.sync.frontier.write().await.mark_applied(&tx.id);
         }
         Err(_) => {
             counters.rejected.fetch_add(1, Ordering::Relaxed);
+            node.sync.frontier.write().await.mark_rejected(&tx.id);
         }
     }
 }

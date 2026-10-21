@@ -13,7 +13,8 @@
 //!   and the byte budget hold, prove a REFUSED payload was not marked seen
 //!   (it is admitted and applied on re-gossip, exactly once), then prove the
 //!   same for a saturated `SyncResponse` batch (frontier marks only what was
-//!   really queued; re-delivery converges without double application).
+//!   really queued; Applied requires DAG insertion, and re-delivery converges
+//!   without double application).
 //! * C — `ba02_*`: a peer that never reads cannot grow its outbound queue
 //!   past the cap; the server refuses instead of buffering; a normal peer
 //!   stays fully served during the storm; after the slow peer resumes, a new
@@ -39,7 +40,7 @@ use aether_unified::p2p::{
     P2P_PROTOCOL_VERSION, STAKE_CHANNEL_CAPACITY_MSGS, TX_INGRESS_CAPACITY_BYTES,
     TX_INGRESS_CAPACITY_MSGS,
 };
-use aether_unified::sync_stats::SyncContext;
+use aether_unified::sync_stats::{PageState, SyncContext};
 use aether_unified::transaction::{Transaction, Vote, DEFAULT_NETWORK_ID, VOTE_FORMAT_VERSION};
 use aether_unified::transport::{
     BoxFuture, PeerAddr, TcpTransport, Transport, TransportError, TransportListener,
@@ -520,20 +521,26 @@ async fn ba01_ingress_saturation_refuses_visibly_and_recovers() {
     // page hangs off the pre-seeded base tip so partition_batch delivers it.
     // ------------------------------------------------------------------
     let pages: Vec<Vec<Transaction>> = (0..3).map(|p| chain_from(base_tip, 20 + p, 100)).collect();
+    let admitted_registered: Vec<[u8; 32]> = pages[0].iter().take(32).map(|tx| tx.id).collect();
+    let refused_registered: Vec<[u8; 32]> = pages[2]
+        .iter()
+        .skip(56)
+        .take(32)
+        .map(|tx| tx.id)
+        .collect();
     // Frontier marks are only recorded for ids the node actually requested.
     // Register 64 (the in-flight cap): 32 admitted in page 1, and 32 in page
     // 3's refused tail (indices 56..88). If marks were recorded BEFORE
-    // admission, the refused tail would show up as applied.
+    // admission, the refused tail would show up as received.
     {
         let peer = sock_of(&p1);
         let mut frontier = h.sync_ctx.frontier.write().await;
-        for tx in pages[0]
+        for id in admitted_registered
             .iter()
-            .take(32)
-            .chain(pages[2].iter().skip(56).take(32))
+            .chain(refused_registered.iter())
+            .cloned()
         {
-            let id = tx.id.to_vec();
-            assert!(frontier.add_pending(id.clone()));
+            assert!(frontier.add_pending(id.to_vec()));
             assert!(frontier.mark_requested(&id, peer));
         }
     }
@@ -560,37 +567,73 @@ async fn ba01_ingress_saturation_refuses_visibly_and_recovers() {
         h.net.ingress_reserved_bytes() <= limits.tx_ingress_bytes,
         "sync ingress stays inside the byte budget"
     );
-    // Only the 32 registered ids that were admitted may be marked applied;
-    // the 32 registered ids refused with page 3's tail must stay unapplied.
-    assert_eq!(
-        h.sync_ctx.frontier.read().await.applied_count(),
-        32,
-        "refused sync items must NOT be marked as applied"
-    );
+    // Queue admission is not DAG insertion: the 32 registered ids that were
+    // admitted are Received, while the 32 refused with page 3's tail remain
+    // Requested. Neither set may be marked Applied yet.
+    {
+        let frontier = h.sync_ctx.frontier.read().await;
+        for id in &admitted_registered {
+            assert_eq!(frontier.entry_state(id), Some(PageState::Received));
+        }
+        for id in &refused_registered {
+            assert_eq!(frontier.entry_state(id), Some(PageState::Requested));
+        }
+        assert_eq!(
+            frontier.applied_count(),
+            0,
+            "queue admission must NOT be marked as applied"
+        );
+    }
 
     assert_eq!(drain_ingress(&mut h.rx, &mut applied, &mut duplicates), 256);
     assert_eq!(h.net.ingress_reserved_bytes(), 0);
 
+    // Model the production drainer: only the payloads really inserted into
+    // the DAG become Applied. The refused tail was never dequeued.
+    {
+        let mut frontier = h.sync_ctx.frontier.write().await;
+        for id in &admitted_registered {
+            assert!(frontier.mark_applied(id));
+        }
+    }
+    assert_eq!(h.sync_ctx.frontier.read().await.applied_count(), 32);
+    {
+        let frontier = h.sync_ctx.frontier.read().await;
+        for id in &refused_registered {
+            assert_eq!(frontier.entry_state(id), Some(PageState::Requested));
+        }
+    }
+
     // Re-deliver page 3 (the saturated one): the 44 refused items are
-    // admitted, the 56 already-applied ones are re-delivered duplicates the
+    // admitted, the 56 already-inserted items are re-delivered duplicates the
     // funnel rejects. Final state: 300 sync txs applied once.
     let third: Vec<Vec<u8>> = pages[2]
         .iter()
         .map(|t| bincode::serialize(t).unwrap())
         .collect();
     p1.send(&P2PMessage::SyncResponse(third)).await;
-    wait_for(
-        "re-delivered page admitted",
-        Duration::from_secs(10),
-        || async { h.rx.len() == 100 && h.sync_ctx.frontier.read().await.applied_count() == 64 },
-    )
+    wait_for("re-delivered page admitted", Duration::from_secs(10), || async {
+        h.rx.len() == 100
+            && {
+                let frontier = h.sync_ctx.frontier.read().await;
+                refused_registered
+                    .iter()
+                    .all(|id| frontier.entry_state(id) == Some(PageState::Received))
+            }
+    })
     .await;
     let newly = drain_ingress(&mut h.rx, &mut applied, &mut duplicates);
     assert_eq!(newly, 44, "exactly the refused tail is new");
+    {
+        let mut frontier = h.sync_ctx.frontier.write().await;
+        for id in &refused_registered {
+            assert!(frontier.mark_applied(id));
+        }
+    }
     assert_eq!(
         h.sync_ctx.frontier.read().await.applied_count(),
         64,
-        "the re-admitted tail is now marked applied (32 + 32)"
+        "the re-admitted tail is now applied (32 + 32)"
     );
     println!(
         "BA01 ingress_msgs={} ingress_bytes={} drops_total={} applied={} dup={} reserved_after=0",
