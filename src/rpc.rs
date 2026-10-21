@@ -485,6 +485,30 @@ pub struct Mempool {
     pub stats: MempoolStats,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MempoolEnqueueError {
+    FeeTooLow { provided: u64, minimum: u64 },
+    CachedRejection,
+    AlreadyQueued,
+    Full,
+}
+
+impl MempoolEnqueueError {
+    fn into_rpc_error(self) -> RpcError {
+        match self {
+            Self::FeeTooLow { provided, minimum } => {
+                RpcError(format!("Insufficient fee: {} < minimum {}", provided, minimum))
+            }
+            Self::CachedRejection | Self::AlreadyQueued => {
+                RpcError("Duplicate transaction".to_string())
+            }
+            Self::Full => {
+                RpcError("Mempool full (consider higher fee for priority)".to_string())
+            }
+        }
+    }
+}
+
 impl Mempool {
     /// Create new mempool with max size and minimum fee
     pub fn new(max_size: usize, max_concurrent: usize) -> Self {
@@ -531,6 +555,16 @@ impl Mempool {
         min_fee: u64,
         mode: ValidationMode,
     ) -> Result<(), RpcError> {
+        self.try_enqueue_with_mode(tx, min_fee, mode)
+            .map_err(MempoolEnqueueError::into_rpc_error)
+    }
+
+    pub fn try_enqueue_with_mode(
+        &mut self,
+        tx: Transaction,
+        min_fee: u64,
+        mode: ValidationMode,
+    ) -> Result<(), MempoolEnqueueError> {
         // Gate order: fee (economic) → permanent-reject cache → in-queue
         // dedup → capacity (backpressure, TRANSIENT: the drainer empties the
         // queue). The pure gate (PoW + signature) and the in-DAG dedup run in
@@ -541,31 +575,29 @@ impl Mempool {
         // Economic validation: check minimum fee
         if tx.fee < min_fee {
             self.stats.rejected.fetch_add(1, Ordering::Relaxed);
-            return Err(RpcError(format!(
-                "Insufficient fee: {} < minimum {}",
-                tx.fee, min_fee
-            )));
+            return Err(MempoolEnqueueError::FeeTooLow {
+                provided: tx.fee,
+                minimum: min_fee,
+            });
         }
 
         // Permanently rejected ids are cached: no infinite retries.
         if self.recent_rejects_set.contains(&tx.id) {
             self.stats.duplicate.fetch_add(1, Ordering::Relaxed);
-            return Err(RpcError("Duplicate transaction".to_string()));
+            return Err(MempoolEnqueueError::CachedRejection);
         }
 
         // In-queue dedup.
         if self.queue.iter().any(|t| t.id == tx.id) {
             self.stats.duplicate.fetch_add(1, Ordering::Relaxed);
-            return Err(RpcError("Duplicate transaction".to_string()));
+            return Err(MempoolEnqueueError::AlreadyQueued);
         }
 
         // PHASE D: capacity is a BACKPRESSURE bound, not a permanent dead-end
         // (the Phase C root cause was a full window that never drained).
         if self.queue.len() >= self.max_size {
             self.stats.rejected.fetch_add(1, Ordering::Relaxed);
-            return Err(RpcError(
-                "Mempool full (consider higher fee for priority)".to_string(),
-            ));
+            return Err(MempoolEnqueueError::Full);
         }
 
         self.queue.push_back(tx.clone());
@@ -1198,6 +1230,7 @@ impl AetherRpcImpl {
                 .stats
                 .rejected
                 .fetch_add(1, Ordering::Relaxed);
+            self.mark_sync_rejected(&tx.id).await;
             return Err(RpcError(e.to_string()));
         }
 
@@ -1213,6 +1246,7 @@ impl AetherRpcImpl {
                     .stats
                     .duplicate
                     .fetch_add(1, Ordering::Relaxed);
+                self.mark_sync_applied_existing(&tx.id).await;
                 return Err(RpcError("Duplicate transaction".to_string()));
             }
         }
@@ -1241,14 +1275,21 @@ impl AetherRpcImpl {
         // PHASE 3B (C1/H1): record the caller mode with the queued tx so the
         // drainer later evaluates it under ITS ingress policy (live = Fresh,
         // sync/orphan/reload = Historical), never under a blanket mode.
+        self.mark_sync_received_external(&tx.id).await;
         let enqueue_result = self
             .mempool
             .write()
             .await
-            .enqueue_with_mode(tx.clone(), min_fee, mode);
+            .try_enqueue_with_mode(tx.clone(), min_fee, mode);
         if let Err(e) = enqueue_result {
-            tracing::warn!("❌ Mempool enqueue rejected: {}", e);
-            return Err(e);
+            tracing::warn!("❌ Mempool enqueue rejected: {:?}", e);
+            if matches!(
+                e,
+                MempoolEnqueueError::FeeTooLow { .. } | MempoolEnqueueError::CachedRejection
+            ) {
+                self.mark_sync_rejected(&tx.id).await;
+            }
+            return Err(e.into_rpc_error());
         }
         // 💾 Persist the pending tx (removed on its terminal disposition)
         if let Ok(storage) = self.storage.try_read() {
@@ -1657,13 +1698,19 @@ impl AetherRpcImpl {
             .fetch_max(total_now, Ordering::Relaxed);
     }
 
-    /// A DAG duplicate is resolved but did not grow the DAG.
-    async fn mark_sync_applied_existing(&self, tx_id: &TransactionId) {
+    async fn mark_sync_received_external(&self, tx_id: &TransactionId) {
         self.sync_ctx
             .frontier
             .write()
             .await
-            .mark_applied_existing(tx_id);
+            .mark_received_external(tx_id);
+    }
+
+    /// A DAG duplicate is resolved but did not grow the DAG.
+    async fn mark_sync_applied_existing(&self, tx_id: &TransactionId) {
+        let mut frontier = self.sync_ctx.frontier.write().await;
+        let _ = frontier.mark_received_external(tx_id);
+        frontier.mark_applied_existing(tx_id);
     }
 
     async fn mark_sync_rejected(&self, tx_id: &TransactionId) {

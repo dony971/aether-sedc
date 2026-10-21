@@ -17123,17 +17123,10 @@ mod phase4cat_e2e_integrity_tests {
             tokio::spawn(async move {
                 while let Some(item) = tx_receiver.recv().await {
                     let tx = item.into_tx();
-                    let tx_id = tx.id;
                     let ingress_mode = sync_ctx.take_ingress_mode(tx.id).await;
                     match rpc.process_transaction(tx, "P2P", ingress_mode).await {
                         Ok(_) => rpc.process_orphans().await,
-                        Err(_) => {
-                            sync_ctx
-                                .frontier
-                                .write()
-                                .await
-                                .mark_rejected(&tx_id);
-                        }
+                        Err(_) => {}
                     }
                 }
             });

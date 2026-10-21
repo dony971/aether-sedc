@@ -436,6 +436,24 @@ impl SyncFrontier {
         true
     }
 
+    pub fn mark_received_external(&mut self, hash: &[u8]) -> bool {
+        let entry = match self.entries.get_mut(hash) {
+            Some(e) => e,
+            None => return false,
+        };
+        if entry.state != PageState::Pending && entry.state != PageState::Requested {
+            return false;
+        }
+        entry.state = PageState::Received;
+        entry.last_updated = Instant::now();
+        entry.peer = None;
+        self.inflight.remove(hash);
+        if let Some(pos) = self.pending.iter().position(|h| h.as_slice() == hash) {
+            self.pending.remove(pos);
+        }
+        true
+    }
+
     /// Mark a received hash as applied (inserted into DAG). This is the terminal
     /// success state — the hash is now resolved and will never be re-requested.
     pub fn mark_applied(&mut self, hash: &[u8]) -> bool {
@@ -475,14 +493,16 @@ impl SyncFrontier {
     /// Mark a request as rejected (bad data, peer error, timeout).
     /// The hash goes back to Pending if retries remain, otherwise stays Rejected.
     pub fn mark_rejected(&mut self, hash: &[u8]) -> bool {
-        // Remove from inflight
-        self.inflight.remove(hash);
         let entry = match self.entries.get_mut(hash) {
             Some(e) => e,
             None => return false,
         };
+        if entry.state == PageState::Applied || entry.state == PageState::Rejected {
+            return false;
+        }
         entry.state = PageState::Rejected;
         entry.last_updated = Instant::now();
+        self.inflight.remove(hash);
         self.pages_rejected += 1;
         true
     }
@@ -853,6 +873,55 @@ mod tests {
         assert!(f.mark_applied(&h));
         assert_eq!(f.applied_count(), 1);
         assert!(f.last_progress().is_some());
+    }
+
+    #[test]
+    fn test_frontier_external_delivery_promotes_pending_without_page_count() {
+        let mut f = SyncFrontier::new();
+        let h = vec![7u8; 32];
+        f.add_pending(h.clone());
+        assert!(f.mark_received_external(&h));
+        assert_eq!(f.pending_count(), 0);
+        assert_eq!(f.inflight_count(), 0);
+        assert_eq!(f.entry_state(&h), Some(PageState::Received));
+        assert_eq!(f.snapshot().pages_received, 0);
+        assert!(f.mark_applied(&h));
+        assert_eq!(f.entry_state(&h), Some(PageState::Applied));
+    }
+
+    #[test]
+    fn test_frontier_external_delivery_promotes_requested_and_clears_inflight() {
+        let mut f = SyncFrontier::new();
+        let h = vec![8u8; 32];
+        f.add_pending(h.clone());
+        assert!(f.mark_requested(&h, addr(1)));
+        assert!(f.mark_received_external(&h));
+        assert_eq!(f.inflight_count(), 0);
+        assert_eq!(f.entry_state(&h), Some(PageState::Received));
+        assert_eq!(f.snapshot().pages_requested, 1);
+        assert_eq!(f.snapshot().pages_received, 0);
+        assert!(!f.mark_received_external(&h));
+    }
+
+    #[test]
+    fn test_frontier_rejection_never_overwrites_applied_or_recounts() {
+        let mut f = SyncFrontier::new();
+        let applied = vec![3u8; 32];
+        f.add_pending(applied.clone());
+        f.mark_requested(&applied, addr(1));
+        f.mark_received(&applied);
+        f.mark_applied(&applied);
+        assert!(!f.mark_rejected(&applied));
+        assert_eq!(f.entry_state(&applied), Some(PageState::Applied));
+
+        let rejected = vec![4u8; 32];
+        f.add_pending(rejected.clone());
+        f.mark_requested(&rejected, addr(1));
+        f.mark_received(&rejected);
+        assert!(f.mark_rejected(&rejected));
+        assert!(!f.mark_rejected(&rejected));
+        assert_eq!(f.entry_state(&rejected), Some(PageState::Rejected));
+        assert_eq!(f.snapshot().pages_rejected, 1);
     }
 
     #[test]

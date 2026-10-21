@@ -889,7 +889,6 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             // 4CP-BA: taking the item releases its ingress byte reservation
             // (the permit rides inside the queued item).
             let tx = item.into_tx();
-            let tx_id = tx.id;
             // PHASE 3B (C1/H1): consume the ingress provenance recorded by
             // the P2P layer (live relay = Fresh, sync backfill = Historical;
             // absent = Historical = pre-3B behavior) and forward it as THE
@@ -922,11 +921,6 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                     rpc_impl.process_orphans().await;
                 }
                 Err(e) => {
-                    sync_ctx_for_p2p
-                        .frontier
-                        .write()
-                        .await
-                        .mark_rejected(&tx_id);
                     tracing::warn!("❌ P2P transaction rejected: {}", e);
                 }
             }

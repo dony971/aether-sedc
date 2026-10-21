@@ -291,15 +291,12 @@ async fn boot_node(port: u16, dir: &std::path::Path) -> Node {
     let consumer = tokio::spawn(async move {
         while let Some(item) = tx_receiver.recv().await {
             let tx = item.into_tx();
-            let tx_id = tx.id;
             let mode = consumer_ctx.take_ingress_mode(tx.id).await;
             match consumer_rpc.process_transaction(tx, "P2P", mode).await {
                 Ok(_) => {
                     consumer_rpc.process_orphans().await;
                 }
-                Err(_) => {
-                    consumer_ctx.frontier.write().await.mark_rejected(&tx_id);
-                }
+                Err(_) => {}
             }
         }
     });
