@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
@@ -647,6 +647,20 @@ pub const SESSION_QUEUE_CAPACITY_MSGS: usize = 64;
 /// large sync page is never refused for lack of budget on an idle queue.
 pub const SESSION_QUEUE_CAPACITY_BYTES: usize = 32 * 1024 * 1024;
 
+/// 4CP-BK: process-wide cap on memory accounted to outbound session frames.
+///
+/// The per-session byte budget alone permits `MAX_PEERS * 32 MiB` of logical
+/// queue capacity. This budget is shared by every session, so queue growth is
+/// bounded even when many peers stall at once. Each frame is charged for the
+/// payload plus the peak writer buffers (see `OutboundBudget::charge`); the
+/// charge is held until the writer has finished with the frame, not merely
+/// until it is dequeued.
+///
+/// 512 MiB is one eighth of the 128 × 32 MiB worst-case logical capacity and
+/// admits 16 maximum-size frames under the 2× charge. It bounds stalled-peer
+/// memory without reducing the existing per-session limits or progress.
+pub const OUTBOUND_GLOBAL_CAPACITY_BYTES: usize = 512 * 1024 * 1024;
+
 /// 4CP-BA: the effective queue bounds, exposed for diagnostics and tests
 /// (single source of truth: the constants above).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -656,6 +670,7 @@ pub struct QueueLimits {
     pub session_msgs: usize,
     pub session_bytes: usize,
     pub stake_msgs: usize,
+    pub outbound_global_bytes: usize,
 }
 
 // --- Peer Scoring ---
@@ -3036,16 +3051,94 @@ impl IngressTx {
     }
 }
 
+/// 4CP-BK: process-wide byte accounting for outbound session frames.
+///
+/// The budget is charged at admission and is held by the queued frame until
+/// the writer is done with it. Unlike a counter that is decremented manually
+/// after `write_all`, the permit is released by `Drop`, so timeout, I/O error,
+/// receiver teardown and task abort all return the charge exactly once.
+///
+/// Scope: frames admitted to a session queue (queued and in the writer's
+/// hands). Serialization buffers and the pre-admission fan-out clones made by
+/// `broadcast_transaction`/`broadcast_stake` are not charged here; they are
+/// short-lived, bounded by `MAX_MESSAGE_SIZE` and `MAX_PROPAGATION_FANOUT`,
+/// and every refused frame remains recoverable by the normal sync paths.
+struct OutboundBudget {
+    capacity: usize,
+    available: Arc<Semaphore>,
+    /// Global-budget refusals (diagnostics only; never drives a decision).
+    refusals: AtomicU64,
+}
+
+impl OutboundBudget {
+    fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            capacity,
+            available: Arc::new(Semaphore::new(capacity)),
+            refusals: AtomicU64::new(0),
+        })
+    }
+
+    /// Bytes accounted for one payload.
+    ///
+    /// The writer holds the serialized payload (until padding), then the
+    /// padded plaintext and the ciphertext while encrypting. The peak writer
+    /// allocation is `padded_plaintext + ciphertext`; twice this frame's padded
+    /// bucket covers that peak with the protocol overhead included. The charge
+    /// is deliberately conservative: it bounds resident memory, not wire
+    /// bytes, while the per-session budget continues to account wire bytes.
+    fn charge(payload_bytes: usize) -> Option<usize> {
+        P2PNetwork::padded_total_len(payload_bytes)?.checked_mul(2)
+    }
+
+    fn try_acquire(&self, charge: usize) -> Option<OwnedSemaphorePermit> {
+        let amount = match u32::try_from(charge) {
+            Ok(amount) => amount,
+            Err(_) => {
+                self.refusals.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+        match self.available.clone().try_acquire_many_owned(amount) {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                self.refusals.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    fn reserved_bytes(&self) -> usize {
+        self.capacity
+            .saturating_sub(self.available.available_permits())
+    }
+
+    fn refusals(&self) -> u64 {
+        self.refusals.load(Ordering::Relaxed)
+    }
+}
+
+/// 4CP-BK: one outbound payload plus the byte reservations that keep it
+/// resident. The frame owns both permits; dropping it (after the write, on
+/// any error, or when an unconsumed queue is torn down) releases the session
+/// and global reservations together.
+struct OutboundFrame {
+    bytes: Vec<u8>,
+    _session_permit: OwnedSemaphorePermit,
+    _global_permit: OwnedSemaphorePermit,
+}
+
 /// 4CP-BA: the send half of one peer session's outbound queue, together
 /// with that session's byte budget.
 ///
 /// Every producer that used to hold a bare `mpsc::UnboundedSender<Vec<u8>>`
 /// now holds this: `try_send` reserves the message's bytes against the
-/// session budget (and refuses when the queue is full in count OR bytes),
-/// the session's writer task releases them after the write attempt through
-/// its own budget/reservation handles. Saturation is therefore a property of
-/// the *refusing producer*; the writer stays a plain bounded-channel
-/// consumer.
+/// session budget and the node-wide outbound budget (and refuses when the
+/// queue is full in count OR either byte budget is exhausted). The
+/// reservations travel inside the queued frame and are released only when
+/// the writer drops it, after the write attempt. Saturation is therefore a
+/// property of the *refusing producer*; the writer stays a plain
+/// bounded-channel consumer.
 ///
 /// What happens on refusal is each producer's policy (see the send sites):
 /// gossip, sync responses/requests and PEX are droppable because the native
@@ -3053,28 +3146,38 @@ impl IngressTx {
 /// re-derives them; nothing that is refused is recorded as delivered.
 #[derive(Clone)]
 pub struct PeerSink {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<OutboundFrame>,
     budget: Arc<Semaphore>,
-    reserved: Arc<AtomicUsize>,
+    global: Arc<OutboundBudget>,
     drops: Arc<AtomicU64>,
     addr: SocketAddr,
 }
 
 impl PeerSink {
     /// Create one session's sink plus its receiver. The shared `drops`
-    /// counter is the node-wide session-refusal gauge (diagnostics only).
-    fn pair(addr: SocketAddr, drops: Arc<AtomicU64>) -> (PeerSink, mpsc::Receiver<Vec<u8>>) {
+    /// counter is the node-wide session-refusal gauge (diagnostics only);
+    /// `global` is the budget shared by every session of the network.
+    fn pair_with_budget(
+        addr: SocketAddr,
+        drops: Arc<AtomicU64>,
+        global: Arc<OutboundBudget>,
+    ) -> (PeerSink, mpsc::Receiver<OutboundFrame>) {
         let (tx, rx) = mpsc::channel(SESSION_QUEUE_CAPACITY_MSGS);
         (
             PeerSink {
                 tx,
                 budget: Arc::new(Semaphore::new(SESSION_QUEUE_CAPACITY_BYTES)),
-                reserved: Arc::new(AtomicUsize::new(0)),
+                global,
                 drops,
                 addr,
             },
             rx,
         )
+    }
+
+    #[cfg(test)]
+    fn pair(addr: SocketAddr, drops: Arc<AtomicU64>) -> (PeerSink, mpsc::Receiver<OutboundFrame>) {
+        Self::pair_with_budget(addr, drops, test_outbound_budget())
     }
 
     /// Address this session belongs to (diagnostics + tests).
@@ -3083,8 +3186,10 @@ impl PeerSink {
     }
 
     /// Bytes currently reserved for queued (not yet written-out) messages.
+    /// This includes the message the writer is currently encrypting/writing;
+    /// it returns to zero only when that frame is dropped.
     pub fn queued_bytes(&self) -> usize {
-        self.reserved.load(Ordering::Relaxed)
+        SESSION_QUEUE_CAPACITY_BYTES.saturating_sub(self.budget.available_permits())
     }
 
     /// 4CP-AS (F1): identity-scoped ownership check for `peers` /
@@ -3094,30 +3199,48 @@ impl PeerSink {
         self.tx.same_channel(&other.tx)
     }
 
-    /// Non-blocking handoff to this session's writer. Reserves the byte
-    /// budget first; on any refusal the reservation is released and the
-    /// caller decides the recovery story. Never blocks, never awaits.
+    /// Non-blocking handoff to this session's writer. Reserves the session
+    /// and global byte budgets first; on any refusal every local reservation
+    /// is released and the caller decides the recovery story. Never blocks,
+    /// never awaits.
     fn try_send(&self, bytes: Vec<u8>) -> Result<(), ()> {
         let n = bytes.len();
-        let permit = match self.budget.clone().try_acquire_many_owned(n as u32) {
-            Ok(p) => p,
+        let charge = match OutboundBudget::charge(n) {
+            Some(charge) => charge,
+            None => {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+                return Err(());
+            }
+        };
+        let session_permit = match self.budget.clone().try_acquire_many_owned(n as u32) {
+            Ok(permit) => permit,
             Err(_) => {
                 self.drops.fetch_add(1, Ordering::Relaxed);
                 return Err(());
             }
         };
-        match self.tx.try_send(bytes) {
-            Ok(()) => {
-                permit.forget();
-                self.reserved.fetch_add(n, Ordering::Relaxed);
-                Ok(())
-            }
+        let global_permit = match self.global.try_acquire(charge) {
+            Some(permit) => permit,
+            None => return Err(()),
+        };
+        let frame = OutboundFrame {
+            bytes,
+            _session_permit: session_permit,
+            _global_permit: global_permit,
+        };
+        match self.tx.try_send(frame) {
+            Ok(()) => Ok(()),
             Err(_) => {
                 self.drops.fetch_add(1, Ordering::Relaxed);
                 Err(())
             }
         }
     }
+}
+
+#[cfg(test)]
+fn test_outbound_budget() -> Arc<OutboundBudget> {
+    OutboundBudget::new(OUTBOUND_GLOBAL_CAPACITY_BYTES)
 }
 
 /// PHASE 4G: node-supplied stake hooks for the P2P layer. Both behind
@@ -3397,6 +3520,10 @@ pub struct P2PNetwork {
     /// 4CP-BA: node-wide count of session-queue refusals (all sessions).
     /// Diagnostics only — never drives a decision.
     session_drops: Arc<AtomicU64>,
+    /// 4CP-BK: node-wide outbound frame memory budget shared by every
+    /// session. Admission reserves from it; the queued frame owns the permit
+    /// until the writer drops it.
+    outbound_budget: Arc<OutboundBudget>,
     /// Phase 2A: addresses with an outbound dial in flight. The initial sweep,
     /// heartbeat, redial loop and PEX can all reach `connect_to_peer` for the
     /// same address concurrently; without this guard a peer gets two sessions
@@ -3526,6 +3653,7 @@ impl P2PNetwork {
             transport: Arc::new(TcpTransport::new()),
             peers: Arc::new(RwLock::new(HashMap::new())),
             session_drops: Arc::new(AtomicU64::new(0)),
+            outbound_budget: OutboundBudget::new(OUTBOUND_GLOBAL_CAPACITY_BYTES),
             dialing: Arc::new(RwLock::new(HashSet::new())),
             outbound_sessions: Arc::new(RwLock::new(HashMap::new())),
             addresses: Arc::new(RwLock::new(AddressManager::new())),
@@ -4196,6 +4324,7 @@ impl P2PNetwork {
         let tx_budget = Arc::clone(&self.tx_budget);
         let tx_drops = Arc::clone(&self.ingress_drops);
         let session_drops = Arc::clone(&self.session_drops);
+        let outbound_budget = Arc::clone(&self.outbound_budget);
         let get_dag_hashes = Arc::clone(&self.get_dag_hashes);
         let get_transaction_by_hash = Arc::clone(&self.get_transaction_by_hash);
         let get_tips = Arc::clone(&self.get_tips);
@@ -4241,6 +4370,7 @@ impl P2PNetwork {
                 tx_budget,
                 tx_drops,
                 session_drops,
+                outbound_budget,
                 get_dag_hashes,
                 get_transaction_by_hash,
                 get_tips,
@@ -5094,6 +5224,7 @@ impl P2PNetwork {
         tx_budget: Arc<Semaphore>,
         tx_drops: Arc<AtomicU64>,
         session_drops: Arc<AtomicU64>,
+        outbound_budget: Arc<OutboundBudget>,
         get_dag_hashes: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
         get_transaction_by_hash: Arc<dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync>,
         get_tips: Arc<dyn Fn() -> Vec<Vec<u8>> + Send + Sync>,
@@ -5179,8 +5310,11 @@ impl P2PNetwork {
                         }
                     }
                     info!("New peer connected: {}", addr);
-                    let (msg_sender, msg_receiver) =
-                        PeerSink::pair(addr, Arc::clone(&session_drops));
+                    let (msg_sender, msg_receiver) = PeerSink::pair_with_budget(
+                        addr,
+                        Arc::clone(&session_drops),
+                        Arc::clone(&outbound_budget),
+                    );
                     {
                         let mut peers = peers.write().await;
                         peers.insert(addr, msg_sender.clone());
@@ -5835,7 +5969,7 @@ impl P2PNetwork {
         seen_transactions: Arc<RwLock<HashMap<Vec<u8>, SeenTxEntry>>>,
         propagation_state: Arc<RwLock<PropagationState>>,
         msg_sender: PeerSink,
-        msg_receiver: mpsc::Receiver<Vec<u8>>,
+        msg_receiver: mpsc::Receiver<OutboundFrame>,
         peer_discovery_tx: mpsc::UnboundedSender<SocketAddr>,
         sync_ctx: Arc<SyncContext>,
         is_orphan: Arc<dyn Fn(&[u8]) -> bool + Send + Sync>,
@@ -5980,21 +6114,21 @@ impl P2PNetwork {
         // the closure, and the captured `writer`/`msg_receiver` are dropped —
         // the socket is released and no task is created.
         let send_admission = Arc::clone(&admission);
-        // 4CP-BA: the writer is the sole RELEASER of this session's byte
-        // budget. Every message taken out of the queue (whatever its fate)
-        // returns its reservation, so `queued_bytes` measures real memory.
+        // 4CP-BK: the writer drops the frame, and dropping it is what returns
+        // both the session and node-wide byte reservations. This remains
+        // correct on every exit path: normal write, timeout, I/O error,
+        // encryption failure, receiver teardown and task abort.
         // It must NOT hold a clone of the Sender: that self-reference would
         // keep the channel open forever, so a read-loop teardown (EOF,
         // protocol violation) would never close the socket's write half.
-        let release_budget = Arc::clone(&msg_sender.budget);
-        let release_reserved = Arc::clone(&msg_sender.reserved);
-        let release = move |n: usize| {
-            release_reserved.fetch_sub(n, Ordering::Relaxed);
-            release_budget.add_permits(n);
-        };
         let _ = Self::admit_task(&send_admission, move |_generation| async move {
-            while let Some(msg) = msg_receiver.recv().await {
-                let msg_len = msg.len();
+            while let Some(frame) = msg_receiver.recv().await {
+                let OutboundFrame {
+                    bytes,
+                    _session_permit,
+                    _global_permit,
+                } = frame;
+                let msg_len = bytes.len();
                 let cipher = {
                     let key = Key::from_slice(key_enc.as_ref());
                     ChaCha20Poly1305::new(key)
@@ -6003,26 +6137,32 @@ impl P2PNetwork {
                 // encrypting, so the clear `total_len` reveals only the
                 // bucket. The pad length travels inside the AEAD, so it is
                 // authenticated and invisible until decryption.
-                let padded = match Self::pad_message(msg.as_ref()) {
+                let padded = match Self::pad_message(bytes.as_ref()) {
                     Some(p) => p,
                     None => {
                         // Unreachable for any realistic message: the ceiling
                         // is one bucket below the 16 MiB receiver bound.
                         warn!(
                             "Dropping message of {} bytes to {}: exceeds padded frame limit",
-                            msg.len(),
-                            addr
+                            msg_len, addr
                         );
-                        release(msg_len);
                         continue;
                     }
                 };
+                // The serialized payload is no longer needed once padding has
+                // copied it. Drop it before encryption so resident memory is
+                // bounded by padded plaintext + ciphertext, which is exactly
+                // the peak covered by the global charge.
+                drop(bytes);
                 let nonce_val =
                     send_counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let nonce_bytes = Self::build_nonce(nonce_val, send_dir_task);
                 let nonce = Nonce::from_slice(&nonce_bytes);
                 match cipher.encrypt(nonce, padded.as_ref()) {
                     Ok(ciphertext) => {
+                        // Encryption has copied the plaintext into the AEAD
+                        // output; release the padded buffer before the write.
+                        drop(padded);
                         let total_len = 12 + ciphertext.len();
                         debug_assert_eq!(
                             total_len % FRAME_PAD_BUCKET,
@@ -6031,7 +6171,7 @@ impl P2PNetwork {
                         );
                         debug_assert_eq!(
                             Some(total_len),
-                            Self::padded_total_len(msg.len()),
+                            Self::padded_total_len(msg_len),
                             "padded frame length must match the declared layout"
                         );
                         // 4CP-Y (X-4): bound every write. A peer that stops
@@ -6048,27 +6188,21 @@ impl P2PNetwork {
                         .await;
                         match write {
                             Ok(Ok(())) => {}
-                            Ok(Err(_)) => {
-                                release(msg_len);
-                                break;
-                            }
+                            Ok(Err(_)) => break,
                             Err(_) => {
                                 warn!(
                                     "Dropping session with {}: write timed out after {:?}",
                                     addr, SESSION_WRITE_TIMEOUT
                                 );
-                                release(msg_len);
                                 break;
                             }
                         }
                     }
                     Err(e) => {
                         warn!("Encryption failed for {}: {:?}", addr, e);
-                        release(msg_len);
                         break;
                     }
                 }
-                release(msg_len);
             }
         });
 
@@ -7100,8 +7234,11 @@ impl P2PNetwork {
         {
             Ok(Ok(stream)) => {
                 info!("Connected to peer: {}", addr);
-                let (msg_sender, msg_receiver) =
-                    PeerSink::pair(addr, Arc::clone(&self.session_drops));
+                let (msg_sender, msg_receiver) = PeerSink::pair_with_budget(
+                    addr,
+                    Arc::clone(&self.session_drops),
+                    Arc::clone(&self.outbound_budget),
+                );
                 {
                     let mut peers = self.peers.write().await;
                     peers.insert(addr, msg_sender.clone());
@@ -7460,6 +7597,20 @@ impl P2PNetwork {
         self.session_drops.load(Ordering::Relaxed)
     }
 
+    /// Bytes currently reserved by queued-but-not-yet-written outbound
+    /// frames, across every session. Includes the frame each writer is still
+    /// working on. Never exceeds [`OUTBOUND_GLOBAL_CAPACITY_BYTES`].
+    pub fn outbound_reserved_bytes(&self) -> usize {
+        self.outbound_budget.reserved_bytes()
+    }
+
+    /// Outbound frames refused because the node-wide outbound budget was
+    /// exhausted. Kept separate from [`Self::session_drops`] so operators can
+    /// tell a local queue limit from global backpressure.
+    pub fn outbound_budget_drops(&self) -> u64 {
+        self.outbound_budget.refusals()
+    }
+
     /// Bytes currently reserved by queued-but-not-yet-consumed ingress
     /// transactions. Never exceeds [`TX_INGRESS_CAPACITY_BYTES`].
     pub fn ingress_reserved_bytes(&self) -> usize {
@@ -7486,6 +7637,7 @@ impl P2PNetwork {
             session_msgs: SESSION_QUEUE_CAPACITY_MSGS,
             session_bytes: SESSION_QUEUE_CAPACITY_BYTES,
             stake_msgs: STAKE_CHANNEL_CAPACITY_MSGS,
+            outbound_global_bytes: OUTBOUND_GLOBAL_CAPACITY_BYTES,
         }
     }
 
@@ -12133,6 +12285,8 @@ mod tests {
         assert!(MAX_MSGS_PER_SEC >= 1);
         assert!(MAX_PEERS >= 1);
         assert!(MAX_INV_ITEMS >= 1);
+        assert!(OUTBOUND_GLOBAL_CAPACITY_BYTES > SESSION_QUEUE_CAPACITY_BYTES);
+        assert!(OUTBOUND_GLOBAL_CAPACITY_BYTES >= 2 * MAX_MESSAGE_SIZE);
     }
 
     /// H4/V-24: handshake identity check — a peer from another network
@@ -12965,7 +13119,7 @@ mod phase2_privacy_propagation_tests {
     /// what actually went on the wire.
     async fn network_with_peers(
         addrs: &[SocketAddr],
-    ) -> (P2PNetwork, Vec<mpsc::Receiver<Vec<u8>>>) {
+    ) -> (P2PNetwork, Vec<mpsc::Receiver<OutboundFrame>>) {
         let (tx_channel, _rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
         let p2p = P2PNetwork::new(
             P2PConfig::default(),
@@ -12986,7 +13140,7 @@ mod phase2_privacy_propagation_tests {
     }
 
     /// Drain everything a peer received since the last call.
-    fn drain(rx: &mut mpsc::Receiver<Vec<u8>>) -> usize {
+    fn drain(rx: &mut mpsc::Receiver<OutboundFrame>) -> usize {
         let mut n = 0;
         while rx.try_recv().is_ok() {
             n += 1;
@@ -16370,7 +16524,7 @@ mod phase4cpas_stale_cleanup_tests {
         identity: Option<Arc<NodeIdentity>>,
         is_initiator: bool,
         own_sender: PeerSink,
-        own_receiver: mpsc::Receiver<Vec<u8>>,
+        own_receiver: mpsc::Receiver<OutboundFrame>,
     ) {
         let (pdtx, _pdrx) = mpsc::unbounded_channel();
         P2PNetwork::handle_peer(
@@ -16487,7 +16641,7 @@ mod phase4cpas_stale_cleanup_tests {
         entry.try_send(vec![9]).unwrap();
         drop(guard);
         assert_eq!(
-            newer_rx.try_recv().unwrap(),
+            newer_rx.try_recv().unwrap().bytes,
             vec![9],
             "the surviving channel is still live"
         );
@@ -16538,7 +16692,7 @@ mod phase4cpas_stale_cleanup_tests {
         assert!(entry.same_channel(&newer_sender));
         entry.try_send(vec![7]).unwrap();
         drop(guard);
-        assert_eq!(newer_rx.try_recv().unwrap(), vec![7]);
+        assert_eq!(newer_rx.try_recv().unwrap().bytes, vec![7]);
         server.abort();
     }
 
@@ -17468,5 +17622,123 @@ mod phase4cat_e2e_integrity_tests {
         }
         let persisted = node.storage.read().await.get_transaction(tx.id);
         assert!(persisted.is_ok(), "accepted tx persisted to Sled");
+    }
+}
+
+/// 4CP-BK: the outbound byte budget is shared by every session, charged at
+/// admission and held until the frame is done, not merely until dequeue.
+#[cfg(test)]
+mod phase4cpbk_outbound_budget_tests {
+    use super::*;
+
+    fn pair_with(global: &Arc<OutboundBudget>) -> (PeerSink, mpsc::Receiver<OutboundFrame>) {
+        PeerSink::pair_with_budget(
+            "127.0.0.1:1".parse().unwrap(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(global),
+        )
+    }
+
+    #[test]
+    fn bk01_global_budget_is_shared_and_released_by_the_frame() {
+        let payload = vec![0x5A; 4096];
+        let charge = OutboundBudget::charge(payload.len()).expect("charge");
+        let global = OutboundBudget::new(charge * 2);
+        let (a, mut a_rx) = pair_with(&global);
+        let (b, b_rx) = pair_with(&global);
+
+        a.try_send(payload.clone()).expect("a admitted");
+        assert_eq!(global.reserved_bytes(), charge);
+        assert_eq!(a.queued_bytes(), payload.len());
+
+        b.try_send(payload.clone()).expect("b admitted");
+        assert_eq!(global.reserved_bytes(), charge * 2);
+
+        assert!(
+            a.try_send(payload.clone()).is_err(),
+            "global budget is shared, not per session"
+        );
+        assert_eq!(global.refusals(), 1);
+
+        let in_flight = a_rx.try_recv().expect("a frame dequeued");
+        assert_eq!(
+            global.reserved_bytes(),
+            charge * 2,
+            "dequeue must NOT release the charge: the writer still holds it"
+        );
+        assert_eq!(
+            a.queued_bytes(),
+            payload.len(),
+            "queued_bytes includes the in-flight frame"
+        );
+        drop(in_flight);
+        assert_eq!(global.reserved_bytes(), charge);
+        assert_eq!(a.queued_bytes(), 0);
+
+        a.try_send(payload.clone()).expect("a admitted after release");
+        assert_eq!(global.reserved_bytes(), charge * 2);
+
+        drop(a_rx);
+        drop(b_rx);
+        assert_eq!(
+            global.reserved_bytes(),
+            0,
+            "dropping unconsumed queues releases every reservation"
+        );
+    }
+
+    #[test]
+    fn bk02_per_session_count_limit_is_unchanged() {
+        let payload = vec![0x11; 32];
+        let global = OutboundBudget::new(OUTBOUND_GLOBAL_CAPACITY_BYTES);
+        let (sink, rx) = pair_with(&global);
+
+        for _ in 0..SESSION_QUEUE_CAPACITY_MSGS {
+            sink.try_send(payload.clone()).expect("admitted under limits");
+        }
+        assert_eq!(
+            sink.queued_bytes(),
+            SESSION_QUEUE_CAPACITY_MSGS * payload.len()
+        );
+        assert!(
+            sink.try_send(payload).is_err(),
+            "the per-session message count bound is unchanged"
+        );
+        assert!(
+            global.reserved_bytes() < OUTBOUND_GLOBAL_CAPACITY_BYTES,
+            "the refusal came from the session, not the global budget"
+        );
+        assert_eq!(global.refusals(), 0);
+        drop(rx);
+        assert_eq!(global.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn bk03_charge_covers_the_peak_writer_buffers() {
+        for payload_bytes in [1, 100, 1024, 16 * 1024, 1024 * 1024] {
+            let frame_bytes = P2PNetwork::padded_total_len(payload_bytes).expect("frame fits");
+            let charge = OutboundBudget::charge(payload_bytes).expect("charge");
+            assert_eq!(
+                charge,
+                frame_bytes * 2,
+                "the charge is two frame buckets"
+            );
+            let padded_plaintext = frame_bytes - NONCE_LEN - AEAD_TAG_LEN;
+            let ciphertext = padded_plaintext + AEAD_TAG_LEN;
+            let peak_after_payload_drop = padded_plaintext + ciphertext;
+            assert!(
+                charge >= peak_after_payload_drop,
+                "writer peak ({peak_after_payload_drop}) exceeds charge ({charge})"
+            );
+        }
+        assert_eq!(
+            OUTBOUND_GLOBAL_CAPACITY_BYTES / (2 * MAX_MESSAGE_SIZE),
+            16,
+            "the global budget still admits at least 16 maximum-size frames"
+        );
+        assert!(
+            OutboundBudget::charge(MAX_MESSAGE_SIZE).is_none(),
+            "a payload that cannot be emitted is never charged"
+        );
     }
 }

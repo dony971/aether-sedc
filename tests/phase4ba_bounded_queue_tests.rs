@@ -37,8 +37,8 @@
 use aether_unified::genesis::GENESIS_HASH;
 use aether_unified::p2p::{
     IngressTx, P2PConfig, P2PMessage, P2PNetwork, P2PProtocolMode, StakePayload,
-    P2P_PROTOCOL_VERSION, STAKE_CHANNEL_CAPACITY_MSGS, TX_INGRESS_CAPACITY_BYTES,
-    TX_INGRESS_CAPACITY_MSGS,
+    OUTBOUND_GLOBAL_CAPACITY_BYTES, P2P_PROTOCOL_VERSION, STAKE_CHANNEL_CAPACITY_MSGS,
+    TX_INGRESS_CAPACITY_BYTES, TX_INGRESS_CAPACITY_MSGS,
 };
 use aether_unified::sync_stats::{PageState, SyncContext};
 use aether_unified::transaction::{Transaction, Vote, DEFAULT_NETWORK_ID, VOTE_FORMAT_VERSION};
@@ -669,6 +669,11 @@ async fn ba02_slow_peer_outbound_queue_is_bounded_and_recovers() {
     let mut normal = RawPeer::connect(PORT).await;
     wait_peers(&h.net, 2).await;
     let limits = h.net.queue_limits();
+    assert_eq!(
+        limits.outbound_global_bytes, OUTBOUND_GLOBAL_CAPACITY_BYTES,
+        "BK global budget is wired into the production limits"
+    );
+    assert!(limits.outbound_global_bytes > limits.session_bytes);
 
     // Normal peer sends a transaction; it must reach ingress even while the
     // slow peer's session is being saturated.
@@ -700,6 +705,10 @@ async fn ba02_slow_peer_outbound_queue_is_bounded_and_recovers() {
                     "session queue bytes {} exceed bound {}",
                     q,
                     limits.session_bytes
+                );
+                assert!(
+                    h.net.outbound_reserved_bytes() <= limits.outbound_global_bytes,
+                    "global outbound accounting exceeds its bound"
                 );
             }
         }
@@ -779,17 +788,29 @@ async fn ba02_slow_peer_outbound_queue_is_bounded_and_recovers() {
     assert!(h.net.session_queued_bytes(sock_of(&fresh)).await.is_some());
 
     println!(
-        "BA02 requests={} pages_first={} max_session_bytes={} bound_bytes={} drops={} sessions_after=2",
+        "BA02 requests={} pages_first={} max_session_bytes={} bound_bytes={} drops={} global_drops={} global_reserved={} sessions_after=2",
         requests,
         first_pages.len(),
         max_slow_queue,
         limits.session_bytes,
-        h.net.session_drops()
+        h.net.session_drops(),
+        h.net.outbound_budget_drops(),
+        h.net.outbound_reserved_bytes()
+    );
+    assert_eq!(
+        h.net.outbound_budget_drops(),
+        0,
+        "BA02 saturation is session-local, not global"
     );
 
     drop(normal);
     drop(fresh);
     h.net.shutdown().await.expect("shutdown");
+    assert_eq!(
+        h.net.outbound_reserved_bytes(),
+        0,
+        "shutdown releases every outbound reservation"
+    );
 }
 
 /// The raw peer's local address is not exposed by `RawPeer`; the session map
