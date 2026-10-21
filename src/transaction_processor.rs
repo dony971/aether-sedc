@@ -1199,24 +1199,40 @@ impl TransactionProcessor {
         dag: &Arc<RwLock<DAG>>,
         ledger: &Arc<RwLock<Ledger>>,
     ) -> Result<(), ProcessingError> {
-        {
-            let mut dag = match dag.try_write() {
-                Ok(l) => l,
-                Err(e) => return Err(ProcessingError::LockError(format!("DAG lock: {}", e))),
-            };
-            if dag.transactions().contains_key(&tx.id) {
-                return Ok(());
-            }
-            if let Err(e) = dag.add_transaction_validated(tx.clone()) {
-                return Err(ProcessingError::DagError(format!("DAG add failed: {}", e)));
-            }
+        let mut dag = match dag.try_write() {
+            Ok(l) => l,
+            Err(e) => return Err(ProcessingError::LockError(format!("DAG lock: {}", e))),
+        };
+        if dag.transactions().contains_key(&tx.id) {
+            return Ok(());
         }
-        if let Some(storage) = ledger.read().await.storage() {
+        if let Err(e) = dag.add_transaction_validated(tx.clone()) {
+            return Err(ProcessingError::DagError(format!("DAG add failed: {}", e)));
+        }
+        let storage = { ledger.read().await.storage() };
+        if let Some(storage) = storage {
             let storage_read = storage.read().await;
             if let Err(e) = storage_read.put_transaction(&tx) {
-                tracing::error!("❌ INC-01: failed to persist recovery tx to Sled: {}", e);
+                let durable_row = matches!(storage_read.transaction_exists(tx.id), Ok(true));
+                if !durable_row {
+                    dag.remove_transaction(&tx.id);
+                    dag.rebuild_tips();
+                    tracing::error!("❌ INC-01: failed to persist recovery tx to Sled: {}", e);
+                    drop(storage_read);
+                    drop(dag);
+                    return Err(ProcessingError::PersistenceError(format!(
+                        "Recovery transaction persist failed: {}",
+                        e
+                    )));
+                }
+                tracing::warn!(
+                    "⚠️ INC-01: recovery put failed but the durable row exists: {} ({})",
+                    hex::encode(&tx.id[..8]),
+                    e
+                );
             }
         }
+        drop(dag);
         tracing::info!(
             "🔁 INC-01 recovery insert (ledger ahead of DAG): {}",
             hex::encode(&tx.id[..8])
