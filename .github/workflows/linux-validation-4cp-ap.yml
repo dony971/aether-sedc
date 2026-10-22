@@ -203,6 +203,227 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "$n: 4/4 formula tests passed"
 
+      # 4CP-BV: engine-only capacity. This measures the real
+      # TransactionProcessor::process path against fresh Sled/ledger state.
+      # It deliberately excludes P2P, propagation jitter and PoW generation,
+      # so it must never be presented as Aether network throughput.
+      - name: 4CP-BV engine-only processing (release)
+        if: always()
+        run: |
+          n=phase4bv; log=/tmp/$n.log; set +e
+          cargo test --test phase4bv_engine_only_tests engine_only_processing --release -- --exact --nocapture --test-threads=1 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          mapfile -t metrics < <(grep -aE 'BENCH_JSONL:' "$log" || true)
+          {
+            echo ""
+            echo "### 4CP-BV engine-only processing (release)"
+            echo ""
+            echo '```jsonl'
+          } >> "$GITHUB_STEP_SUMMARY"
+          bad=0
+          for line in "${metrics[@]}"; do
+            json="${line#*BENCH_JSONL:}"
+            if ! python3 -c 'import json,sys; json.loads(sys.argv[1])' "$json" 2>/dev/null; then
+              bad=1
+              echo "::error::$n invalid BENCH_JSONL JSON: $line"
+              continue
+            fi
+            printf '%s\n' "$json" >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::BENCH_JSONL:$json"
+          done
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ "$c" -ne 0 ]; then
+            echo "::error::$n failed on Linux (exit $c)"
+            grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done
+            exit "$c"
+          fi
+          if [ "${#metrics[@]}" -eq 0 ]; then
+            echo "::error::$n produced no BENCH_JSONL measurement"
+            exit 1
+          fi
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::$n published invalid BENCH_JSONL data"
+            exit 1
+          fi
+          : > "/tmp/$n.jsonl"
+          for line in "${metrics[@]}"; do printf '%s\n' "${line#*BENCH_JSONL:}" >> "/tmp/$n.jsonl"; done
+          if ! python3 - "$n" "/tmp/$n.jsonl" <<'PY'
+          import json
+          import os
+          import statistics
+          import sys
+
+          label, path = sys.argv[1], sys.argv[2]
+          rows = [json.loads(line) for line in open(path, encoding="utf-8")]
+          reps = [r for r in rows if r.get("record_type") == "repetition"]
+          aggs = [r for r in rows if r.get("record_type") == "aggregate"]
+          expected_reps = 5
+          per_rep = 300
+          expected_total = expected_reps * per_rep
+
+          def fail(message):
+              print(f"{label}: {message}", file=sys.stderr)
+              sys.exit(1)
+
+          def check_identity(where, record):
+              applied = record["transactions_applied"]
+              total = record["total_duration_us"]
+              if total <= 0:
+                  fail(f"{where}: total_duration_us is not positive")
+              expected_tps = applied / (total / 1_000_000.0)
+              expected_mean = total / applied
+              if abs(record["applied_tps"] - expected_tps) > 1e-6:
+                  fail(f"{where}: applied_tps is not applied / (total_duration_us / 1e6)")
+              if abs(record["mean_duration_us"] - expected_mean) > 1e-6:
+                  fail(f"{where}: mean_duration_us is not total_duration_us / applied")
+              if abs(record["applied_tps"] * record["mean_duration_us"] - 1_000_000.0) > 1e-3:
+                  fail(f"{where}: throughput * mean duration is not 1e6")
+              samples = record["sample_duration_us"]
+              if len(samples) != record["latency_samples"]:
+                  fail(f"{where}: latency_samples does not match raw samples")
+              if any(sample <= 0 for sample in samples):
+                  fail(f"{where}: non-positive raw duration sample")
+              sample_sum = sum(samples)
+              if sample_sum > total:
+                  fail(f"{where}: raw sample sum exceeds total duration")
+              if record["sample_duration_sum_us"] != sample_sum:
+                  fail(f"{where}: sample_duration_sum_us does not match raw samples")
+              if record["total_minus_sample_sum_us"] != total - sample_sum:
+                  fail(f"{where}: total_minus_sample_sum_us is inconsistent")
+              if abs(record["tps_mean_identity_error"]) > 1e-6:
+                  fail(f"{where}: tps_mean_identity_error is not zero")
+
+          if any(r.get("schema_version") != 5 for r in rows):
+              fail("unexpected schema_version")
+          if len({r.get("sha") for r in rows}) != 1:
+              fail("inconsistent SHA across records")
+          if len(reps) != expected_reps or len(aggs) != 1:
+              fail(f"expected {expected_reps} repetitions and 1 aggregate, got {len(reps)} and {len(aggs)}")
+          if sorted(r["repetition"] for r in reps) != list(range(1, expected_reps + 1)):
+              fail("repetition ids are not 1..5")
+
+          for r in reps:
+              if r.get("scenario") != "engine_only_processing":
+                  fail(f"repetition {r.get('repetition')}: unexpected scenario")
+              if r.get("transactions_per_repetition") != per_rep:
+                  fail(f"repetition {r.get('repetition')}: wrong transactions_per_repetition")
+              if r.get("generation_included_in_rates") is not False:
+                  fail(f"repetition {r.get('repetition')}: generation included in rates")
+              if r.get("includes_p2p") is not False or r.get("includes_propagation_jitter") is not False:
+                  fail(f"repetition {r.get('repetition')}: claims P2P/jitter inclusion")
+              if r.get("includes_generation") is not False or r.get("includes_setup") is not False:
+                  fail(f"repetition {r.get('repetition')}: claims generation/setup inclusion")
+              if r.get("includes_pow_validation") is not True or r.get("includes_signature_validation") is not True:
+                  fail(f"repetition {r.get('repetition')}: missing real validation scope")
+              if r.get("includes_storage_persistence") is not True:
+                  fail(f"repetition {r.get('repetition')}: missing storage persistence scope")
+              if not (
+                  r["transactions_submitted"] == r["transactions_applied"] == r["transactions_persisted"] == per_rep
+              ):
+                  fail(f"repetition {r.get('repetition')}: inconsistent submitted/applied/persisted counters")
+              if r["transactions_rejected"] != 0 or r["persistence_failures"] != 0 or r["duplicates_skipped"] != 0:
+                  fail(f"repetition {r.get('repetition')}: rejection/persistence/duplicate counter is not zero")
+              if r["latency_samples"] != per_rep or r["sample_duration_us"] is None:
+                  fail(f"repetition {r.get('repetition')}: missing raw per-transaction samples")
+              if r["ledger_nonce"] != per_rep or r["ledger_applied_count"] != per_rep:
+                  fail(f"repetition {r.get('repetition')}: ledger did not apply all transactions")
+              if r["sender_balance_end"] != 1_000_000_000 - per_rep * 1_001:
+                  fail(f"repetition {r.get('repetition')}: sender balance mismatch")
+              if r["receiver_balance_end"] != per_rep * 1_000:
+                  fail(f"repetition {r.get('repetition')}: receiver balance mismatch")
+              if r["fees_burned_end"] != per_rep:
+                  fail(f"repetition {r.get('repetition')}: fee burn mismatch")
+              if r["error_samples"]:
+                  fail(f"repetition {r.get('repetition')}: non-empty error samples")
+              for key in ("latency_min_us", "latency_p50_us", "latency_p95_us", "latency_p99_us", "latency_max_us"):
+                  if r[key] is None:
+                      fail(f"repetition {r.get('repetition')}: missing {key}")
+              if not (
+                  r["latency_min_us"] <= r["latency_p50_us"] <= r["latency_p95_us"]
+                  <= r["latency_p99_us"] <= r["latency_max_us"]
+              ):
+                  fail(f"repetition {r.get('repetition')}: latency percentiles are not monotone")
+              for key in (
+                  "rss_before_kb", "rss_under_load_peak_kb", "rss_after_kb",
+                  "rss_after_cleanup_kb", "rss_process_peak_kb",
+              ):
+                  if r[key] is None:
+                      fail(f"repetition {r.get('repetition')}: missing {key}")
+              check_identity(f"repetition {r.get('repetition')}", r)
+
+          agg = aggs[0]
+          if agg.get("scenario") != "engine_only_processing_aggregate" or agg.get("aggregate_scope") != "overall":
+              fail("unexpected aggregate scenario or scope")
+          if agg.get("repetitions_total") != expected_reps:
+              fail("aggregate repetitions_total mismatch")
+          if not (agg["transactions_submitted"] == agg["transactions_applied"] == agg["transactions_persisted"] == expected_total):
+              fail("aggregate counters are not 1500")
+          if agg["transactions_rejected"] != 0 or agg["persistence_failures"] != 0 or agg["duplicates_skipped"] != 0:
+              fail("aggregate rejection/persistence/duplicate counter is not zero")
+          if agg["latency_samples"] != expected_total or len(agg["sample_duration_us"]) != expected_total:
+              fail("aggregate is missing raw samples")
+          if agg["total_duration_us"] != sum(r["total_duration_us"] for r in reps):
+              fail("aggregate total_duration_us is not the sum of repetition totals")
+          if agg["ledger_nonce"] is not None or agg["sender_balance_end"] is not None:
+              fail("aggregate must not claim a single repetition's terminal ledger state")
+          if agg["error_samples"]:
+              fail("aggregate has non-empty error samples")
+          for key in (
+              "rss_before_kb", "rss_under_load_peak_kb", "rss_after_kb",
+              "rss_after_cleanup_kb", "rss_process_peak_kb",
+          ):
+              if agg[key] is None:
+                  fail(f"aggregate missing {key}")
+          check_identity("aggregate", agg)
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              tps_values = [r["applied_tps"] for r in reps]
+              tps_mean = sum(tps_values) / len(tps_values)
+              tps_cv = (statistics.stdev(tps_values) / tps_mean * 100.0) if len(tps_values) > 1 else 0.0
+              lines = [
+                  "",
+                  "### 4CP-BV engine-only processing summary",
+                  "",
+                  f"`sha={rows[0]['sha']}`; `TransactionProcessor::process` with fresh Sled/ledger/DAG/mempool per repetition; 300 transactions/repetition; 5 repetitions; PoW difficulty 20; one shared pre-generated transaction set. Engine-only excludes P2P, propagation jitter, receipt waiting and PoW generation. It is an engine-capacity measurement, not Aether network throughput.",
+                  "",
+                  "| repetition | applied | total duration (ms) | applied tx/s | mean (us) | p50 (us) | p95 (us) | p99 (us) | max (us) | RSS under-load peak (KiB) | VmHWM (KiB) |",
+                  "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+              ]
+              for r in reps:
+                  lines.append(
+                      f"| {r['repetition']} | {r['transactions_applied']} | {r['total_duration_us'] / 1000:.3f} | "
+                      f"{r['applied_tps']:.1f} | {r['mean_duration_us']:.2f} | {r['latency_p50_us']} | "
+                      f"{r['latency_p95_us']} | {r['latency_p99_us']} | {r['latency_max_us']} | "
+                      f"{r['rss_under_load_peak_kb']} | {r['rss_process_peak_kb']} |"
+                  )
+              lines.append(
+                  f"| **aggregate** | **{agg['transactions_applied']}** | **{agg['total_duration_us'] / 1000:.3f}** | "
+                  f"**{agg['applied_tps']:.1f}** | **{agg['mean_duration_us']:.2f}** | **{agg['latency_p50_us']}** | "
+                  f"**{agg['latency_p95_us']}** | **{agg['latency_p99_us']}** | **{agg['latency_max_us']}** | "
+                  f"**{agg['rss_under_load_peak_kb']}** | **{agg['rss_process_peak_kb']}** |"
+              )
+              lines += [
+                  "",
+                  f"Mean repetition throughput: `{tps_mean:.1f} tx/s`; observed coefficient of variation: `{tps_cv:.1f}%` ({min(tps_values):.1f}–{max(tps_values):.1f} tx/s).",
+                  "",
+                  "`applied_tps = applied / (total_duration_us / 1_000_000)`; `mean_duration_us = total_duration_us / applied`; `applied_tps * mean_duration_us = 1_000_000` (checked to 1e-3). The raw per-transaction samples are published in `sample_duration_us`; their sum is slightly below the wall-clock total because the total also includes loop/await overhead. PoW generation/signing and storage setup are excluded from all rates.",
+                  "",
+                  "This engine-only result does not replace or reinterpret the 4CP-BS/BT end-to-end measurements, which retain P2P and the 20–250 ms privacy jitter. The earlier 4CP-BU `113 µs/tx` figure timed validate/DAG/Sled record stages without the full ledger/processor path; the engine-only record above is the reproducible replacement for that figure.",
+                  "",
+                  "RSS is whole-process RSS: engine-only harness, shared transaction set, fresh Sled database and ledger. `rss_under_load_peak_kb` is current VmRSS sampled at 1 ms during the measured loop; `rss_process_peak_kb` is lifetime VmHWM and includes earlier work in the same test process. Successive repetitions share one process, so this is not a per-repetition leak measurement.",
+              ]
+              with open(summary, "a", encoding="utf-8") as fh:
+                  fh.write("\n".join(lines) + "\n")
+
+          print(f"{label}: schema v5 validated ({len(reps)} repetitions, {agg['latency_samples']} raw samples)")
+          PY
+          then
+            echo "::error::$n expected BENCH_JSONL records are missing or inconsistent"
+            exit 1
+          fi
+          echo "$n: ${#metrics[@]} measurement(s) published"
+
       # 4CP-BO/BQ: release-mode performance baseline (JSONL schema v2).
       # Publish every valid BENCH_JSONL record in the step summary and as a
       # notice annotation. Fail on cargo failure (preserving its exit code),
