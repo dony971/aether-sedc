@@ -168,10 +168,10 @@ jobs:
         if: always()
         run: cargo build --bins
 
-      # 4CP-BO: release-mode performance baseline. Publish every valid
-      # BENCH_JSONL record in the step summary and as a notice annotation.
-      # Fail on cargo failure (preserving its exit code), invalid JSON, or no
-      # measurement at all.
+      # 4CP-BO/BQ: release-mode performance baseline (JSONL schema v2).
+      # Publish every valid BENCH_JSONL record in the step summary and as a
+      # notice annotation. Fail on cargo failure (preserving its exit code),
+      # invalid JSON, missing measurements, or an inconsistent record set.
       - name: 4CP-BO performance baseline (release)
         if: always()
         run: |
@@ -208,6 +208,42 @@ jobs:
           fi
           if [ "$bad" -ne 0 ]; then
             echo "::error::$n published invalid BENCH_JSONL data"
+            exit 1
+          fi
+          : > "/tmp/$n.jsonl"
+          for line in "${metrics[@]}"; do printf '%s\n' "${line#BENCH_JSONL:}" >> "/tmp/$n.jsonl"; done
+          if ! python3 - "$n" "/tmp/$n.jsonl" <<'PY'
+          import json
+          import sys
+
+          label, path = sys.argv[1], sys.argv[2]
+          rows = [json.loads(line) for line in open(path, encoding="utf-8")]
+          reps = [r for r in rows if r.get("record_type") == "repetition"]
+          aggs = [r for r in rows if r.get("record_type") == "aggregate"]
+          if any(r.get("schema_version") != 2 for r in rows):
+              print(f"{label}: unexpected schema_version", file=sys.stderr)
+              sys.exit(1)
+          if len({r.get("sha") for r in rows}) != 1:
+              print(f"{label}: inconsistent SHA across records", file=sys.stderr)
+              sys.exit(1)
+          if len(reps) != 3 or len(aggs) != 1:
+              print(f"{label}: expected 3 repetitions and 1 aggregate, got {len(reps)} and {len(aggs)}", file=sys.stderr)
+              sys.exit(1)
+          for r in reps:
+              if not (r["transactions_submitted"] == r["transactions_received"] == r["transactions_applied"] == 100):
+                  print(f"{label}: inconsistent counters in repetition {r.get('repetition')}", file=sys.stderr)
+                  sys.exit(1)
+              if r["transactions_rejected"] != 0 or r["latency_samples"] != 100:
+                  print(f"{label}: rejected or missing samples in repetition {r.get('repetition')}", file=sys.stderr)
+                  sys.exit(1)
+          agg = aggs[0]
+          if agg["transactions_applied"] != 300 or agg["latency_samples"] != 300:
+              print(f"{label}: aggregate sample count is not 300", file=sys.stderr)
+              sys.exit(1)
+          print(f"{label}: schema v2 validated ({len(reps)} repetitions, {agg['latency_samples']} latency samples)")
+          PY
+          then
+            echo "::error::$n expected BENCH_JSONL records are missing or inconsistent"
             exit 1
           fi
           echo "$n: ${#metrics[@]} measurement(s) published"
