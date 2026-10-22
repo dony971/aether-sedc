@@ -1166,6 +1166,470 @@ jobs:
           fi
           echo "$n: ${#metrics[@]} measurement(s) published"
 
+      # 4CP-BY: release-mode full TransactionProcessor::process ledger-apply
+      # comparison (JSONL schema v8). 2 topologies x 2 jitter profiles x 2
+      # offered loads x 3 repetitions = 24 independent ledger/storage states.
+      # Publish every record, validate applied/persisted/economic/persistent
+      # invariants, and summarise paired topology deltas.
+      - name: 4CP-BY full ledger apply (release)
+        if: always()
+        run: |
+          n=phase4by; log=/tmp/$n.log; set +e
+          cargo test --test phase4by_ledger_apply_benchmark_tests by01_ledger_apply --features test-jitter-control --release -- --exact --nocapture --test-threads=1 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          mapfile -t metrics < <(grep -aE 'BENCH_JSONL:' "$log" || true)
+          {
+            echo ""
+            echo "### 4CP-BY full ledger apply (release)"
+            echo ""
+            echo '```jsonl'
+          } >> "$GITHUB_STEP_SUMMARY"
+          bad=0
+          for line in "${metrics[@]}"; do
+            json="${line#*BENCH_JSONL:}"
+            if ! python3 -c 'import json,sys; json.loads(sys.argv[1])' "$json" 2>/dev/null; then
+              bad=1
+              echo "::error::$n invalid BENCH_JSONL JSON: $line"
+              continue
+            fi
+            printf '%s\n' "$json" >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::BENCH_JSONL:$json"
+          done
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ "$c" -ne 0 ]; then
+            echo "::error::$n failed on Linux (exit $c)"
+            grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile|TIMEOUT" "$log" | tail -n 12 | while IFS= read -r l; do echo "::error::$l"; done
+            exit "$c"
+          fi
+          if [ "${#metrics[@]}" -eq 0 ]; then
+            echo "::error::$n produced no BENCH_JSONL measurement"
+            exit 1
+          fi
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::$n published invalid BENCH_JSONL data"
+            exit 1
+          fi
+          : > "/tmp/$n.jsonl"
+          for line in "${metrics[@]}"; do printf '%s\n' "${line#*BENCH_JSONL:}" >> "/tmp/$n.jsonl"; done
+          if ! python3 - "$n" "/tmp/$n.jsonl" <<'PY'
+          import json
+          import os
+          import sys
+
+          label, path = sys.argv[1], sys.argv[2]
+          rows = [json.loads(line) for line in open(path, encoding="utf-8")]
+          reps = [r for r in rows if r.get("record_type") == "repetition"]
+          cells = [r for r in rows if r.get("record_type") == "cell_aggregate"]
+          overalls = [r for r in rows if r.get("record_type") == "overall_aggregate"]
+
+          profiles = {"none_0_0": (0, 0), "20_250": (20, 250)}
+          rates = (550, 1000)
+          layouts = {
+              "chain": ("single_wallet_single_parent_chain", 1, 300, "chain_1x300_v2_ledger"),
+              "multi_lane": ("ten_independent_single_parent_lane_chains", 10, 30, "multi_lane_10x30_v2_ledger"),
+          }
+          expected_reps = len(layouts) * len(profiles) * len(rates) * 3
+          expected_cells = len(layouts) * len(profiles) * len(rates)
+          per_rep = 300
+          reps_per_cell = 3
+          initial_per_wallet = 1_000_000
+          fee_per_tx = 1
+
+          def fail(message):
+              print(f"{label}: {message}", file=sys.stderr)
+              sys.exit(1)
+
+          def check_rate(where, metric, numerator):
+              if metric["numerator"] != numerator:
+                  fail(f"{where}: rate numerator mismatch")
+              if metric["duration_us"] != metric["window_end_us"] - metric["window_start_us"]:
+                  fail(f"{where}: rate duration is not window end - start")
+              if metric["duration_us"] == 0:
+                  if metric["value"] is not None:
+                      fail(f"{where}: zero-duration rate is not null")
+              else:
+                  expected = numerator / (metric["duration_us"] / 1_000_000.0)
+                  if metric["value"] is None or abs(metric["value"] - expected) > 1e-6:
+                      fail(f"{where}: rate value is not numerator / duration")
+              if metric.get("unit") != "transactions_per_second":
+                  fail(f"{where}: unexpected rate unit")
+
+          def check_percentiles(where, record, prefix):
+              keys = [f"{prefix}_{name}_us" for name in ("p50", "p95", "p99")]
+              for key in keys:
+                  if record.get(key) is None:
+                      fail(f"{where}: missing {key}")
+              if not (
+                  record[f"{prefix}_p50_us"] <= record[f"{prefix}_p95_us"]
+                  <= record[f"{prefix}_p99_us"]
+              ):
+                  fail(f"{where}: {prefix} percentiles are not monotone")
+
+          def check_counters(where, record, expected):
+              for key in (
+                  "transactions_submitted", "transactions_received",
+                  "transactions_applied", "transactions_persisted",
+              ):
+                  if record[key] != expected:
+                      fail(f"{where}: {key} is not {expected}")
+              if record["transactions_applied"] != record["transactions_persisted"]:
+                  fail(f"{where}: applied and persisted counts diverge")
+              for key in (
+                  "transactions_rejected", "duplicates_received", "persistence_failures",
+                  "transaction_effect_mismatches", "unresolved_dependency_transactions",
+                  "parent_missing_count",
+              ):
+                  if record[key] != 0:
+                      fail(f"{where}: {key} is not zero")
+              for key in ("ingress_drops", "session_drops", "outbound_budget_drops"):
+                  if record.get(key, 0) != 0:
+                      fail(f"{where}: {key} is not zero")
+              for key in (
+                  "latency_samples", "propagation_samples", "dependency_wait_samples",
+                  "ledger_apply_samples", "end_to_end_samples",
+              ):
+                  if record[key] != expected:
+                      fail(f"{where}: {key} is not {expected}")
+              for key in ("dag_transaction_count", "storage_transaction_count", "applied_mark_count"):
+                  if record[key] != expected:
+                      fail(f"{where}: {key} is not {expected}")
+
+          def check_ledger(where, record, expected_initial, expected_txs):
+              expected_fees = expected_txs * fee_per_tx
+              if record["ledger_initial_supply"] != expected_initial:
+                  fail(f"{where}: initial supply mismatch")
+              if record["fees_burned"] != expected_fees or record["expected_fees_burned"] != expected_fees:
+                  fail(f"{where}: fee burn mismatch")
+              if record["ledger_final_supply"] != record["ledger_expected_final_supply"]:
+                  fail(f"{where}: final supply mismatch")
+              if record["ledger_expected_final_supply"] != expected_initial - expected_fees:
+                  fail(f"{where}: expected final supply mismatch")
+              for key in (
+                  "sender_nonce_mismatches", "sender_balance_mismatches",
+                  "receiver_balance_mismatches", "fee_burn_mismatches",
+                  "supply_mismatches", "storage_balance_mismatches",
+                  "storage_nonce_mismatches", "storage_applied_mismatches",
+                  "storage_row_mismatches",
+              ):
+                  if record[key] != 0:
+                      fail(f"{where}: {key} is not zero")
+              if record["persistent_reload_verified"] is not True:
+                  fail(f"{where}: persistent reload was not verified")
+              for key in (
+                  "persistent_balance_mismatches", "persistent_nonce_mismatches",
+                  "persistent_applied_mismatches", "persistent_supply_mismatches",
+                  "persistent_fee_mismatches", "persistent_transaction_count_mismatches",
+              ):
+                  if record[key] != 0:
+                      fail(f"{where}: {key} is not zero")
+
+          if any(r.get("schema_version") != 8 for r in rows):
+              fail("unexpected schema_version")
+          if len({r.get("sha") for r in rows}) != 1:
+              fail("inconsistent SHA across records")
+          if len(reps) != expected_reps or len(cells) != expected_cells or len(overalls) != 1:
+              fail(f"expected {expected_reps} repetitions, {expected_cells} cells and 1 overall aggregate, got {len(reps)}, {len(cells)} and {len(overalls)}")
+          if sorted(r["repetition"] for r in reps) != list(range(1, expected_reps + 1)):
+              fail("repetition ids are not 1..24")
+
+          seen_cells = set()
+          generation_by_topology = {}
+          for r in reps:
+              where = f"repetition {r.get('repetition')}"
+              topology = r.get("topology")
+              profile = r.get("profile_id")
+              target = r.get("target_offered_tps")
+              if topology not in layouts or profile not in profiles or target not in rates:
+                  fail(f"{where}: unknown topology, profile or target")
+              layout, lanes, per_lane, set_id = layouts[topology]
+              if (r["topology_layout"], r["lanes"], r["transactions_per_lane"]) != (layout, lanes, per_lane):
+                  fail(f"{where}: topology layout metadata mismatch")
+              if (
+                  r.get("transaction_set_id") != set_id
+                  or r.get("transaction_set") != "one_shared_pre_generated_valid_set_per_topology"
+                  or r.get("generation_scope") != "one_time_shared_pow_per_topology_before_all_repetitions"
+              ):
+                  fail(f"{where}: transaction-set metadata mismatch")
+              if r.get("generation_included_in_rates") is not False:
+                  fail(f"{where}: generation included in rates")
+              if r.get("pow_difficulty") != 20:
+                  fail(f"{where}: unexpected PoW difficulty")
+              if r.get("nodes") != 2 or r.get("nodes_in_same_process") is not True:
+                  fail(f"{where}: unexpected node scope")
+              window = profiles[profile]
+              if (r["jitter_min_ms"], r["jitter_max_ms"]) != window:
+                  fail(f"{where}: jitter window mismatch")
+              if r.get("scenario") != "by01_ledger_apply":
+                  fail(f"{where}: unexpected scenario")
+              if r.get("processing_path") != "transaction_processor_process_full_ledger_apply":
+                  fail(f"{where}: unexpected processing path")
+              if r.get("validation_mode") != "historical_pre_activation_fixture":
+                  fail(f"{where}: unexpected validation mode")
+              if r.get("min_fee_at_process") != 0:
+                  fail(f"{where}: unexpected process fee gate")
+              if r["target_submission_interval_us"] != 1_000_000 // target:
+                  fail(f"{where}: submission interval mismatch")
+              if r["topology_repetition"] not in (1, 2, 3):
+                  fail(f"{where}: cell repetition metadata mismatch")
+              for key in ("ingress_drops", "session_drops", "outbound_budget_drops", "ingress_queue_capacity_msgs"):
+                  if key not in r:
+                      fail(f"{where}: missing {key}")
+              if r["repetitions_total"] != reps_per_cell:
+                  fail(f"{where}: repetitions_total mismatch")
+              if r["transactions_per_repetition"] != per_rep:
+                  fail(f"{where}: wrong transactions_per_repetition")
+              previous_generation = generation_by_topology.setdefault(topology, r["generation_span_ms"])
+              if r["generation_span_ms"] != previous_generation:
+                  fail(f"{where}: generation span changed between repetitions")
+              check_counters(where, r, per_rep)
+              check_ledger(where, r, lanes * initial_per_wallet, per_rep)
+              if r["ingress_queue_capacity_msgs"] != 512:
+                  fail(f"{where}: unexpected ingress queue capacity")
+              if r["submission_start_us"] >= r["submission_end_us"]:
+                  fail(f"{where}: non-positive submission span")
+              if not (
+                  r["submission_start_us"] <= r["first_receipt_us"] <= r["last_receipt_us"]
+                  and r["first_receipt_us"] <= r["first_applied_us"] <= r["last_applied_us"]
+                  and r["first_applied_us"] <= r["first_persisted_us"] <= r["last_persisted_us"]
+                  and r["last_applied_us"] <= r["last_persisted_us"]
+                  and r["submission_end_us"] <= r["last_persisted_us"]
+              ):
+                  fail(f"{where}: inconsistent timestamp ordering")
+              if r["drain_ms"] != (r["last_applied_us"] - r["submission_end_us"]) // 1_000:
+                  fail(f"{where}: drain_ms mismatch")
+              if r["persisted_drain_ms"] != (r["last_persisted_us"] - r["submission_end_us"]) // 1_000:
+                  fail(f"{where}: persisted_drain_ms mismatch")
+              if r["offered_rate"]["window_start_us"] != r["submission_start_us"]:
+                  fail(f"{where}: offered window does not start at first submission")
+              if r["offered_rate"]["window_end_us"] != r["submission_end_us"]:
+                  fail(f"{where}: offered window does not end at last submission")
+              if r["reception_rate"]["window_start_us"] != r["first_receipt_us"] or r["reception_rate"]["window_end_us"] != r["last_receipt_us"]:
+                  fail(f"{where}: reception window mismatch")
+              if r["ledger_application_rate"]["window_start_us"] != r["first_applied_us"] or r["ledger_application_rate"]["window_end_us"] != r["last_applied_us"]:
+                  fail(f"{where}: ledger application window mismatch")
+              if r["persistence_rate"]["window_start_us"] != r["first_persisted_us"] or r["persistence_rate"]["window_end_us"] != r["last_persisted_us"]:
+                  fail(f"{where}: persistence window mismatch")
+              if r["completion_rate"]["window_start_us"] != r["submission_start_us"] or r["completion_rate"]["window_end_us"] != r["last_persisted_us"]:
+                  fail(f"{where}: completion window mismatch")
+              for name, metric in (
+                  ("offered", r["offered_rate"]),
+                  ("reception", r["reception_rate"]),
+                  ("ledger_application", r["ledger_application_rate"]),
+                  ("persistence", r["persistence_rate"]),
+                  ("completion", r["completion_rate"]),
+              ):
+                  check_rate(f"{where} {name}", metric, per_rep)
+              for prefix in (
+                  "propagation_latency", "dependency_wait_latency",
+                  "ledger_apply_latency", "end_to_end_latency",
+              ):
+                  check_percentiles(where, r, prefix)
+              series_len = r["backlog_sample_count"]
+              arrays = [
+                  r["backlog_series_ms"], r["backlog_series_submitted"],
+                  r["backlog_series_received"], r["backlog_series_applied"],
+                  r["backlog_series_persisted"], r["backlog_series_dependency_pending"],
+                  r["backlog_series_pending"], r["backlog_series_rss_kb"],
+              ]
+              if series_len == 0 or any(len(values) != series_len for values in arrays):
+                  fail(f"{where}: backlog series lengths disagree")
+              if any(a > b for a, b in zip(r["backlog_series_ms"], r["backlog_series_ms"][1:])):
+                  fail(f"{where}: backlog timestamps are not non-decreasing")
+              counts = (
+                  r["backlog_series_submitted"], r["backlog_series_received"],
+                  r["backlog_series_applied"], r["backlog_series_persisted"],
+              )
+              for name, values in zip(("submitted", "received", "applied", "persisted"), counts):
+                  if any(a > b for a, b in zip(values, values[1:])):
+                      fail(f"{where}: backlog {name} count is not non-decreasing")
+              pending_values = []
+              dependency_values = []
+              for submitted, received, applied, persisted, dependency, pending in zip(
+                  r["backlog_series_submitted"], r["backlog_series_received"],
+                  r["backlog_series_applied"], r["backlog_series_persisted"],
+                  r["backlog_series_dependency_pending"], r["backlog_series_pending"],
+              ):
+                  if received > submitted or applied > received or persisted > applied:
+                      fail(f"{where}: backlog counters are not ordered")
+                  if pending != submitted - applied:
+                      fail(f"{where}: pending is not submitted - applied")
+                  pending_values.append(pending)
+                  dependency_values.append(dependency)
+              if r["backlog_peak"] != max(pending_values):
+                  fail(f"{where}: backlog_peak is not the series maximum")
+              if r["backlog_peak_at_ms"] not in [
+                  at for at, pending in zip(r["backlog_series_ms"], pending_values)
+                  if pending == max(pending_values)
+              ]:
+                  fail(f"{where}: backlog_peak_at_ms does not identify the peak")
+              if r["dependency_pending_peak"] != max(dependency_values):
+                  fail(f"{where}: dependency pending peak mismatch")
+              if r["backlog_series_pending"][-1] != 0:
+                  fail(f"{where}: backlog did not drain")
+              if r["backlog_series_submitted"][-1] != per_rep or r["backlog_series_applied"][-1] != per_rep or r["backlog_series_persisted"][-1] != per_rep:
+                  fail(f"{where}: backlog series does not reach the full transaction count")
+              if sys.platform.startswith("linux"):
+                  for key in ("rss_before_load_kb", "rss_after_submissions_kb", "rss_under_load_peak_kb", "rss_after_cleanup_kb", "rss_process_peak_kb"):
+                      if r[key] is None:
+                          fail(f"{where}: missing {key}")
+              seen_cells.add((topology, profile, target, r["topology_repetition"]))
+
+          if len(seen_cells) != expected_reps:
+              fail("topology/profile/target/repetition combinations are not unique")
+
+          def check_aggregate(where, agg, expected_reps_count, total, expected_initial, topology=None, profile=None, target=None):
+              if agg.get("repetitions") != expected_reps_count:
+                  fail(f"{where}: repetitions mismatch")
+              if agg.get("transactions_per_repetition") != per_rep:
+                  fail(f"{where}: transactions_per_repetition mismatch")
+              check_counters(where, agg, total)
+              check_ledger(where, agg, expected_initial, total)
+              if topology is not None:
+                  layout, lanes, per_lane, _ = layouts[topology]
+                  if (
+                      agg["topology"] != topology or agg["topology_layout"] != layout
+                      or agg["lanes"] != lanes or agg["transactions_per_lane"] != per_lane
+                  ):
+                      fail(f"{where}: topology metadata mismatch")
+                  expected_scope = f"topology={topology},profile={profile},target_tps={target}"
+                  if agg["aggregate_scope"] != expected_scope:
+                      fail(f"{where}: aggregate scope mismatch")
+                  if agg["profile_id"] != profile or agg["target_offered_tps"] != target:
+                      fail(f"{where}: aggregate profile/target mismatch")
+                  if (agg["jitter_min_ms"], agg["jitter_max_ms"]) != profiles[profile]:
+                      fail(f"{where}: aggregate jitter window mismatch")
+              for prefix in (
+                  "propagation_latency", "dependency_wait_latency",
+                  "ledger_apply_latency", "end_to_end_latency",
+              ):
+                  check_percentiles(where, agg, prefix)
+              for key in ("drain_ms_mean", "drain_ms_max", "persisted_drain_ms_mean", "persisted_drain_ms_max"):
+                  if agg[key] is None:
+                      fail(f"{where}: missing {key}")
+              if not (0 <= agg["drain_ms_mean"] <= agg["drain_ms_max"]):
+                  fail(f"{where}: drain mean is outside [0,max]")
+              if not (0 <= agg["persisted_drain_ms_mean"] <= agg["persisted_drain_ms_max"]):
+                  fail(f"{where}: persisted drain mean is outside [0,max]")
+              for name, metric in (
+                  ("offered", agg["offered_rate"]),
+                  ("reception", agg["reception_rate"]),
+                  ("ledger_application", agg["ledger_application_rate"]),
+                  ("persistence", agg["persistence_rate"]),
+                  ("completion", agg["completion_rate"]),
+              ):
+                  check_rate(f"{where} {name}", metric, total)
+
+          cell_lookup = {}
+          for cell in cells:
+              key = (cell["topology"], cell["profile_id"], cell["target_offered_tps"])
+              if key in cell_lookup:
+                  fail("duplicate cell aggregate")
+              cell_lookup[key] = cell
+              members = [r for r in reps if (r["topology"], r["profile_id"], r["target_offered_tps"]) == key]
+              where = f"cell {key[0]}/{key[1]}/{key[2]}"
+              lanes = layouts[key[0]][1]
+              check_aggregate(where, cell, reps_per_cell, per_rep * reps_per_cell, lanes * reps_per_cell * initial_per_wallet, *key)
+              if len(members) != reps_per_cell:
+                  fail(f"{where}: wrong repetition count")
+              for metric_name, start_key, end_key in (
+                  ("offered_rate", "submission_start_us", "submission_end_us"),
+                  ("reception_rate", "first_receipt_us", "last_receipt_us"),
+                  ("ledger_application_rate", "first_applied_us", "last_applied_us"),
+                  ("persistence_rate", "first_persisted_us", "last_persisted_us"),
+                  ("completion_rate", "submission_start_us", "last_persisted_us"),
+              ):
+                  joined = sum(r[end_key] - r[start_key] for r in members)
+                  if cell[metric_name]["duration_us"] != joined:
+                      fail(f"{where}: {metric_name} duration is not the sum of repetitions")
+              if cell["latency_samples"] != per_rep * reps_per_cell:
+                  fail(f"{where}: wrong latency sample count")
+              if cell["drain_ms_max"] != max(r["drain_ms"] for r in members):
+                  fail(f"{where}: drain max mismatch")
+              if cell["persisted_drain_ms_max"] != max(r["persisted_drain_ms"] for r in members):
+                  fail(f"{where}: persisted drain max mismatch")
+              if cell["backlog_peak_max"] != max(r["backlog_peak"] for r in members):
+                  fail(f"{where}: backlog max mismatch")
+              if cell["dependency_pending_peak_max"] != max(r["dependency_pending_peak"] for r in members):
+                  fail(f"{where}: dependency pending max mismatch")
+              if cell["dag_transaction_count"] != per_rep * reps_per_cell:
+                  fail(f"{where}: DAG total mismatch")
+
+          if len(cell_lookup) != expected_cells:
+              fail("missing cell aggregate")
+
+          agg = overalls[0]
+          if agg.get("scenario") != "by01_ledger_apply_aggregate" or agg.get("aggregate_scope") != "overall":
+              fail("unexpected overall aggregate scenario or scope")
+          if agg["profile_id"] != "all" or agg["topology"] != "all" or agg["topology_layout"] != "all_topologies":
+              fail("overall aggregate claims a single topology/profile")
+          if agg["jitter_min_ms"] is not None or agg["jitter_max_ms"] is not None or agg["target_offered_tps"] is not None:
+              fail("overall aggregate claims a single jitter window or target")
+          overall_initial = sum(r["ledger_initial_supply"] for r in reps)
+          check_aggregate("overall", agg, expected_reps, per_rep * expected_reps, overall_initial)
+          for metric_name, start_key, end_key in (
+              ("offered_rate", "submission_start_us", "submission_end_us"),
+              ("reception_rate", "first_receipt_us", "last_receipt_us"),
+              ("ledger_application_rate", "first_applied_us", "last_applied_us"),
+              ("persistence_rate", "first_persisted_us", "last_persisted_us"),
+              ("completion_rate", "submission_start_us", "last_persisted_us"),
+          ):
+              joined = sum(r[end_key] - r[start_key] for r in reps)
+              if agg[metric_name]["duration_us"] != joined:
+                  fail(f"overall {metric_name} duration is not the sum of repetitions")
+          if agg["drain_ms_max"] != max(r["drain_ms"] for r in reps):
+              fail("overall drain max mismatch")
+          if agg["persisted_drain_ms_max"] != max(r["persisted_drain_ms"] for r in reps):
+              fail("overall persisted drain max mismatch")
+          if agg["backlog_peak_max"] != max(r["backlog_peak"] for r in reps):
+              fail("overall backlog max mismatch")
+          if agg["dependency_pending_peak_max"] != max(r["dependency_pending_peak"] for r in reps):
+              fail("overall dependency pending max mismatch")
+          if agg["dag_transaction_count"] != per_rep * expected_reps:
+              fail("overall DAG total mismatch")
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              lines = [
+                  "",
+                  "### 4CP-BY full ledger apply summary",
+                  "",
+                  f"`sha={rows[0]['sha']}`; 2 nodes in one process over loopback; 300 pre-generated valid transactions per repetition; 24 independent repetitions (2 topologies x 2 jitter profiles x 2 offered loads x 3); PoW difficulty 20; one shared transaction set per topology, generated once before all repetitions. Every timed transaction goes through `TransactionProcessor::process` with ledger transfer, nonce commit, DAG insertion, transaction-row write and applied-mark persistence. PoW generation is excluded.",
+                  "",
+                  "| profile | target tx/s | chain ledger tx/s | multi-lane ledger tx/s | delta % | chain completion tx/s | multi completion tx/s | chain e2e p50 (us) | multi e2e p50 (us) | chain dep-wait p50 (us) | multi dep-wait p50 (us) | chain backlog | multi backlog | chain RSS peak (KB) | multi RSS peak (KB) |",
+                  "|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+              ]
+              for profile in profiles:
+                  for target in rates:
+                      chain = cell_lookup[("chain", profile, target)]
+                      multi = cell_lookup[("multi_lane", profile, target)]
+                      c_tps = chain["ledger_application_rate"]["value"] or 0.0
+                      m_tps = multi["ledger_application_rate"]["value"] or 0.0
+                      pct = ((m_tps - c_tps) / c_tps * 100.0) if c_tps else float("nan")
+                      lines.append(
+                          f"| {profile} | {target} | {c_tps:.1f} | {m_tps:.1f} | {pct:+.1f}% | "
+                          f"{chain['completion_rate']['value'] or 0.0:.1f} | {multi['completion_rate']['value'] or 0.0:.1f} | "
+                          f"{chain['end_to_end_latency_p50_us']} | {multi['end_to_end_latency_p50_us']} | "
+                          f"{chain['dependency_wait_latency_p50_us']} | {multi['dependency_wait_latency_p50_us']} | "
+                          f"{chain['backlog_peak_max']} | {multi['backlog_peak_max']} | "
+                          f"{chain['rss_under_load_peak_max_kb']} | {multi['rss_under_load_peak_max_kb']} |"
+                      )
+              lines += [
+                  "",
+                  "`completion` includes the post-submission drain and is lower than the steady-state ledger-application rate. The no-jitter arm is a laboratory control, not a deployment recommendation. Differences here are workload-topology effects within this harness; they do not establish a general advantage for either topology. The timed path is not full node ingestion: RPC admission, mempool fee selection, orphan re-request and background flush are excluded, so these numbers are not directly interchangeable with 4CP-BX or production throughput.",
+                  "",
+                  "Limits: two-node loopback, no WAN loss/reordering, no adversarial observer, short 300-transaction repetitions, CI hardware, platform-specific storage and scheduling, and an explicit `test-jitter-control` build. These results characterise this harness only and are not a claim about Bitcoin or production.",
+              ]
+              with open(summary, "a", encoding="utf-8") as fh:
+                  fh.write("\n".join(lines) + "\n")
+
+          print(f"{label}: schema v8 validated ({len(reps)} repetitions, {len(cells)} cells, {agg['end_to_end_samples']} end-to-end samples)")
+          PY
+          then
+            echo "::error::$n expected BENCH_JSONL records are missing or inconsistent"
+            exit 1
+          fi
+          echo "$n: ${#metrics[@]} measurement(s) published"
+
       # 4CP-BO/BQ: release-mode performance baseline (JSONL schema v2).
       # Publish every valid BENCH_JSONL record in the step summary and as a
       # notice annotation. Fail on cargo failure (preserving its exit code),
