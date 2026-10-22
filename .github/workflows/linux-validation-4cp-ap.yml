@@ -176,9 +176,9 @@ jobs:
         if: always()
         run: |
           n=phase4bo; log=/tmp/$n.log; set +e
-          cargo test --test phase4bo_performance_baseline_tests --release -- --nocapture 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          cargo test --test phase4bo_performance_baseline_tests bo01_scenario_a_throughput_baseline --release -- --exact --nocapture --test-threads=1 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
           c=${PIPESTATUS[0]}
-          mapfile -t metrics < <(grep -aE '^BENCH_JSONL:' "$log" || true)
+          mapfile -t metrics < <(grep -aE 'BENCH_JSONL:' "$log" || true)
           {
             echo ""
             echo "### 4CP-BO performance baseline (release)"
@@ -187,7 +187,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           bad=0
           for line in "${metrics[@]}"; do
-            json="${line#BENCH_JSONL:}"
+            json="${line#*BENCH_JSONL:}"
             if ! python3 -c 'import json,sys; json.loads(sys.argv[1])' "$json" 2>/dev/null; then
               bad=1
               echo "::error::$n invalid BENCH_JSONL JSON: $line"
@@ -211,7 +211,7 @@ jobs:
             exit 1
           fi
           : > "/tmp/$n.jsonl"
-          for line in "${metrics[@]}"; do printf '%s\n' "${line#BENCH_JSONL:}" >> "/tmp/$n.jsonl"; done
+          for line in "${metrics[@]}"; do printf '%s\n' "${line#*BENCH_JSONL:}" >> "/tmp/$n.jsonl"; done
           if ! python3 - "$n" "/tmp/$n.jsonl" <<'PY'
           import json
           import sys
@@ -241,6 +241,111 @@ jobs:
               print(f"{label}: aggregate sample count is not 300", file=sys.stderr)
               sys.exit(1)
           print(f"{label}: schema v2 validated ({len(reps)} repetitions, {agg['latency_samples']} latency samples)")
+          PY
+          then
+            echo "::error::$n expected BENCH_JSONL records are missing or inconsistent"
+            exit 1
+          fi
+          echo "$n: ${#metrics[@]} measurement(s) published"
+
+      # 4CP-BS: sustained submission with concurrent receipt/application.
+      # Publishes schema v3 JSONL with backlog time series and explicit RSS scopes.
+      - name: 4CP-BS sustained load (release)
+        if: always()
+        run: |
+          n=phase4bs; log=/tmp/$n.log; set +e
+          cargo test --test phase4bo_performance_baseline_tests bs01_sustained_load --release -- --exact --nocapture --test-threads=1 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          mapfile -t metrics < <(grep -aE 'BENCH_JSONL:' "$log" || true)
+          {
+            echo ""
+            echo "### 4CP-BS sustained load (release)"
+            echo ""
+            echo '```jsonl'
+          } >> "$GITHUB_STEP_SUMMARY"
+          bad=0
+          for line in "${metrics[@]}"; do
+            json="${line#*BENCH_JSONL:}"
+            if ! python3 -c 'import json,sys; json.loads(sys.argv[1])' "$json" 2>/dev/null; then
+              bad=1
+              echo "::error::$n invalid BENCH_JSONL JSON: $line"
+              continue
+            fi
+            printf '%s\n' "$json" >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::BENCH_JSONL:$json"
+          done
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ "$c" -ne 0 ]; then
+            echo "::error::$n failed on Linux (exit $c)"
+            grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done
+            exit "$c"
+          fi
+          if [ "${#metrics[@]}" -eq 0 ]; then
+            echo "::error::$n produced no BENCH_JSONL measurement"
+            exit 1
+          fi
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::$n published invalid BENCH_JSONL data"
+            exit 1
+          fi
+          : > "/tmp/$n.jsonl"
+          for line in "${metrics[@]}"; do printf '%s\n' "${line#*BENCH_JSONL:}" >> "/tmp/$n.jsonl"; done
+          if ! python3 - "$n" "/tmp/$n.jsonl" <<'PY'
+          import json
+          import sys
+
+          label, path = sys.argv[1], sys.argv[2]
+          rows = [json.loads(line) for line in open(path, encoding="utf-8")]
+          reps = [r for r in rows if r.get("record_type") == "repetition"]
+          aggs = [r for r in rows if r.get("record_type") == "aggregate"]
+          if any(r.get("schema_version") != 3 for r in rows):
+              print(f"{label}: unexpected schema_version", file=sys.stderr)
+              sys.exit(1)
+          if len({r.get("sha") for r in rows}) != 1:
+              print(f"{label}: inconsistent SHA across records", file=sys.stderr)
+              sys.exit(1)
+          if len(reps) != 3 or len(aggs) != 1:
+              print(f"{label}: expected 3 repetitions and 1 aggregate, got {len(reps)} and {len(aggs)}", file=sys.stderr)
+              sys.exit(1)
+          if any(r.get("scenario") != "bs01_sustained_load" for r in reps):
+              print(f"{label}: unexpected repetition scenario", file=sys.stderr)
+              sys.exit(1)
+          for r in reps:
+              if not (r["transactions_submitted"] == r["transactions_received"] == r["transactions_applied"] == 300):
+                  print(f"{label}: inconsistent counters in repetition {r.get('repetition')}", file=sys.stderr)
+                  sys.exit(1)
+              if r["transactions_rejected"] != 0 or r["latency_samples"] != 300:
+                  print(f"{label}: rejected or missing samples in repetition {r.get('repetition')}", file=sys.stderr)
+                  sys.exit(1)
+              n = r["backlog_sample_count"]
+              if n < 1 or any(len(r[key]) != n for key in (
+                  "backlog_series_ms", "backlog_series_submitted", "backlog_series_received",
+                  "backlog_series_applied", "backlog_series_pending", "backlog_series_rss_kb",
+              )):
+                  print(f"{label}: missing or misaligned backlog series in repetition {r.get('repetition')}", file=sys.stderr)
+                  sys.exit(1)
+              for submitted, applied, pending in zip(
+                  r["backlog_series_submitted"], r["backlog_series_applied"], r["backlog_series_pending"]
+              ):
+                  if max(0, submitted - applied) != pending:
+                      print(f"{label}: inconsistent backlog series in repetition {r.get('repetition')}", file=sys.stderr)
+                      sys.exit(1)
+              for key in ("end_to_end_latency_p50_us", "end_to_end_latency_p95_us", "end_to_end_latency_p99_us"):
+                  if r[key] is None:
+                      print(f"{label}: missing {key} in repetition {r.get('repetition')}", file=sys.stderr)
+                      sys.exit(1)
+              for key in (
+                  "rss_process_start_kb", "rss_before_load_kb", "rss_after_submissions_kb",
+                  "rss_under_load_peak_kb", "rss_after_cleanup_kb", "rss_process_peak_kb",
+              ):
+                  if r[key] is None:
+                      print(f"{label}: missing {key} in repetition {r.get('repetition')}", file=sys.stderr)
+                      sys.exit(1)
+          agg = aggs[0]
+          if agg["transactions_applied"] != 900 or agg["latency_samples"] != 900:
+              print(f"{label}: aggregate sample count is not 900", file=sys.stderr)
+              sys.exit(1)
+          print(f"{label}: schema v3 validated ({len(reps)} repetitions, {agg['latency_samples']} latency samples)")
           PY
           then
             echo "::error::$n expected BENCH_JSONL records are missing or inconsistent"

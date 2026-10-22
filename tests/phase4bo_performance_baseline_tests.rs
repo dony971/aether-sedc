@@ -10,12 +10,15 @@ use aether_unified::wallet::Wallet;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 
 const SCENARIO_A: &str = "bo01_scenario_a_throughput";
 const SCENARIO_A_AGGREGATE: &str = "bo01_scenario_a_throughput_aggregate";
+const SCENARIO_BS: &str = "bs01_sustained_load";
+const SCENARIO_BS_AGGREGATE: &str = "bs01_sustained_load_aggregate";
 const POW_DIFFICULTY: u8 = 20;
 const TX_VALUE: u64 = 1000;
 const TX_FEE: u64 = 1;
@@ -23,6 +26,11 @@ const TXS_PER_REPETITION: usize = 100;
 const REPETITIONS: usize = 3;
 const SUBMISSION_INTERVAL_MS: u64 = 5;
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(120);
+const BS_TXS_PER_REPETITION: usize = 300;
+const BS_REPETITIONS: usize = 3;
+const BS_SUBMISSION_INTERVAL_US: u64 = 1_000;
+const BS_RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+const BS_SAMPLE_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Serialize)]
 struct BenchRecord {
@@ -219,7 +227,7 @@ fn build_record(
         rss_after_repetition_kb: rss_after_repetition,
         rss_peak_kb: rss_peak,
         rss_scope: "test_process (both P2P nodes and the harness run in one process)".to_string(),
-        rss_note: "Linux VmRSS (current) and VmHWM (peak) for the whole test process; null when /proc is unavailable".to_string(),
+        rss_note: "Linux only, whole test process including both nodes and the harness. rss_idle_two_nodes_kb is VmRSS before load; rss_after_repetition_kb is VmRSS immediately after load; rss_peak_kb is process-lifetime VmHWM, so it includes all earlier phases and is not a per-repetition peak. null when /proc is unavailable.".to_string(),
         throughput_note: "generation: first mine start to last mine end (PoW included); reception: first submission to last first receipt; application: batch application window after all receipts to last apply end; end_to_end: first submission to last apply end. Generation is excluded from reception, application and end_to_end. Application latency starts at receipt and therefore includes the wait for the batch application window; application throughput covers only that batch window. Aggregate spans are sums of non-overlapping repetition spans.".to_string(),
     }
 }
@@ -488,6 +496,442 @@ fn aggregate_rounds(rounds: &[RoundResult], rss_process_start: Option<u64>) -> B
     )
 }
 
+#[derive(Debug, Serialize)]
+struct SustainedRecord {
+    schema_version: u32,
+    record_type: String,
+    scenario: String,
+    sha: String,
+    profile: String,
+    os: String,
+    arch: String,
+    nodes: usize,
+    nodes_in_same_process: bool,
+    repetition: Option<usize>,
+    repetitions_total: usize,
+    transactions_per_repetition: usize,
+    pow_difficulty: u8,
+    tx_value: u64,
+    tx_fee: u64,
+    load_model: String,
+    target_submission_interval_us: u64,
+    target_submission_tps: f64,
+    transactions_submitted: u64,
+    transactions_received: u64,
+    transactions_applied: u64,
+    transactions_rejected: u64,
+    duplicates_received: u64,
+    latency_samples: usize,
+    generation_span_ms: u64,
+    submission_span_ms: u64,
+    reception_span_ms: u64,
+    drain_span_ms: u64,
+    sustained_span_ms: u64,
+    recovery_ms: Option<u64>,
+    sustained_application_tps: f64,
+    reception_tps: f64,
+    end_to_end_latency_p50_us: Option<u64>,
+    end_to_end_latency_p95_us: Option<u64>,
+    end_to_end_latency_p99_us: Option<u64>,
+    backlog_peak: u64,
+    backlog_peak_at_ms: Option<u64>,
+    backlog_sample_count: usize,
+    backlog_series_ms: Vec<u64>,
+    backlog_series_submitted: Vec<u64>,
+    backlog_series_received: Vec<u64>,
+    backlog_series_applied: Vec<u64>,
+    backlog_series_pending: Vec<u64>,
+    backlog_series_rss_kb: Vec<Option<u64>>,
+    rss_process_start_kb: Option<u64>,
+    rss_before_load_kb: Option<u64>,
+    rss_after_submissions_kb: Option<u64>,
+    rss_under_load_peak_kb: Option<u64>,
+    rss_after_cleanup_kb: Option<u64>,
+    rss_process_peak_kb: Option<u64>,
+    rss_scope: String,
+    rss_peak_scope: String,
+    rss_note: String,
+    throughput_note: String,
+}
+
+struct SustainedRound {
+    submitted: u64,
+    received: u64,
+    applied: u64,
+    rejected: u64,
+    duplicates: u64,
+    generation_span: Duration,
+    submission_span: Duration,
+    reception_span: Duration,
+    drain_span: Duration,
+    sustained_span: Duration,
+    end_to_end_us: Vec<u64>,
+    backlog_peak: u64,
+    backlog_peak_at_ms: Option<u64>,
+    series: Vec<(u64, u64, u64, u64, Option<u64>)>,
+    rss_before_load: Option<u64>,
+    rss_after_submissions: Option<u64>,
+    rss_under_load_peak: Option<u64>,
+    rss_after_cleanup: Option<u64>,
+    rss_process_peak: Option<u64>,
+}
+
+struct SustainedConsumerResult {
+    received: u64,
+    applied: u64,
+    rejected: u64,
+    duplicates: u64,
+    end_to_end_us: Vec<u64>,
+    last_receipt: Instant,
+    last_apply: Instant,
+}
+
+fn build_sustained_record(
+    record_type: &str,
+    repetition: Option<usize>,
+    r: &SustainedRound,
+    rss_process_start: Option<u64>,
+) -> SustainedRecord {
+    let (e50, e95, e99) = stats_us(&r.end_to_end_us);
+    let (series_ms, series_submitted, series_received, series_applied, series_pending, series_rss) = {
+        let mut ms = Vec::with_capacity(r.series.len());
+        let mut submitted = Vec::with_capacity(r.series.len());
+        let mut received = Vec::with_capacity(r.series.len());
+        let mut applied = Vec::with_capacity(r.series.len());
+        let mut pending = Vec::with_capacity(r.series.len());
+        let mut rss = Vec::with_capacity(r.series.len());
+        for (t, s, recv, a, mem) in &r.series {
+            ms.push(*t);
+            submitted.push(*s);
+            received.push(*recv);
+            applied.push(*a);
+            pending.push(s.saturating_sub(*a));
+            rss.push(*mem);
+        }
+        (ms, submitted, received, applied, pending, rss)
+    };
+    SustainedRecord {
+        schema_version: 3,
+        record_type: record_type.to_string(),
+        scenario: if record_type == "aggregate" { SCENARIO_BS_AGGREGATE } else { SCENARIO_BS }.to_string(),
+        sha: get_sha(),
+        profile: get_profile(),
+        os: get_os(),
+        arch: get_arch(),
+        nodes: 2,
+        nodes_in_same_process: true,
+        repetition,
+        repetitions_total: BS_REPETITIONS,
+        transactions_per_repetition: BS_TXS_PER_REPETITION,
+        pow_difficulty: POW_DIFFICULTY,
+        tx_value: TX_VALUE,
+        tx_fee: TX_FEE,
+        load_model: "steady_submission_with_concurrent_application".to_string(),
+        target_submission_interval_us: BS_SUBMISSION_INTERVAL_US,
+        target_submission_tps: 1_000_000.0 / BS_SUBMISSION_INTERVAL_US as f64,
+        transactions_submitted: r.submitted,
+        transactions_received: r.received,
+        transactions_applied: r.applied,
+        transactions_rejected: r.rejected,
+        duplicates_received: r.duplicates,
+        latency_samples: r.end_to_end_us.len(),
+        generation_span_ms: r.generation_span.as_millis() as u64,
+        submission_span_ms: r.submission_span.as_millis() as u64,
+        reception_span_ms: r.reception_span.as_millis() as u64,
+        drain_span_ms: r.drain_span.as_millis() as u64,
+        sustained_span_ms: r.sustained_span.as_millis() as u64,
+        recovery_ms: Some(r.drain_span.as_millis() as u64),
+        sustained_application_tps: tps(r.applied, r.sustained_span),
+        reception_tps: tps(r.received, r.reception_span),
+        end_to_end_latency_p50_us: e50,
+        end_to_end_latency_p95_us: e95,
+        end_to_end_latency_p99_us: e99,
+        backlog_peak: r.backlog_peak,
+        backlog_peak_at_ms: r.backlog_peak_at_ms,
+        backlog_sample_count: r.series.len(),
+        backlog_series_ms: series_ms,
+        backlog_series_submitted: series_submitted,
+        backlog_series_received: series_received,
+        backlog_series_applied: series_applied,
+        backlog_series_pending: series_pending,
+        backlog_series_rss_kb: series_rss,
+        rss_process_start_kb: rss_process_start,
+        rss_before_load_kb: r.rss_before_load,
+        rss_after_submissions_kb: r.rss_after_submissions,
+        rss_under_load_peak_kb: r.rss_under_load_peak,
+        rss_after_cleanup_kb: r.rss_after_cleanup,
+        rss_process_peak_kb: r.rss_process_peak,
+        rss_scope: "whole test process: both P2P nodes and the benchmark harness".to_string(),
+        rss_peak_scope: "rss_process_peak_kb is VmHWM over the whole process lifetime, including previous repetitions and setup; it is not a per-repetition peak".to_string(),
+        rss_note: "Linux only. rss_before_load_kb is VmRSS before submission; rss_after_submissions_kb is VmRSS immediately after the last submission; rss_under_load_peak_kb is the maximum VmRSS sampled every 10 ms during submission+drain, so narrow spikes may be missed; rss_after_cleanup_kb is VmRSS after nodes are dropped; rss_process_peak_kb is lifetime VmHWM. RSS includes allocator retention and harness copies. null when /proc is unavailable.".to_string(),
+        throughput_note: "PoW generation is measured before node boot and excluded from all network/application rates. sustained_application_tps uses first submission to last application; reception_tps uses first submission to last unique receipt; drain_span/recovery_ms is last submission to last application; submission_span is first to last submission. Backlog pending is submitted minus applied (network in-flight plus receive/apply queue).".to_string(),
+    }
+}
+
+fn log_record_sustained(record: &SustainedRecord) {
+    println!("BENCH_JSONL:{}", serde_json::to_string(record).expect("serialize sustained BENCH_JSONL"));
+}
+
+fn aggregate_sustained(rounds: &[SustainedRound], rss_process_start: Option<u64>) -> SustainedRecord {
+    let mut aggregate = SustainedRound {
+        submitted: 0,
+        received: 0,
+        applied: 0,
+        rejected: 0,
+        duplicates: 0,
+        generation_span: Duration::ZERO,
+        submission_span: Duration::ZERO,
+        reception_span: Duration::ZERO,
+        drain_span: Duration::ZERO,
+        sustained_span: Duration::ZERO,
+        end_to_end_us: Vec::new(),
+        backlog_peak: 0,
+        backlog_peak_at_ms: None,
+        series: Vec::new(),
+        rss_before_load: rounds.first().and_then(|r| r.rss_before_load),
+        rss_after_submissions: rounds.last().and_then(|r| r.rss_after_submissions),
+        rss_under_load_peak: rounds.iter().filter_map(|r| r.rss_under_load_peak).max(),
+        rss_after_cleanup: rounds.last().and_then(|r| r.rss_after_cleanup),
+        rss_process_peak: rounds.iter().filter_map(|r| r.rss_process_peak).max(),
+    };
+    for round in rounds {
+        aggregate.submitted += round.submitted;
+        aggregate.received += round.received;
+        aggregate.applied += round.applied;
+        aggregate.rejected += round.rejected;
+        aggregate.duplicates += round.duplicates;
+        aggregate.generation_span += round.generation_span;
+        aggregate.submission_span += round.submission_span;
+        aggregate.reception_span += round.reception_span;
+        aggregate.sustained_span += round.sustained_span;
+        aggregate.drain_span = aggregate.drain_span.max(round.drain_span);
+        aggregate.end_to_end_us.extend_from_slice(&round.end_to_end_us);
+        aggregate.backlog_peak = aggregate.backlog_peak.max(round.backlog_peak);
+    }
+    build_sustained_record("aggregate", None, &aggregate, rss_process_start)
+}
+
+async fn run_sustained_round(round: usize, sent: Vec<Transaction>, generation_span: Duration) -> SustainedRound {
+    let (port_a, port_b) = (56100 + (round as u16) * 4, 56101 + (round as u16) * 4);
+    let dir_a = tempfile::tempdir().expect("dirA");
+    let dir_b = tempfile::tempdir().expect("dirB");
+    let pa: SocketAddr = format!("127.0.0.1:{}", port_a).parse().unwrap();
+
+    let node_a = boot_node_bo(dir_a, port_a, vec![]).await;
+    let node_b = boot_node_bo(dir_b, port_b, vec![pa]).await;
+
+    wait_for_bo("sustained peering", Duration::from_secs(20), || async {
+        node_a.p2p.peer_count().await >= 1 && node_b.p2p.peer_count().await >= 1
+    })
+    .await;
+
+    let rss_before_load = get_rss_kb();
+    let TestNodeBo { _dir_guard: dir_b_guard, storage: storage_b, dag: dag_b, p2p: p2p_b, rx: mut rx } = node_b;
+    let expected = sent.len();
+    assert!(expected > 0, "sustained load requires transactions");
+
+    let submitted_count = Arc::new(AtomicU64::new(0));
+    let received_count = Arc::new(AtomicU64::new(0));
+    let applied_count = Arc::new(AtomicU64::new(0));
+    let submitted_at: Arc<StdMutex<HashMap<[u8; 32], Instant>>> =
+        Arc::new(StdMutex::new(HashMap::with_capacity(expected)));
+
+    let load_start = Instant::now();
+    let stop_sampler = Arc::new(AtomicBool::new(false));
+    let sampler_peak_rss = Arc::new(AtomicU64::new(0));
+    let series: Arc<StdMutex<Vec<(u64, u64, u64, u64, Option<u64>)>>> =
+        Arc::new(StdMutex::new(Vec::new()));
+    let sampler = {
+        let stop = stop_sampler.clone();
+        let peak = sampler_peak_rss.clone();
+        let series = series.clone();
+        let submitted = submitted_count.clone();
+        let received = received_count.clone();
+        let applied = applied_count.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let rss = get_rss_kb();
+                if let Some(value) = rss {
+                    peak.fetch_max(value, Ordering::Relaxed);
+                }
+                series.lock().expect("series lock").push((
+                    load_start.elapsed().as_millis() as u64,
+                    submitted.load(Ordering::Relaxed),
+                    received.load(Ordering::Relaxed),
+                    applied.load(Ordering::Relaxed),
+                    rss,
+                ));
+                std::thread::sleep(BS_SAMPLE_INTERVAL);
+            }
+        })
+    };
+
+    let submitted_at_consumer = submitted_at.clone();
+    let received_atomic = received_count.clone();
+    let applied_atomic = applied_count.clone();
+    let dag_consumer = dag_b.clone();
+    let storage_consumer = storage_b.clone();
+    let consumer = tokio::spawn(async move {
+        let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::with_capacity(expected);
+        let mut pending: HashMap<u64, (Instant, Transaction)> = HashMap::new();
+        let mut next_nonce = 1u64;
+        let mut result = SustainedConsumerResult {
+            received: 0,
+            applied: 0,
+            rejected: 0,
+            duplicates: 0,
+            end_to_end_us: Vec::with_capacity(expected),
+            last_receipt: load_start,
+            last_apply: load_start,
+        };
+        let processor = TransactionProcessor::new();
+
+        while let Some(ingress) = rx.recv().await {
+            let received_at = Instant::now();
+            result.last_receipt = received_at;
+            let tx = ingress.into_tx();
+            if !seen.insert(tx.id) {
+                result.duplicates += 1;
+                continue;
+            }
+            result.received += 1;
+            received_atomic.fetch_add(1, Ordering::Relaxed);
+            pending.insert(tx.account_nonce, (received_at, tx));
+
+            while let Some((_, tx)) = pending.remove(&next_nonce) {
+                let submitted = submitted_at_consumer
+                    .lock()
+                    .expect("submitted timestamps")
+                    .get(&tx.id)
+                    .copied();
+                let outcome = {
+                    let mut dag = dag_consumer.write().await;
+                    let store = storage_consumer.read().await;
+                    record_tx_bo(&mut dag, &store, &processor, &tx)
+                };
+                match outcome {
+                    Ok(()) => {
+                        let applied_at = Instant::now();
+                        result.applied += 1;
+                        applied_atomic.fetch_add(1, Ordering::Relaxed);
+                        if let Some(submitted) = submitted {
+                            result
+                                .end_to_end_us
+                                .push(applied_at.duration_since(submitted).as_micros() as u64);
+                        }
+                        result.last_apply = applied_at;
+                        next_nonce += 1;
+                    }
+                    Err(error) => {
+                        result.rejected += 1;
+                        eprintln!("sustained application rejected tx {}: {}", hex::encode(tx.id), error);
+                        break;
+                    }
+                }
+                if result.applied as usize >= expected {
+                    break;
+                }
+            }
+            if result.applied as usize >= expected {
+                break;
+            }
+        }
+        result
+    });
+
+    let mut last_submission = load_start;
+    for (index, tx) in sent.iter().enumerate() {
+        let target = load_start + Duration::from_micros(BS_SUBMISSION_INTERVAL_US * index as u64);
+        if let Some(wait) = target.checked_duration_since(Instant::now()) {
+            tokio::time::sleep(wait).await;
+        }
+        let submitted = Instant::now();
+        submitted_at
+            .lock()
+            .expect("submitted timestamps")
+            .insert(tx.id, submitted);
+        submitted_count.fetch_add(1, Ordering::Relaxed);
+        node_a.p2p.broadcast_transaction(tx.clone()).await;
+        last_submission = Instant::now();
+    }
+    let submission_span = last_submission.duration_since(load_start);
+    let rss_after_submissions = get_rss_kb();
+
+    let result = match tokio::time::timeout(BS_RECOVERY_TIMEOUT, consumer).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(join_error)) => panic!("sustained consumer task failed: {}", join_error),
+        Err(_) => panic!("TIMEOUT waiting for sustained backlog recovery"),
+    };
+
+    stop_sampler.store(true, Ordering::Relaxed);
+    sampler.join().expect("sampler join");
+
+    let final_at = result.last_apply.duration_since(load_start).as_millis() as u64;
+    let final_rss = get_rss_kb();
+    let mut points = series.lock().expect("series lock").clone();
+    points.push((
+        final_at,
+        submitted_count.load(Ordering::Relaxed),
+        received_count.load(Ordering::Relaxed),
+        applied_count.load(Ordering::Relaxed),
+        final_rss,
+    ));
+    points.sort_by_key(|point| point.0);
+    points.dedup_by_key(|point| point.0);
+
+    let mut backlog_peak = 0u64;
+    let mut backlog_peak_at_ms = None;
+    for (at_ms, submitted, _, applied, _) in &points {
+        let pending = submitted.saturating_sub(*applied);
+        if pending > backlog_peak {
+            backlog_peak = pending;
+            backlog_peak_at_ms = Some(*at_ms);
+        }
+    }
+
+    let mut rss_under_load_peak = sampler_peak_rss.load(Ordering::Relaxed);
+    if let Some(value) = final_rss {
+        rss_under_load_peak = rss_under_load_peak.max(value);
+    }
+    let rss_under_load_peak = (rss_under_load_peak > 0).then_some(rss_under_load_peak);
+
+    assert_eq!(result.received as usize, expected, "received {} of {} sustained transactions", result.received, expected);
+    assert_eq!(result.applied as usize, expected, "applied {} of {} sustained transactions", result.applied, expected);
+    assert_eq!(result.rejected, 0, "rejected sustained transactions");
+    assert_eq!(result.end_to_end_us.len(), expected, "end-to-end latency samples");
+
+    drop(node_a);
+    drop(p2p_b);
+    drop(dag_b);
+    drop(storage_b);
+    drop(dir_b_guard);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let rss_after_cleanup = get_rss_kb();
+    let rss_process_peak = get_peak_rss_kb();
+
+    SustainedRound {
+        submitted: expected as u64,
+        received: result.received,
+        applied: result.applied,
+        rejected: result.rejected,
+        duplicates: result.duplicates,
+        generation_span,
+        submission_span,
+        reception_span: result.last_receipt.duration_since(load_start),
+        drain_span: result.last_apply.duration_since(last_submission),
+        sustained_span: result.last_apply.duration_since(load_start),
+        end_to_end_us: result.end_to_end_us,
+        backlog_peak,
+        backlog_peak_at_ms,
+        series: points,
+        rss_before_load,
+        rss_after_submissions,
+        rss_under_load_peak,
+        rss_after_cleanup,
+        rss_process_peak,
+    }
+}
+
 #[tokio::test]
 async fn bo01_scenario_a_throughput_baseline() {
     let rss_process_start = get_rss_kb();
@@ -520,4 +964,47 @@ async fn bo01_scenario_a_throughput_baseline() {
     let aggregate = aggregate_rounds(&rounds, rss_process_start);
     assert_eq!(aggregate.latency_samples, REPETITIONS * TXS_PER_REPETITION, "aggregate samples");
     log_record(&aggregate);
+}
+
+
+#[tokio::test]
+async fn bs01_sustained_load() {
+    let rss_process_start = get_rss_kb();
+    let mut rounds: Vec<SustainedRound> = Vec::with_capacity(BS_REPETITIONS);
+
+    for round in 0..BS_REPETITIONS {
+        let wallet = wallet_bo(888888);
+        let ts0: u64 = 1_750_000_100_000 + (round as u64) * 1_000_000;
+        let mut prev = [0u8; 32];
+        let mut sent: Vec<Transaction> = Vec::with_capacity(BS_TXS_PER_REPETITION);
+        let generation_start = Instant::now();
+        for i in 0..BS_TXS_PER_REPETITION {
+            let tx = make_valid_tx_bo(&wallet, [prev, [0u8; 32]], 1 + i as u64, ts0 + i as u64);
+            prev = tx.id;
+            sent.push(tx);
+        }
+        let generation_span = generation_start.elapsed();
+
+        let result = run_sustained_round(round, sent, generation_span).await;
+        assert_eq!(result.submitted, BS_TXS_PER_REPETITION as u64, "sustained submitted count");
+        assert_eq!(result.received, BS_TXS_PER_REPETITION as u64, "sustained received count");
+        assert_eq!(result.applied, BS_TXS_PER_REPETITION as u64, "sustained applied count");
+        assert_eq!(result.rejected, 0, "sustained rejected count");
+        assert_eq!(result.end_to_end_us.len(), BS_TXS_PER_REPETITION, "sustained end-to-end samples");
+        assert!(!result.series.is_empty(), "sustained backlog samples");
+        let (p50, p95, p99) = stats_us(&result.end_to_end_us);
+        assert!(p50.is_some() && p95.is_some() && p99.is_some(), "sustained latency percentiles");
+
+        let record = build_sustained_record("repetition", Some(round + 1), &result, rss_process_start);
+        log_record_sustained(&record);
+        rounds.push(result);
+    }
+
+    let aggregate = aggregate_sustained(&rounds, rss_process_start);
+    assert_eq!(aggregate.transactions_submitted, (BS_TXS_PER_REPETITION * BS_REPETITIONS) as u64, "aggregate submitted");
+    assert_eq!(aggregate.transactions_received, (BS_TXS_PER_REPETITION * BS_REPETITIONS) as u64, "aggregate received");
+    assert_eq!(aggregate.transactions_applied, (BS_TXS_PER_REPETITION * BS_REPETITIONS) as u64, "aggregate applied");
+    assert_eq!(aggregate.transactions_rejected, 0, "aggregate rejected");
+    assert_eq!(aggregate.latency_samples, BS_TXS_PER_REPETITION * BS_REPETITIONS, "aggregate latency samples");
+    log_record_sustained(&aggregate);
 }
