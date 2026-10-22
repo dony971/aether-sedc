@@ -168,6 +168,41 @@ jobs:
         if: always()
         run: cargo build --bins
 
+      # 4CP-BT: rate-window formula regression tests. These must pass before
+      # any benchmark metrics are treated as publishable.
+      - name: 4CP-BT rate formula tests (release)
+        if: always()
+        run: |
+          n=phase4bt-formulas; log=/tmp/$n.log; set +e
+          cargo test --test phase4bo_performance_baseline_tests formula_ --release -- --nocapture --test-threads=1 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then
+            echo "::error::$n failed on Linux (exit $c)"
+            grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done
+            exit "$c"
+          fi
+          if ! grep -q 'test result: ok. 4 passed' "$log"; then
+            echo "::error::$n did not run all four formula tests"
+            exit 1
+          fi
+          {
+            echo ""
+            echo "### 4CP-BT rate formula validation"
+            echo ""
+            echo 'Unit: `transactions_per_second`. `duration_us = window_end_us - window_start_us`; `value = numerator / (duration_us / 1_000_000)`; zero duration publishes `null`, never `0`.'
+            echo ""
+            echo '- `offered`: `submitted / ((last_submission_us - first_submission_us) / 1_000_000)`'
+            echo '- `reception`: `received / ((last_receipt_us - first_receipt_us) / 1_000_000)`'
+            echo '- `application`: `applied / ((last_apply_us - first_apply_us) / 1_000_000)`'
+            echo '- `completion`: `applied / ((last_apply_us - first_submission_us) / 1_000_000)`'
+            echo '- `recovery`: `(last_apply - last_submission)` in ms'
+            echo ''
+            echo 'Resolution of the prior `566.3` vs `118.490` discrepancy: `118.4896831032922 = 300 / 2.531866 s` is the BO v2 aggregate from run `#33`; `566.3194708814259 = 900 / 1.589209 s` is the BS aggregate from run `#35`. They use the same completion formula on different scenarios and windows, not two values of one measurement.'
+            echo ''
+            echo '`4/4 formula tests passed`.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$n: 4/4 formula tests passed"
+
       # 4CP-BO/BQ: release-mode performance baseline (JSONL schema v2).
       # Publish every valid BENCH_JSONL record in the step summary and as a
       # notice annotation. Fail on cargo failure (preserving its exit code),
@@ -248,8 +283,9 @@ jobs:
           fi
           echo "$n: ${#metrics[@]} measurement(s) published"
 
-      # 4CP-BS: sustained submission with concurrent receipt/application.
-      # Publishes schema v3 JSONL with backlog time series and explicit RSS scopes.
+      # 4CP-BS/BT: sustained submission with concurrent receipt/application.
+      # Publishes schema v4 JSONL with explicit rate windows and RSS scopes,
+      # then validates every formula, counter, sample count, and scope field.
       - name: 4CP-BS sustained load (release)
         if: always()
         run: |
@@ -298,54 +334,324 @@ jobs:
           rows = [json.loads(line) for line in open(path, encoding="utf-8")]
           reps = [r for r in rows if r.get("record_type") == "repetition"]
           aggs = [r for r in rows if r.get("record_type") == "aggregate"]
-          if any(r.get("schema_version") != 3 for r in rows):
-              print(f"{label}: unexpected schema_version", file=sys.stderr)
+
+          def fail(message):
+              print(f"{label}: {message}", file=sys.stderr)
               sys.exit(1)
+
+          def check_rate(where, metric, numerator):
+              if metric.get("numerator") != numerator:
+                  fail(f"{where}: rate numerator {metric.get('numerator')} != {numerator}")
+              if metric.get("unit") != "transactions_per_second":
+                  fail(f"{where}: unexpected rate unit")
+              duration = metric["window_end_us"] - metric["window_start_us"]
+              if duration < 0 or metric.get("duration_us") != duration:
+                  fail(f"{where}: rate duration is not window_end - window_start")
+              value = metric.get("value")
+              if duration == 0:
+                  if value is not None:
+                      fail(f"{where}: zero-duration rate is not null")
+              else:
+                  expected = numerator / (duration / 1_000_000.0)
+                  if value is None or abs(value - expected) > 1e-6:
+                      fail(f"{where}: rate value {value} != {expected}")
+
+          if any(r.get("schema_version") != 4 for r in rows):
+              fail("unexpected schema_version")
           if len({r.get("sha") for r in rows}) != 1:
-              print(f"{label}: inconsistent SHA across records", file=sys.stderr)
-              sys.exit(1)
+              fail("inconsistent SHA across records")
           if len(reps) != 3 or len(aggs) != 1:
-              print(f"{label}: expected 3 repetitions and 1 aggregate, got {len(reps)} and {len(aggs)}", file=sys.stderr)
-              sys.exit(1)
-          if any(r.get("scenario") != "bs01_sustained_load" for r in reps):
-              print(f"{label}: unexpected repetition scenario", file=sys.stderr)
-              sys.exit(1)
+              fail(f"expected 3 repetitions and 1 aggregate, got {len(reps)} and {len(aggs)}")
           for r in reps:
+              if r.get("scenario") != "bs01_sustained_load":
+                  fail("unexpected repetition scenario")
+              if r.get("transactions_per_repetition") != 300:
+                  fail(f"repetition {r.get('repetition')}: wrong transactions_per_repetition")
               if not (r["transactions_submitted"] == r["transactions_received"] == r["transactions_applied"] == 300):
-                  print(f"{label}: inconsistent counters in repetition {r.get('repetition')}", file=sys.stderr)
-                  sys.exit(1)
+                  fail(f"inconsistent counters in repetition {r.get('repetition')}")
               if r["transactions_rejected"] != 0 or r["latency_samples"] != 300:
-                  print(f"{label}: rejected or missing samples in repetition {r.get('repetition')}", file=sys.stderr)
-                  sys.exit(1)
+                  fail(f"rejected or missing samples in repetition {r.get('repetition')}")
+              for key, numerator in (
+                  ("offered_rate", 300), ("reception_rate", 300),
+                  ("application_rate", 300), ("completion_rate", 300),
+              ):
+                  check_rate(f"repetition {r.get('repetition')} {key}", r[key], numerator)
+              if r["submission_start_us"] != 0:
+                  fail(f"repetition {r.get('repetition')}: submission_start_us is not 0")
+              if r["offered_rate"]["window_end_us"] != r["submission_end_us"]:
+                  fail(f"repetition {r.get('repetition')}: offered window does not end at last submission")
+              if r["completion_rate"]["window_end_us"] != r["last_apply_us"]:
+                  fail(f"repetition {r.get('repetition')}: completion window does not end at last apply")
+              if r.get("generation_included_in_rates") is not False:
+                  fail(f"repetition {r.get('repetition')}: generation included in rates")
               n = r["backlog_sample_count"]
               if n < 1 or any(len(r[key]) != n for key in (
                   "backlog_series_ms", "backlog_series_submitted", "backlog_series_received",
                   "backlog_series_applied", "backlog_series_pending", "backlog_series_rss_kb",
               )):
-                  print(f"{label}: missing or misaligned backlog series in repetition {r.get('repetition')}", file=sys.stderr)
-                  sys.exit(1)
+                  fail(f"repetition {r.get('repetition')}: missing or misaligned backlog series")
               for submitted, applied, pending in zip(
                   r["backlog_series_submitted"], r["backlog_series_applied"], r["backlog_series_pending"]
               ):
                   if max(0, submitted - applied) != pending:
-                      print(f"{label}: inconsistent backlog series in repetition {r.get('repetition')}", file=sys.stderr)
-                      sys.exit(1)
-              for key in ("end_to_end_latency_p50_us", "end_to_end_latency_p95_us", "end_to_end_latency_p99_us"):
+                      fail(f"repetition {r.get('repetition')}: inconsistent backlog series")
+              for key in ("end_to_end_latency_p50_us", "end_to_end_latency_p95_us", "end_to_end_latency_p99_us", "recovery_ms"):
                   if r[key] is None:
-                      print(f"{label}: missing {key} in repetition {r.get('repetition')}", file=sys.stderr)
-                      sys.exit(1)
+                      fail(f"repetition {r.get('repetition')}: missing {key}")
               for key in (
                   "rss_process_start_kb", "rss_before_load_kb", "rss_after_submissions_kb",
                   "rss_under_load_peak_kb", "rss_after_cleanup_kb", "rss_process_peak_kb",
               ):
                   if r[key] is None:
-                      print(f"{label}: missing {key} in repetition {r.get('repetition')}", file=sys.stderr)
-                      sys.exit(1)
+                      fail(f"repetition {r.get('repetition')}: missing {key}")
           agg = aggs[0]
-          if agg["transactions_applied"] != 900 or agg["latency_samples"] != 900:
-              print(f"{label}: aggregate sample count is not 900", file=sys.stderr)
+          if agg.get("scenario") != "bs01_sustained_load_aggregate" or agg.get("aggregate_scope") != "overall":
+              fail("unexpected aggregate scenario or scope")
+          if not (agg["transactions_submitted"] == agg["transactions_received"] == agg["transactions_applied"] == 900):
+              fail("aggregate counters are not 900")
+          if agg["transactions_rejected"] != 0 or agg["latency_samples"] != 900:
+              fail("aggregate rejected or missing samples")
+          for key in ("submission_end_us", "first_receipt_us", "last_receipt_us", "first_apply_us", "last_apply_us"):
+              if agg[key] is not None:
+                  fail(f"aggregate raw timestamp {key} is not null")
+          for key in ("offered_rate", "reception_rate", "application_rate", "completion_rate"):
+              check_rate(f"aggregate {key}", agg[key], 900)
+          if agg["backlog_sample_count"] != 0 or agg["backlog_series_ms"]:
+              fail("aggregate must not claim a per-repetition backlog series")
+          for key in (
+              "rss_process_start_kb", "rss_before_load_kb", "rss_after_submissions_kb",
+              "rss_under_load_peak_kb", "rss_after_cleanup_kb", "rss_process_peak_kb",
+          ):
+              if agg[key] is None:
+                  fail(f"aggregate missing {key}")
+          print(f"{label}: schema v4 validated ({len(reps)} repetitions, {agg['latency_samples']} latency samples)")
+          PY
+          then
+            echo "::error::$n expected BENCH_JSONL records are missing or inconsistent"
+            exit 1
+          fi
+          echo "$n: ${#metrics[@]} measurement(s) published"
+
+      # 4CP-BT: five offered-load levels, three fresh-state repetitions each.
+      # Reuses one pre-generated valid transaction set, never a dirty state.
+      - name: 4CP-BT load curve (release)
+        if: always()
+        run: |
+          n=phase4bt; log=/tmp/$n.log; set +e
+          cargo test --test phase4bo_performance_baseline_tests bt01_load_curve --release -- --exact --nocapture --test-threads=1 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          mapfile -t metrics < <(grep -aE 'BENCH_JSONL:' "$log" || true)
+          {
+            echo ""
+            echo "### 4CP-BT load curve (release)"
+            echo ""
+            echo '```jsonl'
+          } >> "$GITHUB_STEP_SUMMARY"
+          bad=0
+          for line in "${metrics[@]}"; do
+            json="${line#*BENCH_JSONL:}"
+            if ! python3 -c 'import json,sys; json.loads(sys.argv[1])' "$json" 2>/dev/null; then
+              bad=1
+              echo "::error::$n invalid BENCH_JSONL JSON: $line"
+              continue
+            fi
+            printf '%s\n' "$json" >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::BENCH_JSONL:$json"
+          done
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ "$c" -ne 0 ]; then
+            echo "::error::$n failed on Linux (exit $c)"
+            grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done
+            exit "$c"
+          fi
+          if [ "${#metrics[@]}" -eq 0 ]; then
+            echo "::error::$n produced no BENCH_JSONL measurement"
+            exit 1
+          fi
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::$n published invalid BENCH_JSONL data"
+            exit 1
+          fi
+          : > "/tmp/$n.jsonl"
+          for line in "${metrics[@]}"; do printf '%s\n' "${line#*BENCH_JSONL:}" >> "/tmp/$n.jsonl"; done
+          if ! python3 - "$n" "/tmp/$n.jsonl" <<'PY'
+          import json
+          import os
+          import sys
+
+          label, path = sys.argv[1], sys.argv[2]
+          rows = [json.loads(line) for line in open(path, encoding="utf-8")]
+          reps = [r for r in rows if r.get("record_type") == "repetition"]
+          level_aggs = [r for r in rows if r.get("record_type") == "level_aggregate"]
+          overall = [r for r in rows if r.get("record_type") == "aggregate"]
+          levels = [250, 400, 550, 700, 1000]
+
+          def fail(message):
+              print(f"{label}: {message}", file=sys.stderr)
               sys.exit(1)
-          print(f"{label}: schema v3 validated ({len(reps)} repetitions, {agg['latency_samples']} latency samples)")
+
+          def check_rate(where, metric, numerator):
+              if metric.get("numerator") != numerator:
+                  fail(f"{where}: rate numerator {metric.get('numerator')} != {numerator}")
+              if metric.get("unit") != "transactions_per_second":
+                  fail(f"{where}: unexpected rate unit")
+              duration = metric["window_end_us"] - metric["window_start_us"]
+              if duration < 0 or metric.get("duration_us") != duration:
+                  fail(f"{where}: rate duration is not window_end - window_start")
+              value = metric.get("value")
+              if duration == 0:
+                  if value is not None:
+                      fail(f"{where}: zero-duration rate is not null")
+              else:
+                  expected = numerator / (duration / 1_000_000.0)
+                  if value is None or abs(value - expected) > 1e-6:
+                      fail(f"{where}: rate value {value} != {expected}")
+
+          def check_rss(where, record):
+              for key in (
+                  "rss_process_start_kb", "rss_before_load_kb", "rss_after_submissions_kb",
+                  "rss_under_load_peak_kb", "rss_after_cleanup_kb", "rss_process_peak_kb",
+              ):
+                  if record[key] is None:
+                      fail(f"{where}: missing {key}")
+
+          def check_backlog(where, record):
+              n = record["backlog_sample_count"]
+              if n < 1 or any(len(record[key]) != n for key in (
+                  "backlog_series_ms", "backlog_series_submitted", "backlog_series_received",
+                  "backlog_series_applied", "backlog_series_pending", "backlog_series_rss_kb",
+              )):
+                  fail(f"{where}: missing or misaligned backlog series")
+              for submitted, applied, pending in zip(
+                  record["backlog_series_submitted"], record["backlog_series_applied"], record["backlog_series_pending"]
+              ):
+                  if max(0, submitted - applied) != pending:
+                      fail(f"{where}: inconsistent backlog series")
+
+          if any(r.get("schema_version") != 4 for r in rows):
+              fail("unexpected schema_version")
+          if len({r.get("sha") for r in rows}) != 1:
+              fail("inconsistent SHA across records")
+          if len(reps) != 15 or len(level_aggs) != 5 or len(overall) != 1:
+              fail(f"expected 15 repetitions, 5 level aggregates, 1 overall; got {len(reps)}, {len(level_aggs)}, {len(overall)}")
+          if sorted(r["repetition"] for r in reps) != list(range(1, 16)):
+              fail("repetition ids are not 1..15")
+
+          for level_index, target in enumerate(levels):
+              rs = [r for r in reps if r.get("load_level_index") == level_index]
+              if len(rs) != 3:
+                  fail(f"level {target}: expected 3 repetitions, got {len(rs)}")
+              for r in rs:
+                if r.get("scenario") != "bt01_load_curve":
+                    fail(f"level {target}: unexpected repetition scenario")
+                if r.get("target_offered_tps") != float(target):
+                    fail(f"level {target}: wrong target_offered_tps")
+                if r.get("target_submission_interval_us") != 1_000_000 // target:
+                    fail(f"level {target}: wrong target_submission_interval_us")
+                if r.get("transactions_per_repetition") != 300:
+                    fail(f"level {target}: wrong transactions_per_repetition")
+                if not (r["transactions_submitted"] == r["transactions_received"] == r["transactions_applied"] == 300):
+                    fail(f"level {target} repetition {r.get('repetition')}: inconsistent counters")
+                if r["transactions_rejected"] != 0 or r["latency_samples"] != 300:
+                    fail(f"level {target} repetition {r.get('repetition')}: rejected or missing samples")
+                for key in ("offered_rate", "reception_rate", "application_rate", "completion_rate"):
+                    check_rate(f"level {target} repetition {r.get('repetition')} {key}", r[key], 300)
+                if r["submission_start_us"] != 0:
+                    fail(f"level {target} repetition {r.get('repetition')}: submission_start_us is not 0")
+                if r["offered_rate"]["window_end_us"] != r["submission_end_us"]:
+                    fail(f"level {target} repetition {r.get('repetition')}: offered window does not end at last submission")
+                if r["completion_rate"]["window_end_us"] != r["last_apply_us"]:
+                    fail(f"level {target} repetition {r.get('repetition')}: completion window does not end at last apply")
+                if r.get("generation_included_in_rates") is not False:
+                    fail(f"level {target} repetition {r.get('repetition')}: generation included in rates")
+                if r.get("generation_scope") != "one_time_shared_pow_before_all_repetitions":
+                    fail(f"level {target} repetition {r.get('repetition')}: wrong generation scope")
+                if r["end_to_end_latency_p50_us"] is None or r["end_to_end_latency_p95_us"] is None or r["end_to_end_latency_p99_us"] is None:
+                    fail(f"level {target} repetition {r.get('repetition')}: missing latency percentiles")
+                if r["recovery_ms"] is None:
+                    fail(f"level {target} repetition {r.get('repetition')}: missing recovery")
+                check_backlog(f"level {target} repetition {r.get('repetition')}", r)
+                check_rss(f"level {target} repetition {r.get('repetition')}", r)
+
+              agg = [r for r in level_aggs if r.get("load_level_index") == level_index]
+              if len(agg) != 1:
+                  fail(f"level {target}: expected exactly one level aggregate")
+              agg = agg[0]
+              if agg.get("scenario") != "bt01_load_curve_level_aggregate" or agg.get("aggregate_scope") != "level":
+                  fail(f"level {target}: unexpected aggregate scenario or scope")
+              if agg.get("target_offered_tps") != float(target):
+                  fail(f"level {target}: aggregate target mismatch")
+              if agg.get("repetitions_total") != 3 or agg.get("levels_total") != 5:
+                  fail(f"level {target}: aggregate repetition/level count mismatch")
+              if not (agg["transactions_submitted"] == agg["transactions_received"] == agg["transactions_applied"] == 900):
+                  fail(f"level {target}: aggregate counters are not 900")
+              if agg["transactions_rejected"] != 0 or agg["latency_samples"] != 900:
+                  fail(f"level {target}: aggregate rejected or missing samples")
+              for key in ("submission_end_us", "first_receipt_us", "last_receipt_us", "first_apply_us", "last_apply_us"):
+                  if agg[key] is not None:
+                      fail(f"level {target}: aggregate raw timestamp {key} is not null")
+              for key in ("offered_rate", "reception_rate", "application_rate", "completion_rate"):
+                  check_rate(f"level {target} aggregate {key}", agg[key], 900)
+              if agg["backlog_sample_count"] != 0 or agg["backlog_series_ms"]:
+                  fail(f"level {target}: aggregate must not claim a per-repetition backlog series")
+              check_rss(f"level {target} aggregate", agg)
+
+          agg = overall[0]
+          if agg.get("scenario") != "bt01_load_curve_aggregate" or agg.get("aggregate_scope") != "overall":
+              fail("unexpected overall aggregate scenario or scope")
+          if agg.get("repetitions_total") != 15 or agg.get("levels_total") != 5:
+              fail("overall aggregate repetition/level count mismatch")
+          if agg.get("target_offered_tps") is not None or agg.get("target_submission_interval_us") is not None:
+              fail("overall aggregate must not claim a single target")
+          if not (agg["transactions_submitted"] == agg["transactions_received"] == agg["transactions_applied"] == 4500):
+              fail("overall aggregate counters are not 4500")
+          if agg["transactions_rejected"] != 0 or agg["latency_samples"] != 4500:
+              fail("overall aggregate rejected or missing samples")
+          for key in ("submission_end_us", "first_receipt_us", "last_receipt_us", "first_apply_us", "last_apply_us"):
+              if agg[key] is not None:
+                  fail(f"overall aggregate raw timestamp {key} is not null")
+          for key in ("offered_rate", "reception_rate", "application_rate", "completion_rate"):
+              check_rate(f"overall aggregate {key}", agg[key], 4500)
+          if agg["backlog_sample_count"] != 0 or agg["backlog_series_ms"]:
+              fail("overall aggregate must not claim a per-repetition backlog series")
+          check_rss("overall aggregate", agg)
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              lines = [
+                  "",
+                  "### 4CP-BT load curve summary",
+                  "",
+                  f"`sha={rows[0]['sha']}`; 2 nodes same process; 300 transactions/repetition; 3 repetitions/level; PoW difficulty 20; one shared pre-generated transaction set; fresh nodes/storage per repetition.",
+                  "",
+                  "| target tx/s | actual offered mean | target reached? | completion mean | p95 mean (us) | samples | backlog max | recovery max (ms) | RSS before mean (KiB) | RSS peak max (KiB) | VmHWM max (KiB) |",
+                  "|---:|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+              ]
+              for level_index, target in enumerate(levels):
+                  rs = [r for r in reps if r.get("load_level_index") == level_index]
+                  offered = sum(r["offered_rate"]["value"] for r in rs) / len(rs)
+                  completion = sum(r["completion_rate"]["value"] for r in rs) / len(rs)
+                  p95 = sum(r["end_to_end_latency_p95_us"] for r in rs) / len(rs)
+                  backlog = max(r["backlog_peak"] for r in rs)
+                  recovery = max(r["recovery_ms"] for r in rs)
+                  rss_before = sum(r["rss_before_load_kb"] for r in rs) / len(rs)
+                  rss_peak = max(r["rss_under_load_peak_kb"] for r in rs)
+                  vhwm = max(r["rss_process_peak_kb"] for r in rs)
+                  reached = "yes" if offered >= target * 0.98 else "NO"
+                  lines.append(
+                      f"| {target} | {offered:.1f} | {reached} | {completion:.1f} | {p95:.0f} | 900 | {backlog} | {recovery} | {rss_before:.0f} | {rss_peak} | {vhwm} |"
+                  )
+              lines += [
+                  "",
+                  "`actual offered` is the mean of the three `submitted / (last_submission - first_submission)` windows. `completion` is `applied / (last_apply - first_submission)` and includes backlog drain. Level aggregates use sums of non-overlapping repetition windows; they are not wall-clock intervals.",
+                  "",
+                  "`target reached?` uses a 2% tolerance on the mean actual offered rate and is descriptive only; the workflow does not force saturation. The overall aggregate covers all 15 repetitions and is not a per-level substitute.",
+                  "",
+                  "RSS is whole-process RSS, including both P2P nodes and the benchmark harness. `rss_under_load_peak_kb` is sampled current VmRSS (10 ms); `rss_process_peak_kb` is lifetime VmHWM and is not a per-repetition peak. Successive repetitions share one process, so this is not evidence of a per-repetition leak.",
+              ]
+              with open(summary, "a", encoding="utf-8") as fh:
+                  fh.write("\n".join(lines) + "\n")
+          print(f"{label}: schema v4 validated (15 repetitions, 5 levels, 4500 latency samples)")
           PY
           then
             echo "::error::$n expected BENCH_JSONL records are missing or inconsistent"
