@@ -211,7 +211,7 @@ fn seed_store(dir: &Path, txs: &[Transaction], processor: &TransactionProcessor)
 
 /// Production boot rebuild: genesis seed + topological insert of the exact
 /// persisted bytes (+ persisted orphans, kept for fidelity) + tips rebuild.
-fn rebuild_dag_from_disk(path: &Path) -> (DAG, usize) {
+fn rebuild_dag_from_disk(path: &Path) -> (DAG, usize, Storage) {
     let store = Storage::open(path).expect("reopen store");
     let mut txs = store.get_all_transactions().expect("read txs");
     for o in store.get_all_orphans().expect("read orphans") {
@@ -219,14 +219,13 @@ fn rebuild_dag_from_disk(path: &Path) -> (DAG, usize) {
             txs.push(o);
         }
     }
-    drop(store);
     let n = txs.len();
     let (mut dag, _b, _o, _m) = initialize_genesis(GenesisConfig::default());
     let (_ins, sk, orph) = rebuild_dag_topological(&mut dag, txs);
     assert_eq!(sk, 0, "no silent skips on rebuild");
     assert!(orph.is_empty(), "no orphans on healthy store");
     dag.rebuild_tips();
-    (dag, n)
+    (dag, n, store)
 }
 
 /// Bridge sync closures to async state (production closures are sync).
@@ -261,9 +260,9 @@ struct TestNode {
 }
 
 async fn boot_node(dir: PathBuf, port: u16, bootnodes: Vec<SocketAddr>) -> TestNode {
-    let (dag, rebuilt_n) = rebuild_dag_from_disk(&dir);
+    let (dag, rebuilt_n, storage) = rebuild_dag_from_disk(&dir);
     let dag = Arc::new(RwLock::new(dag));
-    let storage = Arc::new(RwLock::new(Storage::open(&dir).expect("open store")));
+    let storage = Arc::new(RwLock::new(storage));
     let (tx_sender, rx) = mpsc::channel::<IngressTx>(TX_INGRESS_CAPACITY_MSGS);
     let sync = Arc::new(SyncContext::default());
 
