@@ -354,6 +354,80 @@ const PROPAGATION_JITTER_MAX: Duration = Duration::from_millis(250);
 /// of them (minus the source).
 const MAX_PROPAGATION_FANOUT: usize = 4;
 
+#[cfg(feature = "test-jitter-control")]
+#[derive(Clone, Copy)]
+struct TestJitterConfig {
+    min: Duration,
+    max: Duration,
+    seed: u64,
+}
+
+#[cfg(feature = "test-jitter-control")]
+static TEST_JITTER_CONFIG: std::sync::OnceLock<std::sync::Mutex<Option<TestJitterConfig>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(feature = "test-jitter-control")]
+fn test_jitter_config() -> &'static std::sync::Mutex<Option<TestJitterConfig>> {
+    TEST_JITTER_CONFIG.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Test-only: override the positive relay-jitter window and RNG seed. Available
+/// only with the `test-jitter-control` feature; production builds use the
+/// fixed 2E-D constants and OS entropy.
+#[cfg(feature = "test-jitter-control")]
+pub fn set_test_propagation_jitter(min: Duration, max: Duration, seed: u64) {
+    assert!(min <= max, "jitter minimum must not exceed maximum");
+    assert!(
+        max <= Duration::from_secs(10),
+        "test jitter maximum above the 10 s sync backstop"
+    );
+    *test_jitter_config().lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(TestJitterConfig { min, max, seed });
+}
+
+/// Test-only: restore the production jitter window and entropy-seeded RNG.
+#[cfg(feature = "test-jitter-control")]
+pub fn clear_test_propagation_jitter() {
+    *test_jitter_config().lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+#[cfg(feature = "test-jitter-control")]
+fn propagation_jitter_window() -> (Duration, Duration) {
+    test_jitter_config()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map(|config| (config.min, config.max))
+        .unwrap_or((PROPAGATION_JITTER_MIN, PROPAGATION_JITTER_MAX))
+}
+
+#[cfg(not(feature = "test-jitter-control"))]
+#[inline]
+fn propagation_jitter_window() -> (Duration, Duration) {
+    (PROPAGATION_JITTER_MIN, PROPAGATION_JITTER_MAX)
+}
+
+#[cfg(feature = "test-jitter-control")]
+fn propagation_rng_seed() -> Option<u64> {
+    test_jitter_config()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map(|config| config.seed)
+}
+
+#[cfg(feature = "test-jitter-control")]
+fn new_propagation_rng() -> StdRng {
+    match propagation_rng_seed() {
+        Some(seed) => StdRng::seed_from_u64(seed),
+        None => StdRng::from_entropy(),
+    }
+}
+
+#[cfg(not(feature = "test-jitter-control"))]
+#[inline]
+fn new_propagation_rng() -> StdRng {
+    StdRng::from_entropy()
+}
+
 /// 2E-A (A.1): write `contents` to `path` so the file is readable by its owner
 /// only (0600) instead of inheriting a world-readable umask (0644); the mode is
 /// re-asserted after the write, so a file left wide by a previous crash is
@@ -921,8 +995,9 @@ where
 /// between neighbours. It is *not* a defence against an observer that sees
 /// both endpoints; 2E-D never claims one.
 fn propagation_delay<R: Rng + ?Sized>(rng: &mut R) -> Duration {
-    let span = (PROPAGATION_JITTER_MAX.as_millis() - PROPAGATION_JITTER_MIN.as_millis()) as u64;
-    PROPAGATION_JITTER_MIN + Duration::from_millis(rng.gen_range(0..=span))
+    let (min, max) = propagation_jitter_window();
+    let span = (max.as_millis() - min.as_millis()) as u64;
+    min + Duration::from_millis(rng.gen_range(0..=span))
 }
 
 /// 2E-D: which connected peers receive one relay wave.
@@ -3671,7 +3746,7 @@ impl P2PNetwork {
             // OS entropy, same policy as the rest of the node: the choice of
             // which neighbour hears first must not be predictable, and must
             // not be reproducible across restarts.
-            propagation_rng: Arc::new(std::sync::Mutex::new(StdRng::from_entropy())),
+            propagation_rng: Arc::new(std::sync::Mutex::new(new_propagation_rng())),
             sync_ctx,
             is_orphan,
   stake_hooks: StakeHooks::default(),

@@ -424,6 +424,346 @@ jobs:
           fi
           echo "$n: ${#metrics[@]} measurement(s) published"
 
+      # 4CP-BW: propagation-jitter compromise. The `test-jitter-control`
+      # feature overrides the window and RNG seed only in this test build;
+      # production still uses 20..250 ms and OS entropy. The no-jitter arm is
+      # a laboratory control and must never be presented as a deployment
+      # recommendation.
+      - name: 4CP-BW propagation jitter compromise (release)
+        if: always()
+        run: |
+          n=phase4bw; log=/tmp/$n.log; set +e
+          cargo test --test phase4bw_jitter_compromise_tests bw01_jitter_compromise --features test-jitter-control --release -- --exact --nocapture --test-threads=1 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          mapfile -t metrics < <(grep -aE 'BENCH_JSONL:' "$log" || true)
+          {
+            echo ""
+            echo "### 4CP-BW propagation jitter compromise (release)"
+            echo ""
+            echo '```jsonl'
+          } >> "$GITHUB_STEP_SUMMARY"
+          bad=0
+          for line in "${metrics[@]}"; do
+            json="${line#*BENCH_JSONL:}"
+            if ! python3 -c 'import json,sys; json.loads(sys.argv[1])' "$json" 2>/dev/null; then
+              bad=1
+              echo "::error::$n invalid BENCH_JSONL JSON: $line"
+              continue
+            fi
+            printf '%s\n' "$json" >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::BENCH_JSONL:$json"
+          done
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ "$c" -ne 0 ]; then
+            echo "::error::$n failed on Linux (exit $c)"
+            grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done
+            exit "$c"
+          fi
+          if [ "${#metrics[@]}" -eq 0 ]; then
+            echo "::error::$n produced no BENCH_JSONL measurement"
+            exit 1
+          fi
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::$n published invalid BENCH_JSONL data"
+            exit 1
+          fi
+          : > "/tmp/$n.jsonl"
+          for line in "${metrics[@]}"; do printf '%s\n' "${line#*BENCH_JSONL:}" >> "/tmp/$n.jsonl"; done
+          if ! python3 - "$n" "/tmp/$n.jsonl" <<'PY'
+          import json
+          import os
+          import sys
+
+          label, path = sys.argv[1], sys.argv[2]
+          rows = [json.loads(line) for line in open(path, encoding="utf-8")]
+          reps = [r for r in rows if r.get("record_type") == "repetition"]
+          cells = [r for r in rows if r.get("record_type") == "cell_aggregate"]
+          overalls = [r for r in rows if r.get("record_type") == "overall_aggregate"]
+          profiles = {"none_0_0": (0, 0), "20_50": (20, 50), "20_100": (20, 100), "20_250": (20, 250)}
+          rates = (550, 1000)
+          expected_reps = len(profiles) * len(rates) * 3
+          expected_cells = len(profiles) * len(rates)
+          per_rep = 300
+
+          def fail(message):
+              print(f"{label}: {message}", file=sys.stderr)
+              sys.exit(1)
+
+          def check_rate(where, metric, numerator):
+              if metric["numerator"] != numerator:
+                  fail(f"{where}: rate numerator mismatch")
+              if metric["duration_us"] != metric["window_end_us"] - metric["window_start_us"]:
+                  fail(f"{where}: rate duration is not window end - start")
+              if metric["duration_us"] == 0:
+                  if metric["value"] is not None:
+                      fail(f"{where}: zero-duration rate is not null")
+              else:
+                  expected = numerator / (metric["duration_us"] / 1_000_000.0)
+                  if abs(metric["value"] - expected) > 1e-6:
+                      fail(f"{where}: rate value is not numerator / duration")
+
+          def check_percentiles(where, record, prefix):
+              keys = [f"{prefix}_{name}_us" for name in ("mean", "p50", "p95", "p99", "max")]
+              for key in keys:
+                  if record.get(key) is None:
+                      fail(f"{where}: missing {key}")
+              if not (
+                  record[f"{prefix}_p50_us"] <= record[f"{prefix}_p95_us"]
+                  <= record[f"{prefix}_p99_us"] <= record[f"{prefix}_max_us"]
+              ):
+                  fail(f"{where}: {prefix} percentiles are not monotone")
+              if record[f"{prefix}_mean_us"] > record[f"{prefix}_max_us"]:
+                  fail(f"{where}: {prefix} mean exceeds max")
+
+          def check_counters(where, record, expected):
+              if not (
+                  record["transactions_submitted"] == expected
+                  and record["transactions_received"] == expected
+                  and record["transactions_applied"] == expected
+              ):
+                  fail(f"{where}: submitted/received/applied counters are not {expected}")
+              if record["transactions_rejected"] != 0 or record["duplicates_received"] != 0:
+                  fail(f"{where}: rejection/duplicate counter is not zero")
+              if record["latency_samples"] != expected:
+                  fail(f"{where}: latency_samples is not {expected}")
+
+          if any(r.get("schema_version") != 6 for r in rows):
+              fail("unexpected schema_version")
+          if len({r.get("sha") for r in rows}) != 1:
+              fail("inconsistent SHA across records")
+          if len(reps) != expected_reps or len(cells) != expected_cells or len(overalls) != 1:
+              fail(f"expected {expected_reps} repetitions, {expected_cells} cells and 1 overall aggregate, got {len(reps)}, {len(cells)} and {len(overalls)}")
+          if sorted(r["repetition"] for r in reps) != list(range(1, expected_reps + 1)):
+              fail("repetition ids are not 1..24")
+
+          seen_cells = set()
+          for r in reps:
+              where = f"repetition {r.get('repetition')}"
+              profile = r.get("profile_id")
+              target = r.get("target_offered_tps")
+              if profile not in profiles or target not in rates:
+                  fail(f"{where}: unknown profile or target")
+              window = profiles[profile]
+              if (r["jitter_min_ms"], r["jitter_max_ms"]) != window:
+                  fail(f"{where}: jitter window mismatch")
+              if r.get("scenario") != "bw01_jitter_compromise":
+                  fail(f"{where}: unexpected scenario")
+              if r["target_submission_interval_us"] != 1_000_000 // target:
+                  fail(f"{where}: submission interval mismatch")
+              if r["cell_repetition"] not in (1, 2, 3) or r["repetitions_total"] != 3:
+                  fail(f"{where}: cell repetition metadata mismatch")
+              if r["transactions_per_repetition"] != per_rep:
+                  fail(f"{where}: wrong transactions_per_repetition")
+              if r.get("generation_included_in_rates") is not False:
+                  fail(f"{where}: generation included in rates")
+              check_counters(where, r, per_rep)
+              if r["submission_start_us"] >= r["submission_end_us"]:
+                  fail(f"{where}: non-positive submission span")
+              if not (
+                  r["submission_start_us"] <= r["first_receipt_us"] <= r["last_receipt_us"]
+                  and r["submission_start_us"] <= r["first_apply_us"] <= r["last_apply_us"]
+                  and r["submission_end_us"] <= r["last_apply_us"]
+              ):
+                  fail(f"{where}: inconsistent timestamp ordering")
+              if r["drain_ms"] != (r["last_apply_us"] - r["submission_end_us"]) // 1_000:
+                  fail(f"{where}: drain_ms mismatch")
+              if r["offered_rate"]["window_start_us"] != r["submission_start_us"]:
+                  fail(f"{where}: offered window does not start at first submission")
+              if r["offered_rate"]["window_end_us"] != r["submission_end_us"]:
+                  fail(f"{where}: offered window does not end at last submission")
+              if r["reception_rate"]["window_start_us"] != r["first_receipt_us"] or r["reception_rate"]["window_end_us"] != r["last_receipt_us"]:
+                  fail(f"{where}: reception window mismatch")
+              if r["application_rate"]["window_start_us"] != r["first_apply_us"] or r["application_rate"]["window_end_us"] != r["last_apply_us"]:
+                  fail(f"{where}: application window mismatch")
+              if r["completion_rate"]["window_start_us"] != r["submission_start_us"] or r["completion_rate"]["window_end_us"] != r["last_apply_us"]:
+                  fail(f"{where}: completion window mismatch")
+              for name, metric in (
+                  ("offered", r["offered_rate"]),
+                  ("reception", r["reception_rate"]),
+                  ("application", r["application_rate"]),
+                  ("completion", r["completion_rate"]),
+              ):
+                  check_rate(f"{where} {name}", metric, per_rep)
+              for prefix in ("propagation_latency", "application_latency", "end_to_end_latency"):
+                  check_percentiles(where, r, prefix)
+              series_len = r["backlog_sample_count"]
+              arrays = [
+                  r["backlog_series_ms"], r["backlog_series_submitted"],
+                  r["backlog_series_received"], r["backlog_series_applied"],
+                  r["backlog_series_pending"], r["backlog_series_rss_kb"],
+              ]
+              if series_len == 0 or any(len(values) != series_len for values in arrays):
+                  fail(f"{where}: backlog series lengths disagree")
+              if any(a > b for a, b in zip(r["backlog_series_ms"], r["backlog_series_ms"][1:])):
+                  fail(f"{where}: backlog timestamps are not non-decreasing")
+              pending_values = []
+              for submitted, received, applied, pending in zip(
+                  r["backlog_series_submitted"], r["backlog_series_received"],
+                  r["backlog_series_applied"], r["backlog_series_pending"],
+              ):
+                  if received > submitted or applied > submitted:
+                      fail(f"{where}: received/applied exceeds submitted in backlog series")
+                  expected_pending = submitted - applied
+                  if pending != expected_pending:
+                      fail(f"{where}: pending is not submitted - applied")
+                  pending_values.append(pending)
+              if r["backlog_peak"] != max(pending_values):
+                  fail(f"{where}: backlog_peak is not the series maximum")
+              if r["backlog_peak_at_ms"] not in [
+                  at for at, pending in zip(r["backlog_series_ms"], pending_values)
+                  if pending == max(pending_values)
+              ]:
+                  fail(f"{where}: backlog_peak_at_ms does not identify the peak")
+              if r["backlog_series_pending"][-1] != 0:
+                  fail(f"{where}: backlog did not drain")
+              if sys.platform.startswith("linux"):
+                  for key in ("rss_before_load_kb", "rss_under_load_peak_kb", "rss_after_cleanup_kb", "rss_process_peak_kb"):
+                      if r[key] is None:
+                          fail(f"{where}: missing {key}")
+              seen_cells.add((profile, target, r["cell_repetition"]))
+
+          if len(seen_cells) != expected_reps:
+              fail("profile/target/repetition combinations are not unique")
+
+          def check_aggregate(where, agg, expected_reps_count, total, profiles_expected=None):
+              if agg.get("repetitions") != expected_reps_count:
+                  fail(f"{where}: repetitions mismatch")
+              if agg.get("transactions_per_repetition") != per_rep:
+                  fail(f"{where}: transactions_per_repetition mismatch")
+              check_counters(where, agg, total)
+              if profiles_expected is not None:
+                  expected_scope = f"profile={profiles_expected[0]},target_tps={profiles_expected[1]}"
+                  if agg["aggregate_scope"] != expected_scope:
+                      fail(f"{where}: aggregate scope mismatch")
+                  if agg["profile_id"] != profiles_expected[0] or agg["target_offered_tps"] != profiles_expected[1]:
+                      fail(f"{where}: aggregate profile/target mismatch")
+              for prefix in ("propagation_latency", "application_latency", "end_to_end_latency"):
+                  check_percentiles(where, agg, prefix)
+              if agg["drain_ms_mean"] is None or agg["drain_ms_max"] is None:
+                  fail(f"{where}: missing drain metrics")
+              if not (0 <= agg["drain_ms_mean"] <= agg["drain_ms_max"]):
+                  fail(f"{where}: drain mean is outside [0,max]")
+              for name, metric in (
+                  ("offered", agg["offered_rate"]),
+                  ("reception", agg["reception_rate"]),
+                  ("application", agg["application_rate"]),
+                  ("completion", agg["completion_rate"]),
+              ):
+                  check_rate(f"{where} {name}", metric, total)
+
+          cell_lookup = {}
+          for cell in cells:
+              key = (cell["profile_id"], cell["target_offered_tps"])
+              if key in cell_lookup:
+                  fail("duplicate cell aggregate")
+              cell_lookup[key] = cell
+              members = [r for r in reps if (r["profile_id"], r["target_offered_tps"]) == key]
+              where = f"cell {key[0]}/{key[1]}"
+              check_aggregate(where, cell, 3, per_rep * 3, key)
+              if len(members) != 3:
+                  fail(f"{where}: wrong repetition count")
+              if cell["jitter_min_ms"] != profiles[key[0]][0] or cell["jitter_max_ms"] != profiles[key[0]][1]:
+                  fail(f"{where}: jitter window mismatch")
+              for metric_name, start_key, end_key in (
+                  ("offered_rate", "submission_start_us", "submission_end_us"),
+                  ("reception_rate", "first_receipt_us", "last_receipt_us"),
+                  ("application_rate", "first_apply_us", "last_apply_us"),
+                  ("completion_rate", "submission_start_us", "last_apply_us"),
+              ):
+                  joined = sum(r[end_key] - r[start_key] for r in members)
+                  if cell[metric_name]["duration_us"] != joined:
+                      fail(f"{where}: {metric_name} duration is not the sum of repetitions")
+              if cell["latency_samples"] != per_rep * 3:
+                  fail(f"{where}: wrong latency sample count")
+              if cell["drain_ms_max"] != max(r["drain_ms"] for r in members):
+                  fail(f"{where}: drain max mismatch")
+              if cell["backlog_peak_max"] != max(r["backlog_peak"] for r in members):
+                  fail(f"{where}: backlog max mismatch")
+
+          if len(cell_lookup) != expected_cells:
+              fail("missing cell aggregate")
+
+          for target in rates:
+              base = cell_lookup[("none_0_0", target)]
+              top = cell_lookup[("20_250", target)]
+              if not base["end_to_end_latency_p50_us"] < top["end_to_end_latency_p50_us"]:
+                  fail(f"target {target}: no-jitter p50 is not below 20..250 ms")
+              if not base["completion_rate"]["value"] > top["completion_rate"]["value"]:
+                  fail(f"target {target}: no-jitter completion is not above 20..250 ms")
+              chain = [cell_lookup[(profile, target)]["propagation_latency_p50_us"] for profile in profiles]
+              if any(a >= b for a, b in zip(chain, chain[1:])):
+                  fail(f"target {target}: propagation p50 is not strictly increasing with the jitter window")
+
+          agg = overalls[0]
+          if agg.get("scenario") != "bw01_jitter_compromise_aggregate" or agg.get("aggregate_scope") != "overall":
+              fail("unexpected overall aggregate scenario or scope")
+          if agg["profile_id"] != "all" or agg["jitter_min_ms"] is not None or agg["jitter_max_ms"] is not None or agg["target_offered_tps"] is not None:
+              fail("overall aggregate claims a single profile/target")
+          check_aggregate("overall", agg, expected_reps, per_rep * expected_reps)
+          for metric_name, start_key, end_key in (
+              ("offered_rate", "submission_start_us", "submission_end_us"),
+              ("reception_rate", "first_receipt_us", "last_receipt_us"),
+              ("application_rate", "first_apply_us", "last_apply_us"),
+              ("completion_rate", "submission_start_us", "last_apply_us"),
+          ):
+              joined = sum(r[end_key] - r[start_key] for r in reps)
+              if agg[metric_name]["duration_us"] != joined:
+                  fail(f"overall {metric_name} duration is not the sum of repetitions")
+          if agg["drain_ms_max"] != max(r["drain_ms"] for r in reps):
+              fail("overall drain max mismatch")
+          if agg["backlog_peak_max"] != max(r["backlog_peak"] for r in reps):
+              fail("overall backlog max mismatch")
+
+          engine_tps = None
+          engine_path = "/tmp/phase4bv.jsonl"
+          if os.path.exists(engine_path):
+              engine_rows = [json.loads(line) for line in open(engine_path, encoding="utf-8")]
+              engine_aggs = [r for r in engine_rows if r.get("record_type") == "aggregate"]
+              if engine_aggs:
+                  engine_tps = engine_aggs[0]["applied_tps"]
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              lines = [
+                  "",
+                  "### 4CP-BW propagation-jitter compromise summary",
+                  "",
+                  f"`sha={rows[0]['sha']}`; 2 nodes in one process over loopback; 300 transactions/repetition; 3 repetitions per profile/load cell; 4 jitter profiles x 2 offered loads; PoW difficulty 20; one shared pre-generated valid transaction set; fresh nodes/storage per repetition. Rates exclude PoW generation. Latency is measured from submission to receipt (propagation), receipt to applied (application), and submission to applied (end-to-end). The consumer applies account nonces in order, so out-of-order relay also delays later transactions.",
+                  "",
+                  "| profile | target tx/s | offered tx/s | completion tx/s | application tx/s | e2e p50 (us) | e2e p95 (us) | e2e p99 (us) | propagation p50 (us) | backlog max | drain mean (ms) |",
+                  "|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+              ]
+              for profile in profiles:
+                  for target in rates:
+                      r = cell_lookup[(profile, target)]
+                      lines.append(
+                          f"| {profile} | {target} | {r['offered_rate']['value']:.1f} | "
+                          f"{r['completion_rate']['value']:.1f} | {r['application_rate']['value']:.1f} | "
+                          f"{r['end_to_end_latency_p50_us']} | {r['end_to_end_latency_p95_us']} | "
+                          f"{r['end_to_end_latency_p99_us']} | {r['propagation_latency_p50_us']} | "
+                          f"{r['backlog_peak_max']} | {r['drain_ms_mean']:.1f} |"
+                      )
+              lines += [
+                  "",
+                  f"`completion` covers the full repetition window including the post-submission drain, so it is lower than the steady-state `application` rate; this is intentional and exposes the fixed tail cost of each jitter window. The no-jitter arm is a laboratory control only: it quantifies the cost of the current privacy mechanism, not a configuration to deploy.",
+                  "",
+                  "The tested loads (`550` and `1000 tx/s`) are below engine-only capacity"
+                  + (f" (`{engine_tps:.1f} tx/s` measured earlier in this run)" if engine_tps is not None else "")
+                  + "; the observed gap is therefore delivery/ordering cost, not engine saturation. No-jitter results must not be compared as if they provided the same timing privacy as the production 20..250 ms window.",
+                  "",
+                  "Limits: two-node loopback, no WAN loss/reordering, no adversarial observer, 300-transaction repetitions with short windows, CI hardware, and an explicit `test-jitter-control` build. These results characterize this harness, not a global network guarantee.",
+              ]
+              with open(summary, "a", encoding="utf-8") as fh:
+                  fh.write("\n".join(lines) + "\n")
+
+          print(f"{label}: schema v6 validated ({len(reps)} repetitions, {len(cells)} cells, {agg['latency_samples']} latency samples)")
+          PY
+          then
+            echo "::error::$n expected BENCH_JSONL records are missing or inconsistent"
+            exit 1
+          fi
+          echo "$n: ${#metrics[@]} measurement(s) published"
+
       # 4CP-BO/BQ: release-mode performance baseline (JSONL schema v2).
       # Publish every valid BENCH_JSONL record in the step summary and as a
       # notice annotation. Fail on cargo failure (preserving its exit code),

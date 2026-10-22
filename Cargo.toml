@@ -13,6 +13,10 @@ path = "src/gui.rs"
 [workspace]
 members = []
 
+[features]
+default = []
+test-jitter-control = []
+
 [dependencies]
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
