@@ -168,6 +168,50 @@ jobs:
         if: always()
         run: cargo build --bins
 
+      # 4CP-BO: release-mode performance baseline. Publish every valid
+      # BENCH_JSONL record in the step summary and as a notice annotation.
+      # Fail on cargo failure (preserving its exit code), invalid JSON, or no
+      # measurement at all.
+      - name: 4CP-BO performance baseline (release)
+        if: always()
+        run: |
+          n=phase4bo; log=/tmp/$n.log; set +e
+          cargo test --test phase4bo_performance_baseline_tests --release -- --nocapture 2>&1 | sed -r 's/\x1b\[[0-9;]*[mGKH]//g' | tee "$log"
+          c=${PIPESTATUS[0]}
+          mapfile -t metrics < <(grep -aE '^BENCH_JSONL:' "$log" || true)
+          {
+            echo ""
+            echo "### 4CP-BO performance baseline (release)"
+            echo ""
+            echo '```jsonl'
+          } >> "$GITHUB_STEP_SUMMARY"
+          bad=0
+          for line in "${metrics[@]}"; do
+            json="${line#BENCH_JSONL:}"
+            if ! python3 -c 'import json,sys; json.loads(sys.argv[1])' "$json" 2>/dev/null; then
+              bad=1
+              echo "::error::$n invalid BENCH_JSONL JSON: $line"
+              continue
+            fi
+            printf '%s\n' "$json" >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::BENCH_JSONL:$json"
+          done
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          if [ "$c" -ne 0 ]; then
+            echo "::error::$n failed on Linux (exit $c)"
+            grep -aE "panicked at|FAILED|test result:|left ==|right ==|assertion|called .*unwrap|refusing|PermissionDenied|Err value|^error|could not compile" "$log" | tail -n 8 | while IFS= read -r l; do echo "::error::$l"; done
+            exit "$c"
+          fi
+          if [ "${#metrics[@]}" -eq 0 ]; then
+            echo "::error::$n produced no BENCH_JSONL measurement"
+            exit 1
+          fi
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::$n published invalid BENCH_JSONL data"
+            exit 1
+          fi
+          echo "$n: ${#metrics[@]} measurement(s) published"
+
       - name: integration phase4aq_inventory_tests
         if: always()
         run: |

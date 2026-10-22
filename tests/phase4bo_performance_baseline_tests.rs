@@ -36,7 +36,20 @@ struct BenchResult {
     memory_rss_kb: Option<u64>,
 }
 
-fn get_sha() -> String { "054551a8383bc67041b47cbe46984b2892884249".to_string() }
+fn get_sha() -> String {
+    if let Ok(sha) = std::env::var("GITHUB_SHA") {
+        let sha = sha.trim();
+        if !sha.is_empty() { return sha.to_string(); }
+    }
+    std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|out| if out.status.success() { String::from_utf8(out.stdout).ok() } else { None })
+        .map(|sha| sha.trim().to_string())
+        .filter(|sha| !sha.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
 fn get_profile() -> String { if cfg!(debug_assertions) { "debug".to_string() } else { "release".to_string() } }
 fn get_os() -> String { std::env::consts::OS.to_string() }
 fn get_arch() -> String { std::env::consts::ARCH.to_string() }
@@ -200,6 +213,7 @@ async fn bo01_scenario_a_throughput_baseline() {
         } else { break; }
     }
     let prop_time = prop_start.elapsed();
+    received.sort_by_key(|tx| tx.account_nonce);
     
     let mut applied_b = 0;
     let mut latencies_ms = Vec::new();
