@@ -168,6 +168,61 @@ jobs:
         if: always()
         run: cargo build --bins
 
+      # 4CP-C0: full pipeline benchmark with JSONL v9 schema
+      - name: phase4c0 full pipeline benchmark
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          n=phase4c0
+          log=/tmp/${n}.log
+          cargo test --test phase4c0_full_pipeline_benchmark_tests --features test-pipeline-trace,test-jitter-control --release -- --nocapture 2>&1 | tee "$log"
+          c=${PIPESTATUS[0]}
+          if [ "$c" -ne 0 ]; then
+            echo "::error::$n failed on Linux (exit $c)"
+            exit "$c"
+          fi
+          if ! grep -aq "BENCH_JSONL:" "$log"; then
+            echo "::error::no BENCH_JSONL produced"
+            exit 1
+          fi
+          {
+            echo "### 4CP-C0 Full Pipeline Benchmark"
+            echo "| Scenario | SHA | Schema | Topology | Profile | Jitter | Target TPS | Nodes | Rep | Submitted | Admitted | Received | Applied | Persisted | Offered TPS | Admission TPS | Apply TPS | Completion TPS | E2E p50 (us) | E2E p99 (us) | Backlog Peak | Queue Peak | RSS (KB) | HTTP Smoke (ms) | Drain (ms) | Reload OK |"
+            echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+            grep -a "BENCH_JSONL:" "$log" | while IFS= read -r line; do
+              json="${line#*BENCH_JSONL:}"
+              echo "$json" | jq -e . >/dev/null 2>&1 || continue
+              s=$(echo "$json" | jq -r '.scenario')
+              sha=$(echo "$json" | jq -r '.sha')
+              schema=$(echo "$json" | jq -r '.schema_version')
+              topo=$(echo "$json" | jq -r '.topology')
+              prof=$(echo "$json" | jq -r '.profile')
+              jitter=$(echo "$json" | jq -r '.jitter_ms')
+              target=$(echo "$json" | jq -r '.target_tps')
+              nodes=$(echo "$json" | jq -r '.nodes')
+              rep=$(echo "$json" | jq -r '.repetition')
+              sub=$(echo "$json" | jq -r '.submitted')
+              adm=$(echo "$json" | jq -r '.admitted')
+              rcv=$(echo "$json" | jq -r '.received')
+              app=$(echo "$json" | jq -r '.applied')
+              per=$(echo "$json" | jq -r '.persisted')
+              oft=$(echo "$json" | jq -r '.offered_tps')
+              atp=$(echo "$json" | jq -r '.admission_tps')
+              apt=$(echo "$json" | jq -r '.apply_tps')
+              ctp=$(echo "$json" | jq -r '.completion_tps')
+              p50=$(echo "$json" | jq -r 'if .e2e_p50_us==null then "-" else .e2e_p50_us end')
+              p99=$(echo "$json" | jq -r 'if .e2e_p99_us==null then "-" else .e2e_p99_us end')
+              bpeak=$(echo "$json" | jq -r 'if .backlog_peak==null then "-" else .backlog_peak end')
+              qpeak=$(echo "$json" | jq -r 'if .queue_peak==null then "-" else .queue_peak end')
+              rss=$(echo "$json" | jq -r 'if .rss_kb==null then "-" else .rss_kb end')
+              http=$(echo "$json" | jq -r 'if .http_smoke_ms==null then "-" else .http_smoke_ms end')
+              drain=$(echo "$json" | jq -r 'if .drain_ms==null then "-" else .drain_ms end')
+              reload=$(echo "$json" | jq -r 'if .reload_ok==null then "-" else .reload_ok end')
+              echo "| $s | $sha | $schema | $topo | $prof | $jitter | $target | $nodes | $rep | $sub | $adm | $rcv | $app | $per | $oft | $atp | $apt | $ctp | $p50 | $p99 | $bpeak | $qpeak | $rss | $http | $drain | $reload |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # 4CP-BT: rate-window formula regression tests. These must pass before
       # any benchmark metrics are treated as publishable.
       - name: 4CP-BT rate formula tests (release)
