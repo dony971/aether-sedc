@@ -19,6 +19,8 @@ pub mod node_identity;
 pub mod node_logging;
 pub mod p2p;
 pub mod parent_selection;
+#[cfg(feature = "test-pipeline-trace")]
+pub mod pipeline_trace;
 pub mod rpc;
 pub mod stake;
 pub mod storage;

@@ -23,6 +23,11 @@ pub struct NodeHandles {
     pub dag: Arc<RwLock<DAG>>,
     pub storage: Arc<RwLock<Storage>>,
     pub dag_store_path: PathBuf,
+    pub ledger: Arc<RwLock<Ledger>>,
+    pub mempool: Arc<RwLock<Mempool>>,
+    pub p2p: Arc<P2PNetwork>,
+    pub sync_ctx: Arc<crate::sync_stats::SyncContext>,
+    pub rpc: Arc<AetherRpcImpl>,
 }
 
 /// PHASE 4V: storage network marker (`network.id`, u64 LE). Prevents two
@@ -102,6 +107,8 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
         tracing::error!("⛔ {}", e);
         e
     })?;
+    #[cfg(feature = "test-pipeline-trace")]
+    let trace_label = cfg.trace_label.clone().unwrap_or_default();
     let node_type = cfg.node_type;
     let data_dir = cfg.data_dir;
     let p2p_port = cfg.p2p_port;
@@ -876,6 +883,8 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     let ledger_for_p2p = ledger.clone();
 
     let p2p_network_for_p2p = p2p_network.clone();
+    #[cfg(feature = "test-pipeline-trace")]
+    let receiver_trace_label = trace_label.clone();
     let ledger_path_for_p2p = ledger_path.clone();
     let storage_for_p2p = storage.clone();
     let orphans_for_p2p = orphans.clone();
@@ -889,6 +898,16 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             // 4CP-BA: taking the item releases its ingress byte reservation
             // (the permit rides inside the queued item).
             let tx = item.into_tx();
+            #[cfg(feature = "test-pipeline-trace")]
+            let rx_started = std::time::Instant::now();
+            #[cfg(feature = "test-pipeline-trace")]
+            let rx_id = tx.id;
+            #[cfg(feature = "test-pipeline-trace")]
+            crate::pipeline_trace::record(
+                &receiver_trace_label,
+                crate::pipeline_trace::PipelineEventKind::ReceiverIngress,
+                tx.id,
+            );
             // PHASE 3B (C1/H1): consume the ingress provenance recorded by
             // the P2P layer (live relay = Fresh, sync backfill = Historical;
             // absent = Historical = pre-3B behavior) and forward it as THE
@@ -909,6 +928,8 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
   rpc_impl.set_stake_registry(stake_for_p2p.clone());
   // PHASE 4V: P2P-path RPC admission under the node's network.
   rpc_impl.set_network_id(network_id);
+  #[cfg(feature = "test-pipeline-trace")]
+  rpc_impl.set_trace_label(receiver_trace_label.clone());
 
             match rpc_impl
                 .process_transaction(tx, "P2P", ingress_mode)
@@ -918,7 +939,18 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
                     // 4CP-BD: admission only. sync_progress/frontier advance
                     // when the drainer inserts the tx into the DAG.
                     tracing::info!("✅ P2P transaction accepted into the mempool");
+                    #[cfg(feature = "test-pipeline-trace")]
+                    let orphans_started = std::time::Instant::now();
                     rpc_impl.process_orphans().await;
+                    #[cfg(feature = "test-pipeline-trace")]
+                    if std::env::var_os("C0_TRACE_RX").is_some() {
+                        eprintln!(
+                            "C0_RX tx={} process_us={} orphans_us={}",
+                            hex::encode(&rx_id[..8]),
+                            orphans_started.duration_since(rx_started).as_micros(),
+                            orphans_started.elapsed().as_micros()
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("❌ P2P transaction rejected: {}", e);
@@ -1011,6 +1043,8 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     let storage_for_drain = storage.clone();
     let ledger_path_for_drain = ledger_path.clone();
     let p2p_for_drain = p2p_network.clone();
+    #[cfg(feature = "test-pipeline-trace")]
+    let drain_trace_label = trace_label.clone();
     let orphans_for_drain = orphans.clone();
     let sync_ctx_for_drain = sync_ctx.clone();
   let stake_for_drain = stake_registry.clone();
@@ -1031,6 +1065,8 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
   rpc_impl.set_stake_registry(stake_for_drain);
   // PHASE 4V: drainer-path RPC admission under the node's network.
   rpc_impl.set_network_id(network_id);
+  #[cfg(feature = "test-pipeline-trace")]
+  rpc_impl.set_trace_label(drain_trace_label);
         let mut last_log = std::time::Instant::now();
         let mut last_removed: u64 = 0;
         loop {
@@ -1314,9 +1350,31 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
         }
     }
 
+    let mut rpc = AetherRpcImpl::new(
+        dag.clone(),
+        ledger.clone(),
+        storage.clone(),
+        ledger_path,
+        mempool.clone(),
+        p2p_network.clone(),
+        mining_enabled,
+        orphans,
+        sync_ctx.clone(),
+    );
+    rpc.set_stake_registry(stake_registry);
+    rpc.set_network_id(network_id);
+    #[cfg(feature = "test-pipeline-trace")]
+    rpc.set_trace_label(trace_label);
+    let rpc = Arc::new(rpc);
+
     Ok(NodeHandles {
         dag,
         storage,
         dag_store_path,
+        ledger,
+        mempool,
+        p2p: p2p_network,
+        sync_ctx,
+        rpc,
     })
 }

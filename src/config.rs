@@ -68,6 +68,9 @@ pub struct NodeConfig {
     /// unauthenticated, preserved byte-for-byte). Pre-4CP-S TOML files that
     /// omit this field MUST be updated with an explicit choice.
     pub p2p_protocol: Option<P2PProtocolMode>,
+    #[cfg(feature = "test-pipeline-trace")]
+    #[serde(skip)]
+    pub trace_label: Option<String>,
 }
 
 impl Default for NodeConfig {
@@ -92,6 +95,8 @@ impl Default for NodeConfig {
             repair_ledger: false,
             network_id: None,
             p2p_protocol: None,
+            #[cfg(feature = "test-pipeline-trace")]
+            trace_label: None,
         }
     }
 }

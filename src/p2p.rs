@@ -3311,6 +3311,65 @@ impl PeerSink {
             }
         }
     }
+
+    /// Bounded handoff that waits for session and global budget instead of
+    /// refusing. Reserved for SyncResponse pages: dropping one of these loses
+    /// the only copy of a requested transaction and turns the native recovery
+    /// path into a re-request storm. The per-session writer drains the queue,
+    /// so waiting here applies TCP backpressure to the requesting peer without
+    /// blocking any other session.
+    async fn send(&self, bytes: Vec<u8>) -> Result<(), ()> {
+        let n = bytes.len();
+        let charge = match OutboundBudget::charge(n) {
+            Some(charge) => charge,
+            None => {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+                return Err(());
+            }
+        };
+        let session_permit = match u32::try_from(n)
+            .ok()
+            .and_then(|amount| self.budget.clone().try_acquire_many_owned(amount).ok())
+        {
+            Some(permit) => permit,
+            None => {
+                let amount = match u32::try_from(n) {
+                    Ok(amount) => amount,
+                    Err(_) => {
+                        self.drops.fetch_add(1, Ordering::Relaxed);
+                        return Err(());
+                    }
+                };
+                self.budget
+                    .clone()
+                    .acquire_many_owned(amount)
+                    .await
+                    .map_err(|_| ())?
+            }
+        };
+        let amount = match u32::try_from(charge) {
+            Ok(amount) => amount,
+            Err(_) => {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+                return Err(());
+            }
+        };
+        let global_permit = self
+            .global
+            .available
+            .clone()
+            .acquire_many_owned(amount)
+            .await
+            .map_err(|_| ())?;
+        let frame = OutboundFrame {
+            bytes,
+            _session_permit: session_permit,
+            _global_permit: global_permit,
+        };
+        self.tx.send(frame).await.map_err(|_| {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        })
+    }
 }
 
 #[cfg(test)]
@@ -6645,7 +6704,18 @@ impl P2PNetwork {
                                         // 4CP-BA: droppable — the requester
                                         // leaves the closure unmarked and
                                         // re-requests it on the next diff.
-                                        let _ = msg_sender.try_send(sync_resp_msg);
+                                        if tokio::time::timeout(
+                                            Duration::from_secs(30),
+                                            msg_sender.send(sync_resp_msg),
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            tracing::warn!(
+                                                "SyncResponse page to {} stalled for 30s",
+                                                addr
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -6721,32 +6791,97 @@ impl P2PNetwork {
                             );
                             // Topologically sort: ancestors first.
                             sort_topo(&mut closure, &topo);
-                            // Split into pages of MAX_SYNC_PAGE and send each.
-                            let total_pages = closure.len().div_ceil(MAX_SYNC_PAGE).max(1);
-                            for (page_idx, chunk) in closure.chunks(MAX_SYNC_PAGE).enumerate() {
-                                let mut tx_bytes_list = Vec::with_capacity(chunk.len());
-                                for hash in chunk {
-                                    if let Some(tx) = get_transaction_by_hash(hash) {
-                                        if let Ok(bytes) = bincode::serialize(&tx) {
-                                            tx_bytes_list.push(bytes);
-                                        }
+                            if std::env::var_os("C0_SRV_TRACE").is_some() {
+                                let have = hashes
+                                    .iter()
+                                    .filter(|h| get_transaction_by_hash(h).is_some())
+                                    .count();
+                                eprintln!(
+                                    "C0_SRV to={} requested={} have={} closure={} dag={}",
+                                    addr,
+                                    hashes.len(),
+                                    have,
+                                    closure.len(),
+                                    get_dag_hashes().len()
+                                );
+                            }
+                            // Send the closure as ONE SyncResponse batch. The
+                            // receiver partitions a batch against the DAG and
+                            // its own contents; splitting an ancestor-closed
+                            // chain into prefix pages makes every page after
+                            // the first start on a parent that is only queued
+                            // (not yet applied), so the whole page is parked
+                            // as waiting and the join stalls at the page
+                            // boundary. The closure is bounded by
+                            // MAX_SYNC_PAGE * MAX_CLOSURE_PAGES, so a single
+                            // message stays inside MAX_MESSAGE_SIZE.
+                            let mut tx_bytes_list = Vec::with_capacity(closure.len());
+                            for hash in &closure {
+                                if let Some(tx) = get_transaction_by_hash(hash) {
+                                    if let Ok(bytes) = bincode::serialize(&tx) {
+                                        tx_bytes_list.push(bytes);
                                     }
                                 }
-                                if !tx_bytes_list.is_empty() {
-                                    tracing::debug!(
-                                        "[Sync] Serving page {}/{} ({} txs) to {}",
-                                        page_idx + 1,
-                                        total_pages,
-                                        tx_bytes_list.len(),
-                                        addr
-                                    );
-                                    if let Ok(sync_resp_msg) =
-                                        bincode::serialize(&P2PMessage::SyncResponse(tx_bytes_list))
-                                    {
-                                        // 4CP-BA: droppable — the requester
-                                        // leaves the closure unmarked and
-                                        // re-requests it on the next diff.
-                                        let _ = msg_sender.try_send(sync_resp_msg);
+                            }
+                            if !tx_bytes_list.is_empty() {
+                                match bincode::serialize(&P2PMessage::SyncResponse(tx_bytes_list)) {
+                                    Ok(sync_resp_msg) if sync_resp_msg.len() <= MAX_MESSAGE_SIZE => {
+                                        if tokio::time::timeout(
+                                            Duration::from_secs(30),
+                                            msg_sender.send(sync_resp_msg),
+                                        )
+                                        .await
+                                        .is_err()
+                                        {
+                                            tracing::warn!(
+                                                "SyncResponse batch to {} stalled for 30s",
+                                                addr
+                                            );
+                                        }
+                                    }
+                                    Ok(sync_resp_msg) => {
+                                        tracing::warn!(
+                                            "SyncResponse closure for {} is {} bytes (max {}); serving it in topologically sorted pages",
+                                            addr,
+                                            sync_resp_msg.len(),
+                                            MAX_MESSAGE_SIZE
+                                        );
+                                        for chunk in closure.chunks(MAX_SYNC_PAGE) {
+                                            let mut page = Vec::with_capacity(chunk.len());
+                                            for hash in chunk {
+                                                if let Some(tx) = get_transaction_by_hash(hash) {
+                                                    if let Ok(bytes) = bincode::serialize(&tx) {
+                                                        page.push(bytes);
+                                                    }
+                                                }
+                                            }
+                                            if page.is_empty() {
+                                                continue;
+                                            }
+                                            if let Ok(msg) =
+                                                bincode::serialize(&P2PMessage::SyncResponse(page))
+                                            {
+                                                if tokio::time::timeout(
+                                                    Duration::from_secs(30),
+                                                    msg_sender.send(msg),
+                                                )
+                                                .await
+                                                .is_err()
+                                                {
+                                                    tracing::warn!(
+                                                        "SyncResponse page to {} stalled for 30s",
+                                                        addr
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Failed to serialize SyncResponse for {}: {}",
+                                            addr,
+                                            e
+                                        );
                                     }
                                 }
                             }
@@ -6846,8 +6981,45 @@ impl P2PNetwork {
                                 .sync_batches
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+                            let batch_ids: std::collections::HashSet<[u8; 32]> =
+                                pending.iter().map(|(_, tx)| tx.id).collect();
                             let (deliverable, waiting) =
                                 Self::partition_batch(pending, &*get_transaction_by_hash);
+                            if std::env::var_os("C0_WAIT_TRACE").is_some() {
+                                let hx = |h: &Vec<u8>| h.iter().take(4).map(|b| format!("{:02x}", b)).collect::<String>();
+                                eprintln!(
+                                    "C0_WAIT from={} items={} deliverable={} waiting={} first={} first_wait={}",
+                                    addr,
+                                    deliverable.len() + waiting.len(),
+                                    deliverable.len(),
+                                    waiting.len(),
+                                    deliverable.first().map(|(h, _)| hx(h)).unwrap_or_default(),
+                                    waiting.first().map(|(h, _)| hx(h)).unwrap_or_default(),
+                                );
+                                for (_, tx) in waiting.iter().take(3) {
+                                    let status = |p: &[u8; 32]| {
+                                        if *p == [0u8; 32] {
+                                            "zero".to_string()
+                                        } else {
+                                            format!(
+                                                "dag={} batch={} orphan={}",
+                                                get_transaction_by_hash(p.as_slice()).is_some(),
+                                                batch_ids.contains(p),
+                                                is_orphan(p.as_slice()),
+                                            )
+                                        }
+                                    };
+                                    eprintln!(
+                                        "C0_WAITITEM anonce={} id={} p0={} [{}] p1={} [{}]",
+                                        tx.account_nonce,
+                                        hx(&tx.id.to_vec()),
+                                        hx(&tx.parents[0].to_vec()),
+                                        status(&tx.parents[0]),
+                                        hx(&tx.parents[1].to_vec()),
+                                        status(&tx.parents[1]),
+                                    );
+                                }
+                            }
 
                             if !waiting.is_empty() {
                                 tracing::info!(
@@ -6860,7 +7032,7 @@ impl P2PNetwork {
                             // DEEP SYNC: adaptive backpressure instead of fixed
                             // 50ms per tx. Scale interval with batch size to
                             // maintain throughput while allowing ledger breathing room.
-                            let batch_len = deliverable.len();
+                            let batch_len = deliverable.len() + waiting.len();
                             let delay_ms = if batch_len > 0 {
                                 // Scale: base interval * sqrt(batch) / 10, clamped to [1, 20]ms
                                 let scaled = (BACKPRESSURE_BASE_MS as f64
@@ -6870,18 +7042,27 @@ impl P2PNetwork {
                             } else {
                                 0
                             };
-                            // CRITICAL FIX: only send deliverable txs to the mempool.
-                            // waiting txs have parents not yet in the DAG. Sending them
-                            // would create orphans whose parents are also in the mempool,
-                            // causing an unresolvable cascade (resolved=0).
-                            // waiting txs will be re-requested by process_orphans() on
-                            // subsequent cycles when their parents arrive.
-                            for (tx_bytes, tx) in deliverable.into_iter() {
+                            // 4CP-C0 FIX: admit the WHOLE batch, waiting items
+                            // included. Dropping the `waiting` tail (the previous
+                            // behavior) loses valid txs that were already paid
+                            // for by the peer: they stay "unreceived" in the
+                            // frontier, are re-requested, and are dropped again
+                            // because their parent is still missing — the
+                            // measured 31x re-download of the same nonces.
+                            // Admitting them routes each one through the normal
+                            // lifecycle: mempool -> drainer -> Orphan gate ->
+                            // park_orphan(), where the bounded orphan solver
+                            // re-requests the missing parents (backoff) and
+                            // re-enqueues the child once they land in the DAG.
+                            for (tx_bytes, tx) in deliverable.into_iter().chain(waiting.into_iter()) {
                                 // 4CP-BD: queue admission is NOT DAG insertion.
                                 // Mark the page received only; Applied is recorded
                                 // by the drainer after the processor really inserts
-                                // it. Waiting txs (parents missing) are NOT marked,
-                                // so the next inventory diff re-requests them.
+                                // it. An item the ingress refused stays unmarked
+                                // (and therefore re-requestable); an item that was
+                                // queued but still needs parents is parked as an
+                                // orphan by the drainer, where the solver owns the
+                                // parent requests and the retry.
                                 //
                                 // 4CP-BA: ADMISSION FIRST, then the marks. The
                                 // bounded ingress queue may refuse an item under
@@ -6908,17 +7089,19 @@ impl P2PNetwork {
                                         continue;
                                     }
                                 };
-                                if tx_channel
-                                    .try_send(IngressTx {
+                                let admitted = tokio::time::timeout(
+                                    Duration::from_secs(30),
+                                    tx_channel.send(IngressTx {
                                         tx,
                                         wire_len,
                                         _permit: permit,
-                                    })
-                                    .is_err()
-                                {
+                                    }),
+                                )
+                                .await;
+                                if !matches!(admitted, Ok(Ok(()))) {
                                     tx_drops.fetch_add(1, Ordering::Relaxed);
-                                    tracing::debug!(
-                                        "Ingress queue full/closed: refused {} byte sync tx from {}",
+                                    tracing::warn!(
+                                        "Ingress queue full/closed for 30s: refused {} byte sync tx from {}",
                                         wire_len,
                                         addr
                                     );

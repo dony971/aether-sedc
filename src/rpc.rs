@@ -888,6 +888,8 @@ pub struct AetherRpcImpl {
   /// admission (0 = legacy default). Set by the node from config via the
   /// setter below; submit paths forward it to the per-call processor.
   network_id: u64,
+  #[cfg(feature = "test-pipeline-trace")]
+  trace_label: String,
 }
 
 struct FeeOracle {
@@ -956,9 +958,16 @@ impl AetherRpcImpl {
             rate_limiter_per_ip: RateLimiter::new(40, 10), // 40 requests per 10s per client IP
             start_time: std::time::Instant::now(),
             sync_ctx,
-  stake_registry: None,
-  network_id: crate::transaction::DEFAULT_NETWORK_ID,
+            stake_registry: None,
+            network_id: crate::transaction::DEFAULT_NETWORK_ID,
+            #[cfg(feature = "test-pipeline-trace")]
+            trace_label: String::new(),
         }
+    }
+
+    #[cfg(feature = "test-pipeline-trace")]
+    pub fn set_trace_label(&mut self, label: String) {
+        self.trace_label = label;
     }
 
   /// PHASE 4G: attach the live stake registry (node boot path).
@@ -1291,6 +1300,12 @@ impl AetherRpcImpl {
             }
             return Err(e.into_rpc_error());
         }
+        #[cfg(feature = "test-pipeline-trace")]
+        crate::pipeline_trace::record(
+            &self.trace_label,
+            crate::pipeline_trace::PipelineEventKind::Accepted,
+            tx.id,
+        );
         // 💾 Persist the pending tx (removed on its terminal disposition)
         if let Ok(storage) = self.storage.try_read() {
             let _ = storage.put_mempool_tx(&tx);
@@ -1528,6 +1543,30 @@ impl AetherRpcImpl {
                 }
 
     pub async fn drain_mempool(&self) {
+        self.drain_queued_batch().await;
+        // Resolve newly applicable orphans in the same cycle (fixpoint).
+        self.process_orphans().await;
+        // INC-01: crash-durability — fsync the Sled log after every drained
+        // batch (incl. orphan resolutions) so a hard kill can never lose more
+        // than the in-flight batch. Bounded by the drain cycle (150ms). The
+        // incident observed ~9658 of 10004 persisted txs lost on a single
+        // unclean kill — the periodic 10s flush alone is NOT enough.
+        if let Ok(storage) = self.storage.try_read() {
+            if let Err(e) = storage.flush() {
+                tracing::error!("❌ INC-01: drain batch flush failed: {}", e);
+            }
+        }
+    }
+
+    /// One bounded SELECT → PROCESS → INCLUDE/park/reject/requeue batch.
+    ///
+    /// The orphan fixpoint is deliberately composed OUTSIDE this helper:
+    /// `process_orphans()` calls it between two fixpoint passes (so a
+    /// re-accepted orphan really reaches the DAG before the next pass scans
+    /// for unlocked children), and re-entering the solver from here would
+    /// make the async call graph recursive. `drain_mempool()` owns the
+    /// drain-then-solve composition.
+    async fn drain_queued_batch(&self) {
         // 1) TTL expiry (bounded retries).
         {
             let mut mempool = self.mempool.write().await;
@@ -1558,6 +1597,12 @@ impl AetherRpcImpl {
             let admit_mode = self.mempool.read().await.mode_of(&tx.id);
             // Retry transient lock contention (the processor uses try_write;
             // a busy lock never drops a tx from the queue).
+            #[cfg(feature = "test-pipeline-trace")]
+            crate::pipeline_trace::record(
+                &self.trace_label,
+                crate::pipeline_trace::PipelineEventKind::DrainStart,
+                tx.id,
+            );
             let mut lock_attempts = 0;
             let result = loop {
                 match processor
@@ -1584,6 +1629,12 @@ impl AetherRpcImpl {
             };
             match result {
                 Ok(_) => {
+                    #[cfg(feature = "test-pipeline-trace")]
+                    crate::pipeline_trace::record(
+                        &self.trace_label,
+                        crate::pipeline_trace::PipelineEventKind::Applied,
+                        tx.id,
+                    );
                     // INCLUDE: the tx reached the DAG and leaves the queue
                     // (processor STEP 7 also removed it; dispose is idempotent).
                     // 4CP-BD: only a real DAG insertion may become Applied.
@@ -1664,18 +1715,6 @@ impl AetherRpcImpl {
                     tracing::debug!("🔄 Mempool tx requeued after transient failure: {}", e);
                     self.requeue_mempool_tx(tx).await;
                 }
-            }
-        }
-        // Resolve newly applicable orphans in the same cycle (fixpoint).
-        self.process_orphans().await;
-        // INC-01: crash-durability — fsync the Sled log after every drained
-        // batch (incl. orphan resolutions) so a hard kill can never lose more
-        // than the in-flight batch. Bounded by the drain cycle (150ms). The
-        // incident observed ~9658 of 10004 persisted txs lost on a single
-        // unclean kill — the periodic 10s flush alone is NOT enough.
-        if let Ok(storage) = self.storage.try_read() {
-            if let Err(e) = storage.flush() {
-                tracing::error!("❌ INC-01: drain batch flush failed: {}", e);
             }
         }
     }
@@ -2016,6 +2055,21 @@ impl AetherRpcImpl {
             if !any_resolved {
                 break;
             }
+            // 4CP-C0 FIX: `process_transaction(..., "Orphan", ...)` only
+            // RE-QUEUES the orphan in the mempool (accept funnel). The pass
+            // loop above re-reads the DAG to unlock children, so draining only
+            // on the node's 150 ms ticker meant the fixpoint degenerated to ONE
+            // DAG layer per `process_orphans()` call: the re-queued parent was
+            // still in the queue when the next pass scanned the DAG, found no
+            // new candidate, and broke out (measured on the joining node: DAG
+            // +4..9 per 10 s while the source node already held all 300 txs).
+            // Drain the batch NOW so every re-accepted orphan really reaches
+            // the DAG and the next pass can unlock its children in the same
+            // cycle. Bounded: a pass only drains when it resolved something,
+            // and ORPHAN_FIXPOINT_MAX_PASSES caps the loop. The helper is the
+            // batch-only half of `drain_mempool()` so the solver cannot recurse
+            // into itself.
+            self.drain_queued_batch().await;
         }
 
         // 🔧 FIX: Re-request missing parents of unresolved orphans via P2P.
@@ -3376,6 +3430,13 @@ mod tests {
         let (tx_channel, _rx) = tokio::sync::mpsc::channel::<crate::p2p::IngressTx>(
             crate::p2p::TX_INGRESS_CAPACITY_MSGS,
         );
+        // 4CP-C0.2: ONE SyncContext shared by the P2P network and the RPC
+        // facade, exactly like node.rs. The parent-request ledger
+        // (`requested_parents`) is written by P2PNetwork::request_transaction
+        // and read by the orphan solver: a split context would hide the
+        // backoff state from both sides and make the request bounds
+        // unobservable (and unlike production).
+        let sync_ctx = Arc::new(crate::sync_stats::SyncContext::default());
         let p2p = Arc::new(P2PNetwork::new(
             P2PConfig {
                 listen_addr: "0.0.0.0:0".parse().unwrap(),
@@ -3388,7 +3449,7 @@ mod tests {
             Arc::new(|| Vec::new()),
             Arc::new(|_| None),
             Arc::new(|| Vec::new()),
-            Arc::new(crate::sync_stats::SyncContext::default()),
+            sync_ctx.clone(),
             Arc::new(|_| false),
         ));
         AetherRpcImpl::new(
@@ -3400,7 +3461,7 @@ mod tests {
             p2p,
             Arc::new(RwLock::new(true)),
             Arc::new(RwLock::new(HashMap::new())),
-            Arc::new(crate::sync_stats::SyncContext::default()),
+            sync_ctx,
         )
     }
 
@@ -4467,11 +4528,262 @@ mod tests {
         );
     }
 
+    /// 4CP-C0.2 regression (child-before-parent in the sync path).
+    ///
+    /// Root cause this pins down: the `SyncResponse` receiver used to DROP
+    /// every item of the batch whose parents were not yet in the DAG (the
+    /// `waiting` tail of `partition_batch`), so a strict-nonce chain delivered
+    /// child-first never entered the orphan store: it was re-requested and
+    /// re-dropped forever. `process_orphans()` also re-queued a resolved
+    /// orphan without draining, so its fixpoint unlocked exactly ONE level per
+    /// call.
+    ///
+    /// The test delivers a 3-level chain leaf-first (the exact order the
+    /// receiver now admits), and asserts:
+    /// - the children are neither lost nor applied before their parents;
+    /// - they are retained in the orphan path (memory + Sled);
+    /// - the parent-request backoff issues each missing parent once and
+    ///   suppresses the repeats (no download loop);
+    /// - ONE drain after the root parent arrives resolves EVERY level (the
+    ///   fixpoint drains between passes);
+    /// - each tx is applied exactly once (DAG count, ledger balance).
+    ///
+    /// Determinism: fixed key, fixed parents, no timers, no peers.
+    #[tokio::test]
+    async fn test_sync_child_before_parent_resolves_multi_level_in_one_cycle() {
+        use crate::wallet::Wallet;
+        let dir = tempfile::tempdir().unwrap();
+        let rpc = test_rpc_impl(dir.path());
+
+        let wallet = Wallet::from_secret_key(
+            "6b0d2c3e4f5a60718293a4b5c6d7e8f90123456789abcdef0123456789abcdef",
+        )
+        .expect("fixed test key");
+        let sender = wallet.address();
+        let receiver = [0x22u8; 32];
+        let pk = wallet.public_key_bytes();
+
+        // Fund the sender through the real DAG -> ledger path.
+        let faucet: [u8; 32] = hex::decode(crate::genesis::FAUCET_ADDRESS)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let funding = Transaction::new(
+            [[0u8; 32]; 2],
+            faucet,
+            sender,
+            5000,
+            5,
+            1234567890,
+            0,
+            1,
+            vec![0u8; 64],
+            vec![1u8; 64],
+        );
+        rpc.dag
+            .write()
+            .await
+            .add_transaction_validated(funding.clone())
+            .unwrap();
+        {
+            let dag_read = rpc.dag.read().await;
+            rpc.ledger.write().await.rebuild_from_dag(&dag_read);
+        }
+        assert_eq!(rpc.ledger.read().await.get_balance(&sender), 5000);
+
+        let amount = 10u64;
+        let fee = 100u64;
+        // Deterministic chain builder: mine (PoW 24), sign, then derive the id.
+        let build = |account_nonce: u64, parents: [[u8; 32]; 2]| -> Transaction {
+            let mut tx = Transaction::new(
+                parents,
+                sender,
+                receiver,
+                amount,
+                fee,
+                1234567890,
+                0,
+                account_nonce,
+                vec![0u8; 64],
+                pk.clone(),
+            );
+            tx.nonce = tx.mine_nonce(24);
+            tx.signature = wallet.sign_transaction(&tx).expect("sign");
+            tx.id = tx.compute_hash();
+            assert!(tx.verify_pow(24));
+            assert!(Wallet::verify_transaction(&tx));
+            tx
+        };
+
+        let root = build(1, [funding.id, [0u8; 32]]);
+        let middle = build(2, [root.id, [0u8; 32]]);
+        let leaf = build(3, [middle.id, [0u8; 32]]);
+
+        // ---- 1) SyncResponse child-first: leaf, then middle. Both pass the
+        // pure gate, are queued, and the drainer parks them as orphans.
+        for tx in [&leaf, &middle] {
+            let result = rpc
+                .process_transaction((*tx).clone(), "Sync", ValidationMode::Historical)
+                .await;
+            assert!(
+                result.is_ok(),
+                "a pure-valid out-of-order tx must be queued (never dropped)"
+            );
+        }
+        rpc.drain_mempool().await;
+
+        assert_eq!(
+            rpc.mempool.read().await.size(),
+            0,
+            "parked orphans must leave the queue"
+        );
+        {
+            let dag = rpc.dag.read().await;
+            assert!(
+                dag.get_transaction(middle.id).is_none(),
+                "middle must NOT be applied before its parent"
+            );
+            assert!(
+                dag.get_transaction(leaf.id).is_none(),
+                "leaf must NOT be applied before its parent"
+            );
+        }
+        {
+            let orphans = rpc.orphans.read().await;
+            assert_eq!(orphans.len(), 2, "both dependents must be retained");
+            assert!(
+                orphans.contains_key(&middle.id),
+                "middle must live in the orphan path"
+            );
+            assert!(
+                orphans.contains_key(&leaf.id),
+                "leaf must live in the orphan path"
+            );
+        }
+        {
+            let storage = rpc.storage.read().await;
+            assert!(
+                storage.get_orphan(middle.id).unwrap().is_some(),
+                "middle must be persisted"
+            );
+            assert!(
+                storage.get_orphan(leaf.id).unwrap().is_some(),
+                "leaf must be persisted"
+            );
+        }
+        assert_eq!(
+            rpc.ledger.read().await.get_balance(&sender),
+            5000,
+            "nothing may be debited before the parents arrive"
+        );
+
+        // ---- 2) Bounded parent requests. `drain_mempool()` above already ran
+        // the solver, which asked for both missing parents exactly once.
+        {
+            let reqs = rpc.sync_ctx.requested_parents.read().await;
+            assert_eq!(
+                reqs.len(),
+                2,
+                "exactly the two missing parents must be requested"
+            );
+            assert!(
+                reqs.values().all(|(_, attempts)| *attempts == 1),
+                "each parent is requested once (attempt 1)"
+            );
+        }
+        // Re-running the solver inside the cooldown must neither re-request
+        // (backoff) nor drop/duplicate the parked orphans.
+        for _ in 0..4 {
+            rpc.process_orphans().await;
+        }
+        {
+            let reqs = rpc.sync_ctx.requested_parents.read().await;
+            assert_eq!(reqs.len(), 2, "no new hash may enter the request set");
+            assert!(
+                reqs.values().all(|(_, attempts)| *attempts == 1),
+                "the existing backoff must suppress the repeats"
+            );
+        }
+        assert_eq!(
+            rpc.orphans.read().await.len(),
+            2,
+            "re-solving must not drop or duplicate the orphans"
+        );
+        assert_eq!(rpc.mempool.read().await.size(), 0);
+
+        // ---- 3) The root parent lands. ONE drain must resolve EVERY level:
+        // `process_orphans()` drains between fixpoint passes, so middle unlocks
+        // leaf inside the same call instead of one level per drain tick.
+        let result = rpc
+            .process_transaction(root.clone(), "Sync", ValidationMode::Historical)
+            .await;
+        assert!(result.is_ok());
+        rpc.drain_mempool().await;
+
+        {
+            let dag = rpc.dag.read().await;
+            for tx in [&root, &middle, &leaf] {
+                assert!(
+                    dag.get_transaction(tx.id).is_some(),
+                    "every level must converge in a single drain cycle \
+                     (fixpoint must not stop after one layer)"
+                );
+            }
+            assert_eq!(
+                dag.transaction_count(),
+                4,
+                "funding + 3: each tx is inserted exactly once"
+            );
+        }
+        {
+            let orphans = rpc.orphans.read().await;
+            assert!(orphans.is_empty(), "resolved orphans must leave the store");
+        }
+        {
+            let storage = rpc.storage.read().await;
+            assert!(storage.get_orphan(middle.id).unwrap().is_none());
+            assert!(storage.get_orphan(leaf.id).unwrap().is_none());
+        }
+        assert_eq!(
+            rpc.mempool.read().await.size(),
+            0,
+            "nothing may linger in the queue"
+        );
+        assert_eq!(
+            rpc.ledger.read().await.get_balance(&sender),
+            5000 - 3 * (amount + fee),
+            "each tx must debit exactly once (no double application)"
+        );
+        assert_eq!(
+            rpc.mempool_stats().await.orphan_parked,
+            2,
+            "exactly two parks: the leaf and the middle"
+        );
+        assert_eq!(
+            rpc.sync_ctx.stats.snapshot().orphan_resolved,
+            2,
+            "exactly two solver resolutions"
+        );
+
+        // ---- 4) No re-download loop: a further cycle neither re-requests a
+        // parent nor re-parks anything.
+        let requested_before = rpc.sync_ctx.stats.snapshot().parent_requested;
+        rpc.process_orphans().await;
+        rpc.drain_mempool().await;
+        assert_eq!(rpc.orphans.read().await.len(), 0);
+        assert_eq!(rpc.mempool.read().await.size(), 0);
+        assert_eq!(
+            rpc.sync_ctx.stats.snapshot().parent_requested,
+            requested_before,
+            "a converged node must not re-request anything"
+        );
+        assert_eq!(rpc.dag.read().await.transaction_count(), 4);
+    }
+
     /// H5: faucet cooldown eviction — stale entries are purged on every check,
     /// so the map cannot grow unbounded, and a cooled-down address is allowed.
     #[test]
-    fn test_faucet_cooldown_evicts_stale() {
-        use std::collections::HashMap;
+    fn test_faucet_cooldown_evicts_stale() {        use std::collections::HashMap;
         let mut cooldowns: HashMap<[u8; 32], std::time::Instant> = HashMap::new();
         let addr_a = [0xAAu8; 32];
         let addr_b = [0xBBu8; 32];
