@@ -6679,44 +6679,21 @@ impl P2PNetwork {
                             info!("[Sync] GetInventory from {}: we need {} tips, peer might need {} tips", 
                                 addr, missing_for_us.len(), missing_for_peer.len());
 
-                            // Send our tips that peer doesn't have (with pagination)
+                            // Advertise our inventory instead of sending tip-only
+                            // payloads here. The old direct tip response raced the
+                            // GetData closure below and delivered children before
+                            // their ancestors, defeating the parents-first serving
+                            // contract. The peer will request the full closure via
+                            // GetData after processing this inventory.
                             if !missing_for_peer.is_empty() {
-                                const PAGE_SIZE: usize = 100;
-                                let mut tx_bytes_list = Vec::new();
-
-                                for hash in missing_for_peer.iter().take(PAGE_SIZE) {
-                                    if let Some(tx) = get_transaction_by_hash(hash) {
-                                        if let Ok(bytes) = bincode::serialize(&tx) {
-                                            tx_bytes_list.push(bytes);
-                                        }
-                                    }
-                                }
-
-                                if !tx_bytes_list.is_empty() {
-                                    info!(
-                                        "[Sync] Sending {} transactions to {}",
-                                        tx_bytes_list.len(),
-                                        addr
-                                    );
-                                    if let Ok(sync_resp_msg) =
-                                        bincode::serialize(&P2PMessage::SyncResponse(tx_bytes_list))
-                                    {
-                                        // 4CP-BA: droppable — the requester
-                                        // leaves the closure unmarked and
-                                        // re-requests it on the next diff.
-                                        if tokio::time::timeout(
-                                            Duration::from_secs(30),
-                                            msg_sender.send(sync_resp_msg),
-                                        )
-                                        .await
-                                        .is_err()
-                                        {
-                                            tracing::warn!(
-                                                "SyncResponse page to {} stalled for 30s",
-                                                addr
-                                            );
-                                        }
-                                    }
+                                let inventory = get_dag_hashes()
+                                    .into_iter()
+                                    .take(MAX_INV_ITEMS)
+                                    .collect::<Vec<_>>();
+                                if let Ok(inventory_msg) =
+                                    bincode::serialize(&P2PMessage::Inventory(inventory))
+                                {
+                                    let _ = msg_sender.try_send(inventory_msg);
                                 }
                             }
 
@@ -7089,19 +7066,17 @@ impl P2PNetwork {
                                         continue;
                                     }
                                 };
-                                let admitted = tokio::time::timeout(
-                                    Duration::from_secs(30),
-                                    tx_channel.send(IngressTx {
+                                if tx_channel
+                                    .try_send(IngressTx {
                                         tx,
                                         wire_len,
                                         _permit: permit,
-                                    }),
-                                )
-                                .await;
-                                if !matches!(admitted, Ok(Ok(()))) {
+                                    })
+                                    .is_err()
+                                {
                                     tx_drops.fetch_add(1, Ordering::Relaxed);
-                                    tracing::warn!(
-                                        "Ingress queue full/closed for 30s: refused {} byte sync tx from {}",
+                                    tracing::debug!(
+                                        "Ingress queue full/closed: refused {} byte sync tx from {}",
                                         wire_len,
                                         addr
                                     );

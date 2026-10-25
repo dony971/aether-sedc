@@ -850,16 +850,24 @@ async fn be04_partial_sync_waits_then_dependency_closes_the_page() {
         node.sync_ctx.stats.snapshot().sync_received >= 1
     })
     .await;
+    // Receipt is recorded when the waiting child is queued. Application is
+    // deferred until the parent closes its dependency set.
     assert_eq!(
         node.sync_ctx.frontier.read().await.entry_state(&child.id),
-        Some(PageState::Requested)
+        Some(PageState::Received)
     );
-    assert_eq!(node.mempool.read().await.size(), 0);
+    assert_eq!(
+        node.mempool.read().await.size(),
+        1,
+        "waiting child remains queued until its parent arrives"
+    );
     assert_eq!(node.dag.read().await.transaction_count(), 0);
 
     request(&node, &mut peer, &[&parent.id]).await;
     send_sync(&mut peer, &[&parent, &child]).await;
-    wait_ingested(&node, 2).await;
+    // The second response contains the new parent and a duplicate copy of
+    // the already queued child; both ingress deliveries are intentional.
+    wait_ingested(&node, 3).await;
     drain_until(&node, 2, 4).await;
 
     assert_lifecycle(

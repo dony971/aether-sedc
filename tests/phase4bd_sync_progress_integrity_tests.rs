@@ -572,11 +572,17 @@ async fn bd04_partial_batch_waits_and_recovers_without_false_apply() {
         || async { node.sync_ctx.stats.snapshot().sync_received >= 1 },
     )
     .await;
+    // The payload has crossed the sync ingress boundary. It is received but
+    // not yet applied because its parent is still absent.
     assert_eq!(
         node.sync_ctx.frontier.read().await.entry_state(&child.id),
-        Some(PageState::Requested)
+        Some(PageState::Received)
     );
-    assert_eq!(node.rpc.mempool_stats().await.added, 0);
+    assert_eq!(
+        node.rpc.mempool_stats().await.added,
+        1,
+        "waiting child is admitted once and remains unapplied"
+    );
     assert_eq!(frontier_snapshot(&node).await.pages_applied, 0);
 
     request(&node, &mut peer, &[&parent.id]).await;
