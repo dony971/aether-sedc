@@ -735,6 +735,43 @@ pub const SESSION_QUEUE_CAPACITY_BYTES: usize = 32 * 1024 * 1024;
 /// memory without reducing the existing per-session limits or progress.
 pub const OUTBOUND_GLOBAL_CAPACITY_BYTES: usize = 512 * 1024 * 1024;
 
+/// 4CP-BN: per-session queue of *serve jobs* (one per accepted `GetData`).
+///
+/// The session reader used to build and emit the whole SyncResponse closure
+/// inline, so a stalled peer (writer blocked on TCP, session queue full) also
+/// blocked the reader: no further request -- from that peer or any message at
+/// all on that session -- was processed until the emission timeout expired.
+/// The reader now only hands the requested set to a per-session responder; the
+/// responder owns the byte-emitting half of the work.
+///
+/// The job queue is bounded in count, and each job holds at most
+/// `MAX_SYNC_PAGE` hashes (the serving cap), so resident memory per session is
+/// at most `SESSION_SYNC_JOBS_CAPACITY * MAX_SYNC_PAGE * 32 B` (400 KiB) plus
+/// the single response currently being serialized. A full job queue is an
+/// explicit refusal (counted by `session_drops`), never an unbounded backlog:
+/// the peer's frontier re-requests with backoff, exactly like every other
+/// droppable sync request in this layer.
+///
+/// Sized at 2x `sync_stats::MAX_INFLIGHT_REQUESTS`: a well-behaved peer can
+/// hold at most 64 requests in flight, so a legitimate burst (plus scheduling
+/// skew between the reader and the responder) never fills it. The storm that
+/// BA02 drives (1200 requests against a peer that reads nothing) still
+/// saturates it, which is exactly the case that must refuse.
+pub const SESSION_SYNC_JOBS_CAPACITY: usize = 2 * crate::sync_stats::MAX_INFLIGHT_REQUESTS;
+
+/// 4CP-BN: per-page bound on one SyncResponse handoff to the session writer.
+/// Same value as the pre-4CP-BN inline `timeout(30s, send())`, so delivery
+/// behaviour for a slowly draining (but live) peer is unchanged; the only
+/// difference is that the wait now happens on the responder task, not on the
+/// session reader.
+const SYNC_RESPONSE_PAGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 4CP-BN: total emission budget for every page of ONE serve job. Bounds the
+/// time a single request can occupy the per-session responder (a request
+/// splits into at most `MAX_CLOSURE_PAGES` pages), so one stalled request can
+/// never starve the requests queued behind it for longer than this.
+const SYNC_RESPONSE_SERVE_BUDGET: Duration = Duration::from_secs(60);
+
 /// 4CP-BA: the effective queue bounds, exposed for diagnostics and tests
 /// (single source of truth: the constants above).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3267,6 +3304,19 @@ impl PeerSink {
         SESSION_QUEUE_CAPACITY_BYTES.saturating_sub(self.budget.available_permits())
     }
 
+    /// 4CP-BN: record a refusal decided ABOVE the outbound channel.
+    ///
+    /// Two events reach this: a `GetData` serve job refused because the
+    /// session's bounded job queue is full (no frame was ever built, so no
+    /// budget permit exists), and a SyncResponse page whose bounded emission
+    /// expired (the `send` future is dropped, which releases its reservations).
+    /// Both mean "this session did not receive a response it asked for", which
+    /// is exactly what `session_drops` counts. Nothing is marked delivered and
+    /// the peer's frontier owns the retry.
+    fn note_refusal(&self) {
+        self.drops.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// 4CP-AS (F1): identity-scoped ownership check for `peers` /
     /// `outbound_sessions` entries (replaces `same_channel` on the raw
     /// sender).
@@ -3317,7 +3367,11 @@ impl PeerSink {
     /// the only copy of a requested transaction and turns the native recovery
     /// path into a re-request storm. The per-session writer drains the queue,
     /// so waiting here applies TCP backpressure to the requesting peer without
-    /// blocking any other session.
+    /// blocking any other session -- and, since 4CP-BN, without blocking the
+    /// reader that called it (only the session's responder task waits).
+    ///
+    /// `bytes` must be a full SyncResponse frame; every caller is a serve job
+    /// running off the session reader.
     async fn send(&self, bytes: Vec<u8>) -> Result<(), ()> {
         let n = bytes.len();
         let charge = match OutboundBudget::charge(n) {
@@ -6340,6 +6394,42 @@ impl P2PNetwork {
             }
         });
 
+        // 4CP-BN: ONE responder per session owns SyncResponse building and
+        // emission. The reader only enqueues the requested hash set, so a
+        // stalled peer can never block message processing on this session
+        // (control traffic, gossip, and the peer's later requests all keep
+        // flowing). The queue is bounded in count; a full queue is an explicit
+        // refusal counted by `session_drops`, never an unbounded backlog.
+        //
+        // The responder is registered through the same admission control as
+        // the writer, so `shutdown()` aborts and awaits it. On normal teardown
+        // the reader drops `sync_job_tx` first: the responder finishes its
+        // current job (bounded by `SYNC_RESPONSE_SERVE_BUDGET`), then drops its
+        // `PeerSink` clone, which lets the writer's channel close.
+        let (sync_job_tx, mut sync_job_rx) =
+            mpsc::channel::<Vec<Vec<u8>>>(SESSION_SYNC_JOBS_CAPACITY);
+        {
+            let responder_sender = msg_sender.clone();
+            let responder_ctx = Arc::clone(&sync_ctx);
+            let responder_dag_hashes = Arc::clone(&get_dag_hashes);
+            let responder_get_tx = Arc::clone(&get_transaction_by_hash);
+            let responder_addr = addr;
+            let responder_admission = Arc::clone(&admission);
+            Self::admit_task(&responder_admission, move |_generation| async move {
+                while let Some(requested) = sync_job_rx.recv().await {
+                    Self::serve_sync_response(
+                        responder_addr,
+                        &responder_sender,
+                        requested,
+                        &responder_ctx,
+                        &*responder_dag_hashes,
+                        &*responder_get_tx,
+                    )
+                    .await;
+                }
+            });
+        }
+
         // Send GetInventory with tips on connection
         let our_tips = get_tips();
         if let Ok(getinv_msg) = bincode::serialize(&P2PMessage::GetInventory {
@@ -6743,123 +6833,42 @@ impl P2PNetwork {
                             // ancestor closure, split into multiple topologically
                             // sorted pages. Each page is ancestor-closed so the
                             // receiver can insert bottom-up without orphans.
-                            let topo = Self::cached_topo_order(
-                                &sync_ctx,
-                                get_dag_hashes(),
-                                &*get_transaction_by_hash,
-                            )
-                            .await;
-                            let sort_topo = |v: &mut Vec<Vec<u8>>, order: &Option<Vec<Vec<u8>>>| {
-                                if let Some(order) = order {
-                                    let pos: HashMap<&Vec<u8>, usize> =
-                                        order.iter().enumerate().map(|(i, h)| (h, i)).collect();
-                                    v.sort_by_key(|h| pos.get(h).copied().unwrap_or(usize::MAX));
-                                }
-                            };
-                            // Take up to MAX_SYNC_PAGE of the requested hashes.
+                            //
+                            // 4CP-BN: the closure is built and emitted by this
+                            // session's responder task, NOT inline. The reader
+                            // only enqueues the (bounded) requested set, so
+                            // emission back-pressure against a stalled peer can
+                            // never stall message processing on this session.
+                            // Jobs run FIFO, so responses are still emitted in
+                            // request order and the pages of one request keep
+                            // their topological order.
+                            //
+                            // The explicit yield is a FAIRNESS point, not
+                            // back-pressure: a peer with requests already
+                            // buffered in the kernel can keep `read_exact`
+                            // Ready, and on a current-thread runtime the reader
+                            // would then run the whole burst before the
+                            // responder ever got polled (the old inline server
+                            // could not starve it -- it *was* the responder).
+                            // Yielding once per job lets the responder and the
+                            // writer make progress between requests, so the
+                            // bounded queue is filled by real saturation only.
                             let requested: Vec<Vec<u8>> =
                                 hashes.iter().take(MAX_SYNC_PAGE).cloned().collect();
-                            // Compute FULL ancestor closure (bounded by MAX_CLOSURE_PAGES).
-                            let max_entries = MAX_SYNC_PAGE.saturating_mul(MAX_CLOSURE_PAGES);
-                            let mut closure = P2PNetwork::ancestor_full_closure(
-                                &requested,
-                                &*get_transaction_by_hash,
-                                max_entries,
-                            );
-                            // Topologically sort: ancestors first.
-                            sort_topo(&mut closure, &topo);
-                            if std::env::var_os("C0_SRV_TRACE").is_some() {
-                                let have = hashes
-                                    .iter()
-                                    .filter(|h| get_transaction_by_hash(h).is_some())
-                                    .count();
-                                eprintln!(
-                                    "C0_SRV to={} requested={} have={} closure={} dag={}",
-                                    addr,
-                                    hashes.len(),
-                                    have,
-                                    closure.len(),
-                                    get_dag_hashes().len()
-                                );
-                            }
-                            // Send the closure as ONE SyncResponse batch. The
-                            // receiver partitions a batch against the DAG and
-                            // its own contents; splitting an ancestor-closed
-                            // chain into prefix pages makes every page after
-                            // the first start on a parent that is only queued
-                            // (not yet applied), so the whole page is parked
-                            // as waiting and the join stalls at the page
-                            // boundary. The closure is bounded by
-                            // MAX_SYNC_PAGE * MAX_CLOSURE_PAGES, so a single
-                            // message stays inside MAX_MESSAGE_SIZE.
-                            let mut tx_bytes_list = Vec::with_capacity(closure.len());
-                            for hash in &closure {
-                                if let Some(tx) = get_transaction_by_hash(hash) {
-                                    if let Ok(bytes) = bincode::serialize(&tx) {
-                                        tx_bytes_list.push(bytes);
-                                    }
-                                }
-                            }
-                            if !tx_bytes_list.is_empty() {
-                                match bincode::serialize(&P2PMessage::SyncResponse(tx_bytes_list)) {
-                                    Ok(sync_resp_msg) if sync_resp_msg.len() <= MAX_MESSAGE_SIZE => {
-                                        if tokio::time::timeout(
-                                            Duration::from_secs(30),
-                                            msg_sender.send(sync_resp_msg),
-                                        )
-                                        .await
-                                        .is_err()
-                                        {
-                                            tracing::warn!(
-                                                "SyncResponse batch to {} stalled for 30s",
-                                                addr
-                                            );
-                                        }
-                                    }
-                                    Ok(sync_resp_msg) => {
-                                        tracing::warn!(
-                                            "SyncResponse closure for {} is {} bytes (max {}); serving it in topologically sorted pages",
-                                            addr,
-                                            sync_resp_msg.len(),
-                                            MAX_MESSAGE_SIZE
-                                        );
-                                        for chunk in closure.chunks(MAX_SYNC_PAGE) {
-                                            let mut page = Vec::with_capacity(chunk.len());
-                                            for hash in chunk {
-                                                if let Some(tx) = get_transaction_by_hash(hash) {
-                                                    if let Ok(bytes) = bincode::serialize(&tx) {
-                                                        page.push(bytes);
-                                                    }
-                                                }
-                                            }
-                                            if page.is_empty() {
-                                                continue;
-                                            }
-                                            if let Ok(msg) =
-                                                bincode::serialize(&P2PMessage::SyncResponse(page))
-                                            {
-                                                if tokio::time::timeout(
-                                                    Duration::from_secs(30),
-                                                    msg_sender.send(msg),
-                                                )
-                                                .await
-                                                .is_err()
-                                                {
-                                                    tracing::warn!(
-                                                        "SyncResponse page to {} stalled for 30s",
-                                                        addr
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "Failed to serialize SyncResponse for {}: {}",
-                                            addr,
-                                            e
-                                        );
-                                    }
+                            match sync_job_tx.try_send(requested) {
+                                Ok(()) => tokio::task::yield_now().await,
+                                Err(_) => {
+                                    // Explicit, counted refusal: bounded serve
+                                    // queue full (the peer's writer is behind).
+                                    // No frame is built, no budget is reserved
+                                    // and nothing is marked delivered; the
+                                    // peer's frontier re-requests with backoff.
+                                    msg_sender.note_refusal();
+                                    tracing::debug!(
+                                        "SyncResponse request from {} deferred: bounded serve queue ({} jobs) full",
+                                        addr,
+                                        SESSION_SYNC_JOBS_CAPACITY
+                                    );
                                 }
                             }
                         }
@@ -7911,6 +7920,172 @@ impl P2PNetwork {
             *cache = Some((o.len() as u64, o.clone()));
         }
         order
+    }
+
+    /// 4CP-BN: build and emit the `SyncResponse` for one accepted `GetData`.
+    ///
+    /// Runs on the session's responder task, never on the reader. The pages of
+    /// one request are emitted strictly in order (the same single ancestor-
+    /// closed batch as before, or the same `MAX_SYNC_PAGE` chunks of the same
+    /// topologically sorted closure when the batch exceeds one frame).
+    async fn serve_sync_response(
+        addr: SocketAddr,
+        msg_sender: &PeerSink,
+        requested: Vec<Vec<u8>>,
+        sync_ctx: &Arc<SyncContext>,
+        get_dag_hashes: &(dyn Fn() -> Vec<Vec<u8>> + Send + Sync),
+        get_transaction_by_hash: &(dyn Fn(&[u8]) -> Option<Transaction> + Send + Sync),
+    ) {
+        let topo =
+            Self::cached_topo_order(sync_ctx, get_dag_hashes(), get_transaction_by_hash).await;
+        let sort_topo = |v: &mut Vec<Vec<u8>>, order: &Option<Vec<Vec<u8>>>| {
+            if let Some(order) = order {
+                let pos: HashMap<&Vec<u8>, usize> =
+                    order.iter().enumerate().map(|(i, h)| (h, i)).collect();
+                v.sort_by_key(|h| pos.get(h).copied().unwrap_or(usize::MAX));
+            }
+        };
+        // Compute FULL ancestor closure (bounded by MAX_CLOSURE_PAGES).
+        let max_entries = MAX_SYNC_PAGE.saturating_mul(MAX_CLOSURE_PAGES);
+        let mut closure = P2PNetwork::ancestor_full_closure(
+            &requested,
+            get_transaction_by_hash,
+            max_entries,
+        );
+        // Topologically sort: ancestors first.
+        sort_topo(&mut closure, &topo);
+        if std::env::var_os("C0_SRV_TRACE").is_some() {
+            let have = requested
+                .iter()
+                .filter(|h| get_transaction_by_hash(h).is_some())
+                .count();
+            eprintln!(
+                "C0_SRV to={} requested={} have={} closure={} dag={}",
+                addr,
+                requested.len(),
+                have,
+                closure.len(),
+                get_dag_hashes().len()
+            );
+        }
+        // Send the closure as ONE SyncResponse batch. The receiver partitions a
+        // batch against the DAG and its own contents; splitting an
+        // ancestor-closed chain into prefix pages makes every page after the
+        // first start on a parent that is only queued (not yet applied), so the
+        // whole page is parked as waiting and the join stalls at the page
+        // boundary. The closure is bounded by MAX_SYNC_PAGE * MAX_CLOSURE_PAGES,
+        // so a single message stays inside MAX_MESSAGE_SIZE.
+        let mut tx_bytes_list = Vec::with_capacity(closure.len());
+        for hash in &closure {
+            if let Some(tx) = get_transaction_by_hash(hash) {
+                if let Ok(bytes) = bincode::serialize(&tx) {
+                    tx_bytes_list.push(bytes);
+                }
+            }
+        }
+        if tx_bytes_list.is_empty() {
+            return;
+        }
+
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        match bincode::serialize(&P2PMessage::SyncResponse(tx_bytes_list)) {
+            Ok(sync_resp_msg) if sync_resp_msg.len() <= MAX_MESSAGE_SIZE => {
+                frames.push(sync_resp_msg);
+            }
+            Ok(sync_resp_msg) => {
+                tracing::warn!(
+                    "SyncResponse closure for {} is {} bytes (max {}); serving it in topologically sorted pages",
+                    addr,
+                    sync_resp_msg.len(),
+                    MAX_MESSAGE_SIZE
+                );
+                for chunk in closure.chunks(MAX_SYNC_PAGE) {
+                    let mut page = Vec::with_capacity(chunk.len());
+                    for hash in chunk {
+                        if let Some(tx) = get_transaction_by_hash(hash) {
+                            if let Ok(bytes) = bincode::serialize(&tx) {
+                                page.push(bytes);
+                            }
+                        }
+                    }
+                    if page.is_empty() {
+                        continue;
+                    }
+                    if let Ok(msg) = bincode::serialize(&P2PMessage::SyncResponse(page)) {
+                        frames.push(msg);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to serialize SyncResponse for {}: {}", addr, e);
+                return;
+            }
+        }
+
+        Self::emit_sync_frames(addr, msg_sender, sync_ctx, frames).await;
+    }
+
+    /// 4CP-BN: emit one request's frames in order, under a bounded wait.
+    ///
+    /// A refusal (job queue) or an expiry (here) is always explicit: the
+    /// request is abandoned as a whole, `session_drops` moves, the reason is
+    /// logged, and the peer's frontier re-requests with backoff. Nothing is
+    /// half-delivered as if it had been acknowledged.
+    async fn emit_sync_frames(
+        addr: SocketAddr,
+        msg_sender: &PeerSink,
+        sync_ctx: &Arc<SyncContext>,
+        frames: Vec<Vec<u8>>,
+    ) {
+        let total = frames.len();
+        let deadline = Instant::now() + SYNC_RESPONSE_SERVE_BUDGET;
+        for (idx, frame) in frames.into_iter().enumerate() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!(
+                    "SyncResponse to {}: serve budget {:?} exhausted after {}/{} page(s); refusing the rest",
+                    addr,
+                    SYNC_RESPONSE_SERVE_BUDGET,
+                    idx,
+                    total
+                );
+                sync_ctx
+                    .stats
+                    .sync_response_timeouts
+                    .fetch_add(1, Ordering::Relaxed);
+                msg_sender.note_refusal();
+                return;
+            }
+            let wait = remaining.min(SYNC_RESPONSE_PAGE_TIMEOUT);
+            match tokio::time::timeout(wait, msg_sender.send(frame)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(())) => {
+                    // The writer is gone (session teardown / closed channel):
+                    // `send` already accounted that refusal. The remaining
+                    // pages belong to a request the peer will re-request.
+                    tracing::debug!(
+                        "SyncResponse to {}: writer closed after {}/{} page(s)",
+                        addr,
+                        idx + 1,
+                        total
+                    );
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "SyncResponse page to {} stalled for {:?}; refusing the rest of the request",
+                        addr,
+                        wait
+                    );
+                    sync_ctx
+                        .stats
+                        .sync_response_timeouts
+                        .fetch_add(1, Ordering::Relaxed);
+                    msg_sender.note_refusal();
+                    return;
+                }
+            }
+        }
     }
 
     /// VPS-2: extend a requested hash set with its DAG-resident ancestors

@@ -130,6 +130,12 @@ pub struct SyncStatsSnapshot {
     pub topo_cache_hits: u64,
     /// C2-004: GetData serving order recomputed (cache empty/stale/capped)
     pub topo_cache_miss: u64,
+    /// 4CP-BN: SyncResponse pages whose bounded emission expired before the
+    /// per-session writer accepted them. Counted once per request that could
+    /// not be fully emitted; the request is refused as a whole (the peer
+    /// re-requests via the frontier). Distinct from `session_drops`, which
+    /// also counts pre-emission refusals at the bounded serve-job queue.
+    pub sync_response_timeouts: u64,
 }
 
 /// Atomic bootstrap counters.
@@ -166,6 +172,8 @@ pub struct SyncStats {
     pub wal_recovery: AtomicU64,
     pub topo_cache_hits: AtomicU64,
     pub topo_cache_miss: AtomicU64,
+    /// 4CP-BN: SyncResponse emission expirations (one per refused request).
+    pub sync_response_timeouts: AtomicU64,
 }
 
 impl SyncStats {
@@ -202,6 +210,7 @@ impl SyncStats {
             wal_recovery: self.wal_recovery.load(Ordering::Relaxed),
             topo_cache_hits: self.topo_cache_hits.load(Ordering::Relaxed),
             topo_cache_miss: self.topo_cache_miss.load(Ordering::Relaxed),
+            sync_response_timeouts: self.sync_response_timeouts.load(Ordering::Relaxed),
         }
     }
 }
