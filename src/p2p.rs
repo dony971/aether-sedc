@@ -6934,7 +6934,23 @@ impl P2PNetwork {
                                     }
                                     let in_dag =
                                         get_transaction_by_hash(&tx.id).is_some();
-                                    if in_dag || is_orphan(&tx.id) {
+                                    // 4CP-BX: the DAG/orphan test alone cannot see
+                                    // a payload that is already ADMITTED (queued
+                                    // by the gossip arm) but not yet applied: it
+                                    // lives in neither store, so the same wire
+                                    // bytes could be queued a second time by this
+                                    // path and be counted as a duplicate at the
+                                    // funnel. The receipt cache is keyed on these
+                                    // very bytes and is written ONLY after a
+                                    // successful admission, so consulting it here
+                                    // closes the window without inventing a
+                                    // refusal: a refused payload is never
+                                    // inserted, and the native re-request path
+                                    // (inventory diff / orphan solver) still owns
+                                    // every payload this node does not hold.
+                                    let already_admitted =
+                                        seen_transactions.read().await.contains_key(&tx_bytes);
+                                    if in_dag || is_orphan(&tx.id) || already_admitted {
                                         sync_ctx
                                             .stats
                                             .duplicate_ignored

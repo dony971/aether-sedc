@@ -27,14 +27,14 @@
 //! synthetic transactions (the same harness style as phase 4BA). Consensus is
 //! covered by AY/AZ/BD/BE.
 //!
-//! Ports 44851-44854 are unique to this suite (44841-44844 = 4BA).
+//! Ports 44851-44856 are unique to this suite (44841-44844 = 4BA).
 
 use aether_unified::genesis::GENESIS_HASH;
 use aether_unified::p2p::{
     IngressTx, P2PConfig, P2PMessage, P2PNetwork, P2PProtocolMode, P2P_PROTOCOL_VERSION,
     TX_INGRESS_CAPACITY_MSGS,
 };
-use aether_unified::sync_stats::SyncContext;
+use aether_unified::sync_stats::{PageState, SyncContext};
 use aether_unified::transaction::{Transaction, DEFAULT_NETWORK_ID};
 use aether_unified::transport::{
     BoxFuture, PeerAddr, TcpTransport, Transport, TransportError, TransportListener,
@@ -731,5 +731,152 @@ async fn bn04_transient_saturation_recovers_without_amplification() {
         resumed.len(),
         drops_during,
         drops_after
+    );
+}
+
+// ---------------------------------------------------------------------------
+// E — receipt dedup spans the whole admission window (4CP-BX)
+// ---------------------------------------------------------------------------
+
+/// A payload admitted by ONE ingress path must not be admitted a second time
+/// by the other while it is still queued: admitted, not yet applied is a state
+/// that neither the DAG nor the orphan store can represent, so a dedup built
+/// on those two alone cannot see it.
+///
+/// This is exactly the event BX counts as a duplicate: two distinct admissions
+/// of the same `tx.id`. The window is real — the reader admits gossip on
+/// arrival, and a `SyncResponse` produced for a request made a moment earlier
+/// can still carry the very same payload before the drainer touched the DAG.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bn05_sync_response_does_not_readmit_a_payload_still_in_ingress() {
+    const PORT: u16 = 44855;
+
+    // Empty DAG and empty orphan store: the payload is admitted by gossip and
+    // then *still in the ingress queue* — the state the SyncResponse dedup
+    // used to miss.
+    let mut h = boot_node(PORT, Arc::new(HashMap::new()), vec![]);
+    h.net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+    h.net.start().await.expect("start");
+
+    let mut peer = RawPeer::connect(PORT).await;
+    wait_peers(&h.net, 1).await;
+
+    let gossip = flat_tx(0x4B4E_0005);
+    let wire = bincode::serialize(&gossip).expect("serialize tx");
+    peer.send(&P2PMessage::Transaction(wire.clone())).await;
+
+    let first = tokio::time::timeout(Duration::from_secs(5), h.rx.recv())
+        .await
+        .expect("gossip must reach ingress")
+        .expect("ingress channel alive")
+        .into_tx();
+    assert_eq!(first.id, gossip.id, "the gossip tx was admitted once");
+
+    let dup_before = h.sync_ctx.stats.duplicate_ignored.load(Ordering::Relaxed);
+    let received_before = h.sync_ctx.stats.sync_received.load(Ordering::Relaxed);
+    let drops_before = h.net.session_drops();
+
+    // Same payload, same wire bytes, second path: SyncResponse. The tx is in
+    // the ingress queue — NOT in the DAG, NOT an orphan.
+    peer.send(&P2PMessage::SyncResponse(vec![wire])).await;
+
+    // THE PROPERTY: no second admission of the same id.
+    match tokio::time::timeout(Duration::from_secs(2), h.rx.recv()).await {
+        Ok(Some(tx)) => panic!(
+            "SyncResponse re-admitted a payload already queued by gossip: {:?}",
+            tx.into_tx().id
+        ),
+        Ok(None) => panic!("ingress channel closed"),
+        // Nothing arrived: the duplicate was suppressed at admission.
+        Err(_) => {}
+    }
+
+    // It is counted as a duplicate — not as a refusal, and not as new growth.
+    assert_eq!(
+        h.sync_ctx.stats.duplicate_ignored.load(Ordering::Relaxed),
+        dup_before + 1,
+        "the second delivery must be counted by the existing duplicate counter"
+    );
+    assert_eq!(
+        h.net.session_drops(),
+        drops_before,
+        "a duplicate is not a refusal: session_drops must not move"
+    );
+    assert_eq!(
+        h.sync_ctx.stats.sync_received.load(Ordering::Relaxed),
+        received_before,
+        "a suppressed duplicate adds nothing to sync_received"
+    );
+    assert_eq!(
+        h.net.outbound_budget_drops(),
+        0,
+        "no global egress budget refusal is involved"
+    );
+
+    // No false Applied: the payload is still queued, never inserted.
+    {
+        let frontier = h.sync_ctx.frontier.read().await;
+        assert_ne!(
+            frontier.entry_state(&gossip.id.to_vec()),
+            Some(PageState::Applied),
+            "an item that was never inserted must not be recorded as applied"
+        );
+    }
+
+    println!(
+        "BN05 dup_ignored={} session_drops={} sync_received={}",
+        h.sync_ctx.stats.duplicate_ignored.load(Ordering::Relaxed),
+        h.net.session_drops(),
+        h.sync_ctx.stats.sync_received.load(Ordering::Relaxed)
+    );
+}
+
+/// The mirror image, which the gossip arm already enforces: a payload admitted
+/// by `SyncResponse` is in the receipt cache, so a same-session gossip copy is
+/// refused before it can be queued twice. Pinning it here keeps the two paths
+/// symmetric — a fix on only one side is a half-fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bn06_gossip_does_not_readmit_a_payload_still_in_ingress_from_sync() {
+    const PORT: u16 = 44856;
+
+    let mut h = boot_node(PORT, Arc::new(HashMap::new()), vec![]);
+    h.net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+    h.net.start().await.expect("start");
+
+    let mut peer = RawPeer::connect(PORT).await;
+    wait_peers(&h.net, 1).await;
+
+    let tx = flat_tx(0x4B4E_0006);
+    let wire = bincode::serialize(&tx).expect("serialize tx");
+    peer.send(&P2PMessage::SyncResponse(vec![wire.clone()])).await;
+
+    let first = tokio::time::timeout(Duration::from_secs(5), h.rx.recv())
+        .await
+        .expect("sync payload must reach ingress")
+        .expect("ingress channel alive")
+        .into_tx();
+    assert_eq!(first.id, tx.id, "the sync payload was admitted once");
+
+    let drops_before = h.net.session_drops();
+    peer.send(&P2PMessage::Transaction(wire)).await;
+
+    match tokio::time::timeout(Duration::from_secs(2), h.rx.recv()).await {
+        Ok(Some(tx)) => panic!(
+            "gossip re-admitted a payload already queued by SyncResponse: {:?}",
+            tx.into_tx().id
+        ),
+        Ok(None) => panic!("ingress channel closed"),
+        Err(_) => {}
+    }
+    assert_eq!(
+        h.net.session_drops(),
+        drops_before,
+        "the gossip-side duplicate is a dedup, not a session refusal"
+    );
+
+    println!(
+        "BN06 dup_ignored={} session_drops={}",
+        h.sync_ctx.stats.duplicate_ignored.load(Ordering::Relaxed),
+        h.net.session_drops()
     );
 }
