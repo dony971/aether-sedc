@@ -34,12 +34,13 @@ use aether_unified::p2p::{
     IngressTx, P2PConfig, P2PMessage, P2PNetwork, P2PProtocolMode, P2P_PROTOCOL_VERSION,
     TX_INGRESS_CAPACITY_MSGS,
 };
-use aether_unified::sync_stats::{PageState, SyncContext};
+use aether_unified::sync_stats::{PipelineSnapshotFn, SyncContext};
 use aether_unified::transaction::{Transaction, DEFAULT_NETWORK_ID};
 use aether_unified::transport::{
     BoxFuture, PeerAddr, TcpTransport, Transport, TransportError, TransportListener,
     TransportStream,
 };
+use aether_unified::validation::ValidationMode;
 use chacha20poly1305::aead::{Aead, NewAead};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand::rngs::OsRng;
@@ -734,103 +735,6 @@ async fn bn04_transient_saturation_recovers_without_amplification() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// E — receipt dedup spans the whole admission window (4CP-BX)
-// ---------------------------------------------------------------------------
-
-/// A payload admitted by ONE ingress path must not be admitted a second time
-/// by the other while it is still queued: admitted, not yet applied is a state
-/// that neither the DAG nor the orphan store can represent, so a dedup built
-/// on those two alone cannot see it.
-///
-/// This is exactly the event BX counts as a duplicate: two distinct admissions
-/// of the same `tx.id`. The window is real — the reader admits gossip on
-/// arrival, and a `SyncResponse` produced for a request made a moment earlier
-/// can still carry the very same payload before the drainer touched the DAG.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bn05_sync_response_does_not_readmit_a_payload_still_in_ingress() {
-    const PORT: u16 = 44855;
-
-    // Empty DAG and empty orphan store: the payload is admitted by gossip and
-    // then *still in the ingress queue* — the state the SyncResponse dedup
-    // used to miss.
-    let mut h = boot_node(PORT, Arc::new(HashMap::new()), vec![]);
-    h.net.set_protocol_mode(P2PProtocolMode::LegacyV5);
-    h.net.start().await.expect("start");
-
-    let mut peer = RawPeer::connect(PORT).await;
-    wait_peers(&h.net, 1).await;
-
-    let gossip = flat_tx(0x4B4E_0005);
-    let wire = bincode::serialize(&gossip).expect("serialize tx");
-    peer.send(&P2PMessage::Transaction(wire.clone())).await;
-
-    let first = tokio::time::timeout(Duration::from_secs(5), h.rx.recv())
-        .await
-        .expect("gossip must reach ingress")
-        .expect("ingress channel alive")
-        .into_tx();
-    assert_eq!(first.id, gossip.id, "the gossip tx was admitted once");
-
-    let dup_before = h.sync_ctx.stats.duplicate_ignored.load(Ordering::Relaxed);
-    let received_before = h.sync_ctx.stats.sync_received.load(Ordering::Relaxed);
-    let drops_before = h.net.session_drops();
-
-    // Same payload, same wire bytes, second path: SyncResponse. The tx is in
-    // the ingress queue — NOT in the DAG, NOT an orphan.
-    peer.send(&P2PMessage::SyncResponse(vec![wire])).await;
-
-    // THE PROPERTY: no second admission of the same id.
-    match tokio::time::timeout(Duration::from_secs(2), h.rx.recv()).await {
-        Ok(Some(tx)) => panic!(
-            "SyncResponse re-admitted a payload already queued by gossip: {:?}",
-            tx.into_tx().id
-        ),
-        Ok(None) => panic!("ingress channel closed"),
-        // Nothing arrived: the duplicate was suppressed at admission.
-        Err(_) => {}
-    }
-
-    // It is counted as a duplicate — not as a refusal, and not as new growth.
-    assert_eq!(
-        h.sync_ctx.stats.duplicate_ignored.load(Ordering::Relaxed),
-        dup_before + 1,
-        "the second delivery must be counted by the existing duplicate counter"
-    );
-    assert_eq!(
-        h.net.session_drops(),
-        drops_before,
-        "a duplicate is not a refusal: session_drops must not move"
-    );
-    assert_eq!(
-        h.sync_ctx.stats.sync_received.load(Ordering::Relaxed),
-        received_before,
-        "a suppressed duplicate adds nothing to sync_received"
-    );
-    assert_eq!(
-        h.net.outbound_budget_drops(),
-        0,
-        "no global egress budget refusal is involved"
-    );
-
-    // No false Applied: the payload is still queued, never inserted.
-    {
-        let frontier = h.sync_ctx.frontier.read().await;
-        assert_ne!(
-            frontier.entry_state(&gossip.id.to_vec()),
-            Some(PageState::Applied),
-            "an item that was never inserted must not be recorded as applied"
-        );
-    }
-
-    println!(
-        "BN05 dup_ignored={} session_drops={} sync_received={}",
-        h.sync_ctx.stats.duplicate_ignored.load(Ordering::Relaxed),
-        h.net.session_drops(),
-        h.sync_ctx.stats.sync_received.load(Ordering::Relaxed)
-    );
-}
-
 /// The mirror image, which the gossip arm already enforces: a payload admitted
 /// by `SyncResponse` is in the receipt cache, so a same-session gossip copy is
 /// refused before it can be queued twice. Pinning it here keeps the two paths
@@ -878,5 +782,594 @@ async fn bn06_gossip_does_not_readmit_a_payload_still_in_ingress_from_sync() {
         "BN06 dup_ignored={} session_drops={}",
         h.sync_ctx.stats.duplicate_ignored.load(Ordering::Relaxed),
         h.net.session_drops()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// E — the duplicate BX counts is closed upstream, in the Inventory diff
+// ---------------------------------------------------------------------------
+
+/// A transaction this node has already ADMITTED but not yet drained lives in
+/// neither the DAG nor the orphan store, so the Inventory diff used to call it
+/// "missing" and re-request it — and the peer's `SyncResponse` then queued the
+/// very same bytes a second time. That second admission is exactly the event
+/// BX counts as a duplicate (`duplicates == 0`).
+///
+/// The in-flight state is `ingress_mode` (written after a successful admission,
+/// taken by the drainer). The second half of the test proves the suppression is
+/// not permanent: once the drainer takes the id, the same inventory DOES produce
+/// a `GetData`. A guard that swallowed legitimate requests would fail there.
+///
+/// Note what is NOT done here: the ingress keeps admitting re-deliveries (the
+/// 4BA/4BE contract — `ba01` requires the re-delivered page to reach the queue).
+/// This fix removes the redundant REQUEST, never a delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bn07_inventory_does_not_rerequest_a_transaction_still_in_ingress() {
+    const PORT: u16 = 44855;
+
+    let mut h = boot_node(PORT, Arc::new(HashMap::new()), vec![]);
+    h.net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+    h.net.start().await.expect("start");
+
+    let mut peer = RawPeer::connect(PORT).await;
+    wait_peers(&h.net, 1).await;
+
+    // 1. Admit by gossip and DO NOT drain: queued, not applied.
+    let tx = flat_tx(0x4B4E_0007);
+    peer.send(&P2PMessage::Transaction(bincode::serialize(&tx).unwrap()))
+        .await;
+    let admitted = tokio::time::timeout(Duration::from_secs(5), h.rx.recv())
+        .await
+        .expect("gossip must reach ingress")
+        .expect("ingress channel alive")
+        .into_tx();
+    assert_eq!(admitted.id, tx.id, "gossip admitted the tx once");
+
+    // The provenance note is written AFTER admission (4CP-BA ordering).
+    wait_for(
+        "the tx is recorded as in flight",
+        Duration::from_secs(5),
+        || async { h.sync_ctx.ingress_mode.read().await.contains_key(&tx.id) },
+    )
+    .await;
+
+    // 2. The peer advertises the same id while it is still queued.
+    let requested_before = h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed);
+    let skipped_before = h
+        .sync_ctx
+        .stats
+        .inventory_skipped_inflight
+        .load(Ordering::Relaxed);
+    let drops_before = h.net.session_drops();
+
+    peer.send(&P2PMessage::Inventory(vec![tx.id.to_vec()]))
+        .await;
+
+    wait_for(
+        "the in-flight id is skipped",
+        Duration::from_secs(5),
+        || async {
+            h.sync_ctx
+                .stats
+                .inventory_skipped_inflight
+                .load(Ordering::Relaxed)
+                > skipped_before
+        },
+    )
+    .await;
+
+    // THE PROPERTY: no GetData for an id already queued in the ingress.
+    assert_eq!(
+        h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed),
+        requested_before,
+        "an id already in flight must not be re-requested"
+    );
+    assert!(
+        !matches!(
+            peer.recv(Duration::from_millis(750)).await,
+            Some(P2PMessage::GetData(_))
+        ),
+        "no GetData may be emitted for an id already queued in ingress"
+    );
+    assert_eq!(
+        h.sync_ctx
+            .stats
+            .inventory_skipped_inflight
+            .load(Ordering::Relaxed),
+        skipped_before + 1,
+        "the suppression is counted, not silent"
+    );
+    assert_eq!(
+        h.net.session_drops(),
+        drops_before,
+        "suppressing a request is not a delivery refusal"
+    );
+    assert!(
+        h.sync_ctx.ingress_mode.read().await.contains_key(&tx.id),
+        "the first delivery is untouched: the id is still in flight"
+    );
+
+    // 3. The drainer takes the id: the in-flight state must not outlive it.
+    h.sync_ctx.take_ingress_mode(tx.id).await;
+    peer.send(&P2PMessage::Inventory(vec![tx.id.to_vec()]))
+        .await;
+
+    wait_for(
+        "a GetData for the now-absent tx",
+        Duration::from_secs(5),
+        || async { h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed) > requested_before },
+    )
+    .await;
+
+    let mut asked = Vec::new();
+    while let Some(msg) = peer.recv(Duration::from_secs(2)).await {
+        if let P2PMessage::GetData(hashes) = msg {
+            asked = hashes;
+            break;
+        }
+    }
+    assert_eq!(
+        asked,
+        vec![tx.id.to_vec()],
+        "once the tx left the in-flight state it must be requested again"
+    );
+
+    println!(
+        "BN07 skipped_inflight={} sync_requested={}->{} session_drops_unchanged={}",
+        h.sync_ctx
+            .stats
+            .inventory_skipped_inflight
+            .load(Ordering::Relaxed),
+        requested_before,
+        h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed),
+        h.net.session_drops() == drops_before
+    );
+}
+// ---------------------------------------------------------------------------
+// 4CP-BX v2.1 (M1) — an outstanding GetData is not re-issued
+// ---------------------------------------------------------------------------
+
+/// Two inventory announcements for the same id, a moment apart, must produce
+/// ONE GetData. Before v2.1 the diff only knew the DAG, the orphan store and
+/// the ingress, so an id that had been requested but not answered yet was
+/// re-requested, the peer answered twice, and the funnel counted the second
+/// copy as a duplicate.
+///
+/// Retry is preserved: once the request is past the serving window the hash is
+/// re-armed as pending and the next announcement asks again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bn08_inventory_does_not_rerequest_an_outstanding_getdata() {
+    const PORT: u16 = 44856;
+    // The responder's own page handoff budget (`SYNC_RESPONSE_PAGE_TIMEOUT`):
+    // inside it, a second request can only fetch the same bytes again.
+    const SERVING_WINDOW: Duration = Duration::from_secs(30);
+
+    let mut h = boot_node(PORT, Arc::new(HashMap::new()), vec![]);
+    h.net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+    h.net.start().await.expect("start");
+
+    let mut peer = RawPeer::connect(PORT).await;
+    wait_peers(&h.net, 1).await;
+
+    // An id this node neither holds nor has requested yet.
+    let tx = flat_tx(0x4B4E_0008);
+    let id = tx.id;
+    let unrelated = flat_tx(0x4B4E_0009).id;
+
+    let requested_before = h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed);
+    let skipped_before = h
+        .sync_ctx
+        .stats
+        .inventory_skipped_requested
+        .load(Ordering::Relaxed);
+    let drops_before = h.net.session_drops();
+
+    // 1. First announcement: the id is unknown, so it must be requested.
+    peer.send(&P2PMessage::Inventory(vec![id.to_vec()])).await;
+    wait_for("the first GetData", Duration::from_secs(5), || async {
+        h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed) > requested_before
+    })
+    .await;
+    assert_eq!(
+        h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed),
+        requested_before + 1,
+        "one id, one request"
+    );
+    let mut asked = Vec::new();
+    while let Some(msg) = peer.recv(Duration::from_secs(2)).await {
+        if let P2PMessage::GetData(hashes) = msg {
+            asked = hashes;
+            break;
+        }
+    }
+    assert_eq!(
+        asked,
+        vec![id.to_vec()],
+        "the first request asks for exactly that id"
+    );
+
+    {
+        let frontier = h.sync_ctx.frontier.read().await;
+        assert!(
+            frontier.request_is_fresh(&id, SERVING_WINDOW),
+            "the frontier must own the request while it is outstanding"
+        );
+    }
+
+    // 2. Second announcement, immediately: still outstanding, must not re-ask.
+    peer.send(&P2PMessage::Inventory(vec![id.to_vec()])).await;
+    wait_for(
+        "the outstanding id is skipped",
+        Duration::from_secs(5),
+        || async {
+            h.sync_ctx
+                .stats
+                .inventory_skipped_requested
+                .load(Ordering::Relaxed)
+                > skipped_before
+        },
+    )
+    .await;
+
+    assert_eq!(
+        h.sync_ctx
+            .stats
+            .inventory_skipped_requested
+            .load(Ordering::Relaxed),
+        skipped_before + 1,
+        "exactly the outstanding id is suppressed"
+    );
+    assert_eq!(
+        h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed),
+        requested_before + 1,
+        "the second announcement must not re-request the outstanding id"
+    );
+    assert!(
+        !matches!(
+            peer.recv(Duration::from_millis(750)).await,
+            Some(P2PMessage::GetData(_))
+        ),
+        "no GetData may be emitted for an id that is already outstanding"
+    );
+    assert_eq!(
+        h.net.session_drops(),
+        drops_before,
+        "suppressing a request is not a delivery refusal"
+    );
+
+    // 2b. A different id in the very next announcement is still requested: the
+    //     filter is per id, never a whole-message drop.
+    peer.send(&P2PMessage::Inventory(vec![unrelated.to_vec()]))
+        .await;
+    let mut asked_second = Vec::new();
+    while let Some(msg) = peer.recv(Duration::from_secs(2)).await {
+        if let P2PMessage::GetData(hashes) = msg {
+            asked_second = hashes;
+            break;
+        }
+    }
+    assert_eq!(
+        asked_second,
+        vec![unrelated.to_vec()],
+        "an id that is not outstanding must still be requested"
+    );
+    assert_eq!(
+        h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed),
+        requested_before + 2,
+        "the unrelated id was requested exactly once"
+    );
+
+    // 3. Past the serving window the request is retryable, not suppressed
+    //    forever. `Duration::ZERO` puts the entry past the horizon exactly as
+    //    the passing of 30 s would (`request_is_fresh` compares elapsed time).
+    {
+        let mut frontier = h.sync_ctx.frontier.write().await;
+        assert!(
+            frontier.rearm_expired(&id, Duration::ZERO),
+            "an expired request must return to Pending"
+        );
+    }
+    let requested_retry = h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed);
+    peer.send(&P2PMessage::Inventory(vec![id.to_vec()])).await;
+    wait_for("the retry GetData", Duration::from_secs(5), || async {
+        h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed) > requested_retry
+    })
+    .await;
+
+    let mut retried = Vec::new();
+    while let Some(msg) = peer.recv(Duration::from_secs(2)).await {
+        if let P2PMessage::GetData(hashes) = msg {
+            retried = hashes;
+            break;
+        }
+    }
+    assert_eq!(
+        retried,
+        vec![id.to_vec()],
+        "an unanswered request must be retried once it is past the horizon"
+    );
+
+    println!(
+        "BN08 requested={}->{} skipped_requested={} session_drops_unchanged={} retried={}",
+        requested_before,
+        h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed),
+        h.sync_ctx
+            .stats
+            .inventory_skipped_requested
+            .load(Ordering::Relaxed),
+        h.net.session_drops() == drops_before,
+        retried.len()
+    );
+}
+// ---------------------------------------------------------------------------
+// 4CP-BX v2.1 (M2) — provenance precedes visibility, refusals leave nothing
+// ---------------------------------------------------------------------------
+
+/// The ingress provenance must be in place BEFORE the queued item becomes
+/// visible to a drainer, and a refused admission must leave no entry behind.
+///
+/// The first half races a drainer that takes the provenance immediately after
+/// `recv` (what `node.rs` does): under the pre-v2.1 order (send, then note) the
+/// take can win the race and receive `Historical` for a gossip transaction, and
+/// the late insert that follows is a phantom nobody removes. The second half
+/// saturates the queue and requires the recorded set to match the queued set
+/// exactly — no admission missing, no refusal recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bn09_ingress_provenance_precedes_visibility_and_leaves_no_phantom() {
+    const PORT: u16 = 44857;
+    const ROUNDS: u64 = 24;
+
+    let mut h = boot_node(PORT, Arc::new(HashMap::new()), vec![]);
+    h.net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+    h.net.start().await.expect("start");
+
+    let mut peer = RawPeer::connect(PORT).await;
+    wait_peers(&h.net, 1).await;
+
+    // 1. Admission followed immediately by the production dequeue step.
+    for i in 0..ROUNDS {
+        let tx = flat_tx(0x4B4F_0000 + i);
+        peer.send(&P2PMessage::Transaction(bincode::serialize(&tx).unwrap()))
+            .await;
+        let ingress = tokio::time::timeout(Duration::from_secs(5), h.rx.recv())
+            .await
+            .expect("gossip must reach ingress")
+            .expect("ingress channel alive");
+        let queued = ingress.into_tx();
+        assert_eq!(queued.id, tx.id);
+        assert_eq!(
+            h.sync_ctx.take_ingress_mode(queued.id).await,
+            ValidationMode::Fresh,
+            "the gossip provenance must exist before the item is visible (round {})",
+            i
+        );
+    }
+    assert!(
+        h.sync_ctx.ingress_mode.read().await.is_empty(),
+        "every reservation was consumed: a take must never leave a phantom"
+    );
+
+    // 2. Saturation: every queued item has provenance, every refusal has none.
+    let total = TX_INGRESS_CAPACITY_MSGS + 32;
+    for i in 0..total {
+        let tx = flat_tx(0x4B50_0000 + i as u64);
+        peer.send(&P2PMessage::Transaction(bincode::serialize(&tx).unwrap()))
+            .await;
+    }
+    // Every frame has been DECIDED once the queued and refused counts add up:
+    // only then can "no reservation left behind by a refusal" be asserted
+    // without racing a reserve that has not reached its `try_send` yet.
+    wait_for("the burst to settle", Duration::from_secs(20), || async {
+        h.rx.len() + h.net.ingress_drops() as usize >= total
+    })
+    .await;
+
+    let queued = h.rx.len();
+    let refused = h.net.ingress_drops() as usize;
+    let recorded = h.sync_ctx.ingress_mode.read().await.len();
+    assert_eq!(
+        queued + refused,
+        total,
+        "every frame is either queued or refused ({} + {} of {})",
+        queued,
+        refused,
+        total
+    );
+    assert!(
+        refused > 0,
+        "the bounded queue must refuse part of the burst ({} queued of {})",
+        queued,
+        total
+    );
+    assert_eq!(
+        recorded, queued,
+        "the recorded reservations must match the queued items exactly: a \
+         refused admission may not leave an entry, an admitted one may not miss one"
+    );
+
+    println!(
+        "BN09 rounds={} queued={} recorded={} refused={}",
+        ROUNDS,
+        queued,
+        recorded,
+        total - queued
+    );
+}
+// ---------------------------------------------------------------------------
+// 4CP-BX v2.2 (R1) — drained-but-unapplied, and the retry that follows
+// ---------------------------------------------------------------------------
+
+/// A transaction the drainer has taken but the funnel has not applied yet is in
+/// no store the diff used to look at: not in the DAG, not an orphan, gone from
+/// the ingress, and past `Requested` in the frontier. Asking a peer for it
+/// fetches bytes the node already holds, and the funnel counts the answer as a
+/// duplicate. The pipeline oracle closes that window without touching delivery.
+fn pipeline_snapshot_of(ids: Vec<[u8; 32]>) -> PipelineSnapshotFn {
+    Arc::new(move || {
+        let ids = ids.clone();
+        Box::pin(async move { ids })
+            as std::pin::Pin<Box<dyn std::future::Future<Output = Vec<[u8; 32]>> + Send>>
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bn10_drained_tx_is_not_requested_and_retry_follows_release() {
+    const PORT: u16 = 44858;
+
+    // An id this node already holds in its DAG: the "applied" control.
+    let applied = flat_tx(0x4B51_0001).id;
+    let mut h = boot_node(PORT, Arc::new(HashMap::new()), vec![applied.to_vec()]);
+    h.net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+    h.net.start().await.expect("start");
+
+    let mut peer = RawPeer::connect(PORT).await;
+    wait_peers(&h.net, 1).await;
+
+    // 1. Admit by gossip, then drain it exactly as `node.rs` does: the tx is now
+    //    in the pipeline, not in the DAG, and no longer in the ingress.
+    let tx = flat_tx(0x4B51_0002);
+    let id = tx.id;
+    peer.send(&P2PMessage::Transaction(bincode::serialize(&tx).unwrap()))
+        .await;
+    let admitted = tokio::time::timeout(Duration::from_secs(5), h.rx.recv())
+        .await
+        .expect("gossip must reach ingress")
+        .expect("ingress channel alive")
+        .into_tx();
+    assert_eq!(admitted.id, id);
+    h.sync_ctx.take_ingress_mode(id).await;
+    assert!(
+        !h.sync_ctx.ingress_mode.read().await.contains_key(&id),
+        "the drainer took the tx: the ingress window is closed"
+    );
+
+    // 2. Publish what the funnel holds — what the node does from its mempool.
+    h.sync_ctx
+        .set_pipeline_holds(pipeline_snapshot_of(vec![id]))
+        .await;
+
+    let requested_before = h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed);
+    let skipped_before = h
+        .sync_ctx
+        .stats
+        .inventory_skipped_pipeline
+        .load(Ordering::Relaxed);
+    let drops_before = h.net.session_drops();
+
+    peer.send(&P2PMessage::Inventory(vec![id.to_vec()])).await;
+    wait_for(
+        "the in-pipeline id is skipped",
+        Duration::from_secs(5),
+        || async {
+            h.sync_ctx
+                .stats
+                .inventory_skipped_pipeline
+                .load(Ordering::Relaxed)
+                > skipped_before
+        },
+    )
+    .await;
+
+    assert_eq!(
+        h.sync_ctx
+            .stats
+            .inventory_skipped_pipeline
+            .load(Ordering::Relaxed),
+        skipped_before + 1,
+        "the drained id is suppressed exactly once"
+    );
+    assert_eq!(
+        h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed),
+        requested_before,
+        "a transaction still in the pipeline must not be re-requested"
+    );
+    assert!(
+        !matches!(
+            peer.recv(Duration::from_millis(750)).await,
+            Some(P2PMessage::GetData(_))
+        ),
+        "no GetData may be emitted for a transaction the funnel already holds"
+    );
+    assert_eq!(
+        h.net.session_drops(),
+        drops_before,
+        "suppressing a request is not a delivery refusal"
+    );
+
+    // 3. The DELIVERY contract is untouched: the same payload sent by
+    //    SyncResponse still reaches the ingress and is still admitted. The
+    //    oracle only ever suppresses the request.
+    peer.send(&P2PMessage::SyncResponse(vec![
+        bincode::serialize(&tx).unwrap()
+    ]))
+    .await;
+    let redelivered = tokio::time::timeout(Duration::from_secs(5), h.rx.recv())
+        .await
+        .expect("a re-delivery must still be admitted (the funnel deduplicates)")
+        .expect("ingress channel alive")
+        .into_tx();
+    assert_eq!(
+        redelivered.id, id,
+        "suppressing the request must never suppress the delivery"
+    );
+    h.sync_ctx.take_ingress_mode(id).await;
+
+    // 4. The funnel disposes it (rejected, expired, or applied): the oracle
+    //    stops reporting it and the next inventory asks again — the retry path
+    //    BE03 depends on.
+    h.sync_ctx
+        .set_pipeline_holds(pipeline_snapshot_of(Vec::new()))
+        .await;
+    peer.send(&P2PMessage::Inventory(vec![id.to_vec()])).await;
+    wait_for("the retry GetData", Duration::from_secs(5), || async {
+        h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed) > requested_before
+    })
+    .await;
+    let mut retried = Vec::new();
+    while let Some(msg) = peer.recv(Duration::from_secs(2)).await {
+        if let P2PMessage::GetData(hashes) = msg {
+            retried = hashes;
+            break;
+        }
+    }
+    assert_eq!(
+        retried,
+        vec![id.to_vec()],
+        "once the funnel no longer holds it, the transaction is requestable again"
+    );
+
+    // 5. Applied is still decided by the DAG, independently of the oracle.
+    let skipped_after = h
+        .sync_ctx
+        .stats
+        .inventory_skipped_pipeline
+        .load(Ordering::Relaxed);
+    let requested_after = h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed);
+    peer.send(&P2PMessage::Inventory(vec![applied.to_vec()]))
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed),
+        requested_after,
+        "a transaction already in the DAG is never requested"
+    );
+    assert_eq!(
+        h.sync_ctx
+            .stats
+            .inventory_skipped_pipeline
+            .load(Ordering::Relaxed),
+        skipped_after,
+        "the DAG check answers first: the pipeline counter must not move"
+    );
+
+    println!(
+        "BN10 requested={}->{} skipped_pipeline={} session_drops_unchanged={}",
+        requested_before,
+        h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed),
+        h.sync_ctx
+            .stats
+            .inventory_skipped_pipeline
+            .load(Ordering::Relaxed),
+        h.net.session_drops() == drops_before
     );
 }

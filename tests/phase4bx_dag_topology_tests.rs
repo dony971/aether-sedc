@@ -6,6 +6,7 @@ use aether_unified::p2p::{
 };
 use aether_unified::parent_selection::DAG;
 use aether_unified::storage::Storage;
+use aether_unified::sync_stats::SyncContext;
 use aether_unified::transaction::{Transaction, TransactionId, DEFAULT_NETWORK_ID};
 use aether_unified::transaction_processor::TransactionProcessor;
 use aether_unified::validation::ValidationMode;
@@ -368,6 +369,12 @@ struct TestNodeBx {
     storage: Arc<RwLock<Storage>>,
     dag: Arc<RwLock<DAG>>,
     p2p: Arc<P2PNetwork>,
+    /// 4CP-BX v2.1 (M3): the node's own SyncContext. Production's drainer takes
+    /// the ingress provenance at dequeue (`node.rs`), so the test consumer must
+    /// do the same; without it `ingress_mode` is never purged in this harness
+    /// and the in-flight window would look permanently open — the test would
+    /// then pass on a state production never reaches.
+    sync_ctx: Arc<SyncContext>,
     rx: mpsc::Receiver<IngressTx>,
 }
 
@@ -417,6 +424,7 @@ async fn boot_node_bx(dir: tempfile::TempDir, port: u16, bootnodes: Vec<SocketAd
                 .collect()
         })
     });
+    let sync_ctx = Arc::new(SyncContext::default());
     let p2p = Arc::new(P2PNetwork::new(
         P2PConfig {
             listen_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
@@ -429,7 +437,7 @@ async fn boot_node_bx(dir: tempfile::TempDir, port: u16, bootnodes: Vec<SocketAd
         get_hashes,
         get_tx,
         get_tips,
-        Arc::new(aether_unified::sync_stats::SyncContext::default()),
+        sync_ctx.clone(),
         Arc::new(|_| false),
     ));
     p2p.set_protocol_mode(P2PProtocolMode::LegacyV5);
@@ -439,6 +447,7 @@ async fn boot_node_bx(dir: tempfile::TempDir, port: u16, bootnodes: Vec<SocketAd
         storage,
         dag,
         p2p,
+        sync_ctx,
         rx,
     }
 }
@@ -579,6 +588,7 @@ async fn run_round_bx(
         storage: storage_b,
         dag: dag_b,
         p2p: p2p_b,
+        sync_ctx: sync_ctx_b,
         mut rx,
     } = node_b;
     let expected = sent.len();
@@ -627,8 +637,33 @@ async fn run_round_bx(
     let received_atomic = received_count.clone();
     let accepted_atomic = accepted_count.clone();
     let persisted_atomic = persisted_count.clone();
+    // 4CP-BX v2.2 (R1): the harness's consumer IS this node's funnel — it holds
+    // the transactions it received until it applies them. Publishing that set to
+    // the node is what production does with `Mempool::held_ids`, so the Inventory
+    // diff sees the same window it sees in a real node instead of a window that
+    // only exists because the harness never reported its queue.
+    let pipeline_held: Arc<StdMutex<HashSet<[u8; 32]>>> =
+        Arc::new(StdMutex::new(HashSet::with_capacity(expected)));
+    {
+        let held = pipeline_held.clone();
+        sync_ctx_b
+            .set_pipeline_holds(Arc::new(move || {
+                let snapshot: Vec<[u8; 32]> = held
+                    .lock()
+                    .expect("pipeline lock")
+                    .iter()
+                    .copied()
+                    .collect();
+                Box::pin(async move { snapshot })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Vec<[u8; 32]>> + Send>>
+            }))
+            .await;
+    }
+
     let dag_consumer = dag_b.clone();
     let storage_consumer = storage_b.clone();
+    let sync_ctx_consumer = sync_ctx_b.clone();
+    let pipeline_consumer = pipeline_held.clone();
     let consumer = tokio::spawn(async move {
         let mut seen: HashSet<[u8; 32]> = HashSet::with_capacity(expected);
         let mut pending: HashMap<[u8; 32], BTreeMap<u64, (Instant, Transaction)>> = HashMap::new();
@@ -660,6 +695,20 @@ async fn run_round_bx(
         while let Some(ingress) = rx.recv().await {
             let received_at = Instant::now();
             let tx = ingress.into_tx();
+            // 4CP-BX v2.3: the same three steps, in the same order, as
+            // `node.rs` — open the handoff (the id stays visible), let the
+            // funnel take ownership (here: publish it in the pipeline set),
+            // then close the handoff. Nothing is inserted before the dequeue
+            // and nothing is published after the handoff ends, so the harness
+            // reproduces the production visibility chain instead of masking a
+            // hole in it.
+            let tx_id = tx.id;
+            let (_ingress_mode, handoff) = sync_ctx_consumer.begin_ingress_handoff(tx_id).await;
+            pipeline_consumer
+                .lock()
+                .expect("pipeline lock")
+                .insert(tx_id);
+            sync_ctx_consumer.end_ingress_handoff(tx_id, handoff).await;
             if !seen.insert(tx.id) {
                 result.duplicates += 1;
                 continue;

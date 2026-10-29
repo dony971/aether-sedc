@@ -620,6 +620,22 @@ impl Mempool {
             .unwrap_or(ValidationMode::Historical)
     }
 
+    /// 4CP-BX v2.2 (R1): ids this funnel still HOLDS — queued, selected by the
+    /// drainer, or requeued, but not yet disposed.
+    ///
+    /// `admit_mode` is exactly that lifecycle: inserted on a successful enqueue,
+    /// untouched by SELECT/requeue, removed on the single terminal `dispose`
+    /// (Included / Rejected / OrphanParked / Expired). A transaction the funnel
+    /// refused never entered it, so it stays eligible for a re-request — the
+    /// retry path BE03 exercises.
+    ///
+    /// Consumed by the P2P Inventory diff through `set_pipeline_holds`, so that
+    /// a transaction that was drained from the ingress but is still being
+    /// processed is not fetched from a peer a second time.
+    pub fn held_ids(&self) -> Vec<TransactionId> {
+        self.admit_mode.keys().copied().collect()
+    }
+
     /// PHASE D: deterministic SELECT (mandate §3). Returns up to `batch`
     /// transactions in a canonical order — fee DESC, then tx id ASC — so two
     /// nodes with the same state always select the same candidates. The
@@ -3591,6 +3607,63 @@ mod tests {
             b2.iter().map(|t| t.id).collect::<Vec<_>>(),
             b1.iter().map(|t| t.id).collect::<Vec<_>>()
         );
+    }
+
+    /// 4CP-BX v2.2 (R1): `held_ids` is the lifecycle the P2P Inventory diff
+    /// consults, so it must be exact — present from the successful enqueue,
+    /// still present while the drainer holds the tx, and gone the instant it is
+    /// disposed. A refused enqueue must never appear, otherwise a transaction
+    /// the funnel rejected could never be requested again (BE03).
+    #[test]
+    fn test_mempool_held_ids_tracks_accept_to_dispose() {
+        let mut mempool = Mempool::new(1000, 10);
+        let tx = Transaction::new(
+            [[0u8; 32]; 2],
+            [7u8; 32],
+            [3u8; 32],
+            1,
+            10,
+            1234567890,
+            0,
+            1,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(
+            mempool.held_ids().is_empty(),
+            "nothing held before any accept"
+        );
+
+        // Refused (fee below the floor): never held, so it stays requestable.
+        assert!(mempool.enqueue(tx.clone(), 100).is_err());
+        assert!(
+            !mempool.held_ids().contains(&tx.id),
+            "a refused transaction must not be reported as held"
+        );
+
+        // Accepted: held from now on.
+        mempool.enqueue(tx.clone(), 1).expect("accept");
+        assert!(mempool.held_ids().contains(&tx.id));
+
+        // Selected by the drainer (the R1 window): STILL held.
+        let batch = mempool.select_batch(10);
+        assert_eq!(batch.len(), 1);
+        assert!(
+            mempool.held_ids().contains(&tx.id),
+            "a transaction the drainer selected is still in flight"
+        );
+
+        // Requeued after a transient failure: still held, still one deadline.
+        mempool.requeue(tx.clone());
+        assert!(mempool.held_ids().contains(&tx.id));
+
+        // Terminal disposition: released, and requestable again.
+        mempool.dispose(&tx.id, MempoolDisposition::Included);
+        assert!(
+            !mempool.held_ids().contains(&tx.id),
+            "a disposed transaction leaves the snapshot immediately"
+        );
+        assert!(mempool.held_ids().is_empty());
     }
 
     /// PHASE D §5: TTL expiry — a tx stuck in the queue past its deadline is

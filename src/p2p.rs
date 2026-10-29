@@ -766,6 +766,16 @@ pub const SESSION_SYNC_JOBS_CAPACITY: usize = 2 * crate::sync_stats::MAX_INFLIGH
 /// session reader.
 const SYNC_RESPONSE_PAGE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 4CP-BX v2.1 (M1): how long an unanswered `GetData` stays "outstanding" for
+/// the Inventory diff. Inside this window the responder is still inside its own
+/// page handoff budget (`SYNC_RESPONSE_PAGE_TIMEOUT`), so re-requesting the same
+/// id can only fetch the same bytes a second time — the duplicate BX counts.
+/// Past it the request is re-armed as pending (see `SyncFrontier::rearm_expired`),
+/// so a lost response is retried on the next inventory round instead of being
+/// suppressed forever. Deriving the horizon from the responder's own window
+/// keeps the two sides on one number instead of inventing a separate timer.
+const INFLIGHT_REQUEST_HORIZON: Duration = SYNC_RESPONSE_PAGE_TIMEOUT;
+
 /// 4CP-BN: total emission budget for every page of ONE serve job. Bounds the
 /// time a single request can occupy the per-session responder (a request
 /// splits into at most `MAX_CLOSURE_PAGES` pages), so one stalled request can
@@ -6641,6 +6651,24 @@ impl P2PNetwork {
                             let live_id = bincode::deserialize::<Transaction>(&tx_bytes)
                                 .ok()
                                 .map(|t| t.id);
+                            // 4CP-BX v2.1 (M2): RESERVE the provenance BEFORE the
+                            // enqueue, then cancel it if the admission is refused.
+                            // The old order (send, then note) left a window in
+                            // which the drainer could take the item and consume
+                            // nothing; the late insert that followed was then a
+                            // phantom entry that no drainer would ever remove,
+                            // and the Inventory diff started skipping a
+                            // transaction that was in no queue at all. Reserving
+                            // first closes the window, and the cancel on refusal
+                            // keeps the 4CP-BA contract (a refused payload
+                            // records NOTHING, so a later Historical re-delivery
+                            // is never poisoned by a Fresh note).
+                            let reserved = match live_id {
+                                Some(id) => {
+                                    sync_ctx.note_ingress_mode(id, ValidationMode::Fresh).await
+                                }
+                                None => None,
+                            };
                             if !accept_inbound_transaction(
                                 tx_bytes,
                                 addr,
@@ -6652,12 +6680,10 @@ impl P2PNetwork {
                             )
                             .await
                             {
+                                if let (Some(id), Some(token)) = (live_id, reserved) {
+                                    sync_ctx.cancel_ingress_reservation(id, token).await;
+                                }
                                 continue;
-                            }
-                            if let Some(id) = live_id {
-                                sync_ctx
-                                    .note_ingress_mode(id, ValidationMode::Fresh)
-                                    .await;
                             }
                         }
                         P2PMessage::Inventory(hashes) => {
@@ -6679,25 +6705,131 @@ impl P2PNetwork {
                                 hashes.len() as u64,
                                 std::sync::atomic::Ordering::Relaxed,
                             );
+                            // 4CP-BX v2: a payload this node has already
+                            // ADMITTED (queued by the gossip arm) but that the
+                            // drainer has not taken yet lives in neither the
+                            // DAG nor the orphan store, so the diff below would
+                            // re-request it, the peer would answer with the very
+                            // same bytes, and the funnel would count the second
+                            // admission as a duplicate. `ingress_mode` is
+                            // exactly that state since v2.1: reserved just
+                            // BEFORE the enqueue, cancelled when the admission is
+                            // refused, removed by `take_ingress_mode` when the
+                            // drainer takes the tx.
+                            //
+                            // The duplicate is closed HERE, upstream, and not at
+                            // the SyncResponse admission: the ingress contract
+                            // is that a delivered copy is never refused for being
+                            // a duplicate (the funnel is the single
+                            // deduplicator — phase4ba::ba01 and
+                            // phase4be::be02-04 REQUIRE the re-delivery to reach
+                            // the queue). Suppressing the REQUEST keeps the first
+                            // delivery intact.
+                            //
+                            // Snapshot once: the guard is dropped before any
+                            // filtering and long before the GetData frame is
+                            // queued, so no lock is held across work that can
+                            // block.
+                            let in_flight: HashSet<[u8; 32]> = {
+                                let map = sync_ctx.ingress_mode.read().await;
+                                map.keys().copied().collect()
+                            };
+                            // 4CP-BX v2.1 (M1): the second half of the same
+                            // window. A tx we already ASKED for (GetData emitted,
+                            // SyncResponse not yet arrived) is in neither the DAG
+                            // nor the orphan store nor the ingress, so a second
+                            // inventory round a moment later would ask again and
+                            // the funnel would then see two copies of one tx.
+                            // Only FRESH requests are suppressed: past the horizon
+                            // `rearm_expired` below puts the hash back to Pending,
+                            // so an unanswered request is still retried.
+                            let outstanding: HashSet<[u8; 32]> = {
+                                let frontier = sync_ctx.frontier.read().await;
+                                frontier
+                                    .fresh_requests(INFLIGHT_REQUEST_HORIZON)
+                                    .into_iter()
+                                    .collect()
+                            };
+                            // 4CP-BX v2.2 (R1): the third window. Once the
+                            // drainer has taken the ingress provenance, a
+                            // transaction being processed sits in neither the
+                            // DAG, nor the orphan store, nor the ingress, nor
+                            // the frontier, so this diff would fetch it a second
+                            // time and the funnel would count the answer as a
+                            // duplicate. The pipeline oracle answers "do I still
+                            // hold it?" and is read as ONE snapshot, exactly
+                            // like the two above: no guard is held while the
+                            // diff runs, and the funnel is consulted once per
+                            // Inventory rather than once per hash.
+                            let pipeline_oracle = sync_ctx.pipeline_holds.read().await.clone();
+                            let pipeline_holds: HashSet<[u8; 32]> = match pipeline_oracle {
+                                Some(oracle) => oracle().await.into_iter().collect(),
+                                None => HashSet::new(),
+                            };
                             let mut skipped_orphan = 0u64;
-                            let missing_hashes: Vec<Vec<u8>> = hashes
-                                .into_iter()
-                                .filter(|h| {
-                                    if our_hash_set.contains(h) {
-                                        return false;
+                            let mut skipped_inflight = 0u64;
+                            let mut skipped_requested = 0u64;
+                            let mut skipped_pipeline = 0u64;
+                            // A loop rather than `filter().take()`: the cap must
+                            // keep bounding the REQUEST (PHASE D), and the scan
+                            // simply stops once that request is full — same
+                            // semantics as before, kept explicit because the
+                            // pipeline check below is an `await`.
+                            let mut missing_hashes: Vec<Vec<u8>> = Vec::new();
+                            for h in hashes {
+                                if missing_hashes.len() >= MAX_INV_ITEMS {
+                                    break;
+                                }
+                                if our_hash_set.contains(&h) {
+                                    continue;
+                                }
+                                if is_orphan(h.as_slice()) {
+                                    skipped_orphan += 1;
+                                    continue;
+                                }
+                                if h.len() == 32 {
+                                    let mut id = [0u8; 32];
+                                    id.copy_from_slice(&h);
+                                    // Admitted but not yet applied: a second
+                                    // copy would be a duplicate, not a
+                                    // delivery.
+                                    if in_flight.contains(&id) {
+                                        skipped_inflight += 1;
+                                        continue;
                                     }
-                                    if is_orphan(h.as_slice()) {
-                                        skipped_orphan += 1;
-                                        return false;
+                                    // 4CP-BX v2.1 (M1): already requested and
+                                    // still awaited — asking again is the
+                                    // duplicate request, not a recovery.
+                                    if outstanding.contains(&id) {
+                                        skipped_requested += 1;
+                                        continue;
                                     }
-                                    true
-                                })
-                                .take(MAX_INV_ITEMS)
-                                .collect();
+                                    // 4CP-BX v2.2 (R1): drained and being
+                                    // processed — the first delivery is already
+                                    // on its way, a second one is a duplicate.
+                                    if pipeline_holds.contains(&id) {
+                                        skipped_pipeline += 1;
+                                        continue;
+                                    }
+                                }
+                                missing_hashes.push(h);
+                            }
                             sync_ctx
                                 .stats
                                 .inventory_skipped_orphan
                                 .fetch_add(skipped_orphan, std::sync::atomic::Ordering::Relaxed);
+                            sync_ctx
+                                .stats
+                                .inventory_skipped_inflight
+                                .fetch_add(skipped_inflight, std::sync::atomic::Ordering::Relaxed);
+                            sync_ctx
+                                .stats
+                                .inventory_skipped_requested
+                                .fetch_add(skipped_requested, std::sync::atomic::Ordering::Relaxed);
+                            sync_ctx
+                                .stats
+                                .inventory_skipped_pipeline
+                                .fetch_add(skipped_pipeline, std::sync::atomic::Ordering::Relaxed);
                             // VPS-2 §5: the diff size itself (how much the
                             // peer has that we lack), independent of caps.
                             sync_ctx.stats.inventory_missing.fetch_add(
@@ -6711,7 +6843,13 @@ impl P2PNetwork {
                                 {
                                     let mut frontier = sync_ctx.frontier.write().await;
                                     for h in &missing_hashes {
-                                        frontier.add_pending(h.clone());
+                                        // 4CP-BX v2.1 (M1): already tracked can mean
+                                        // "pending" (a deferred frame) or
+                                        // "requested but expired" — re-arm the
+                                        // latter so the retry below can renew it.
+                                        if !frontier.add_pending(h.clone()) {
+                                            frontier.rearm_expired(h, INFLIGHT_REQUEST_HORIZON);
+                                        }
                                     }
                                 }
                                 info!(
@@ -6934,23 +7072,21 @@ impl P2PNetwork {
                                     }
                                     let in_dag =
                                         get_transaction_by_hash(&tx.id).is_some();
-                                    // 4CP-BX: the DAG/orphan test alone cannot see
-                                    // a payload that is already ADMITTED (queued
-                                    // by the gossip arm) but not yet applied: it
-                                    // lives in neither store, so the same wire
-                                    // bytes could be queued a second time by this
-                                    // path and be counted as a duplicate at the
-                                    // funnel. The receipt cache is keyed on these
-                                    // very bytes and is written ONLY after a
-                                    // successful admission, so consulting it here
-                                    // closes the window without inventing a
-                                    // refusal: a refused payload is never
-                                    // inserted, and the native re-request path
-                                    // (inventory diff / orphan solver) still owns
-                                    // every payload this node does not hold.
-                                    let already_admitted =
-                                        seen_transactions.read().await.contains_key(&tx_bytes);
-                                    if in_dag || is_orphan(&tx.id) || already_admitted {
+                                    // 4CP-BX v2: a duplicate is closed UPSTREAM,
+                                    // in the Inventory diff, never here. Gating
+                                    // this admission on the receipt cache
+                                    // (seen_transactions) was the v1 fix and it
+                                    // was regressive: the ingress contract is
+                                    // that a delivered copy is NEVER refused for
+                                    // being a duplicate — the funnel is the single
+                                    // deduplicator (phase4ba::ba01 and
+                                    // phase4be::be02-04 require a re-delivered
+                                    // payload to reach the queue). A gate here also
+                                    // cannot separate "already applied" (a real
+                                    // duplicate) from "still queued" (a perfectly
+                                    // good delivery), and seen_transactions is
+                                    // additionally fed by the local broadcast path.
+                                    if in_dag || is_orphan(&tx.id) {
                                         sync_ctx
                                             .stats
                                             .duplicate_ignored
@@ -7091,6 +7227,20 @@ impl P2PNetwork {
                                         continue;
                                     }
                                 };
+                                // PHASE 3B (H1): this is the SYNC backfill path
+                                // (inventory diffs, GetData closures, healing).
+                                // Backfill carries genuinely-old txs that live
+                                // policy (Fresh) must not reject, so it records
+                                // Historical. Live gossip singles record Fresh at
+                                // the Transaction arm above; first-delivery-wins
+                                // on duplicates.
+                                //
+                                // 4CP-BX v2.1 (M2): reserve BEFORE the enqueue and
+                                // cancel on refusal, exactly as the gossip arm
+                                // does — see the long note there.
+                                let reserved = sync_ctx
+                                    .note_ingress_mode(tx_id, ValidationMode::Historical)
+                                    .await;
                                 if tx_channel
                                     .try_send(IngressTx {
                                         tx,
@@ -7105,19 +7255,13 @@ impl P2PNetwork {
                                         wire_len,
                                         addr
                                     );
+                                    if let Some(token) = reserved {
+                                        sync_ctx
+                                            .cancel_ingress_reservation(tx_id, token)
+                                            .await;
+                                    }
                                     continue;
                                 }
-                                // PHASE 3B (H1): this is the SYNC backfill path
-                                // (inventory diffs, GetData closures, healing).
-                                // Record Historical provenance now that the
-                                // payload is queued: backfill carries
-                                // genuinely-old txs that live policy (Fresh)
-                                // must not reject. Live gossip singles record
-                                // Fresh at the Transaction arm above;
-                                // first-delivery-wins on duplicates.
-                                sync_ctx
-                                    .note_ingress_mode(tx_id, ValidationMode::Historical)
-                                    .await;
                                 sync_ctx
                                     .frontier
                                     .write()
@@ -17731,17 +17875,21 @@ mod phase4cat_e2e_integrity_tests {
             sync_ctx.clone(),
         ));
 
-        // node.rs:856-913, replicated on the shared Arcs.
+        // node.rs, replicated on the shared Arcs — including the 4CP-BX v2.3
+        // handoff, so this harness exercises the real visibility transition
+        // (an id is never in no store between the ingress and the funnel).
         {
             let rpc = rpc.clone();
             let sync_ctx = sync_ctx.clone();
             tokio::spawn(async move {
                 while let Some(item) = tx_receiver.recv().await {
                     let tx = item.into_tx();
-                    let ingress_mode = sync_ctx.take_ingress_mode(tx.id).await;
-                    match rpc.process_transaction(tx, "P2P", ingress_mode).await {
-                        Ok(_) => rpc.process_orphans().await,
-                        Err(_) => {}
+                    let tx_id = tx.id;
+                    let (ingress_mode, handoff) = sync_ctx.begin_ingress_handoff(tx_id).await;
+                    let outcome = rpc.process_transaction(tx, "P2P", ingress_mode).await;
+                    sync_ctx.end_ingress_handoff(tx_id, handoff).await;
+                    if outcome.is_ok() {
+                        rpc.process_orphans().await;
                     }
                 }
             });

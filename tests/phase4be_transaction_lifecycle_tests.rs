@@ -342,10 +342,19 @@ async fn boot_with_state(
     let consumer = tokio::spawn(async move {
         while let Some(item) = tx_receiver.recv().await {
             let tx = item.into_tx();
-            let mode = consumer_ctx.take_ingress_mode(tx.id).await;
-            match consumer_rpc.process_transaction(tx, "P2P", mode).await {
-                Ok(_) => consumer_rpc.process_orphans().await,
-                Err(_) => {}
+            // 4CP-BX v2.3: this consumer replicates `node.rs`, which hands the
+            // id to the funnel with `begin_ingress_handoff` and releases it on
+            // both outcomes. Taking the provenance and only then calling the
+            // funnel would leave the id in no store for the whole PoW/signature
+            // verification, and an `Inventory` arriving there would re-request
+            // it. Kept in step with production so this suite measures the real
+            // transition.
+            let tx_id = tx.id;
+            let (mode, handoff) = consumer_ctx.begin_ingress_handoff(tx_id).await;
+            let outcome = consumer_rpc.process_transaction(tx, "P2P", mode).await;
+            consumer_ctx.end_ingress_handoff(tx_id, handoff).await;
+            if outcome.is_ok() {
+                consumer_rpc.process_orphans().await;
             }
             consumer_ingested.fetch_add(1, Ordering::Relaxed);
         }
@@ -1012,6 +1021,127 @@ async fn be06_permanent_rejection_is_not_retried_and_transient_debt_is() {
     )
     .await;
     assert_eq!(node.rpc.mempool_stats().await.expired, 0);
+
+    drop(peer);
+    shutdown(node).await;
+}
+// ---------------------------------------------------------------------------
+// 4CP-BX v2.3 — the ingress→funnel handoff leaves no uncovered instant
+// ---------------------------------------------------------------------------
+
+/// A transaction that has left the ingress channel but has not reached the
+/// mempool yet is in NO store: not the DAG, not the orphan store, not the
+/// ingress, and the frontier holds no request for it. An `Inventory` arriving
+/// in that window used to re-request bytes the node was already processing.
+///
+/// The window is made deterministic here instead of sampled: the funnel is
+/// frozen by holding the mempool write lock, so the consumer takes the item,
+/// opens the handoff and then blocks inside `process_transaction` (its first
+/// mempool access is a read, queued behind the writer). The handoff gauge is
+/// the rendezvous — no sleeps, no timing assumption.
+///
+/// With the handoff, the id stays in `ingress_mode` for the whole transfer and
+/// the diff must skip it. Without it (v2.2 and earlier) the diff sees nothing
+/// and emits a `GetData`, which increments `sync_requested`: this test then
+/// fails deterministically.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn be07_handoff_keeps_the_id_visible_across_the_funnel_call() {
+    const PORT: u16 = 44935;
+    let dir = tempfile::tempdir().expect("dir");
+    let node = boot_node(PORT, dir.path(), 100).await;
+    let wallet = wallet_n(5_000_007);
+    fund(&node, &wallet, 2_000_000).await;
+    let tx = live_tx(&wallet, [[0u8; 32]; 2], 1_000, 10, 1);
+
+    let mut peer = RawPeer::connect(PORT).await;
+    wait_peer(&node).await;
+
+    // Freeze the funnel BEFORE the transaction is delivered.
+    let frozen = node.mempool.write().await;
+
+    gossip(&mut peer, &tx).await;
+    wait_for("the handoff to open", || async {
+        node.sync_ctx
+            .stats
+            .ingress_handoffs_active
+            .load(Ordering::Relaxed)
+            == 1
+    })
+    .await;
+
+    // The id must be visible here: this is the instant the funnel is inside
+    // `process_transaction` and the mempool does not hold it yet.
+    let requested_before = node.sync_ctx.stats.sync_requested.load(Ordering::Relaxed);
+    let advertised_before = node
+        .sync_ctx
+        .stats
+        .inventory_advertised
+        .load(Ordering::Relaxed);
+    let skipped_before = node
+        .sync_ctx
+        .stats
+        .inventory_skipped_inflight
+        .load(Ordering::Relaxed);
+    assert!(
+        node.sync_ctx.ingress_mode.read().await.contains_key(&tx.id),
+        "the handoff reservation must be the visible record during the transfer"
+    );
+
+    // A peer announces the very id the funnel is holding.
+    peer.send(&P2PMessage::Inventory(vec![tx.id.to_vec()]))
+        .await;
+    wait_for("the inventory to be processed", || async {
+        node.sync_ctx
+            .stats
+            .inventory_advertised
+            .load(Ordering::Relaxed)
+            > advertised_before
+    })
+    .await;
+    wait_for("the in-flight id to be skipped", || async {
+        node.sync_ctx
+            .stats
+            .inventory_skipped_inflight
+            .load(Ordering::Relaxed)
+            > skipped_before
+    })
+    .await;
+
+    // THE PROPERTY: no request for a transaction already on its way in.
+    assert_eq!(
+        node.sync_ctx.stats.sync_requested.load(Ordering::Relaxed),
+        requested_before,
+        "the handoff must keep the id visible: no GetData for a transaction the \
+         funnel is already processing"
+    );
+
+    // Release the funnel: the transaction must complete its lifecycle, and the
+    // handoff must not survive it.
+    drop(frozen);
+    wait_ingested(&node, 1).await;
+    drain_until(&node, 1, 6).await;
+
+    assert!(
+        node.dag.read().await.get_transaction(tx.id).is_some(),
+        "the transaction the handoff covered must still be applied"
+    );
+    assert_eq!(
+        node.sync_ctx
+            .stats
+            .ingress_handoffs_active
+            .load(Ordering::Relaxed),
+        0,
+        "the handoff is released on the success path"
+    );
+    assert!(
+        !node.sync_ctx.ingress_mode.read().await.contains_key(&tx.id),
+        "no phantom reservation may outlive the handoff"
+    );
+    assert_eq!(
+        node.rpc.mempool_stats().await.added,
+        1,
+        "the transaction was admitted exactly once"
+    );
 
     drop(peer);
     shutdown(node).await;

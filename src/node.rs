@@ -819,6 +819,28 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
     ));
     tracing::info!("✅ P2P network initialized");
 
+    // 4CP-BX v2.2 (R1): give the Inventory diff sight of the funnel's own
+    // queue. Without it, a transaction drained from the ingress but not yet
+    // applied (in the mempool, or selected by the drainer) is invisible to
+    // every other check — not in the DAG, not an orphan, gone from the ingress
+    // and from the frontier — so the node re-requests bytes it already holds
+    // and the funnel legitimately counts the answer as a duplicate.
+    //
+    // `held_ids` is the mempool's own accept-to-dispose lifecycle, so a refused
+    // transaction is absent at once and stays re-requestable (BE03), and a
+    // disposed one leaves the snapshot the moment it is terminal. Nothing new
+    // to expire and nothing to leak.
+    {
+        let mempool_for_pipeline = mempool.clone();
+        sync_ctx
+            .set_pipeline_holds(Arc::new(move || {
+                let mempool = mempool_for_pipeline.clone();
+                Box::pin(async move { mempool.read().await.held_ids() })
+                    as crate::transport::BoxFuture<'static, Vec<TransactionId>>
+            }))
+            .await;
+    }
+
     // PHASE 4CP-S: select the P2P handshake protocol from the EXPLICIT config
     // choice (`resolve_p2p_protocol` refused to start if it was unset). The
     // choice is independent of `network_id`:
@@ -913,7 +935,19 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
             // absent = Historical = pre-3B behavior) and forward it as THE
             // validation mode for the whole pipeline, so accept gate,
             // drainer, STEP 0 and STEP 1 evaluate one tx under ONE policy.
-            let ingress_mode = sync_ctx_for_p2p.take_ingress_mode(tx.id).await;
+            //
+            // 4CP-BX v2.3: the consumption and the re-reservation are ONE lock
+            // acquisition (`begin_ingress_handoff`). Taking the provenance and
+            // only then calling the funnel left a window in which the id was
+            // in NO store — not the DAG, not the orphan store, not the ingress,
+            // not the mempool (which is written at the very end of
+            // `process_transaction`, after PoW/signature verification) — so a
+            // peer's Inventory arriving there re-requested bytes this node was
+            // already processing. The handoff keeps the id visible for the
+            // whole transfer and is released below, on BOTH outcomes.
+            let tx_id = tx.id;
+            let (ingress_mode, handoff_token) =
+                sync_ctx_for_p2p.begin_ingress_handoff(tx_id).await;
   let mut rpc_impl = AetherRpcImpl::new(
                 dag_for_p2p.clone(),
                 ledger_for_p2p.clone(),
@@ -931,10 +965,16 @@ pub async fn run_node(cfg: NodeConfig) -> Result<NodeHandles, Box<dyn std::error
   #[cfg(feature = "test-pipeline-trace")]
   rpc_impl.set_trace_label(receiver_trace_label.clone());
 
-            match rpc_impl
-                .process_transaction(tx, "P2P", ingress_mode)
-                .await
-            {
+            let admission = rpc_impl.process_transaction(tx, "P2P", ingress_mode).await;
+            // 4CP-BX v2.3: the funnel either owns the tx now (mempool) or
+            // refused it outright; either way the handoff reservation has no
+            // further purpose. Released before anything else runs on this path,
+            // and only if it is still ours — a delivery that re-reserved the id
+            // in the meantime keeps its provenance.
+            sync_ctx_for_p2p
+                .end_ingress_handoff(tx_id, handoff_token)
+                .await;
+            match admission {
                 Ok(_) => {
                     // 4CP-BD: admission only. sync_progress/frontier advance
                     // when the drainer inserts the tx into the DAG.

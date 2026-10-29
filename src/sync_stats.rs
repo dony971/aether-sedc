@@ -18,6 +18,7 @@
 //! No consensus logic lives here: weights, VQV/min-id, pruning, ledger,
 //! finality, parent selection and genesis are untouched.
 
+use crate::validation::ValidationMode;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -25,7 +26,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use crate::validation::ValidationMode;
 
 /// B4: a missing parent is re-requested at most once per cooldown (see
 /// `PARENT_BACKOFF_STEPS`). Without this, every parked orphan re-requested its
@@ -136,6 +136,24 @@ pub struct SyncStatsSnapshot {
     /// re-requests via the frontier). Distinct from `session_drops`, which
     /// also counts pre-emission refusals at the bounded serve-job queue.
     pub sync_response_timeouts: u64,
+    /// 4CP-BX v2: inventory hashes NOT requested because this node had already
+    /// admitted them and the drainer had not taken them yet. Each one is a
+    /// duplicate admission avoided upstream (the ingress keeps delivering
+    /// every copy; the funnel stays the single deduplicator).
+    pub inventory_skipped_inflight: u64,
+    /// 4CP-BX v2.1 (M1): inventory hashes skipped because a GetData for them is
+    /// already outstanding and still inside its serving window.
+    pub inventory_skipped_requested: u64,
+    /// 4CP-BX v2.2 (R1): inventory hashes skipped because the node's own
+    /// pipeline still holds them (drained from ingress, not yet applied).
+    /// Nothing is lost: the delivery in flight is the original one.
+    pub inventory_skipped_pipeline: u64,
+    /// 4CP-BX v2.3: ingress→funnel handoffs started (total).
+    pub ingress_handoffs: u64,
+    /// 4CP-BX v2.3: handoffs currently open. Non-zero means a transaction has
+    /// left the ingress channel but has not reached the funnel yet — the exact
+    /// instant a redundant `GetData` could otherwise be emitted.
+    pub ingress_handoffs_active: u64,
 }
 
 /// Atomic bootstrap counters.
@@ -174,6 +192,17 @@ pub struct SyncStats {
     pub topo_cache_miss: AtomicU64,
     /// 4CP-BN: SyncResponse emission expirations (one per refused request).
     pub sync_response_timeouts: AtomicU64,
+    /// 4CP-BX v2: inventory hashes skipped because they are already admitted
+    /// and still in flight (see `SyncContext::ingress_mode`).
+    pub inventory_skipped_inflight: AtomicU64,
+    /// 4CP-BX v2.1 (M1): see `SyncStatsSnapshot::inventory_skipped_requested`.
+    pub inventory_skipped_requested: AtomicU64,
+    /// 4CP-BX v2.2 (R1): see `SyncStatsSnapshot::inventory_skipped_pipeline`.
+    pub inventory_skipped_pipeline: AtomicU64,
+    /// 4CP-BX v2.3: see `SyncStatsSnapshot::ingress_handoffs`.
+    pub ingress_handoffs: AtomicU64,
+    /// 4CP-BX v2.3: see `SyncStatsSnapshot::ingress_handoffs_active`.
+    pub ingress_handoffs_active: AtomicU64,
 }
 
 impl SyncStats {
@@ -211,7 +240,58 @@ impl SyncStats {
             topo_cache_hits: self.topo_cache_hits.load(Ordering::Relaxed),
             topo_cache_miss: self.topo_cache_miss.load(Ordering::Relaxed),
             sync_response_timeouts: self.sync_response_timeouts.load(Ordering::Relaxed),
+            inventory_skipped_inflight: self.inventory_skipped_inflight.load(Ordering::Relaxed),
+            inventory_skipped_requested: self.inventory_skipped_requested.load(Ordering::Relaxed),
+            inventory_skipped_pipeline: self.inventory_skipped_pipeline.load(Ordering::Relaxed),
+            ingress_handoffs: self.ingress_handoffs.load(Ordering::Relaxed),
+            ingress_handoffs_active: self.ingress_handoffs_active.load(Ordering::Relaxed),
         }
+    }
+}
+
+/// 4CP-BX v2.2 (R1): snapshot of the ids the node's own pipeline still holds —
+/// queued or selected in the funnel, not yet applied, not yet disposed.
+///
+/// A closure rather than a direct `Mempool` handle: the mempool lives behind
+/// `AetherRpcImpl` in `rpc.rs`, which already depends on `p2p.rs`; handing P2P
+/// the concrete type would close a module cycle, and widening the P2P
+/// constructors would touch every harness in the tree. The optional oracle is
+/// installed by the node on the shared `SyncContext`, so harnesses that drive
+/// P2P without a funnel simply leave it `None` and keep the previous behaviour.
+pub type PipelineSnapshotFn =
+    Arc<dyn Fn() -> crate::transport::BoxFuture<'static, Vec<[u8; 32]>> + Send + Sync>;
+
+/// 4CP-BX v2.3: one ingress reservation.
+///
+/// `token` identifies the WRITER that created it. Two deliveries of the same
+/// transaction can both be in the ingress at once, and the handoff between the
+/// drainer and the funnel briefly re-reserves an id that was already consumed —
+/// so "this entry exists" is not the same question as "this entry is mine".
+/// A release compares the token and leaves any other writer's reservation in
+/// place, which is what keeps a queued delivery's provenance from being erased
+/// by the handoff of a different copy.
+#[derive(Debug, Clone, Copy)]
+pub struct IngressReservation {
+    /// Validation policy recorded at first delivery (first-delivery-wins).
+    pub mode: ValidationMode,
+    /// Instant the reservation was taken (oldest-first eviction key).
+    pub at: Instant,
+    /// Writer identity for conditional release. Opaque; compare for equality.
+    pub token: u64,
+}
+
+/// 4CP-BX v2.3: source of reservation tokens. Monotonic and process-wide; a
+/// token is only ever compared for equality with the reservation it created.
+static NEXT_INGRESS_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// Oldest-first eviction once the map reaches its cap. Same policy as before:
+/// self-healing, because an evicted id simply re-records on the next delivery.
+fn evict_oldest_ingress(map: &mut HashMap<[u8; 32], IngressReservation>) {
+    if map.len() < MAX_INGRESS_MODE_ENTRIES {
+        return;
+    }
+    if let Some(oldest) = map.iter().min_by_key(|(_, e)| e.at).map(|(k, _)| *k) {
+        map.remove(&oldest);
     }
 }
 
@@ -235,6 +315,11 @@ pub struct SyncContext {
     pub topo_cache: Arc<RwLock<Option<(u64, Vec<Vec<u8>>)>>>,
     /// DEEP SYNC: monotone frontier tracker for sync progress.
     pub frontier: Arc<RwLock<SyncFrontier>>,
+    // NOTE (4CP-BX v2): `ingress_mode` below is ALSO the in-flight admission
+    // registry used by the Inventory diff. 4CP-BX v2.1 reserves the entry just
+    // BEFORE the enqueue and cancels it if the admission is refused, so it
+    // holds exactly "admitted, not yet applied" — the window BX counts as a
+    // duplicate — with no race against the drainer. No second registry.
     /// PHASE 3B (C1/H1): ingress provenance for validation-mode selection.
     /// tx id -> (mode recorded at first delivery, record instant). Written by
     /// the P2P ingress (live relay = Fresh, sync backfill = Historical;
@@ -243,7 +328,31 @@ pub struct SyncContext {
     /// gate, drainer, STEP 0, STEP 1) evaluates one tx under ONE policy.
     /// Absent = Historical (timeless evaluation = pre-3B behavior; every live
     /// path records explicitly).
-    pub ingress_mode: Arc<RwLock<HashMap<[u8; 32], (ValidationMode, Instant)>>>,
+    pub ingress_mode: Arc<RwLock<HashMap<[u8; 32], IngressReservation>>>,
+    /// 4CP-BX v2.2 (R1): what the node's funnel still holds. Consulted by the
+    /// Inventory diff AFTER `ingress_mode`, to close the window between the
+    /// drainer taking the provenance and the transaction being applied: in that
+    /// window the id is in no other store, so the node would ask a peer for the
+    /// very bytes it is already processing. Installed by the node from its
+    /// mempool (`Mempool::held_ids`); `None` in harnesses without a funnel.
+    pub pipeline_holds: Arc<RwLock<Option<PipelineSnapshotFn>>>,
+}
+
+impl SyncContext {
+    /// 4CP-BX v2.2 (R1): install the pipeline-liveness oracle.
+    ///
+    /// It only ever suppresses a REQUEST. Every delivery is still admitted and
+    /// the funnel stays the single deduplicator. A transaction the funnel
+    /// refused never enters the snapshot, and a disposed one leaves it at once,
+    /// so the retry path re-opens by itself — no timer and nothing to expire.
+    pub async fn set_pipeline_holds(&self, oracle: PipelineSnapshotFn) {
+        *self.pipeline_holds.write().await = Some(oracle);
+    }
+
+    /// 4CP-BX v2.2 (R1): is an oracle installed? (diagnostics / tests)
+    pub async fn has_pipeline_holds(&self) -> bool {
+        self.pipeline_holds.read().await.is_some()
+    }
 }
 
 /// DEEP SYNC: maximum in-flight requests at any time.
@@ -392,6 +501,65 @@ impl SyncFrontier {
             },
         );
         self.pending.push_back(hash);
+        true
+    }
+
+    /// 4CP-BX v2.1 (M1): is a GetData for this hash still outstanding and
+    /// recent? `Requested` inside `horizon` means the peer is still inside its
+    /// own serving window, so asking again would fetch the same bytes twice and
+    /// the funnel would count the second copy as a duplicate. Past the horizon
+    /// the request is treated as lost and becomes requestable again (see
+    /// `rearm_expired`), so a dropped response never blocks the hash forever.
+    pub fn request_is_fresh(&self, hash: &[u8], horizon: Duration) -> bool {
+        match self.entries.get(hash) {
+            Some(entry) if entry.state == PageState::Requested => {
+                // A `Requested` entry always has an inflight record
+                // (`mark_requested` writes both). Treat a missing record as
+                // expired rather than fresh: liveness beats suppression.
+                self.inflight
+                    .get(hash)
+                    .map(|req| req.requested_at.elapsed() < horizon)
+                    .unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
+    /// 4CP-BX v2.1 (M1): snapshot of the hashes whose GetData is outstanding
+    /// and still inside `horizon`. Bounded by `MAX_INFLIGHT_REQUESTS`, so the
+    /// caller can hold it without any further locking.
+    pub fn fresh_requests(&self, horizon: Duration) -> Vec<[u8; 32]> {
+        self.inflight
+            .keys()
+            .filter(|hash| self.request_is_fresh(hash, horizon))
+            .filter_map(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok())
+            .collect()
+    }
+
+    /// 4CP-BX v2.1 (M1): re-arm an EXPIRED outstanding request so the next
+    /// inventory round can ask for it again — the retry path for a response
+    /// that never came while the session stayed up (`on_peer_disconnect`
+    /// covers the session-loss case). No-op unless the entry is `Requested` and
+    /// past `horizon`.
+    pub fn rearm_expired(&mut self, hash: &[u8], horizon: Duration) -> bool {
+        let stale = match self.entries.get(hash) {
+            Some(entry) if entry.state == PageState::Requested => {
+                !self.request_is_fresh(hash, horizon)
+            }
+            _ => return false,
+        };
+        if !stale {
+            return false;
+        }
+        self.inflight.remove(hash);
+        if let Some(entry) = self.entries.get_mut(hash) {
+            entry.state = PageState::Pending;
+            entry.last_updated = Instant::now();
+            entry.peer = None;
+        }
+        if !self.pending.iter().any(|h| h.as_slice() == hash) {
+            self.pending.push_back(hash.to_vec());
+        }
         true
     }
 
@@ -767,19 +935,109 @@ impl SyncContext {
     /// Historical). Oldest-evicted past the cap (self-healing: an evicted tx
     /// re-records on re-delivery; a queued instance keeps its
     /// mempool-recorded mode regardless).
-    pub async fn note_ingress_mode(&self, id: [u8; 32], mode: ValidationMode) {
+    ///
+    /// 4CP-BX v2.1 (M2) / v2.3: returns `Some(token)` when THIS call created
+    /// the entry. The caller therefore owns the reservation and must cancel it
+    /// with that token if the admission it annotates is refused — otherwise a
+    /// refusal (queue full, budget, forged id) would leave a phantom "in
+    /// flight" entry that the drainer can never take, and the Inventory diff
+    /// would stop re-requesting a transaction that was never queued. `None`
+    /// means another delivery already reserved the id: that entry belongs to a
+    /// queued instance and must be left alone.
+    ///
+    /// The reserve-then-send order is what makes the pair race-free: by the
+    /// time the item is visible to the drainer, the entry is already present,
+    /// so `take_ingress_mode` can never miss it and then be followed by a late
+    /// insert that nobody removes.
+    pub async fn note_ingress_mode(&self, id: [u8; 32], mode: ValidationMode) -> Option<u64> {
         let mut map = self.ingress_mode.write().await;
-        if !map.contains_key(&id) {
-            if map.len() >= MAX_INGRESS_MODE_ENTRIES {
-                if let Some(oldest) = map
-                    .iter()
-                    .min_by_key(|(_, (_, t))| *t)
-                    .map(|(k, _)| *k)
-                {
-                    map.remove(&oldest);
-                }
+        if map.contains_key(&id) {
+            return None;
+        }
+        evict_oldest_ingress(&mut map);
+        let token = NEXT_INGRESS_TOKEN.fetch_add(1, Ordering::Relaxed);
+        map.insert(
+            id,
+            IngressReservation {
+                mode,
+                at: Instant::now(),
+                token,
+            },
+        );
+        Some(token)
+    }
+
+    /// 4CP-BX v2.3: cancel a reservation THIS caller created, identified by its
+    /// token, because the admission it annotated was refused. Conditional on
+    /// the token: if another writer has since taken the id, its reservation is
+    /// left untouched. Nothing was queued by the refused send, so the entry is
+    /// ours whenever the token still matches — and a refusal still records
+    /// NOTHING (the pre-4CP-BA contract).
+    pub async fn cancel_ingress_reservation(&self, id: [u8; 32], token: u64) -> bool {
+        let mut map = self.ingress_mode.write().await;
+        match map.get(&id) {
+            Some(entry) if entry.token == token => {
+                map.remove(&id);
+                true
             }
-            map.insert(id, (mode, Instant::now()));
+            _ => false,
+        }
+    }
+
+    /// 4CP-BX v2.3: hand the id from the ingress to the funnel WITHOUT an
+    /// instant in which no store holds it.
+    ///
+    /// The drainer used to `take` the provenance and only then call into
+    /// `process_transaction`, which inserts into the mempool at its very end —
+    /// after PoW/signature verification. An `Inventory` arriving in that gap
+    /// saw the id in no store at all (not the DAG, not the orphan store, not
+    /// the ingress, not the mempool, and the frontier has no request for it)
+    /// and re-requested bytes the node was already processing.
+    ///
+    /// This is ONE lock acquisition: it removes the previous entry and installs
+    /// a handoff reservation under the same guard, returning the mode to use
+    /// and the token that owns the new reservation. The caller MUST release it
+    /// with `end_ingress_handoff` once the funnel call returns, whatever the
+    /// outcome.
+    pub async fn begin_ingress_handoff(&self, id: [u8; 32]) -> (ValidationMode, u64) {
+        let mut map = self.ingress_mode.write().await;
+        let mode = map
+            .remove(&id)
+            .map(|entry| entry.mode)
+            .unwrap_or(ValidationMode::Historical);
+        evict_oldest_ingress(&mut map);
+        let token = NEXT_INGRESS_TOKEN.fetch_add(1, Ordering::Relaxed);
+        map.insert(
+            id,
+            IngressReservation {
+                mode,
+                at: Instant::now(),
+                token,
+            },
+        );
+        self.stats.ingress_handoffs.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .ingress_handoffs_active
+            .fetch_add(1, Ordering::Relaxed);
+        (mode, token)
+    }
+
+    /// 4CP-BX v2.3: end a handoff started by `begin_ingress_handoff`.
+    ///
+    /// Releases the reservation only if `token` still owns it, so a delivery
+    /// that re-reserved the id in the meantime keeps its provenance. Returns
+    /// whether the reservation was actually removed (diagnostics).
+    pub async fn end_ingress_handoff(&self, id: [u8; 32], token: u64) -> bool {
+        self.stats
+            .ingress_handoffs_active
+            .fetch_sub(1, Ordering::Relaxed);
+        let mut map = self.ingress_mode.write().await;
+        match map.get(&id) {
+            Some(entry) if entry.token == token => {
+                map.remove(&id);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -791,7 +1049,7 @@ impl SyncContext {
             .write()
             .await
             .remove(&id)
-            .map(|(m, _)| m)
+            .map(|entry| entry.mode)
             .unwrap_or(ValidationMode::Historical)
     }
 }
@@ -1242,5 +1500,162 @@ mod tests {
             ctx.ingress_mode.read().await.len() <= MAX_INGRESS_MODE_ENTRIES,
             "provenance map must stay bounded"
         );
+    }
+
+    /// 4CP-BX v2.1 (M2): the reserve/cancel pair. A reservation created by this
+    /// caller is reportable and cancellable; one that belongs to an earlier
+    /// delivery is neither, so a refusal can never erase the provenance of a
+    /// transaction that really is queued.
+    #[tokio::test]
+    async fn test_ingress_reservation_is_owned_and_cancellable() {
+        let ctx = SyncContext::default();
+        let id = [0xEFu8; 32];
+        let token = ctx
+            .note_ingress_mode(id, ValidationMode::Fresh)
+            .await
+            .expect("the first reserve is ours");
+        assert!(
+            ctx.note_ingress_mode(id, ValidationMode::Historical)
+                .await
+                .is_none(),
+            "a re-delivery owns nothing: the entry is the first delivery's"
+        );
+        assert!(
+            ctx.cancel_ingress_reservation(id, token).await,
+            "cancelling our own reservation removes it"
+        );
+        assert!(
+            ctx.ingress_mode.read().await.is_empty(),
+            "cancelling our own reservation leaves nothing behind"
+        );
+        assert!(
+            ctx.note_ingress_mode(id, ValidationMode::Historical)
+                .await
+                .is_some(),
+            "the next delivery records from scratch"
+        );
+        assert_eq!(ctx.take_ingress_mode(id).await, ValidationMode::Historical);
+    }
+
+    /// 4CP-BX v2.3: the handoff is ONE transition — there is no instant in which
+    /// the id is held by no store, which is the window that let an Inventory
+    /// re-request a transaction the funnel was already processing.
+    #[tokio::test]
+    async fn test_ingress_handoff_leaves_no_uncovered_instant() {
+        let ctx = SyncContext::default();
+        let id = [0x1Au8; 32];
+        let before = ctx.stats.ingress_handoffs.load(Ordering::Relaxed);
+        ctx.note_ingress_mode(id, ValidationMode::Fresh).await;
+
+        let (mode, token) = ctx.begin_ingress_handoff(id).await;
+        assert_eq!(mode, ValidationMode::Fresh, "the mode crosses the handoff");
+        assert!(
+            ctx.ingress_mode.read().await.contains_key(&id),
+            "the id is covered at the instant the handoff starts"
+        );
+        assert_eq!(
+            ctx.stats.ingress_handoffs.load(Ordering::Relaxed),
+            before + 1
+        );
+        assert_eq!(
+            ctx.stats.ingress_handoffs_active.load(Ordering::Relaxed),
+            1,
+            "the open handoff is observable"
+        );
+
+        assert!(ctx.end_ingress_handoff(id, token).await);
+        assert!(
+            !ctx.ingress_mode.read().await.contains_key(&id),
+            "release leaves nothing behind: the funnel owns it now"
+        );
+        assert_eq!(ctx.stats.ingress_handoffs_active.load(Ordering::Relaxed), 0);
+    }
+
+    /// 4CP-BX v2.3: a handoff releases ONLY its own reservation. When a second
+    /// delivery re-reserved the id in the meantime, its provenance survives —
+    /// the queued copy must still be evaluated under the mode it arrived with.
+    #[tokio::test]
+    async fn test_ingress_handoff_releases_only_its_own_reservation() {
+        let ctx = SyncContext::default();
+        let id = [0x2Bu8; 32];
+        let (_mode, handoff) = ctx.begin_ingress_handoff(id).await;
+
+        // A re-delivery during the handoff does not own the entry...
+        assert!(ctx
+            .note_ingress_mode(id, ValidationMode::Historical)
+            .await
+            .is_none());
+        // ...but a later writer that re-reserves after the handoff released it
+        // is the one that must be preserved.
+        assert!(ctx.end_ingress_handoff(id, handoff).await);
+        let delivery = ctx
+            .note_ingress_mode(id, ValidationMode::Historical)
+            .await
+            .expect("new delivery owns it");
+        assert!(
+            !ctx.end_ingress_handoff(id, handoff).await,
+            "a stale handoff token must never remove another writer's entry"
+        );
+        assert_eq!(
+            ctx.ingress_mode.read().await.get(&id).map(|e| e.token),
+            Some(delivery),
+            "the delivery's reservation is untouched"
+        );
+        assert_eq!(ctx.take_ingress_mode(id).await, ValidationMode::Historical);
+    }
+
+    /// 4CP-BX v2.3: a refused admission cancels with its own token, so the id is
+    /// requestable again while any other writer's reservation is left alone.
+    #[tokio::test]
+    async fn test_ingress_cancel_is_token_scoped() {
+        let ctx = SyncContext::default();
+        let id = [0x3Cu8; 32];
+        let token = ctx
+            .note_ingress_mode(id, ValidationMode::Fresh)
+            .await
+            .expect("reserved");
+        assert!(
+            !ctx.cancel_ingress_reservation(id, token + 1).await,
+            "a foreign token cancels nothing"
+        );
+        assert!(ctx.ingress_mode.read().await.contains_key(&id));
+        assert!(ctx.cancel_ingress_reservation(id, token).await);
+        assert!(ctx.ingress_mode.read().await.is_empty());
+    }
+
+    /// 4CP-BX v2.1 (M1): an outstanding request suppresses a re-request only
+    /// while it is fresh; past the horizon it is re-armed as Pending so the
+    /// retry can fire. This is the predicate the Inventory diff consults.
+    #[test]
+    fn test_request_freshness_and_rearm() {
+        let mut f = SyncFrontier::new();
+        let h = vec![7u8; 32];
+        assert!(
+            !f.request_is_fresh(&h, Duration::from_secs(30)),
+            "an untracked hash is not outstanding"
+        );
+        assert!(f.add_pending(h.clone()));
+        assert!(f.mark_requested(&h, addr(1)));
+        assert!(
+            f.request_is_fresh(&h, Duration::from_secs(30)),
+            "a just-sent request is fresh"
+        );
+        assert_eq!(f.fresh_requests(Duration::from_secs(30)), vec![[7u8; 32]]);
+        // Zero horizon: the request is already past it, so it is not fresh and
+        // may be re-armed — the retry path for a response that never came.
+        assert!(!f.request_is_fresh(&h, Duration::ZERO));
+        assert!(!f.fresh_requests(Duration::ZERO).contains(&[7u8; 32]));
+        assert!(f.rearm_expired(&h, Duration::ZERO));
+        assert!(!f.rearm_expired(&h, Duration::ZERO), "re-arm is one-shot");
+        assert!(
+            !f.request_is_fresh(&h, Duration::from_secs(30)),
+            "a re-armed hash is pending, not outstanding"
+        );
+        assert_eq!(f.pending_count(), 1, "the retry waits in pending");
+        assert!(
+            f.mark_requested(&h, addr(1)),
+            "the retry can request the same hash again"
+        );
+        assert_eq!(f.pending_count(), 0);
     }
 }
