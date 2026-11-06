@@ -1,0 +1,150 @@
+name: Linux Validation BX v2.4 (temporary)
+
+# TEMPORARY validation-only workflow for the BX v2.4 branch.
+# It runs ONLY the commands required by the v2.4 validation brief:
+#   PHASE 3 - targeted suites (ingress, claim, phase4bn, be07 exact)
+#   PHASE 5 - the canonical BX test, three times, sequentially
+#   PHASE 7 - compile checks on the Linux target
+# No deployment, no release, no publication, no secrets. contents: read.
+# Every command runs even if a previous one failed, so one failure does not
+# hide the rest of the matrix; the step exit code is preserved and printed.
+# Delete this file once the validation is recorded.
+
+on:
+  push:
+    branches:
+      - ci/linux-validation-4cp-ap-bx-validate
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bx24-validation:
+    name: BX v2.4 targeted validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.97.1
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          target: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Environment
+        if: always()
+        run: |
+          {
+            echo "rustc --version : $(rustc --version)"
+            echo "cargo --version : $(cargo --version)"
+            echo "uname -a        : $(uname -a)"
+            echo "uname -m        : $(uname -m)"
+            echo "nproc           : $(nproc)"
+            echo "--- /etc/os-release ---"
+            cat /etc/os-release
+          } | tee /tmp/00_env.log
+
+      - name: P3 lib ingress
+        if: always()
+        run: |
+          set +e
+          cargo test --lib ingress -- --nocapture --test-threads=1 2>&1 | tee /tmp/10_p3_ingress.log
+          c=${PIPESTATUS[0]}
+          echo "EXIT_CODE=$c" | tee -a /tmp/10_p3_ingress.log
+          exit $c
+
+      - name: P3 lib claim
+        if: always()
+        run: |
+          set +e
+          cargo test --lib claim -- --nocapture --test-threads=1 2>&1 | tee /tmp/11_p3_claim.log
+          c=${PIPESTATUS[0]}
+          echo "EXIT_CODE=$c" | tee -a /tmp/11_p3_claim.log
+          exit $c
+
+      - name: P3 phase4bn sync emission
+        if: always()
+        run: |
+          set +e
+          cargo test --test phase4bn_sync_emission_tests -- --nocapture --test-threads=1 2>&1 | tee /tmp/12_p3_phase4bn.log
+          c=${PIPESTATUS[0]}
+          echo "EXIT_CODE=$c" | tee -a /tmp/12_p3_phase4bn.log
+          exit $c
+
+      - name: P3 be07 handoff id visibility
+        if: always()
+        run: |
+          set +e
+          cargo test --test phase4be_transaction_lifecycle_tests be07_handoff_keeps_the_id_visible_across_the_funnel_call --exact --nocapture --test-threads=1 2>&1 | tee /tmp/13_p3_be07.log
+          c=${PIPESTATUS[0]}
+          echo "EXIT_CODE=$c" | tee -a /tmp/13_p3_be07.log
+          exit $c
+
+      - name: P7 cargo check lib
+        if: always()
+        run: |
+          set +e
+          cargo check --lib 2>&1 | tee /tmp/20_p7_check_lib.log
+          c=${PIPESTATUS[0]}
+          echo "EXIT_CODE=$c" | tee -a /tmp/20_p7_check_lib.log
+          exit $c
+
+      - name: P7 cargo check tests
+        if: always()
+        run: |
+          set +e
+          cargo check --tests 2>&1 | tee /tmp/21_p7_check_tests.log
+          c=${PIPESTATUS[0]}
+          echo "EXIT_CODE=$c" | tee -a /tmp/21_p7_check_tests.log
+          exit $c
+
+      - name: P5 BX run 1 of 3
+        if: always()
+        run: |
+          set +e
+          s=$(date +%s)
+          cargo test --test phase4bx_dag_topology_tests bx01_dag_topology --features test-jitter-control --release -- --exact --nocapture --test-threads=1 2>&1 | tee /tmp/30_p5_bx_run1.log
+          c=${PIPESTATUS[0]}
+          e=$(date +%s)
+          echo "EXIT_CODE=$c DURATION_S=$((e-s))" | tee -a /tmp/30_p5_bx_run1.log
+          exit $c
+
+      - name: P5 BX run 2 of 3
+        if: always()
+        run: |
+          set +e
+          s=$(date +%s)
+          cargo test --test phase4bx_dag_topology_tests bx01_dag_topology --features test-jitter-control --release -- --exact --nocapture --test-threads=1 2>&1 | tee /tmp/31_p5_bx_run2.log
+          c=${PIPESTATUS[0]}
+          e=$(date +%s)
+          echo "EXIT_CODE=$c DURATION_S=$((e-s))" | tee -a /tmp/31_p5_bx_run2.log
+          exit $c
+
+      - name: P5 BX run 3 of 3
+        if: always()
+        run: |
+          set +e
+          s=$(date +%s)
+          cargo test --test phase4bx_dag_topology_tests bx01_dag_topology --features test-jitter-control --release -- --exact --nocapture --test-threads=1 2>&1 | tee /tmp/32_p5_bx_run3.log
+          c=${PIPESTATUS[0]}
+          e=$(date +%s)
+          echo "EXIT_CODE=$c DURATION_S=$((e-s))" | tee -a /tmp/32_p5_bx_run3.log
+          exit $c
+
+      - name: Upload validation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bx24-linux-validation-logs
+          path: /tmp/*.log
+          if-no-files-found: warn
+          retention-days: 7
