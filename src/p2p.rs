@@ -6730,9 +6730,22 @@ impl P2PNetwork {
                             // filtering and long before the GetData frame is
                             // queued, so no lock is held across work that can
                             // block.
+                            // 4CP-BX v2.4 (R2): a HANDOFF entry is a lease, not
+                            // a permanent claim. It is held across the funnel
+                            // call by a task that can panic or be cancelled, and
+                            // a `Drop` cannot await this registry — so without
+                            // the lease a lost release would suppress the id for
+                            // the lifetime of the process and the node would
+                            // never re-request a transaction it does not have.
+                            // Queued (non-handoff) entries never expire: their
+                            // channel is bounded and the drainer empties it.
                             let in_flight: HashSet<[u8; 32]> = {
                                 let map = sync_ctx.ingress_mode.read().await;
-                                map.keys().copied().collect()
+                                let now = Instant::now();
+                                map.iter()
+                                    .filter(|(_, entry)| entry.suppresses_inventory(now))
+                                    .map(|(id, _)| *id)
+                                    .collect()
                             };
                             // 4CP-BX v2.1 (M1): the second half of the same
                             // window. A tx we already ASKED for (GetData emitted,
@@ -6839,47 +6852,98 @@ impl P2PNetwork {
 
                             // Request missing transactions via GetData
                             if !missing_hashes.is_empty() {
-                                // DEEP SYNC: register missing hashes in the frontier
-                                {
-                                    let mut frontier = sync_ctx.frontier.write().await;
-                                    for h in &missing_hashes {
-                                        // 4CP-BX v2.1 (M1): already tracked can mean
-                                        // "pending" (a deferred frame) or
-                                        // "requested but expired" — re-arm the
-                                        // latter so the retry below can renew it.
-                                        if !frontier.add_pending(h.clone()) {
-                                            frontier.rearm_expired(h, INFLIGHT_REQUEST_HORIZON);
-                                        }
+                                // 4CP-BX v2.4 (R1): CLAIM, then send, under ONE
+                                // frontier guard.
+                                //
+                                // The three snapshots above are taken once per
+                                // Inventory, so two sessions handling the same
+                                // advertisement concurrently both pass them:
+                                // neither has published its own request yet.
+                                // The arbitration therefore has to be a single
+                                // shared transition, and it is performed under
+                                // the SAME guard that publishes "requested", so
+                                // a session that loses the claim can never still
+                                // see the hash as free.
+                                //
+                                // Nothing here awaits: `try_send` is the
+                                // non-blocking budget-checked handoff, so the
+                                // guard covers hash inserts and one
+                                // serialization, never I/O.
+                                let mut frontier = sync_ctx.frontier.write().await;
+                                let mut claimed: Vec<Vec<u8>> =
+                                    Vec::with_capacity(missing_hashes.len());
+                                let mut skipped_claim = 0u64;
+                                for h in missing_hashes.iter() {
+                                    // 4CP-BX v2.1 (M1): already tracked can mean
+                                    // "pending" (a deferred frame) or
+                                    // "requested but expired" — re-arm the
+                                    // latter so the claim below can renew it.
+                                    if !frontier.add_pending(h.clone()) {
+                                        frontier.rearm_expired(h, INFLIGHT_REQUEST_HORIZON);
+                                    }
+                                    // 4CP-BX v2.4 (R1): the claim is what makes
+                                    // concurrent sessions mutually exclusive. It
+                                    // is also the record that covers the hashes
+                                    // past MAX_INFLIGHT_REQUESTS that
+                                    // `mark_requested` cannot take.
+                                    if frontier.claim_request(h, INFLIGHT_REQUEST_HORIZON) {
+                                        claimed.push(h.clone());
+                                    } else {
+                                        skipped_claim += 1;
                                     }
                                 }
-                                info!(
-                                    "Requesting {} missing transactions from {}",
-                                    missing_hashes.len(),
-                                    addr
-                                );
-                                if let Ok(getdata_msg) =
-                                    bincode::serialize(&P2PMessage::GetData(missing_hashes.clone()))
-                                {
+                                if skipped_claim > 0 {
+                                    // Same meaning as the snapshot filter above:
+                                    // a GetData for this hash is already
+                                    // outstanding (claimed here or by another
+                                    // session).
+                                    sync_ctx.stats.inventory_skipped_requested.fetch_add(
+                                        skipped_claim,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                                if !claimed.is_empty() {
+                                    info!(
+                                        "Requesting {} missing transactions from {}",
+                                        claimed.len(),
+                                        addr
+                                    );
                                     // A frame may be refused by either the
                                     // session or node-wide egress budget. Only
-                                    // an admitted frame is an in-flight
-                                    // request: otherwise the frontier must stay
-                                    // Pending so the next inventory round can
-                                    // retry it immediately.
-                                    if msg_sender.try_send(getdata_msg).is_ok() {
-                                        sync_ctx.stats.sync_requested.fetch_add(
-                                            missing_hashes.len() as u64,
-                                            std::sync::atomic::Ordering::Relaxed,
-                                        );
-                                        let mut frontier = sync_ctx.frontier.write().await;
-                                        for h in &missing_hashes {
-                                            frontier.mark_requested(h, addr);
+                                    // an admitted frame is an in-flight request:
+                                    // a refused one releases its claims so the
+                                    // next inventory round can retry it at once
+                                    // instead of waiting out the horizon.
+                                    match bincode::serialize(&P2PMessage::GetData(claimed.clone())) {
+                                        Ok(getdata_msg) => {
+                                            if msg_sender.try_send(getdata_msg).is_ok() {
+                                                sync_ctx.stats.sync_requested.fetch_add(
+                                                    claimed.len() as u64,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                for h in &claimed {
+                                                    frontier.mark_requested(h, addr);
+                                                }
+                                            } else {
+                                                for h in &claimed {
+                                                    frontier.release_claim(h);
+                                                }
+                                                tracing::debug!(
+                                                    "GetData request to {} deferred: outbound queue or global budget saturated",
+                                                    addr
+                                                );
+                                            }
                                         }
-                                    } else {
-                                        tracing::debug!(
-                                            "GetData request to {} deferred: outbound queue or global budget saturated",
-                                            addr
-                                        );
+                                        Err(e) => {
+                                            for h in &claimed {
+                                                frontier.release_claim(h);
+                                            }
+                                            tracing::debug!(
+                                                "GetData frame for {} not serialized: {}",
+                                                addr,
+                                                e
+                                            );
+                                        }
                                     }
                                 }
                             }

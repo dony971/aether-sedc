@@ -247,6 +247,27 @@ impl SyncStats {
             ingress_handoffs_active: self.ingress_handoffs_active.load(Ordering::Relaxed),
         }
     }
+
+    /// 4CP-BX v2.4 (R3): close ONE live handoff entry.
+    ///
+    /// The gauge is maintained by removal, not by call pairing: an entry marked
+    /// `handoff` is counted once when it is inserted and uncounted once when it
+    /// is removed, under the registry lock. A double release therefore cannot
+    /// reach this function (the entry is already gone, so the token no longer
+    /// matches and the caller returns `false`), and a foreign token cannot
+    /// reach it either. `saturating_sub` plus the debug assertion is a belt for
+    /// a future regression: the gauge can no longer wrap to `u64::MAX`, and any
+    /// drift is loud in tests.
+    #[inline]
+    fn close_handoff(&self) {
+        let previous = self
+            .ingress_handoffs_active
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .unwrap_or(0);
+        debug_assert!(previous > 0, "ingress_handoffs_active underflow");
+    }
 }
 
 /// 4CP-BX v2.2 (R1): snapshot of the ids the node's own pipeline still holds —
@@ -274,11 +295,43 @@ pub type PipelineSnapshotFn =
 pub struct IngressReservation {
     /// Validation policy recorded at first delivery (first-delivery-wins).
     pub mode: ValidationMode,
-    /// Instant the reservation was taken (oldest-first eviction key).
+    /// Instant the reservation was taken (oldest-first eviction key, and the
+    /// lease reference point for a handoff).
     pub at: Instant,
     /// Writer identity for conditional release. Opaque; compare for equality.
     pub token: u64,
+    /// 4CP-BX v2.4 (R3): was this entry created by `begin_ingress_handoff`?
+    /// Only handoff entries own a unit of `ingress_handoffs_active`, so the
+    /// gauge is tightened to "live handoff entries" and no caller can move it
+    /// by releasing something it does not own.
+    pub handoff: bool,
 }
+
+impl IngressReservation {
+    /// 4CP-BX v2.4 (R2): may this entry still suppress an `Inventory` request?
+    ///
+    /// A QUEUED entry (not a handoff) is owned by a channel that is bounded and
+    /// drained, so it suppresses until the drainer takes it — no timer needed.
+    ///
+    /// A HANDOFF entry is held across the funnel call by a task that can panic
+    /// or be cancelled; because a `Drop` cannot await the registry lock, a
+    /// leaked handoff entry would otherwise suppress the id for the lifetime of
+    /// the process and the node would never re-request a transaction it does
+    /// not actually have. The handoff is therefore a LEASE: past
+    /// `INGRESS_HANDOFF_LEASE` the entry stops suppressing, so a lost release
+    /// costs at most one redundant request race window, never liveness. The
+    /// lease is far longer than any real funnel call (verification plus
+    /// persistence is milliseconds), so the nominal path keeps full suppression.
+    pub fn suppresses_inventory(&self, now: Instant) -> bool {
+        !self.handoff || now.saturating_duration_since(self.at) < INGRESS_HANDOFF_LEASE
+    }
+}
+
+/// 4CP-BX v2.4 (R2): how long a handoff may suppress an `Inventory` request.
+/// Twice the serving window (`SYNC_RESPONSE_PAGE_TIMEOUT`): long enough that a
+/// real funnel call always keeps the id hidden, short enough that an
+/// interrupted handoff self-heals instead of pinning the id forever.
+pub const INGRESS_HANDOFF_LEASE: Duration = Duration::from_secs(60);
 
 /// 4CP-BX v2.3: source of reservation tokens. Monotonic and process-wide; a
 /// token is only ever compared for equality with the reservation it created.
@@ -286,12 +339,16 @@ static NEXT_INGRESS_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Oldest-first eviction once the map reaches its cap. Same policy as before:
 /// self-healing, because an evicted id simply re-records on the next delivery.
-fn evict_oldest_ingress(map: &mut HashMap<[u8; 32], IngressReservation>) {
+fn evict_oldest_ingress(map: &mut HashMap<[u8; 32], IngressReservation>, stats: &SyncStats) {
     if map.len() < MAX_INGRESS_MODE_ENTRIES {
         return;
     }
     if let Some(oldest) = map.iter().min_by_key(|(_, e)| e.at).map(|(k, _)| *k) {
-        map.remove(&oldest);
+        // 4CP-BX v2.4 (R3): the gauge counts LIVE handoff entries, so whoever
+        // removes one closes it. Eviction is a removal like any other.
+        if map.remove(&oldest).map(|e| e.handoff).unwrap_or(false) {
+            stats.close_handoff();
+        }
     }
 }
 
@@ -453,6 +510,18 @@ pub struct SyncFrontier {
     pending: VecDeque<Vec<u8>>,
     inflight: HashMap<Vec<u8>, InflightRequest>,
     entries: HashMap<Vec<u8>, FrontierEntry>,
+    /// 4CP-BX v2.4 (R1): hashes this node has ALREADY asked a peer for, with
+    /// the instant the request was claimed.
+    ///
+    /// `inflight` cannot carry this role. It is a state-machine record capped at
+    /// `MAX_INFLIGHT_REQUESTS` (64) by design, while ONE `GetData` frame carries
+    /// up to `MAX_INV_ITEMS` (1000) hashes: past the 64th hash of a batch there
+    /// is no `inflight` record at all, so a second session (or the next round)
+    /// saw those hashes as requestable and asked again — the funnel then counted
+    /// the extra copies as duplicates. `claims` is the authoritative
+    /// "asked recently" set: bounded by `MAX_FRONTIER_ENTRIES`, expired by the
+    /// same horizon as `inflight`, and cleared on every terminal transition.
+    claims: HashMap<Vec<u8>, Instant>,
     pages_requested: u64,
     pages_received: u64,
     pages_applied: u64,
@@ -469,6 +538,7 @@ impl SyncFrontier {
             pending: VecDeque::new(),
             inflight: HashMap::new(),
             entries: HashMap::new(),
+            claims: HashMap::new(),
             pages_requested: 0,
             pages_received: 0,
             pages_applied: 0,
@@ -536,6 +606,50 @@ impl SyncFrontier {
             .collect()
     }
 
+    /// 4CP-BX v2.4 (R1): claim the request for `hash` — "I am about to emit a
+    /// GetData for it" — atomically, so two sessions cannot both ask.
+    ///
+    /// Returns `true` when this caller owns the claim. `false` means another
+    /// caller claimed it inside `horizon`, or the claim table is full; either
+    /// way the hash must NOT be put on the wire now. The claim expires on its
+    /// own after `horizon`, so a lost or refused frame never pins a hash.
+    ///
+    /// This is deliberately independent of the state machine: `mark_requested`
+    /// stops recording past `MAX_INFLIGHT_REQUESTS`, and refusing to request
+    /// hash 65 of a 1000-hash batch would stall bootstrap. The claim table has
+    /// the frontier's own bound instead.
+    pub fn claim_request(&mut self, hash: &[u8], horizon: Duration) -> bool {
+        let now = Instant::now();
+        if let Some(at) = self.claims.get(hash) {
+            if now.saturating_duration_since(*at) < horizon {
+                return false;
+            }
+        }
+        if self.claims.len() >= MAX_FRONTIER_ENTRIES {
+            // Bounded: drop the expired generation first (cheap and rare), then
+            // refuse if every claim is still live — the caller retries.
+            self.claims
+                .retain(|_, at| now.saturating_duration_since(*at) < horizon);
+            if self.claims.len() >= MAX_FRONTIER_ENTRIES {
+                return false;
+            }
+        }
+        self.claims.insert(hash.to_vec(), now);
+        true
+    }
+
+    /// 4CP-BX v2.4 (R1): give a claim back because no frame was emitted
+    /// (refused by the session/global budget, or not serializable). The hash is
+    /// immediately requestable again instead of waiting out the horizon.
+    pub fn release_claim(&mut self, hash: &[u8]) -> bool {
+        self.claims.remove(hash).is_some()
+    }
+
+    /// 4CP-BX v2.4: number of live claims (diagnostics and tests).
+    pub fn claimed_requests(&self) -> usize {
+        self.claims.len()
+    }
+
     /// 4CP-BX v2.1 (M1): re-arm an EXPIRED outstanding request so the next
     /// inventory round can ask for it again — the retry path for a response
     /// that never came while the session stayed up (`on_peer_disconnect`
@@ -552,6 +666,11 @@ impl SyncFrontier {
             return false;
         }
         self.inflight.remove(hash);
+        // 4CP-BX v2.4 (R1): the claim follows the REQUEST, so the retry path
+        // releases it here. `rearm_expired` is the frontier's own "that request
+        // is over" transition; leaving the claim behind would suppress the
+        // retry for the rest of the horizon.
+        self.claims.remove(hash);
         if let Some(entry) = self.entries.get_mut(hash) {
             entry.state = PageState::Pending;
             entry.last_updated = Instant::now();
@@ -644,6 +763,9 @@ impl SyncFrontier {
         let now = Instant::now();
         entry.state = PageState::Applied;
         entry.last_updated = now;
+        // 4CP-BX v2.4 (R1): terminal — the hash is in the DAG, so the request
+        // claim has done its job and must not outlive it.
+        self.claims.remove(hash);
         self.last_progress = Some(now);
         self.sync_state = FrontierSyncState::Progressing;
         self.pages_applied += 1;
@@ -663,6 +785,8 @@ impl SyncFrontier {
         }
         entry.state = PageState::Applied;
         entry.last_updated = Instant::now();
+        // 4CP-BX v2.4 (R1): terminal (already resident in the DAG).
+        self.claims.remove(hash);
         self.pages_applied += 1;
         true
     }
@@ -680,6 +804,9 @@ impl SyncFrontier {
         entry.state = PageState::Rejected;
         entry.last_updated = Instant::now();
         self.inflight.remove(hash);
+        // 4CP-BX v2.4 (R1): a rejected hash is not re-requested by this node
+        // (a retry, if any, goes through `requeue`), so the claim is dropped.
+        self.claims.remove(hash);
         self.pages_rejected += 1;
         true
     }
@@ -735,6 +862,10 @@ impl SyncFrontier {
         let count = disconnected.len();
         for hash in &disconnected {
             self.inflight.remove(hash);
+            // 4CP-BX v2.4 (R1): the peer that owned the request is gone, so the
+            // claim goes with it — a session loss must never leave a hash
+            // suppressed until the horizon runs out.
+            self.claims.remove(hash);
             if let Some(entry) = self.entries.get_mut(hash) {
                 let now = Instant::now();
                 entry.state = PageState::Pending;
@@ -954,7 +1085,7 @@ impl SyncContext {
         if map.contains_key(&id) {
             return None;
         }
-        evict_oldest_ingress(&mut map);
+        evict_oldest_ingress(&mut map, &self.stats);
         let token = NEXT_INGRESS_TOKEN.fetch_add(1, Ordering::Relaxed);
         map.insert(
             id,
@@ -962,6 +1093,10 @@ impl SyncContext {
                 mode,
                 at: Instant::now(),
                 token,
+                // A queued delivery is owned by a bounded channel that the
+                // drainer empties: it suppresses until taken, and it owns no
+                // unit of the handoff gauge.
+                handoff: false,
             },
         );
         Some(token)
@@ -977,7 +1112,13 @@ impl SyncContext {
         let mut map = self.ingress_mode.write().await;
         match map.get(&id) {
             Some(entry) if entry.token == token => {
-                map.remove(&id);
+                let removed = map.remove(&id);
+                // 4CP-BX v2.4 (R3): removal, not call pairing, moves the gauge.
+                // (A delivery never owns a handoff token, so this is normally a
+                // no-op; it keeps the invariant true for every removal path.)
+                if removed.map(|e| e.handoff).unwrap_or(false) {
+                    self.stats.close_handoff();
+                }
                 true
             }
             _ => false,
@@ -1001,11 +1142,18 @@ impl SyncContext {
     /// outcome.
     pub async fn begin_ingress_handoff(&self, id: [u8; 32]) -> (ValidationMode, u64) {
         let mut map = self.ingress_mode.write().await;
-        let mode = map
-            .remove(&id)
+        let previous = map.remove(&id);
+        // 4CP-BX v2.4 (R3): keep the gauge equal to the number of LIVE handoff
+        // entries even if an entry is replaced (a second handoff for the same
+        // id: impossible with the single receiver, but the invariant must not
+        // depend on that).
+        if previous.map(|e| e.handoff).unwrap_or(false) {
+            self.stats.close_handoff();
+        }
+        let mode = previous
             .map(|entry| entry.mode)
             .unwrap_or(ValidationMode::Historical);
-        evict_oldest_ingress(&mut map);
+        evict_oldest_ingress(&mut map, &self.stats);
         let token = NEXT_INGRESS_TOKEN.fetch_add(1, Ordering::Relaxed);
         map.insert(
             id,
@@ -1013,6 +1161,7 @@ impl SyncContext {
                 mode,
                 at: Instant::now(),
                 token,
+                handoff: true,
             },
         );
         self.stats.ingress_handoffs.fetch_add(1, Ordering::Relaxed);
@@ -1027,14 +1176,19 @@ impl SyncContext {
     /// Releases the reservation only if `token` still owns it, so a delivery
     /// that re-reserved the id in the meantime keeps its provenance. Returns
     /// whether the reservation was actually removed (diagnostics).
+    /// 4CP-BX v2.4 (R3): the gauge moves ONLY when this token really releases a
+    /// handoff entry. A stale token (already released, evicted, or superseded)
+    /// returns `false` and leaves every counter untouched, so a double release
+    /// or a foreign token can neither wrap the gauge nor steal another
+    /// handoff's slot.
     pub async fn end_ingress_handoff(&self, id: [u8; 32], token: u64) -> bool {
-        self.stats
-            .ingress_handoffs_active
-            .fetch_sub(1, Ordering::Relaxed);
         let mut map = self.ingress_mode.write().await;
         match map.get(&id) {
             Some(entry) if entry.token == token => {
-                map.remove(&id);
+                let removed = map.remove(&id);
+                if removed.map(|e| e.handoff).unwrap_or(false) {
+                    self.stats.close_handoff();
+                }
                 true
             }
             _ => false,
@@ -1045,12 +1199,18 @@ impl SyncContext {
     /// boot paths that never crossed the P2P ingress) defaults to Historical
     /// = timeless evaluation = pre-3B behavior.
     pub async fn take_ingress_mode(&self, id: [u8; 32]) -> ValidationMode {
-        self.ingress_mode
-            .write()
-            .await
-            .remove(&id)
-            .map(|entry| entry.mode)
-            .unwrap_or(ValidationMode::Historical)
+        let removed = self.ingress_mode.write().await.remove(&id);
+        // 4CP-BX v2.4 (R3): whoever removes a handoff entry closes it; no
+        // production caller takes a handoff (the drainer uses the atomic
+        // handoff pair), but the gauge must not depend on that.
+        if let Some(entry) = removed {
+            if entry.handoff {
+                self.stats.close_handoff();
+            }
+            entry.mode
+        } else {
+            ValidationMode::Historical
+        }
     }
 }
 
@@ -1621,6 +1781,324 @@ mod tests {
         assert!(ctx.ingress_mode.read().await.contains_key(&id));
         assert!(ctx.cancel_ingress_reservation(id, token).await);
         assert!(ctx.ingress_mode.read().await.is_empty());
+    }
+
+    /// 4CP-BX v2.4 (R3): the gauge counts LIVE handoff entries and is moved by
+    /// REMOVAL only — so a double release can neither underflow it (the old
+    /// code decremented before checking ownership and wrapped to `u64::MAX`) nor
+    /// steal the slot of a handoff that is still open.
+    #[tokio::test]
+    async fn test_ingress_handoff_gauge_is_release_driven() {
+        let ctx = SyncContext::default();
+        let id = [0x4Du8; 32];
+        let active = || ctx.stats.ingress_handoffs_active.load(Ordering::Relaxed);
+        assert_eq!(active(), 0);
+
+        let (_mode, token) = ctx.begin_ingress_handoff(id).await;
+        assert_eq!(active(), 1, "an open handoff is counted once");
+        assert!(ctx.end_ingress_handoff(id, token).await);
+        assert_eq!(active(), 0);
+
+        // The entry is gone, so this token owns nothing any more. Releasing it
+        // again must be a no-op, not a decrement.
+        assert!(
+            !ctx.end_ingress_handoff(id, token).await,
+            "a second release has nothing to release"
+        );
+        assert_eq!(active(), 0, "a double release must not move the gauge");
+        assert!(!ctx.ingress_mode.read().await.contains_key(&id));
+
+        // Two successive handoffs: the gauge must track both exactly.
+        let (_m1, t1) = ctx.begin_ingress_handoff([0x4Eu8; 32]).await;
+        let (_m2, t2) = ctx.begin_ingress_handoff([0x4Fu8; 32]).await;
+        assert_eq!(active(), 2);
+        assert!(ctx.end_ingress_handoff([0x4Eu8; 32], t1).await);
+        assert_eq!(active(), 1);
+        assert!(ctx.end_ingress_handoff([0x4Fu8; 32], t2).await);
+        assert_eq!(active(), 0);
+    }
+
+    /// 4CP-BX v2.4 (R3): a foreign token releases nothing, moves no counter and
+    /// leaves the entry for its owner.
+    #[tokio::test]
+    async fn test_ingress_handoff_foreign_token_cannot_close() {
+        let ctx = SyncContext::default();
+        let id = [0x5Eu8; 32];
+        let (_mode, token) = ctx.begin_ingress_handoff(id).await;
+
+        assert!(
+            !ctx.end_ingress_handoff(id, token.wrapping_add(1)).await,
+            "a foreign token releases nothing"
+        );
+        assert_eq!(
+            ctx.stats.ingress_handoffs_active.load(Ordering::Relaxed),
+            1,
+            "a foreign token must not move the gauge"
+        );
+        assert!(ctx.ingress_mode.read().await.contains_key(&id));
+
+        assert!(ctx.end_ingress_handoff(id, token).await);
+        assert_eq!(ctx.stats.ingress_handoffs_active.load(Ordering::Relaxed), 0);
+    }
+
+    /// 4CP-BX v2.4 (R3): every removal path closes the handoff it removes, and a
+    /// queued delivery never owns a gauge slot.
+    #[tokio::test]
+    async fn test_ingress_gauge_follows_every_removal_path() {
+        let ctx = SyncContext::default();
+        let active = || ctx.stats.ingress_handoffs_active.load(Ordering::Relaxed);
+
+        let id = [0x6Fu8; 32];
+        let (mode, token) = ctx.begin_ingress_handoff(id).await;
+        assert_eq!(mode, ValidationMode::Historical);
+        assert_eq!(active(), 1);
+        // Legacy take (harnesses only) still closes the handoff it consumed.
+        assert_eq!(ctx.take_ingress_mode(id).await, ValidationMode::Historical);
+        assert_eq!(active(), 0, "take closes the handoff it removes");
+        assert!(!ctx.end_ingress_handoff(id, token).await);
+        assert_eq!(active(), 0);
+
+        let queued = [0x70u8; 32];
+        let delivery = ctx
+            .note_ingress_mode(queued, ValidationMode::Fresh)
+            .await
+            .expect("reserved");
+        assert_eq!(active(), 0, "a queued delivery is not a handoff");
+        assert!(ctx.cancel_ingress_reservation(queued, delivery).await);
+        assert_eq!(active(), 0);
+    }
+
+    /// 4CP-BX v2.4 (R2): an interrupted handoff (panic or task cancellation
+    /// between `begin` and `end`) is a LEASE. A `Drop` cannot await the registry
+    /// lock, so the lease is what keeps liveness: after it the id stops
+    /// suppressing `Inventory` requests and can be fetched again. Queued
+    /// provenance is drained by its channel and never expires.
+    #[test]
+    fn test_ingress_handoff_lease_expires() {
+        let now = Instant::now();
+        let open = IngressReservation {
+            mode: ValidationMode::Fresh,
+            at: now,
+            token: 1,
+            handoff: true,
+        };
+        assert!(
+            open.suppresses_inventory(now),
+            "an open handoff must keep the id visible-in-flight"
+        );
+
+        let leaked = IngressReservation {
+            at: now - (INGRESS_HANDOFF_LEASE + Duration::from_secs(1)),
+            ..open
+        };
+        assert!(
+            !leaked.suppresses_inventory(now),
+            "a lost release must not hide the id for the process lifetime"
+        );
+        assert!(
+            leaked.suppresses_inventory(now - Duration::from_secs(2)),
+            "the lease is relative to the handoff instant"
+        );
+
+        let queued = IngressReservation {
+            handoff: false,
+            at: now - Duration::from_secs(3600),
+            ..open
+        };
+        assert!(
+            queued.suppresses_inventory(now),
+            "queued provenance keeps suppressing until the drainer takes it"
+        );
+    }
+
+    /// 4CP-BX v2.4 (R1): the claim is the arbitration point between sessions —
+    /// one wins, the other is told to skip, and the state machine still records
+    /// the request exactly once.
+    #[test]
+    fn test_frontier_claim_is_exclusive() {
+        let mut f = SyncFrontier::new();
+        let peer: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let h = vec![9u8; 32];
+        f.add_pending(h.clone());
+
+        assert!(f.claim_request(&h, Duration::from_secs(30)), "the first claim wins");
+        assert_eq!(f.claimed_requests(), 1);
+        assert!(
+            !f.claim_request(&h, Duration::from_secs(30)),
+            "a concurrent session must lose the claim"
+        );
+        assert_eq!(f.claimed_requests(), 1, "a lost claim adds nothing");
+
+        assert!(f.mark_requested(&h, peer));
+        assert!(f.request_is_fresh(&h, Duration::from_secs(30)));
+        assert_eq!(f.pages_requested, 1, "the request is counted once");
+    }
+
+    /// 4CP-BX v2.4 (R1): claims are per hash — claiming one id must never
+    /// suppress a different one in the same advertisement.
+    #[test]
+    fn test_frontier_claim_is_per_hash() {
+        let mut f = SyncFrontier::new();
+        let a = vec![1u8; 32];
+        let b = vec![2u8; 32];
+        assert!(f.claim_request(&a, Duration::from_secs(30)));
+        assert!(
+            f.claim_request(&b, Duration::from_secs(30)),
+            "a second hash must still be requestable"
+        );
+        assert_eq!(f.claimed_requests(), 2);
+    }
+
+    /// 4CP-BX v2.4 (R1): a claim expires with the same horizon as an in-flight
+    /// request, so a lost or unanswered request is retried and never pins the
+    /// hash — no new timer, no arbitrary delay.
+    #[test]
+    fn test_frontier_claim_expires_with_the_horizon() {
+        let mut f = SyncFrontier::new();
+        let h = vec![0xAAu8; 32];
+        assert!(f.claim_request(&h, Duration::from_secs(30)));
+        assert!(!f.claim_request(&h, Duration::from_secs(30)));
+
+        // Age the claim past the horizon (the peer had its whole window).
+        f.claims
+            .insert(h.clone(), Instant::now() - Duration::from_secs(31));
+        assert!(
+            f.claim_request(&h, Duration::from_secs(30)),
+            "an expired claim must be re-claimable: retry beats suppression"
+        );
+    }
+
+    /// 4CP-BX v2.4 (R1): one frame carries up to MAX_INV_ITEMS hashes but the
+    /// inflight record stops at MAX_INFLIGHT_REQUESTS — which is exactly why the
+    /// claim table exists. Every hash of the batch must be claimed so the next
+    /// round (or another session) does not re-ask for the tail.
+    #[test]
+    fn test_frontier_claim_covers_batches_beyond_inflight_cap() {
+        let mut f = SyncFrontier::new();
+        let peer: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let horizon = Duration::from_secs(30);
+        let hashes: Vec<Vec<u8>> = (0..(MAX_INFLIGHT_REQUESTS + 8))
+            .map(|i| {
+                let mut h = vec![0u8; 32];
+                h[0] = i as u8;
+                h[1] = (i >> 8) as u8;
+                h
+            })
+            .collect();
+
+        for h in &hashes {
+            f.add_pending(h.clone());
+            assert!(f.claim_request(h, horizon), "every hash of the frame is claimed");
+        }
+        let mut recorded = 0;
+        for h in &hashes {
+            if f.mark_requested(h, peer) {
+                recorded += 1;
+            }
+        }
+        assert_eq!(
+            recorded, MAX_INFLIGHT_REQUESTS,
+            "the inflight record is capped by design"
+        );
+        assert_eq!(
+            f.claimed_requests(),
+            hashes.len(),
+            "the claim table covers the whole frame, including the tail"
+        );
+        for h in &hashes {
+            assert!(
+                !f.claim_request(h, horizon),
+                "the tail must not look requestable to the next round"
+            );
+        }
+    }
+
+    /// 4CP-BX v2.4 (R1): a frame refused by the egress budget releases its
+    /// claims, so the next inventory round retries immediately instead of
+    /// waiting out the horizon.
+    #[test]
+    fn test_frontier_release_claim_reopens_request() {
+        let mut f = SyncFrontier::new();
+        let h = vec![0xBBu8; 32];
+        let horizon = Duration::from_secs(30);
+        assert!(f.claim_request(&h, horizon));
+        assert!(!f.claim_request(&h, horizon));
+        assert!(f.release_claim(&h), "the refused frame gives the claim back");
+        assert!(f.claim_request(&h, horizon), "the hash is requestable again at once");
+        assert!(!f.release_claim(&vec![0xCCu8; 32]), "releasing an unknown hash is a no-op");
+    }
+
+    /// 4CP-BX v2.4 (R1): the claim follows the REQUEST through both retry
+    /// transitions — an expired request (`rearm_expired`, the retry the
+    /// Inventory path performs) and a lost session (`on_peer_disconnect`).
+    /// Otherwise a retry would be suppressed for the rest of the horizon.
+    #[test]
+    fn test_frontier_claim_follows_the_retry_paths() {
+        let mut f = SyncFrontier::new();
+        let peer: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let horizon = Duration::from_secs(30);
+
+        let expired = vec![0xE1u8; 32];
+        f.add_pending(expired.clone());
+        assert!(f.claim_request(&expired, horizon));
+        assert!(f.mark_requested(&expired, peer));
+        assert!(
+            f.rearm_expired(&expired, Duration::ZERO),
+            "a request past its window returns to Pending"
+        );
+        assert_eq!(f.claimed_requests(), 0, "re-arm releases the claim");
+        assert!(
+            f.claim_request(&expired, horizon),
+            "the retry must be claimable immediately"
+        );
+
+        let lost = vec![0xE2u8; 32];
+        f.add_pending(lost.clone());
+        assert!(f.claim_request(&lost, horizon));
+        assert!(f.mark_requested(&lost, peer));
+        assert_eq!(f.on_peer_disconnect(&peer), 1);
+        assert!(
+            !f.claims.contains_key(&lost),
+            "a lost session releases the claim"
+        );
+        assert!(
+            f.claim_request(&lost, horizon),
+            "the hash is requestable from another peer at once"
+        );
+    }
+
+    /// 4CP-BX v2.4 (R1): terminal transitions drop the claim. A `Received` hash
+    /// keeps it (the answer is on its way), a duplicate response that resolves
+    /// to an existing DAG entry drops it, and a rejected hash is not re-asked.
+    #[test]
+    fn test_frontier_claim_cleared_on_terminal_states() {
+        let mut f = SyncFrontier::new();
+        let peer: SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let horizon = Duration::from_secs(30);
+
+        let applied = vec![0xD1u8; 32];
+        f.add_pending(applied.clone());
+        assert!(f.claim_request(&applied, horizon));
+        assert!(f.mark_requested(&applied, peer));
+        assert!(f.mark_received(&applied));
+        assert_eq!(f.claimed_requests(), 1, "Received keeps the claim: bytes are in flight");
+        assert!(f.mark_applied(&applied));
+        assert_eq!(f.claimed_requests(), 0, "Applied drops the claim");
+
+        let existing = vec![0xD2u8; 32];
+        f.add_pending(existing.clone());
+        assert!(f.claim_request(&existing, horizon));
+        assert!(f.mark_requested(&existing, peer));
+        assert!(f.mark_received(&existing));
+        assert!(f.mark_applied_existing(&existing));
+        assert_eq!(f.claimed_requests(), 0, "a DAG duplicate is terminal too");
+
+        let rejected = vec![0xD3u8; 32];
+        f.add_pending(rejected.clone());
+        assert!(f.claim_request(&rejected, horizon));
+        assert!(f.mark_requested(&rejected, peer));
+        assert!(f.mark_rejected(&rejected));
+        assert_eq!(f.claimed_requests(), 0, "a rejected hash is not re-requested");
     }
 
     /// 4CP-BX v2.1 (M1): an outstanding request suppresses a re-request only

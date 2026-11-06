@@ -34,7 +34,9 @@ use aether_unified::p2p::{
     IngressTx, P2PConfig, P2PMessage, P2PNetwork, P2PProtocolMode, P2P_PROTOCOL_VERSION,
     TX_INGRESS_CAPACITY_MSGS,
 };
-use aether_unified::sync_stats::{PipelineSnapshotFn, SyncContext};
+use aether_unified::sync_stats::{
+    IngressReservation, PipelineSnapshotFn, SyncContext, INGRESS_HANDOFF_LEASE,
+};
 use aether_unified::transaction::{Transaction, DEFAULT_NETWORK_ID};
 use aether_unified::transport::{
     BoxFuture, PeerAddr, TcpTransport, Transport, TransportError, TransportListener,
@@ -825,7 +827,9 @@ async fn bn07_inventory_does_not_rerequest_a_transaction_still_in_ingress() {
         .into_tx();
     assert_eq!(admitted.id, tx.id, "gossip admitted the tx once");
 
-    // The provenance note is written AFTER admission (4CP-BA ordering).
+    // The provenance note is written BEFORE the channel send and cancelled if
+    // the send is refused (4CP-BX v2.1/v2.3) — that ordering is what keeps the
+    // entry and the queued item in step.
     wait_for(
         "the tx is recorded as in flight",
         Duration::from_secs(5),
@@ -1371,5 +1375,274 @@ async fn bn10_drained_tx_is_not_requested_and_retry_follows_release() {
             .inventory_skipped_pipeline
             .load(Ordering::Relaxed),
         h.net.session_drops() == drops_before
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4CP-BX v2.4 (R1) — two sessions cannot both request the same batch
+// ---------------------------------------------------------------------------
+
+/// The frontier snapshot that feeds the Inventory diff is read ONCE per message,
+/// and a request only became visible to the other sessions once the frame had
+/// already been queued. Two peers advertising the same batch at the same time
+/// therefore both saw the batch as missing and both asked: the funnel then
+/// received two copies of every hash and counted them as duplicates.
+///
+/// The arbitration is now a single shared transition (`SyncFrontier::claim_request`)
+/// taken under the same guard that publishes "requested", so exactly one session
+/// owns each hash. The batch is deliberately large: with 300 hashes the pre-fix
+/// window (diff loop + serialization) is wide enough that both sessions emit the
+/// whole batch, and the assertion `sync_requested == 300` fails loudly instead of
+/// being satisfied by a lucky interleaving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bn11_two_sessions_cannot_both_request_the_same_batch() {
+    const PORT: u16 = 44857;
+    const BATCH: u32 = 300;
+
+    let mut h = boot_node(PORT, Arc::new(HashMap::new()), vec![]);
+    h.net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+    h.net.start().await.expect("start");
+
+    let mut peer_a = RawPeer::connect(PORT).await;
+    let mut peer_b = RawPeer::connect(PORT).await;
+    wait_peers(&h.net, 2).await;
+
+    let hashes: Vec<Vec<u8>> = (0..BATCH)
+        .map(|i| {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&i.to_le_bytes());
+            // A byte no other suite mints, so nothing collides with a DAG entry.
+            id[4] = 0xB1;
+            id.to_vec()
+        })
+        .collect();
+
+    let requested_before = h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed);
+    let skipped_before = h
+        .sync_ctx
+        .stats
+        .inventory_skipped_requested
+        .load(Ordering::Relaxed);
+    let advertised_before = h
+        .sync_ctx
+        .stats
+        .inventory_advertised
+        .load(Ordering::Relaxed);
+    let drops_before = h.net.session_drops();
+
+    // Both sessions announce the SAME batch, back to back: the reader tasks run
+    // concurrently from here on.
+    let inventory = P2PMessage::Inventory(hashes.clone());
+    peer_a.send(&inventory).await;
+    peer_b.send(&inventory).await;
+
+    wait_for(
+        "both inventories processed",
+        Duration::from_secs(10),
+        || async {
+            h.sync_ctx
+                .stats
+                .inventory_advertised
+                .load(Ordering::Relaxed)
+                >= advertised_before + (2 * BATCH) as u64
+        },
+    )
+    .await;
+
+    // Drain every GetData frame both sessions may have received.
+    let mut asked: Vec<Vec<u8>> = Vec::new();
+    for peer in [&mut peer_a, &mut peer_b] {
+        while let Some(msg) = peer.recv(Duration::from_secs(1)).await {
+            if let P2PMessage::GetData(payload) = msg {
+                asked.extend(payload);
+            }
+        }
+    }
+
+    let requested_delta = h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed) - requested_before;
+    assert_eq!(
+        requested_delta, BATCH as u64,
+        "each hash of the batch must be requested exactly once across BOTH sessions"
+    );
+    assert_eq!(
+        asked.len(),
+        BATCH as usize,
+        "the wire must carry one copy of each hash, not one per session"
+    );
+    let unique: HashSet<Vec<u8>> = asked.iter().cloned().collect();
+    assert_eq!(
+        unique.len(),
+        BATCH as usize,
+        "no hash may appear twice in the emitted requests"
+    );
+    assert!(
+        h.sync_ctx
+            .stats
+            .inventory_skipped_requested
+            .load(Ordering::Relaxed)
+            > skipped_before,
+        "the losing session must record the skip instead of staying silent"
+    );
+    // Suppressing a request is not a delivery refusal.
+    assert_eq!(
+        h.net.session_drops(),
+        drops_before,
+        "no session may be charged a drop for the arbitration"
+    );
+
+    println!(
+        "BN11 batch={} asked={} sync_requested={}->{} skipped_requested={}->{}",
+        BATCH,
+        asked.len(),
+        requested_before,
+        h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed),
+        skipped_before,
+        h.sync_ctx
+            .stats
+            .inventory_skipped_requested
+            .load(Ordering::Relaxed)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4CP-BX v2.4 (R2) — an interrupted handoff must not hide the id forever
+// ---------------------------------------------------------------------------
+
+/// A handoff is held across the funnel call by a task that can panic or be
+/// cancelled. Such a task never reaches `end_ingress_handoff`, so its entry
+/// survives — and while it survives the Inventory diff treats the id as
+/// in-flight and never asks for it again. A `Drop` cannot await the registry
+/// lock, so the entry cannot be released from an unwinding task; instead the
+/// handoff is a LEASE.
+///
+/// This test drives the real Inventory path twice, with entries planted exactly
+/// as the interrupted handoff and the live handoff would leave them (no sleeps,
+/// no timing assumption: the lease is relative to the entry's own instant):
+/// 1. an entry older than the lease must NOT suppress — the id is requested;
+/// 2. a live entry must suppress — the id is skipped and no GetData is emitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bn12_a_leaked_handoff_stops_hiding_the_id_after_its_lease() {
+    const PORT: u16 = 44858;
+
+    let h = boot_node(PORT, Arc::new(HashMap::new()), vec![]);
+    h.net.set_protocol_mode(P2PProtocolMode::LegacyV5);
+    h.net.start().await.expect("start");
+
+    let mut peer = RawPeer::connect(PORT).await;
+    wait_peers(&h.net, 1).await;
+
+    // 1. A LEAKED handoff: the entry is present, but its lease expired long ago.
+    let leaked_id = [0x5Cu8; 32];
+    {
+        let mut map = h.sync_ctx.ingress_mode.write().await;
+        map.insert(
+            leaked_id,
+            IngressReservation {
+                mode: ValidationMode::Historical,
+                at: Instant::now() - (INGRESS_HANDOFF_LEASE + Duration::from_secs(5)),
+                token: 424_242,
+                handoff: true,
+            },
+        );
+    }
+
+    let requested_before = h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed);
+    let skipped_before = h
+        .sync_ctx
+        .stats
+        .inventory_skipped_inflight
+        .load(Ordering::Relaxed);
+
+    peer.send(&P2PMessage::Inventory(vec![leaked_id.to_vec()]))
+        .await;
+
+    wait_for(
+        "a GetData for the id whose lease expired",
+        Duration::from_secs(5),
+        || async { h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed) > requested_before },
+    )
+    .await;
+
+    let mut asked = Vec::new();
+    while let Some(msg) = peer.recv(Duration::from_secs(2)).await {
+        if let P2PMessage::GetData(hashes) = msg {
+            asked = hashes;
+            break;
+        }
+    }
+    assert_eq!(
+        asked,
+        vec![leaked_id.to_vec()],
+        "a leaked handoff must stop suppressing once its lease is over"
+    );
+    assert_eq!(
+        h.sync_ctx
+            .stats
+            .inventory_skipped_inflight
+            .load(Ordering::Relaxed),
+        skipped_before,
+        "an expired lease is not an in-flight skip"
+    );
+
+    // 2. A LIVE handoff: the funnel is inside `process_transaction` right now.
+    let live_id = [0x5Du8; 32];
+    {
+        let mut map = h.sync_ctx.ingress_mode.write().await;
+        map.insert(
+            live_id,
+            IngressReservation {
+                mode: ValidationMode::Historical,
+                at: Instant::now(),
+                token: 434_343,
+                handoff: true,
+            },
+        );
+    }
+
+    let requested_snapshot = h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed);
+    let skipped_snapshot = h
+        .sync_ctx
+        .stats
+        .inventory_skipped_inflight
+        .load(Ordering::Relaxed);
+
+    peer.send(&P2PMessage::Inventory(vec![live_id.to_vec()]))
+        .await;
+
+    wait_for(
+        "the live handoff to suppress the request",
+        Duration::from_secs(5),
+        || async {
+            h.sync_ctx
+                .stats
+                .inventory_skipped_inflight
+                .load(Ordering::Relaxed)
+                > skipped_snapshot
+        },
+    )
+    .await;
+
+    assert_eq!(
+        h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed),
+        requested_snapshot,
+        "a live handoff must keep the id hidden: no GetData while it is open"
+    );
+    assert!(
+        !matches!(
+            peer.recv(Duration::from_millis(500)).await,
+            Some(P2PMessage::GetData(_))
+        ),
+        "no GetData may be emitted for an id inside a live handoff"
+    );
+
+    println!(
+        "BN12 leaked_recovered={} live_suppressed={} sync_requested={}",
+        h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed) - requested_before,
+        h.sync_ctx
+            .stats
+            .inventory_skipped_inflight
+            .load(Ordering::Relaxed)
+            - skipped_before,
+        h.sync_ctx.stats.sync_requested.load(Ordering::Relaxed)
     );
 }
