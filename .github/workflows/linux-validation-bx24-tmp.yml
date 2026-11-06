@@ -84,7 +84,10 @@ jobs:
         if: always()
         run: |
           set +e
-          cargo test --test phase4be_transaction_lifecycle_tests be07_handoff_keeps_the_id_visible_across_the_funnel_call --exact --nocapture --test-threads=1 2>&1 | tee /tmp/13_p3_be07.log
+          # The brief writes `... <NAME> --exact --nocapture --test-threads=1`, but cargo 1.97.1
+          # rejects `--exact` before the `--` separator ("unexpected argument '--exact' found"),
+          # so the first run never executed the test. libtest requires the flags after `--`.
+          cargo test --test phase4be_transaction_lifecycle_tests be07_handoff_keeps_the_id_visible_across_the_funnel_call -- --exact --nocapture --test-threads=1 2>&1 | tee /tmp/13_p3_be07.log
           c=${PIPESTATUS[0]}
           echo "EXIT_CODE=$c" | tee -a /tmp/13_p3_be07.log
           exit $c
