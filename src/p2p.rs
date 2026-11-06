@@ -6870,9 +6870,23 @@ impl P2PNetwork {
                                 // guard covers hash inserts and one
                                 // serialization, never I/O.
                                 let mut frontier = sync_ctx.frontier.write().await;
+                                // 4CP-BX v2.5 (P1): sweep the claim table AT MOST
+                                // once per frame, and only when it is full — the
+                                // only moment expired entries can block a live
+                                // claim. v2.4 swept inside EVERY
+                                // `claim_request`, which made a saturated frame
+                                // quadratic under this same guard (measured:
+                                // 476 ms for 1 000 hashes at the cap).
+                                if frontier.claim_table_at_capacity() {
+                                    frontier.sweep_expired_claims(
+                                        Instant::now(),
+                                        INFLIGHT_REQUEST_HORIZON,
+                                    );
+                                }
                                 let mut claimed: Vec<Vec<u8>> =
                                     Vec::with_capacity(missing_hashes.len());
-                                let mut skipped_claim = 0u64;
+                                let mut skipped_held = 0u64;
+                                let mut skipped_capacity = 0u64;
                                 for h in missing_hashes.iter() {
                                     // 4CP-BX v2.1 (M1): already tracked can mean
                                     // "pending" (a deferred frame) or
@@ -6886,19 +6900,51 @@ impl P2PNetwork {
                                     // is also the record that covers the hashes
                                     // past MAX_INFLIGHT_REQUESTS that
                                     // `mark_requested` cannot take.
-                                    if frontier.claim_request(h, INFLIGHT_REQUEST_HORIZON) {
-                                        claimed.push(h.clone());
-                                    } else {
-                                        skipped_claim += 1;
+                                    match frontier
+                                        .claim_request_detailed(h, INFLIGHT_REQUEST_HORIZON)
+                                    {
+                                        crate::sync_stats::ClaimOutcome::Claimed => {
+                                            claimed.push(h.clone())
+                                        }
+                                        crate::sync_stats::ClaimOutcome::Held => {
+                                            skipped_held += 1
+                                        }
+                                        crate::sync_stats::ClaimOutcome::Capacity => {
+                                            skipped_capacity += 1
+                                        }
                                     }
                                 }
-                                if skipped_claim > 0 {
-                                    // Same meaning as the snapshot filter above:
-                                    // a GetData for this hash is already
-                                    // outstanding (claimed here or by another
-                                    // session).
+                                // 4CP-BX v2.5 (P2): the two ways of losing a claim
+                                // are counted apart. `Held` = the arbitration
+                                // worked (another session owns the hash);
+                                // `Capacity` = the table is full of LIVE claims,
+                                // so the hash stays Pending for the next
+                                // advertised round and is not lost.
+                                // `inventory_skipped_requested` keeps its v2.1
+                                // meaning: a GetData already outstanding and
+                                // still inside its serving window.
+                                if skipped_held > 0 {
+                                    sync_ctx.stats.inventory_skipped_claim_held.fetch_add(
+                                        skipped_held,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                                if skipped_capacity > 0 {
+                                    sync_ctx.stats.inventory_skipped_claim_capacity.fetch_add(
+                                        skipped_capacity,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                                // Backward compatibility: `inventory_skipped_
+                                // requested` stays the AGGREGATE of every hash
+                                // skipped at the claim stage (it also carries
+                                // the "already outstanding and fresh" skips
+                                // counted above), so existing consumers and the
+                                // bn11 contract are unchanged while the two
+                                // v2.5 counters give the breakdown.
+                                if skipped_held + skipped_capacity > 0 {
                                     sync_ctx.stats.inventory_skipped_requested.fetch_add(
-                                        skipped_claim,
+                                        skipped_held + skipped_capacity,
                                         std::sync::atomic::Ordering::Relaxed,
                                     );
                                 }

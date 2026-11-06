@@ -148,6 +148,12 @@ pub struct SyncStatsSnapshot {
     /// pipeline still holds them (drained from ingress, not yet applied).
     /// Nothing is lost: the delivery in flight is the original one.
     pub inventory_skipped_pipeline: u64,
+    /// 4CP-BX v2.5 (P2): inventory hashes skipped because ANOTHER session
+    /// already holds a live claim on them — the arbitration worked.
+    pub inventory_skipped_claim_held: u64,
+    /// 4CP-BX v2.5 (P2): inventory hashes skipped because the claim table was
+    /// FULL of live claims. A capacity signal, not an arbitration loss.
+    pub inventory_skipped_claim_capacity: u64,
     /// 4CP-BX v2.3: ingress→funnel handoffs started (total).
     pub ingress_handoffs: u64,
     /// 4CP-BX v2.3: handoffs currently open. Non-zero means a transaction has
@@ -199,6 +205,10 @@ pub struct SyncStats {
     pub inventory_skipped_requested: AtomicU64,
     /// 4CP-BX v2.2 (R1): see `SyncStatsSnapshot::inventory_skipped_pipeline`.
     pub inventory_skipped_pipeline: AtomicU64,
+    /// 4CP-BX v2.5 (P2): see `SyncStatsSnapshot::inventory_skipped_claim_held`.
+    pub inventory_skipped_claim_held: AtomicU64,
+    /// 4CP-BX v2.5 (P2): see `SyncStatsSnapshot::inventory_skipped_claim_capacity`.
+    pub inventory_skipped_claim_capacity: AtomicU64,
     /// 4CP-BX v2.3: see `SyncStatsSnapshot::ingress_handoffs`.
     pub ingress_handoffs: AtomicU64,
     /// 4CP-BX v2.3: see `SyncStatsSnapshot::ingress_handoffs_active`.
@@ -243,6 +253,10 @@ impl SyncStats {
             inventory_skipped_inflight: self.inventory_skipped_inflight.load(Ordering::Relaxed),
             inventory_skipped_requested: self.inventory_skipped_requested.load(Ordering::Relaxed),
             inventory_skipped_pipeline: self.inventory_skipped_pipeline.load(Ordering::Relaxed),
+            inventory_skipped_claim_held: self.inventory_skipped_claim_held.load(Ordering::Relaxed),
+            inventory_skipped_claim_capacity: self
+                .inventory_skipped_claim_capacity
+                .load(Ordering::Relaxed),
             ingress_handoffs: self.ingress_handoffs.load(Ordering::Relaxed),
             ingress_handoffs_active: self.ingress_handoffs_active.load(Ordering::Relaxed),
         }
@@ -522,6 +536,10 @@ pub struct SyncFrontier {
     /// "asked recently" set: bounded by `MAX_FRONTIER_ENTRIES`, expired by the
     /// same horizon as `inflight`, and cleared on every terminal transition.
     claims: HashMap<Vec<u8>, Instant>,
+    /// 4CP-BX v2.5 (R1): how many times the expired-claim sweep actually ran.
+    /// Diagnostic for the "one sweep per frame" contract: the P2P Inventory
+    /// path sweeps at most once per frame, and only when the table is full.
+    claim_sweeps: u64,
     pages_requested: u64,
     pages_received: u64,
     pages_applied: u64,
@@ -532,6 +550,23 @@ pub struct SyncFrontier {
     started_at: Instant,
 }
 
+/// 4CP-BX v2.5 (P2): why a `claim_request` did or did not take the claim.
+///
+/// `claim_request` keeps its `bool` contract for every existing caller and
+/// test; the P2P Inventory path uses this richer form so the two ways of
+/// losing a claim are counted apart — `Held` means another session won the
+/// arbitration, `Capacity` means the table was full of LIVE claims (a capacity
+/// signal, not an arbitration loss).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// This caller owns the claim and must put the hash on the wire.
+    Claimed,
+    /// Another caller claimed it inside the horizon: do NOT ask again.
+    Held,
+    /// The table is full of live claims: the hash was not claimed.
+    Capacity,
+}
+
 impl SyncFrontier {
     pub fn new() -> Self {
         Self {
@@ -539,6 +574,7 @@ impl SyncFrontier {
             inflight: HashMap::new(),
             entries: HashMap::new(),
             claims: HashMap::new(),
+            claim_sweeps: 0,
             pages_requested: 0,
             pages_received: 0,
             pages_applied: 0,
@@ -619,23 +655,70 @@ impl SyncFrontier {
     /// hash 65 of a 1000-hash batch would stall bootstrap. The claim table has
     /// the frontier's own bound instead.
     pub fn claim_request(&mut self, hash: &[u8], horizon: Duration) -> bool {
+        matches!(
+            self.claim_request_detailed(hash, horizon),
+            ClaimOutcome::Claimed
+        )
+    }
+
+    /// 4CP-BX v2.5 (P1): claim `hash`, reporting WHY it was refused.
+    ///
+    /// v2.4 swept the whole table HERE, on every call, once the table was full:
+    /// with 100 000 live claims and 1 000 hashes per frame that is a
+    /// 10^8-operation stall INSIDE the frontier write guard (measured on the
+    /// v2.4 tree: 476 ms for one frame at the cap, versus 133 us below it).
+    /// The sweep is now a caller concern — the P2P Inventory path calls
+    /// [`Self::sweep_expired_claims`] at most ONCE per frame, and only when the
+    /// table is actually at capacity — so this function stays O(1).
+    ///
+    /// Refusing at capacity is deliberate and unchanged: a LIVE claim is never
+    /// evicted to make room. The hash stays `Pending` in the frontier and the
+    /// next advertised round claims it, because claims expire after `horizon`.
+    pub fn claim_request_detailed(&mut self, hash: &[u8], horizon: Duration) -> ClaimOutcome {
         let now = Instant::now();
         if let Some(at) = self.claims.get(hash) {
             if now.saturating_duration_since(*at) < horizon {
-                return false;
+                return ClaimOutcome::Held;
             }
         }
         if self.claims.len() >= MAX_FRONTIER_ENTRIES {
-            // Bounded: drop the expired generation first (cheap and rare), then
-            // refuse if every claim is still live — the caller retries.
-            self.claims
-                .retain(|_, at| now.saturating_duration_since(*at) < horizon);
-            if self.claims.len() >= MAX_FRONTIER_ENTRIES {
-                return false;
-            }
+            return ClaimOutcome::Capacity;
         }
         self.claims.insert(hash.to_vec(), now);
-        true
+        ClaimOutcome::Claimed
+    }
+
+    /// 4CP-BX v2.5 (P1): drop every EXPIRED claim, once, for a whole frame.
+    ///
+    /// Returns the number of claims released. The caller invokes this at most
+    /// once per frame and only when [`Self::claim_table_at_capacity`] is true,
+    /// which is the only moment expired entries can block a live claim: below
+    /// the cap a new claim always has room, and a stale hash is already
+    /// re-claimable per hash (it overwrites its own entry).
+    ///
+    /// Expired claims are released, NEVER live ones — capacity pressure must
+    /// not cost a session the claim it is about to use.
+    pub fn sweep_expired_claims(&mut self, now: Instant, horizon: Duration) -> usize {
+        self.claim_sweeps = self.claim_sweeps.saturating_add(1);
+        if self.claims.is_empty() {
+            return 0;
+        }
+        let before = self.claims.len();
+        self.claims
+            .retain(|_, at| now.saturating_duration_since(*at) < horizon);
+        before - self.claims.len()
+    }
+
+    /// 4CP-BX v2.5 (P1): is the claim table at its cap (so a sweep can matter)?
+    #[inline]
+    pub fn claim_table_at_capacity(&self) -> bool {
+        self.claims.len() >= MAX_FRONTIER_ENTRIES
+    }
+
+    /// 4CP-BX v2.5 (P1): how many expired-claim sweeps have run (diagnostics).
+    #[inline]
+    pub fn claim_sweeps(&self) -> u64 {
+        self.claim_sweeps
     }
 
     /// 4CP-BX v2.4 (R1): give a claim back because no frame was emitted
@@ -1868,6 +1951,207 @@ mod tests {
         assert_eq!(active(), 0);
     }
 
+    // -----------------------------------------------------------------------
+    // 4CP-BX v2.5 (R2) — a live handoff evicted before its release
+    // -----------------------------------------------------------------------
+
+    /// 4CP-BX v2.5 (R2): evicting a LIVE handoff closes its gauge unit exactly
+    /// once, the evicted writer's late release is a no-op, and the id becomes
+    /// requestable again (absence from the registry is what suppresses it).
+    #[tokio::test]
+    async fn test_evicted_handoff_closes_gauge_once_and_frees_the_id() {
+        let ctx = SyncContext::default();
+        let live = [0xE7u8; 32];
+        let (_mode, token) = ctx.begin_ingress_handoff(live).await;
+        assert_eq!(
+            ctx.stats.ingress_handoffs_active.load(Ordering::Relaxed),
+            1,
+            "an open handoff is counted once"
+        );
+
+        // Fill the registry to its cap with QUEUED entries, all older than the
+        // handoff, then age the handoff itself so it is the oldest of all.
+        {
+            let mut map = ctx.ingress_mode.write().await;
+            for i in 0..(MAX_INGRESS_MODE_ENTRIES - 1) {
+                let mut id = [0u8; 32];
+                id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                id[31] = 0x42;
+                map.insert(
+                    id,
+                    IngressReservation {
+                        mode: ValidationMode::Historical,
+                        at: Instant::now() - Duration::from_secs(3600),
+                        token: 9_000_000 + i as u64,
+                        handoff: false,
+                    },
+                );
+            }
+            map.get_mut(&live).expect("handoff present").at =
+                Instant::now() - Duration::from_secs(7200);
+        }
+
+        // A new reservation at the cap evicts the oldest entry: our handoff.
+        let queued = [0xE8u8; 32];
+        assert!(
+            ctx.note_ingress_mode(queued, ValidationMode::Fresh)
+                .await
+                .is_some(),
+            "a new reservation is admitted at the cap"
+        );
+        assert_eq!(
+            ctx.stats.ingress_handoffs_active.load(Ordering::Relaxed),
+            0,
+            "the evicted handoff closed its gauge unit exactly once"
+        );
+        assert!(
+            !ctx.ingress_mode.read().await.contains_key(&live),
+            "oldest-first eviction took the handoff"
+        );
+        assert!(
+            !ctx.end_ingress_handoff(live, token).await,
+            "the evicted writer no longer owns the entry"
+        );
+        assert_eq!(
+            ctx.stats.ingress_handoffs_active.load(Ordering::Relaxed),
+            0,
+            "a late release must not decrement a second time"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 4CP-BX v2.5 (R4) — behaviour past the handoff lease
+    // -----------------------------------------------------------------------
+
+    /// 4CP-BX v2.5 (R4): a lease that has EXPIRED reopens the request, but it
+    /// does not open a second admission path — a duplicate delivery of the same
+    /// id is still refused by the ingestion guard, and the funnel's DAG dedup
+    /// sits on top of that. Suppression is a bandwidth optimisation; admission
+    /// stays the deduplicator.
+    #[tokio::test]
+    async fn test_expired_lease_reopens_request_but_not_admission() {
+        let ctx = SyncContext::default();
+        let id = [0xB7u8; 32];
+        ctx.ingress_mode.write().await.insert(
+            id,
+            IngressReservation {
+                mode: ValidationMode::Historical,
+                at: Instant::now() - (INGRESS_HANDOFF_LEASE + Duration::from_secs(5)),
+                token: 7_777,
+                handoff: true,
+            },
+        );
+        let now = Instant::now();
+        assert!(
+            !ctx.ingress_mode
+                .read()
+                .await
+                .get(&id)
+                .expect("entry")
+                .suppresses_inventory(now),
+            "an expired lease must stop hiding the id"
+        );
+        assert!(
+            ctx.note_ingress_mode(id, ValidationMode::Fresh)
+                .await
+                .is_none(),
+            "the id is still reserved: a duplicate cannot re-enter the pipeline"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 4CP-BX v2.5 (R5) — gauge equals the live handoff entries
+    // -----------------------------------------------------------------------
+
+    /// 4CP-BX v2.5 (R5): after every kind of operation the gauge equals the
+    /// number of LIVE `handoff` entries in the registry — the structural
+    /// invariant, not a hand-maintained tally.
+    #[tokio::test]
+    async fn test_gauge_equals_live_handoff_entries_after_mixed_operations() {
+        let ctx = SyncContext::default();
+        let gauge = || ctx.stats.ingress_handoffs_active.load(Ordering::Relaxed) as usize;
+        macro_rules! check {
+            ($step:expr) => {
+                assert_eq!(
+                    gauge(),
+                    ctx.ingress_mode
+                        .read()
+                        .await
+                        .values()
+                        .filter(|e| e.handoff)
+                        .count(),
+                    "gauge must equal the live handoff entries after {}",
+                    $step
+                );
+            };
+        }
+
+        // begin + end
+        let a = [0xA1u8; 32];
+        let (_m, ta) = ctx.begin_ingress_handoff(a).await;
+        check!("begin");
+        assert!(ctx.end_ingress_handoff(a, ta).await);
+        check!("end");
+        // double end (nothing left to release)
+        assert!(!ctx.end_ingress_handoff(a, ta).await);
+        check!("double end");
+        // foreign token
+        let b = [0xA2u8; 32];
+        let (_m, tb) = ctx.begin_ingress_handoff(b).await;
+        assert!(!ctx.end_ingress_handoff(b, tb.wrapping_add(77)).await);
+        check!("foreign token");
+        // cancel of a queued reservation (never owns a gauge unit)
+        let c = [0xA3u8; 32];
+        let tc = ctx
+            .note_ingress_mode(c, ValidationMode::Fresh)
+            .await
+            .expect("reserved");
+        assert!(ctx.cancel_ingress_reservation(c, tc).await);
+        check!("cancel");
+        // take consumes (and closes) a handoff
+        assert_eq!(ctx.take_ingress_mode(b).await, ValidationMode::Historical);
+        check!("take");
+        // stale token after take
+        assert!(!ctx.end_ingress_handoff(b, tb).await);
+        check!("stale token");
+        // replacement: a second handoff for the same id
+        let d = [0xA4u8; 32];
+        let (_m1, _t1) = ctx.begin_ingress_handoff(d).await;
+        let (_m2, t2) = ctx.begin_ingress_handoff(d).await;
+        check!("replacement");
+        // eviction at capacity: the fillers are older than `d`, so `d` survives
+        {
+            let mut map = ctx.ingress_mode.write().await;
+            let target = MAX_INGRESS_MODE_ENTRIES - map.len();
+            for i in 0..target {
+                let mut id = [0u8; 32];
+                id[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                id[31] = 0x43;
+                map.insert(
+                    id,
+                    IngressReservation {
+                        mode: ValidationMode::Historical,
+                        at: Instant::now() - Duration::from_secs(3600),
+                        token: 5_000_000 + i as u64,
+                        handoff: false,
+                    },
+                );
+            }
+        }
+        check!("fill to cap");
+        let q = [0xA5u8; 32];
+        assert!(
+            ctx.note_ingress_mode(q, ValidationMode::Fresh)
+                .await
+                .is_some(),
+            "a reservation is admitted at the cap"
+        );
+        check!("eviction");
+        assert!(ctx.end_ingress_handoff(d, t2).await);
+        check!("final end");
+        assert_eq!(gauge(), 0, "every handoff is closed");
+    }
+
     /// 4CP-BX v2.4 (R2): an interrupted handoff (panic or task cancellation
     /// between `begin` and `end`) is a LEASE. A `Drop` cannot await the registry
     /// lock, so the lease is what keeps liveness: after it the id stops
@@ -2099,6 +2383,127 @@ mod tests {
         assert!(f.mark_requested(&rejected, peer));
         assert!(f.mark_rejected(&rejected));
         assert_eq!(f.claimed_requests(), 0, "a rejected hash is not re-requested");
+    }
+
+    // -----------------------------------------------------------------------
+    // 4CP-BX v2.5 (R1) — saturation of the claim table
+    // -----------------------------------------------------------------------
+
+    /// 4CP-BX v2.5 (R1/P1): a table full of LIVE claims refuses new ones WITHOUT
+    /// evicting anything, one frame triggers exactly ONE sweep, and expiring a
+    /// single entry frees exactly one slot for the next frame.
+    #[test]
+    fn test_frontier_claim_saturation_refuses_then_frees_exactly_one_slot() {
+        let mut f = SyncFrontier::new();
+        let horizon = Duration::from_secs(30);
+        let now = Instant::now();
+        for i in 0..MAX_FRONTIER_ENTRIES {
+            let mut h = vec![0u8; 32];
+            h[0] = 0x51;
+            h[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+            f.claims.insert(h, now);
+        }
+        assert!(f.claim_table_at_capacity());
+        assert_eq!(f.claimed_requests(), MAX_FRONTIER_ENTRIES);
+        let sweeps_before = f.claim_sweeps();
+
+        // ONE sweep for the whole frame: every claim is live, nothing is freed.
+        assert_eq!(f.sweep_expired_claims(now, horizon), 0);
+        assert_eq!(f.claim_sweeps(), sweeps_before + 1, "one sweep per frame");
+
+        // The frame is refused at capacity, and no live claim is evicted.
+        for i in 0..1000u64 {
+            let mut h = vec![0u8; 32];
+            h[0] = 0x52;
+            h[1..9].copy_from_slice(&i.to_le_bytes());
+            assert_eq!(
+                f.claim_request_detailed(&h, horizon),
+                ClaimOutcome::Capacity,
+                "a full table of live claims must refuse, not evict"
+            );
+        }
+        assert_eq!(
+            f.claimed_requests(),
+            MAX_FRONTIER_ENTRIES,
+            "no live claim may be evicted to make room"
+        );
+
+        // Expire exactly one entry: the next frame frees exactly one slot.
+        let mut victim = vec![0u8; 32];
+        victim[0] = 0x51;
+        victim[1..9].copy_from_slice(&0u64.to_le_bytes());
+        f.claims
+            .insert(victim, now - (horizon + Duration::from_secs(1)));
+        assert_eq!(
+            f.sweep_expired_claims(now, horizon),
+            1,
+            "exactly one expired claim is released"
+        );
+        assert_eq!(f.claimed_requests(), MAX_FRONTIER_ENTRIES - 1);
+        let mut fresh = vec![0u8; 32];
+        fresh[0] = 0x53;
+        assert_eq!(
+            f.claim_request_detailed(&fresh, horizon),
+            ClaimOutcome::Claimed,
+            "the freed slot is immediately usable"
+        );
+        assert_eq!(f.claimed_requests(), MAX_FRONTIER_ENTRIES);
+    }
+
+    /// 4CP-BX v2.5 (R1): the sweep drops EXPIRED claims only — never a live one.
+    #[test]
+    fn test_frontier_claim_sweep_drops_only_expired() {
+        let mut f = SyncFrontier::new();
+        let horizon = Duration::from_secs(30);
+        let now = Instant::now();
+        f.claims.insert(vec![1u8; 32], now);
+        f.claims.insert(vec![2u8; 32], now - Duration::from_secs(10));
+        f.claims
+            .insert(vec![3u8; 32], now - (horizon + Duration::from_secs(1)));
+        f.claims
+            .insert(vec![4u8; 32], now - (horizon + Duration::from_secs(60)));
+        assert_eq!(f.sweep_expired_claims(now, horizon), 2);
+        assert_eq!(f.claimed_requests(), 2);
+        assert!(f.claims.contains_key(&vec![1u8; 32]));
+        assert!(
+            f.claims.contains_key(&vec![2u8; 32]),
+            "a claim inside the horizon survives the sweep"
+        );
+    }
+
+    /// 4CP-BX v2.5 (R3): the claim arbitrates between PEERS, not within one
+    /// session — another peer's advertisement is refused while the claim is
+    /// live, accepted once the horizon has passed, and released immediately
+    /// when the session that owned it disconnects.
+    #[test]
+    fn test_frontier_claim_blocks_another_peer_until_horizon() {
+        let mut f = SyncFrontier::new();
+        let horizon = Duration::from_secs(30);
+        let peer_a: SocketAddr = "127.0.0.1:9101".parse().unwrap();
+        let peer_b: SocketAddr = "127.0.0.1:9102".parse().unwrap();
+
+        let h = vec![0x7Au8; 32];
+        f.add_pending(h.clone());
+        assert!(f.claim_request(&h, horizon));
+        assert!(f.mark_requested(&h, peer_a));
+        // Peer B advertises the same hash while A is silent: suppressed.
+        assert_eq!(f.claim_request_detailed(&h, horizon), ClaimOutcome::Held);
+        // Past the horizon the claim is re-claimable: availability wins.
+        f.claims
+            .insert(h.clone(), Instant::now() - (horizon + Duration::from_secs(1)));
+        assert_eq!(f.claim_request_detailed(&h, horizon), ClaimOutcome::Claimed);
+
+        // A lost session releases the claim at once (no 30 s wait).
+        let h2 = vec![0x7Bu8; 32];
+        f.add_pending(h2.clone());
+        assert!(f.claim_request(&h2, horizon));
+        assert!(f.mark_requested(&h2, peer_b));
+        assert_eq!(f.on_peer_disconnect(&peer_b), 1);
+        assert!(
+            !f.claims.contains_key(&h2),
+            "a lost session releases the claim"
+        );
+        assert_eq!(f.claim_request_detailed(&h2, horizon), ClaimOutcome::Claimed);
     }
 
     /// 4CP-BX v2.1 (M1): an outstanding request suppresses a re-request only
