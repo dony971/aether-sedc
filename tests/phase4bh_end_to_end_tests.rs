@@ -603,10 +603,60 @@ fn bh_10_alert_never_halts_a_node() {
             Some([0x77u8; 32]),
             "the alert is recorded by node {i}"
         );
-        assert!(!mesh.nodes[i].engine().is_halted(), "an alert stops nothing");
+        assert!(
+            !mesh.nodes[i].engine().is_halted(),
+            "an alert stops nothing"
+        );
+        assert!(
+            mesh.nodes[i].status().may_sign,
+            "node {i} still signs after an alert"
+        );
+        assert!(
+            !mesh.nodes[i].halt_persisted(),
+            "an alert writes no halt record"
+        );
         assert!(mesh.nodes[i].round_changes == 0);
     }
-    // And the node is still useful: a round change still goes through.
+
+    // BZ.5 (A1): the alert must not gate consensus ingress. Three members
+    // prevote the same value; every node records all three prevotes, including
+    // the nodes that saw the alert.
+    let value = [0x42u8; 32];
+    for i in 0..3 {
+        let prevote = mesh.nodes[i]
+            .prevote_value(value)
+            .expect("a node that saw an alert still prevotes");
+        mesh.nodes[i].broadcast(MessageKind::Prevote, prevote.vote().encode());
+    }
+    mesh.drain();
+    for i in 1..mesh.nodes.len() {
+        assert_eq!(
+            mesh.nodes[i].status().prevotes,
+            3,
+            "prevotes are still accepted by node {i} after an alert"
+        );
+        assert!(mesh.nodes[i].status().may_sign);
+    }
+
+    // And precommit: node 1 builds the POL from the prevotes it recorded, and
+    // the other nodes accept the precommit.
+    let pol: PrevoteCertificate = mesh.nodes[1]
+        .certify_prevotes(value)
+        .expect("prevote quorum after an alert");
+    let precommit = mesh.nodes[1]
+        .precommit_value(&pol)
+        .expect("precommit after an alert");
+    mesh.nodes[1].broadcast(MessageKind::Precommit, precommit.vote().encode());
+    mesh.drain();
+    for i in 2..mesh.nodes.len() {
+        assert_eq!(
+            mesh.nodes[i].status().precommits,
+            1,
+            "precommits are still accepted by node {i} after an alert"
+        );
+    }
+
+    // The rest of the network still works: a round change still goes through.
     let bytes = mesh.round_change(1, 1, None).encode();
     mesh.nodes[0].broadcast(MessageKind::RoundChange, bytes);
     mesh.drain();

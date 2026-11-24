@@ -254,6 +254,14 @@ pub struct Node {
     halt_evidence: Option<[u8; 32]>,
     /// Halt **proof** that was verified and injected into the engine.
     halt_proof: Option<Box<HaltProof>>,
+    /// Whether the halt record was written, flushed and read back unchanged.
+    ///
+    /// BZ.5 (A2): set only from the result of the write and the read-back. The
+    /// presence of a store or of a proof is never enough to claim durability.
+    halt_durable: bool,
+    /// Why durability was not confirmed, for the operator. `None` only when the
+    /// halt is either absent or confirmed durable.
+    halt_record_error: Option<String>,
     /// Content identifiers of votes this node has already relayed, so a relay
     /// ring terminates instead of echoing a vote forever.
     relayed: BTreeSet<[u8; 32]>,
@@ -364,6 +372,8 @@ impl Node {
             registry,
             halt_evidence: None,
             halt_proof: None,
+            halt_durable: false,
+            halt_record_error: None,
             relayed: BTreeSet::new(),
             directions: BTreeMap::new(),
             duplicates_closed: 0,
@@ -784,7 +794,10 @@ impl Node {
                     };
                     match authenticate(peer, &envelope, self.network, now) {
                         Ok(()) => {
-                            let halted = self.halt_evidence.is_some();
+                            // BZ.5 (A1): only the engine's own HALT state gates
+                            // consensus ingress. A HALT *alert* is evidence for an
+                            // operator and must never stop a node, whoever sent it.
+                            let halted = self.state.is_halted();
                             dispatch(peer, &envelope, &mut self.state, &self.registry, halted)
                         }
                         Err(reject) => Incoming::Refused(reject),
@@ -843,12 +856,51 @@ impl Node {
                                 // a conflict; `halt_with` is the single way to stop.
                                 if self.halt_proof.is_none() {
                                     if let Ok(reason) = proof.verify(&self.registry) {
-                                        if let Some(store) = self.halt_store.as_deref() {
-                                            let _ = self.state.halt_with(reason, store);
-                                        } else {
-                                            let _ = reason;
-                                        }
                                         self.halt_proof = Some(Box::new(proof));
+                                        // BZ.5 (A2): the node reports durable only
+                                        // after the write, the flush and a read-back
+                                        // all succeeded. Every failure is recorded
+                                        // rather than turned into a silent success.
+                                        match self.halt_store.as_deref() {
+                                            Some(store) => {
+                                                let verified = match self
+                                                    .state
+                                                    .halt_with(reason, store)
+                                                {
+                                                    Ok(()) => match self
+                                                        .state
+                                                        .halt_is_durable(store)
+                                                    {
+                                                        Ok(true) => Ok(()),
+                                                        Ok(false) => Err("the store holds no matching halt record".to_string()),
+                                                        Err(error) => Err(error.to_string()),
+                                                    },
+                                                    Err(error) => Err(error.to_string()),
+                                                };
+                                                match verified {
+                                                    Ok(()) => {
+                                                        self.halt_durable = true;
+                                                        self.halt_record_error = None;
+                                                    }
+                                                    Err(error) => {
+                                                        self.halt_durable = false;
+                                                        self.halt_record_error = Some(error);
+                                                    }
+                                                }
+                                            }
+                                            None => {
+                                                // Explicit and honest: without a
+                                                // store the engine still stops, but
+                                                // only in memory; a restart does not
+                                                // preserve it.
+                                                self.state.halt_in_memory(reason);
+                                                self.halt_durable = false;
+                                                self.halt_record_error = Some(
+                                                    "no store attached: the halt is in memory only"
+                                                        .to_string(),
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1258,7 +1310,9 @@ impl Node {
         &mut self,
         transaction: Transaction,
     ) -> Result<TransactionId, SubmitError> {
-        if self.state.is_halted() || self.halt_evidence.is_some() {
+        // BZ.5 (A1): a HALT alert stops nothing, transactions included. Only the
+        // engine's own HALT state refuses work.
+        if self.state.is_halted() {
             return Err(SubmitError::Halted);
         }
         if !transaction.verify_hash_compatible() {
@@ -1450,7 +1504,9 @@ impl Node {
     ///
     /// A verified proof handed to a node without a store stops the engine in memory
     /// and sets `halt_persisted == false`: the node is honest about the difference
-    /// rather than pretending a restart would stay stopped.
+    /// rather than pretending a restart would stay stopped. Attaching a store after
+    /// the halt does not retroactively persist it; only a new `halt_with` request
+    /// (a fresh verified proof, or an engine-level retry) can confirm durability.
     pub fn attach_halt_store(&mut self, store: Box<dyn AtomicSlotStore>) {
         self.halt_store = Some(store);
     }
@@ -1517,9 +1573,21 @@ impl Node {
         self.served = Some(history);
     }
 
-    /// Whether the halt record reached durable storage.
+    /// Whether the halt record reached durable storage **and was read back**.
+    ///
+    /// BZ.5 (A2): this is never inferred from the presence of a store or of a
+    /// proof. It is true only after [`BftState::halt_with`] returned `Ok` and the
+    /// stored record was read back identical.
     pub fn halt_persisted(&self) -> bool {
-        self.halt_store.is_some() && self.halt_proof.is_some()
+        self.halt_durable
+    }
+
+    /// Why the durable halt record was not confirmed, if it was not.
+    ///
+    /// `Some` also covers the deliberate case of a node with no store: the halt
+    /// is real in memory, but it is not durable and the node says so.
+    pub fn halt_record_error(&self) -> Option<&str> {
+        self.halt_record_error.as_deref()
     }
 
     /// Drop one peer's connection (simulating a disconnect).

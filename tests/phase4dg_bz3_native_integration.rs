@@ -598,23 +598,106 @@ fn bz3_12_submission_without_peers_is_accepted_and_says_so() {
 }
 
 #[test]
-fn bz3_13_a_halted_node_accepts_no_new_transaction() {
+fn bz3_13_an_alert_admits_work_and_a_halt_proof_refuses_it() {
     let mut nodes = mesh(&[1, 2]);
+    nodes[1].attach_halt_store(Box::new(MemoryAtomicSlotStore::new()));
+
+    // (1) BZ.5 (A1): an alert is evidence, never a stop. It must not refuse a
+    // transaction, let alone consensus work.
     // The alert is sent by a peer: a node does not warn itself.
     nodes[0].broadcast(MessageKind::HaltEvidence, vec![0x11u8; 32]);
     drain(&mut nodes[1]);
     assert_eq!(nodes[1].halt_evidence(), Some([0x11u8; 32]));
+    assert!(!nodes[1].engine().is_halted());
 
     let wallet = Wallet::new();
     let transaction = signed_transaction(&wallet, [[0u8; 32]; 2], 1);
-    assert_eq!(
-        nodes[1].submit(transaction),
-        Err(aether_unified::network::SubmitError::Halted)
-    );
-    // The sender is not halted: an alert stops nobody by itself.
+    nodes[1]
+        .submit(transaction)
+        .expect("an alert refuses no work");
+    // The sender is not halted either: an alert stops nobody by itself.
     let mut sender_transaction = signed_transaction(&wallet, [[0u8; 32]; 2], 2);
     sender_transaction.id = sender_transaction.compute_hash();
     assert!(nodes[0].submit(sender_transaction).is_ok());
+
+    // (2) A verified HALT proof does stop the node, and a halted node refuses
+    // new work. The proof is built here from two quorum certificates over two
+    // different values at one height, with the mesh's own two validators.
+    let registry = registry_with(&[1, 2]);
+    let seeds = [1u8, 2];
+    let make = |salt: u8| -> (Checkpoint, PrecommitCertificate) {
+        let mut engines: Vec<BftState> = seeds
+            .iter()
+            .map(|_| BftState::new(NET, &registry, CheckpointHeight(0), ANCHOR))
+            .collect();
+        let stores: Vec<MemoryAtomicSlotStore> =
+            seeds.iter().map(|_| MemoryAtomicSlotStore::new()).collect();
+        let checkpoint = Checkpoint::new(
+            registry.generation(),
+            CheckpointHeight(0),
+            [0u8; 32],
+            [0x40u8 ^ salt; 32],
+            [0x50u8 ^ salt; 32],
+            registry.set_root(),
+            None,
+        )
+        .expect("checkpoint");
+        let value = checkpoint.id();
+        let mut prevotes: Vec<ConsensusVote> = Vec::new();
+        for i in 0..seeds.len() {
+            let vote = engines[i]
+                .prevote(value, vid(seeds[i]), &registry, &stores[i], |message| {
+                    sk(seeds[i]).sign(message).to_bytes()
+                })
+                .expect("prevote");
+            prevotes.push(vote.vote().clone());
+        }
+        for engine in engines.iter_mut() {
+            for vote in &prevotes {
+                engine.accept_vote(vote, &registry);
+            }
+        }
+        let pol = engines[0]
+            .certify_prevotes_for(value, &registry)
+            .expect("prevote quorum");
+        let mut precommits: Vec<ConsensusVote> = Vec::new();
+        for i in 0..seeds.len() {
+            let vote = engines[i]
+                .precommit(&pol, vid(seeds[i]), &registry, &stores[i], |message| {
+                    sk(seeds[i]).sign(message).to_bytes()
+                })
+                .expect("precommit");
+            precommits.push(vote.vote().clone());
+        }
+        for engine in engines.iter_mut() {
+            for vote in &precommits {
+                engine.accept_vote(vote, &registry);
+            }
+        }
+        let certificate = engines[0]
+            .certify_precommits_for(value, &registry)
+            .expect("precommit quorum");
+        (checkpoint, certificate)
+    };
+    let proof = aether_unified::l2bft::halt_proof::HaltProof {
+        network: NET,
+        generation: registry.generation(),
+        height: CheckpointHeight(0),
+        first: make(0),
+        second: make(0x80),
+    };
+    nodes[0].broadcast(MessageKind::HaltEvidence, proof.encode());
+    drain(&mut nodes[1]);
+    assert!(nodes[1].engine().is_halted(), "a proof stops the node");
+    assert!(
+        nodes[1].halt_persisted(),
+        "the halt record is durable and read back"
+    );
+    let refused = signed_transaction(&wallet, [[0u8; 32]; 2], 3);
+    assert_eq!(
+        nodes[1].submit(refused),
+        Err(aether_unified::network::SubmitError::Halted)
+    );
 }
 
 // ---------------------------------------------------------------------------

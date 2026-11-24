@@ -1546,23 +1546,58 @@ impl BftState {
     /// - the record is written to the store and flushed, so a restart reloads it as
     ///   [`HaltReason::Persisted`];
     /// - if the write fails, the in-memory halt is kept anyway: the node stays
-    ///   stopped rather than continuing with an unpersisted stop.
+    ///   stopped rather than continuing with an unpersisted stop;
+    /// - **BZ.5 (A2):** the returned `Result` is the durability verdict. A repeated
+    ///   request is still a request: it re-runs the write and the read-back, so a
+    ///   caller that retries after a failure is told whether the record is now
+    ///   durable instead of receiving a silent `Ok(())`.
     pub fn halt_with(
         &mut self,
         reason: HaltReason,
         store: &dyn AtomicSlotStore,
     ) -> Result<(), BftError> {
-        if self.halt.is_some() {
-            return Ok(());
-        }
-        self.halt = Some(reason);
-        self.block_signing_after_halt();
+        self.halt_in_memory(reason);
+        // The first reason is kept; `persist_halt` refuses to replace a different
+        // durable record and verifies what it wrote.
         self.persist_halt(store)
+    }
+
+    /// Enter the HALT state with no durable record.
+    ///
+    /// BZ.5 (A2): this is the explicit behaviour for a node that has no store to
+    /// write to. The engine really stops — it refuses signatures and consensus
+    /// work — but nothing survives a restart, so callers must not report this as
+    /// durable. It never replaces an existing reason and never clears one.
+    pub(crate) fn halt_in_memory(&mut self, reason: HaltReason) {
+        if self.halt.is_none() {
+            self.halt = Some(reason);
+            self.block_signing_after_halt();
+        }
     }
 
     /// Whether this engine refuses to sign.
     pub fn is_halted(&self) -> bool {
         self.halt.is_some()
+    }
+
+    /// Whether the durable halt record exists **and** matches this engine's halt.
+    ///
+    /// BZ.5 (A2): this is a read-back of the store, not an inference from
+    /// [`Self::is_halted`]. `Ok(false)` means no matching record (absent, or a
+    /// different record); an unreadable store is an error, never "not halted".
+    pub fn halt_is_durable(&self, store: &dyn AtomicSlotStore) -> Result<bool, BftError> {
+        let halt = match &self.halt {
+            Some(halt) => halt,
+            None => return Ok(false),
+        };
+        let expected = seal(&halt.describe().into_bytes());
+        match store.get(HALT_KEY) {
+            Ok(Some(bytes)) => Ok(bytes == expected),
+            Ok(None) => Ok(false),
+            Err(error) => Err(BftError::Rejected(format!(
+                "halt record unreadable: {error}"
+            ))),
+        }
     }
 
     /// Make the in-memory safety state refuse signatures as well (BW, R-BV-2).
@@ -1582,10 +1617,39 @@ impl BftState {
     fn persist_halt(&self, store: &dyn AtomicSlotStore) -> Result<(), BftError> {
         if let Some(halt) = &self.halt {
             let bytes = halt.describe().into_bytes();
-            let _ = store.cas(HALT_KEY, None, &seal(&bytes))?;
+            let sealed = seal(&bytes);
+            // BZ.5 (A2): the CAS verdict is no longer discarded. `false` means a
+            // record is already present; that is acceptable only when it is the
+            // same record this halt would write, never a silent overwrite.
+            if !store.cas(HALT_KEY, None, &sealed)? {
+                match store.get(HALT_KEY)? {
+                    Some(existing) if existing == sealed => {}
+                    Some(_) => {
+                        return Err(BftError::Rejected(
+                            "a different halt record is already durable".to_string(),
+                        ))
+                    }
+                    None => {
+                        return Err(BftError::Rejected(
+                            "halt write was not accepted and no record is readable".to_string(),
+                        ))
+                    }
+                }
+            }
             store.flush()?;
+            // BZ.5 (A2): durable means written, flushed and read back identical.
+            match store.get(HALT_KEY)? {
+                Some(written) if written == sealed => Ok(()),
+                Some(_) => Err(BftError::Rejected(
+                    "halt record read back differs from the record written".to_string(),
+                )),
+                None => Err(BftError::Rejected(
+                    "halt record missing after the write".to_string(),
+                )),
+            }
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
     /// Offer a vote from the network to the engine.
