@@ -27,7 +27,10 @@
 //! synthetic transactions (the same harness style as phase 4BA). Consensus is
 //! covered by AY/AZ/BD/BE.
 //!
-//! Ports 44851-44856 are unique to this suite (44841-44844 = 4BA).
+//! Ports 44851-44861 are unique to this suite (44841-44844 = 4BA), and every
+//! test binds its own: 44856/44857/44858 were each used twice (bn06/bn08,
+//! bn09/bn11, bn10/bn12), which failed with `AddrInUse` under the default
+//! parallel harness (mission BY-FINAL, §3).
 
 use aether_unified::genesis::GENESIS_HASH;
 use aether_unified::p2p::{
@@ -943,7 +946,7 @@ async fn bn07_inventory_does_not_rerequest_a_transaction_still_in_ingress() {
 /// re-armed as pending and the next announcement asks again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bn08_inventory_does_not_rerequest_an_outstanding_getdata() {
-    const PORT: u16 = 44856;
+    const PORT: u16 = 44859;
     // The responder's own page handoff budget (`SYNC_RESPONSE_PAGE_TIMEOUT`):
     // inside it, a second request can only fetch the same bytes again.
     const SERVING_WINDOW: Duration = Duration::from_secs(30);
@@ -1396,7 +1399,7 @@ async fn bn10_drained_tx_is_not_requested_and_retry_follows_release() {
 /// being satisfied by a lucky interleaving.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bn11_two_sessions_cannot_both_request_the_same_batch() {
-    const PORT: u16 = 44857;
+    const PORT: u16 = 44860;
     const BATCH: u32 = 300;
 
     let mut h = boot_node(PORT, Arc::new(HashMap::new()), vec![]);
@@ -1522,7 +1525,7 @@ async fn bn11_two_sessions_cannot_both_request_the_same_batch() {
 /// 2. a live entry must suppress — the id is skipped and no GetData is emitted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bn12_a_leaked_handoff_stops_hiding_the_id_after_its_lease() {
-    const PORT: u16 = 44858;
+    const PORT: u16 = 44861;
 
     let h = boot_node(PORT, Arc::new(HashMap::new()), vec![]);
     h.net.set_protocol_mode(P2PProtocolMode::LegacyV5);

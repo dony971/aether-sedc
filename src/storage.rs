@@ -536,6 +536,58 @@ impl Storage {
         Ok(value.to_vec())
     }
 
+    /// Atomic compare-and-swap on a metadata key (PHASE 4CP-AU, additive).
+    ///
+    /// Why this exists: [`Storage::put_metadata`] is an unconditional upsert
+    /// (`tree.insert`). A read followed by a write is therefore **not** a
+    /// compare-and-swap: two racing writers both read "empty" and both install
+    /// their own value, last writer silently winning. Nothing else in `Storage`
+    /// can reserve a key exactly once, so the anti-equivocation layer had no
+    /// safe primitive to build on.
+    ///
+    /// `sled::Tree::compare_and_swap` is atomic inside the database, so exactly
+    /// one of several racing writers observes `expected` and installs `new`.
+    ///
+    /// Returns `Ok(true)` when the swap was applied, `Ok(false)` when the stored
+    /// value no longer equals `expected`. A `false` result is a normal conflict,
+    /// not an error. Atomicity only: this does not fsync, call
+    /// [`Storage::flush`] for durability.
+    pub fn compare_and_swap_metadata(
+        &self,
+        key: &str,
+        expected: Option<&[u8]>,
+        new: &[u8],
+    ) -> Result<bool, StorageError> {
+        // sled 0.34 takes `Option` for both sides: `None` means "expect absent"
+        // on the left and would mean "delete" on the right.
+        match self.metadata.compare_and_swap(key, expected, Some(new)) {
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(_conflict)) => Ok(false),
+            Err(e) => Err(StorageError::from(e)),
+        }
+    }
+
+    /// Iterate metadata keys sharing `prefix`, in key order (PHASE 4CP-AU,
+    /// additive).
+    ///
+    /// Needed by startup recovery: vote-slot records must be scanned from disk,
+    /// not listed from memory, or a restart would forget reservations and the
+    /// node would sign a second, conflicting vote.
+    pub fn scan_metadata_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, StorageError> {
+        let mut out = Vec::new();
+        for item in self.metadata.scan_prefix(prefix.as_bytes()) {
+            let (k, v) = item?;
+            let key = String::from_utf8(k.to_vec()).map_err(|_| {
+                StorageError::DatabaseError("metadata key is not valid UTF-8".to_string())
+            })?;
+            out.push((key, v.to_vec()));
+        }
+        Ok(out)
+    }
+
     /// Batch write operations (atomic using Sled transaction)
     /// All operations are wrapped in a single Sled transaction to guarantee
     /// that a crash cannot leave partial data

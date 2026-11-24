@@ -790,7 +790,7 @@ async fn run_round_bx(
                             }
                             match outcome.persisted_at {
                                 Some(persisted_at) => {
-                                    result.persisted += 1;
+                                    result.persisted() += 1;
                                     persisted_atomic.fetch_add(1, Ordering::Relaxed);
                                     if result.first_persisted.is_none() {
                                         result.first_persisted = Some(persisted_at);
@@ -831,15 +831,15 @@ async fn run_round_bx(
                             fatal = true;
                         }
                     }
-                    if result.persisted as usize >= expected || fatal {
+                    if result.persisted() as usize >= expected || fatal {
                         break;
                     }
                 }
-                if !progress || fatal || result.persisted as usize >= expected {
+                if !progress || fatal || result.persisted() as usize >= expected {
                     break;
                 }
             }
-            if fatal || result.persisted as usize >= expected {
+            if fatal || result.persisted() as usize >= expected {
                 break;
             }
         }
@@ -967,9 +967,9 @@ async fn run_round_bx(
         result.stored, expected
     );
     assert_eq!(
-        result.persisted as usize, expected,
+        result.persisted() as usize, expected,
         "persisted {} of {} topology transactions",
-        result.persisted, expected
+        result.persisted(), expected
     );
     assert_eq!(result.rejected, 0, "rejected topology transactions");
     assert_eq!(result.duplicates, 0, "duplicate topology transactions");
@@ -1037,7 +1037,7 @@ async fn run_round_bx(
         received: result.received,
         accepted: result.accepted,
         stored: result.stored,
-        persisted: result.persisted,
+        persisted: result.persisted(),
         rejected: result.rejected,
         duplicates: result.duplicates,
         storage_errors: result.storage_errors,
@@ -1241,7 +1241,7 @@ fn build_repetition_record(
         transactions_received: round.received,
         transactions_accepted: round.accepted,
         transactions_stored: round.stored,
-        transactions_persisted: round.persisted,
+        transactions_persisted: round.persisted(),
         transactions_rejected: round.rejected,
         duplicates_received: round.duplicates,
         storage_errors: round.storage_errors,
@@ -1281,13 +1281,13 @@ fn build_repetition_record(
             FORMULA_ACCEPTED,
         ),
         persisted_acceptance_rate: make_rate_metric(
-            round.persisted,
+            round.persisted(),
             round.first_persisted_us,
             round.last_persisted_us,
             FORMULA_PERSISTED_ACCEPTANCE,
         ),
         completion_rate: make_rate_metric(
-            round.persisted,
+            round.persisted(),
             round.first_submission_us,
             round.last_persisted_us,
             FORMULA_COMPLETION,
@@ -1452,7 +1452,7 @@ fn aggregate_rounds(
         received += round.received;
         accepted += round.accepted;
         stored += round.stored;
-        persisted += round.persisted;
+        persisted += round.persisted();
         rejected += round.rejected;
         duplicates += round.duplicates;
         storage_errors += round.storage_errors;

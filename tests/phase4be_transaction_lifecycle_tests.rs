@@ -1046,7 +1046,10 @@ async fn be06_permanent_rejection_is_not_retried_and_transient_debt_is() {
 /// fails deterministically.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn be07_handoff_keeps_the_id_visible_across_the_funnel_call() {
-    const PORT: u16 = 44935;
+    // 44935 is be05's port, and be05 also holds 44936 for its restart; a
+    // second binder of 44935 fails with `AddrInUse` when the two tests run in
+    // parallel (mission BY-FINAL, §3).
+    const PORT: u16 = 44938;
     let dir = tempfile::tempdir().expect("dir");
     let node = boot_node(PORT, dir.path(), 100).await;
     let wallet = wallet_n(5_000_007);

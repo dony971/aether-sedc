@@ -624,10 +624,12 @@ impl StakeRegistry {
     }
 
     /// Supporting weight for `side` of `key`: sum over validators of
-    /// (latest vote for this key pointing at `side` or strictly inside its
-    /// descendant closure) x weight. Latest-per-validator rule: max by
-    /// (epoch, vote-id)  -  pure function of the vote SET (deterministic across
-    /// nodes/orders). Eligibility + weight read live (unbonded/slashed
+    /// (latest ADMISSIBLE vote for this key pointing at `side` or strictly
+    /// inside its descendant closure) x weight. Latest-per-validator rule:
+    /// filter `vote.epoch <= at_epoch` FIRST, then max by (epoch, vote-id)
+    ///  -  pure function of the admissible vote SET (deterministic across
+    /// nodes/orders; a future vote never shadows an older admissible one).
+    /// Eligibility + weight read live (unbonded/slashed
     /// contribute zero automatically). `is_strict_descendant` tests strict
     /// DAG descent (txid descends from `side`, excluding `side` itself;
     /// equality is handled here) and is supplied by the caller (DAG
@@ -646,6 +648,35 @@ impl StakeRegistry {
         self.support_breakdown(key, side, at_epoch, is_strict_descendant).0
     }
 
+    /// Best admissible vote per validator for `key` at `at_epoch`
+    /// (max by `(epoch, vote_id)` with `epoch <= at_epoch`), computed in ONE
+    /// pass over the authoritative map. This is the correctness fallback of
+    /// the optimized path: `vote_index` caches the GLOBAL latest vote, so a
+    /// future vote can hide an admissible historical vote from the same
+    /// validator. Exactly one vote is returned per validator, so no double
+    /// counting is possible. Only called when at least one indexed entry is
+    /// future; the common case never pays for it.
+    fn best_admissible_votes(
+        &self,
+        key: ConflictKey,
+        at_epoch: u64,
+    ) -> HashMap<[u8; 32], &Vote> {
+        let mut best: HashMap<[u8; 32], &Vote> = HashMap::new();
+        for ((vv, epoch, k), vote) in self.votes.iter() {
+            if *k != key || *epoch > at_epoch {
+                continue;
+            }
+            let better = match best.get(vv) {
+                None => true,
+                Some(b) => (*epoch, vote.id()) > (b.epoch, b.id()),
+            };
+            if better {
+                best.insert(*vv, vote);
+            }
+        }
+        best
+    }
+
     /// Supporting weight PLUS the contributing vote ids (sorted, distinct
     /// validators — latest-per-validator, same selection as support_for).
     /// Powers finality certificates (F-D4): the quorum vote set pinned
@@ -662,19 +693,46 @@ impl StakeRegistry {
         F: Fn(&[u8; 32]) -> bool,
     {
         // PHASE 4L (B+G optimized path): read the per-conflict latest-vote
-        // index instead of scanning the whole registry. The index entry for
-        // (key, validator) is exactly the reference per-validator selection
-        // (max by (epoch, vote id) over the map), maintained incrementally
-        // on every insert_vote exit and rebuilt on restore. Iteration order
-        // stays sorted, same as the reference. Weights still read live
-        // (eligibility/slash applied at read time, never cached).
+        // index instead of scanning the whole registry on every call. The
+        // index stores the GLOBAL latest vote for (key, validator) (max by
+        // (epoch, vote id) over the map), maintained incrementally on every
+        // insert_vote exit and rebuilt on restore. When that vote is future
+        // relative to `at_epoch`, the admissible vote is recovered from the
+        // authoritative map (L1.1-C fallback). Iteration order stays sorted,
+        // same as the reference. Weights still read live (eligibility/slash
+        // applied at read time, never cached).
         let mut total = 0u64;
         let mut ids: Vec<VoteId> = Vec::new();
         if let Some(per_validator) = self.vote_index.get(&key) {
             let mut ordered: Vec<[u8; 32]> = per_validator.keys().copied().collect();
             ordered.sort();
+            // L1.1-C (Rule B): the index caches the GLOBAL latest vote. It
+            // does not tell us whether that vote is admissible at `at_epoch`,
+            // so a future vote must never shadow an older admissible vote
+            // from the same validator: filter BEFORE selecting, not after.
+            // When any indexed entry is future, recover the admissible
+            // winners from the authoritative map in ONE pass (not one pass
+            // per validator). Votes stay stored/indexed either way (gossip
+            // convergence); they just do not weigh yet.
+            let fallback = if ordered
+                .iter()
+                .any(|v| per_validator[v].epoch > at_epoch)
+            {
+                Some(self.best_admissible_votes(key, at_epoch))
+            } else {
+                None
+            };
             for v in ordered {
-                let bv = &per_validator[&v];
+                let indexed = &per_validator[&v];
+                let bv = if indexed.epoch <= at_epoch {
+                    indexed
+                } else {
+                    match fallback.as_ref().and_then(|m| m.get(&v)) {
+                        Some(b) => *b,
+                        None => continue,
+                    }
+                };
+                debug_assert!(bv.epoch <= at_epoch);
                 if bv.side == *side || is_strict_descendant(&bv.side) {
                     total = total.saturating_add(self.voting_weight(&v, at_epoch));
                     ids.push(bv.id());
@@ -716,6 +774,13 @@ impl StakeRegistry {
                 if *vv != v || *k != key {
                     continue;
                 }
+                // L1.1-C (Rule B): filter BEFORE the max. A future vote must
+                // not shadow an admissible historical vote. Kept as an
+                // independent selection loop (not the optimized helper) so
+                // the reference remains a genuine oracle.
+                if *epoch > at_epoch {
+                    continue;
+                }
                 let better = match best {
                     None => true,
                     Some(b) => (*epoch, vote.id()) > (b.epoch, b.id()),
@@ -725,6 +790,7 @@ impl StakeRegistry {
                 }
             }
             if let Some(bv) = best {
+                debug_assert!(bv.epoch <= at_epoch);
                 latest.insert(v, bv);
             }
         }
@@ -734,6 +800,7 @@ impl StakeRegistry {
         ordered.sort();
         for v in ordered {
             let bv = latest[&v];
+            debug_assert!(bv.epoch <= at_epoch);
             if bv.side == *side || is_strict_descendant(&bv.side) {
                 total = total.saturating_add(self.voting_weight(&v, at_epoch));
                 ids.push(bv.id());

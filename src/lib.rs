@@ -9,9 +9,14 @@
 
 pub mod anchor;
 pub mod config;
+pub mod consensus;
 pub mod genesis;
 pub mod inventory;
 pub mod json_storage;
+pub mod l2bft;
+pub mod network;
+pub mod l2crypto;
+pub mod l2persist;
 pub mod ledger;
 pub mod log_privacy;
 pub mod node;
