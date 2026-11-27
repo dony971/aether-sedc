@@ -1,0 +1,617 @@
+name: M3 Distributed Lab (4 validators)
+
+# M3-GITHUB: distributed validation lab on a free public-repository runner.
+#
+# TRIGGER: workflow_dispatch ONLY. Pushing the branch runs nothing; a human must
+# start the run after granting authorisation. No push/PR/schedule trigger exists,
+# so this file can never start a campaign by itself.
+#
+# Fail-closed rules enforced here:
+#   * the commit under test is pinned by input `expected_head`;
+#   * every gated source file is hashed and compared to expected-sources.sha256
+#     BEFORE anything is compiled;
+#   * no step swallows an error or upgrades NOT_RUN to PASS;
+#   * perturbations are skipped unless NETNS_OK and NETEM_OK both passed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_head:
+        description: "Exact commit SHA to validate (fail-closed identity gate)"
+        required: true
+        type: string
+      heights:
+        description: "BZ3_HEIGHTS (heights to decide per scenario)"
+        required: false
+        default: "3"
+        type: string
+      run_perturbations:
+        description: "Run the perturbation job (requires NETNS_OK and NETEM_OK)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: m3-lab-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_TOOLCHAIN: "1.97.1"
+
+jobs:
+  # ---------------------------------------------------------------- job 1
+  environment-precheck:
+    name: environment-precheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      os_ok: ${{ steps.caps.outputs.os_ok }}
+      arch_ok: ${{ steps.caps.outputs.arch_ok }}
+      cpu_ok: ${{ steps.caps.outputs.cpu_ok }}
+      ram_ok: ${{ steps.caps.outputs.ram_ok }}
+      disk_ok: ${{ steps.caps.outputs.disk_ok }}
+      sudo_ok: ${{ steps.caps.outputs.sudo_ok }}
+      netns_ok: ${{ steps.caps.outputs.netns_ok }}
+      veth_ok: ${{ steps.caps.outputs.veth_ok }}
+      netem_ok: ${{ steps.caps.outputs.netem_ok }}
+      nft_ok: ${{ steps.caps.outputs.nft_ok }}
+      tcp_ok: ${{ steps.caps.outputs.tcp_ok }}
+      compatible: ${{ steps.caps.outputs.compatible }}
+
+    steps:
+      - name: Runner identity
+        run: |
+          set -eu
+          echo "| Item | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| uname | \`$(uname -srm)\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| distribution | \`$(. /etc/os-release && echo "$PRETTY_NAME")\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| nproc | \`$(nproc)\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| memory | \`$(free -g | awk '/^Mem:/{print $2" GB total, "$7" GB available"}')\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| disk / | \`$(df -h / | awk 'NR==2{print $4" free on "$2}')\` |" >> "$GITHUB_STEP_SUMMARY"
+          df -h / /mnt 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || echo "no separate /mnt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # stable (pinned 2026-11-27)
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Assert toolchain version
+        run: |
+          set -eu
+          rustc --version
+          cargo --version
+          test "$(rustc --version)" = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+
+      - name: Capability probes
+        id: caps
+        shell: bash
+        run: |
+          set +e
+          OUT="$GITHUB_OUTPUT"
+          SUM="$GITHUB_STEP_SUMMARY"
+          emit() {  # emit <output_key> <PASS|FAIL> <detail>
+            printf '%s=%s\n' "$1" "$2" >> "$OUT"
+            printf '| %s | **%s** | %s |\n' "$1" "$2" "$3" >> "$SUM"
+            printf 'RESULT %s=%s (%s)\n' "$1" "$2" "$3" >> capabilities.txt
+            printf 'RESULT %s=%s (%s)\n' "$1" "$2" "$3"
+          }
+          echo "" >> "$SUM"
+          echo "| Capability | Result | Detail |" >> "$SUM"
+          echo "|---|---|---|" >> "$SUM"
+
+          # OS
+          if . /etc/os-release && [ "${VERSION_ID:-}" = "24.04" ]; then
+            emit os_ok PASS "$PRETTY_NAME"
+          else
+            emit os_ok FAIL "expected Ubuntu 24.04"
+          fi
+
+          # ARCH
+          if [ "$(uname -m)" = "x86_64" ]; then emit arch_ok PASS "$(uname -m)"; else emit arch_ok FAIL "$(uname -m)"; fi
+
+          # CPU
+          CPUS=$(nproc)
+          if [ "$CPUS" -ge 4 ]; then emit cpu_ok PASS "$CPUS vCPU"; else emit cpu_ok FAIL "$CPUS vCPU"; fi
+
+          # RAM (GB)
+          MEMG=$(free -g | awk '/^Mem:/{print $2}')
+          if [ "$MEMG" -ge 8 ]; then emit ram_ok PASS "$MEMG GB"; else emit ram_ok FAIL "$MEMG GB"; fi
+
+          # DISK free on / (GB)
+          DFREE=$(df -BG / | awk 'NR==2{gsub("G","",$4); print $4}')
+          if [ "$DFREE" -ge 10 ]; then emit disk_ok PASS "$DFREE GB free on /"; else emit disk_ok FAIL "$DFREE GB free on /"; fi
+
+          # SUDO
+          if sudo -n true 2>/dev/null; then emit sudo_ok PASS "passwordless sudo"; else emit sudo_ok FAIL "sudo refused"; fi
+
+          # NETNS
+          sudo ip netns del m3probe >/dev/null 2>&1
+          if sudo ip netns add m3probe >/tmp/netns.err 2>&1 \
+             && sudo ip netns exec m3probe ip link set lo up >>/tmp/netns.err 2>&1 \
+             && sudo ip netns exec m3probe ip addr show lo >>/tmp/netns.err 2>&1; then
+            emit netns_ok PASS "add+exec+del"
+          else
+            emit netns_ok FAIL "$(tr '\n' ';' </tmp/netns.err | cut -c1-120)"
+          fi
+          sudo ip netns del m3probe >/dev/null 2>&1
+
+          # VETH + ping across two namespaces
+          sudo ip netns del m3v1 >/dev/null 2>&1; sudo ip netns del m3v2 >/dev/null 2>&1
+          sudo ip link del m3a >/dev/null 2>&1
+          VETH_DETAIL=""
+          sudo ip netns add m3v1 >>/tmp/veth.err 2>&1
+          sudo ip netns add m3v2 >>/tmp/veth.err 2>&1
+          sudo ip -n m3v1 link set lo up >>/tmp/veth.err 2>&1
+          sudo ip -n m3v2 link set lo up >>/tmp/veth.err 2>&1
+          sudo ip link add m3a type veth peer name m3b >>/tmp/veth.err 2>&1
+          sudo ip link set m3a netns m3v1 >>/tmp/veth.err 2>&1
+          sudo ip link set m3b netns m3v2 >>/tmp/veth.err 2>&1
+          sudo ip -n m3v1 addr add 10.99.0.1/30 dev m3a >>/tmp/veth.err 2>&1
+          sudo ip -n m3v2 addr add 10.99.0.2/30 dev m3b >>/tmp/veth.err 2>&1
+          sudo ip -n m3v1 link set m3a up >>/tmp/veth.err 2>&1
+          sudo ip -n m3v2 link set m3b up >>/tmp/veth.err 2>&1
+          if sudo ip netns exec m3v1 ping -c1 -W2 10.99.0.2 >>/tmp/veth.err 2>&1; then
+            emit veth_ok PASS "veth ping across two namespaces"
+          else
+            VETH_DETAIL=$(tr '\n' ';' </tmp/veth.err | cut -c1-120)
+            emit veth_ok FAIL "$VETH_DETAIL"
+          fi
+          sudo ip netns del m3v1 >/dev/null 2>&1; sudo ip netns del m3v2 >/dev/null 2>&1
+
+          # NETEM
+          sudo tc qdisc del dev lo root >/dev/null 2>&1
+          if sudo tc qdisc add dev lo root netem delay 5ms 2>/tmp/netem.err \
+             && sudo tc qdisc show dev lo | grep -q netem; then
+            emit netem_ok PASS "$(sudo tc qdisc show dev lo | head -1)"
+          else
+            emit netem_ok FAIL "$(tr '\n' ';' </tmp/netem.err | cut -c1-120)"
+          fi
+          sudo tc qdisc del dev lo root >/dev/null 2>&1
+
+          # NFTABLES
+          if sudo nft add table inet m3probe 2>/tmp/nft.err \
+             && sudo nft add chain inet m3probe output '{ type filter hook output priority 0; }' >>/tmp/nft.err 2>&1 \
+             && sudo nft delete table inet m3probe >>/tmp/nft.err 2>&1; then
+            emit nft_ok PASS "table+chain+delete"
+          else
+            emit nft_ok FAIL "$(tr '\n' ';' </tmp/nft.err | cut -c1-120)"
+          fi
+
+          # TCP between two independent processes
+          PORT=27999
+          python3 - "$PORT" >/tmp/tcpsrv.log 2>&1 <<'PY' &
+          import socket, sys
+          port = int(sys.argv[1])
+          s = socket.socket()
+          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          s.bind(("127.0.0.1", port))
+          s.listen(1)
+          c, _ = s.accept()
+          data = c.recv(4)
+          c.sendall(b"PONG" if data == b"PING" else b"BAD")
+          c.close(); s.close()
+          PY
+          SRV=$!
+          sleep 1
+          REPLY=$(python3 - "$PORT" <<'PY' 2>&1
+          import socket, sys
+          s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), 5)
+          s.sendall(b"PING")
+          print(s.recv(4).decode())
+          s.close()
+          PY
+          )
+          wait "$SRV"
+          SRV_RC=$?
+          if [ "$SRV_RC" -eq 0 ] && [ "$REPLY" = "PONG" ]; then
+            emit tcp_ok PASS "two processes exchanged 8 bytes on 127.0.0.1:$PORT"
+          else
+            emit tcp_ok FAIL "reply=$REPLY server_rc=$SRV_RC"
+          fi
+
+          # Compatibility verdict: EVERY capability must pass.
+          COMPAT=FAIL
+          if [ "$(grep -c '=PASS$' "$OUT")" -ge 11 ] \
+             && ! grep -q '=FAIL$' "$OUT"; then COMPAT=PASS; fi
+          emit compatible "$COMPAT" "requires os,arch,cpu,ram,disk,sudo,netns,veth,netem,nft,tcp"
+
+          echo "" >> "$SUM"
+          echo "compatible=$COMPAT" >> "$SUM"
+
+      - name: Upload capability report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: m3-runner-capabilities
+          path: capabilities.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------- job 2
+  linux-compilation:
+    name: linux-compilation
+    needs: environment-precheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout the exact commit under test
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          ref: ${{ inputs.expected_head }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Identity gate (fail-closed)
+        run: |
+          set -eu
+          echo "HEAD=$(git rev-parse HEAD)"
+          test "$(git rev-parse HEAD)" = "${{ inputs.expected_head }}"
+          bash scripts/m3_verify_tree.sh expected-sources.sha256
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # stable (pinned 2026-11-27)
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+
+      - name: Build the real validator harness (bz3_node)
+        run: cargo build --release --bin bz3_node --verbose
+
+      - name: Print binary identity
+        run: |
+          set -eu
+          ls -l target/release/bz3_node
+          file target/release/bz3_node
+          sha256sum target/release/bz3_node | tee bz3_node.sha256
+
+      - name: Upload bz3_node
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: m3-bz3-node
+          path: |
+            target/release/bz3_node
+            bz3_node.sha256
+          retention-days: 7
+
+  # ---------------------------------------------------------------- job 3
+  m1-m2-regression:
+    name: m1-m2-regression
+    needs: linux-compilation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          ref: ${{ inputs.expected_head }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Identity gate (fail-closed)
+        run: bash scripts/m3_verify_tree.sh expected-sources.sha256
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca  # stable (pinned 2026-11-27)
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+
+      - name: M1 regression targets (166 tests baseline)
+        run: |
+          set -eu
+          cargo test --test phase4bm_safety_correction_tests --verbose
+          cargo test --test phase4bo_inter_node_validation --verbose
+          cargo test --test phase4bp_generation_installation --verbose
+          cargo test --test phase4dd_generation_integration_tests --verbose
+          cargo test --test phase4de_bootstrap_sync_tests --verbose
+          cargo test --test phase4f3_setpolicy_validation_tests --verbose
+
+      - name: BX / BY / C0 regression
+        run: |
+          set -eu
+          cargo test --test phase4bx_dag_topology_tests --verbose
+          cargo test --test phase4by_ledger_apply_benchmark_tests --verbose
+          cargo test --test phase4c0_full_pipeline_benchmark_tests --verbose
+
+      - name: F13 vote-index tests (optimisation M2)
+        run: |
+          set -eu
+          cargo test --lib phase4f13 --verbose
+
+      - name: Stake / quorum library tests
+        run: |
+          set -eu
+          cargo test --lib stake:: --verbose
+
+      - name: Archive test logs
+        if: always()
+        run: |
+          set -eu
+          mkdir -p m3-artifacts
+          echo "per-target results are in this job's log; this artifact pins what ran" > m3-artifacts/README.txt
+          git rev-parse HEAD > m3-artifacts/HEAD.txt
+          git status --porcelain > m3-artifacts/worktree-status.txt
+          rustc --version > m3-artifacts/toolchain.txt
+          cargo --version >> m3-artifacts/toolchain.txt
+          sha256sum expected-sources.sha256 > m3-artifacts/manifest.sha256
+
+      - name: Upload regression logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: m3-regression
+          path: m3-artifacts/
+          retention-days: 14
+
+  # ---------------------------------------------------------------- job 4
+  four-validator-network:
+    name: four-validator-network
+    needs: [environment-precheck, linux-compilation]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          ref: ${{ inputs.expected_head }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Download validator binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: m3-bz3-node
+          path: m3-bin
+
+      - name: Verify binary before use
+        run: |
+          set -eu
+          cd m3-bin
+          sha256sum -c bz3_node.sha256
+          chmod +x bz3_node
+
+      - name: Four independent validators, scenarios A/B/C
+        env:
+          BZ3_HEIGHTS: ${{ inputs.heights }}
+        run: |
+          set -eu
+          bash scripts/m3_lab.sh "$PWD/m3-bin/bz3_node" "$PWD/m3-lab"
+
+      - name: Upload lab logs and states
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: m3-four-validators
+          path: m3-lab/
+          retention-days: 14
+
+  # --------------------------------------------------------- job 4bis
+  # Isolated variant: four validators in four network namespaces. Runs ONLY when
+  # the runner proved NETNS_OK and VETH_OK. When it is skipped, the loopback lab
+  # above still runs, so an incapable runner never blocks the whole campaign --
+  # and the report says SKIPPED rather than PASS.
+  four-validator-namespaces:
+    name: four-validator-namespaces
+    needs: [environment-precheck, linux-compilation]
+    if: >-
+      needs.environment-precheck.outputs.netns_ok == 'PASS' &&
+      needs.environment-precheck.outputs.veth_ok == 'PASS'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          ref: ${{ inputs.expected_head }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Download validator binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: m3-bz3-node
+          path: m3-bin
+
+      - name: Verify binary before use
+        run: |
+          set -eu
+          cd m3-bin && sha256sum -c bz3_node.sha256 && chmod +x bz3_node
+
+      - name: Four validators in four network namespaces
+        env:
+          BZ3_HEIGHTS: ${{ inputs.heights }}
+        run: sudo --preserve-env=BZ3_HEIGHTS bash scripts/m3_ns_lab.sh "$PWD/m3-bin/bz3_node" "$PWD/m3-ns-lab"
+
+      - name: Upload isolated-lab logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: m3-isolated-lab
+          path: m3-ns-lab/
+          retention-days: 14
+
+  # ---------------------------------------------------------------- job 5
+  network-perturbations:
+    name: network-perturbations
+    needs: [environment-precheck, four-validator-network]
+    # Skipped unless a human asked for it AND both capabilities passed.
+    if: >-
+      inputs.run_perturbations &&
+      needs.environment-precheck.outputs.netns_ok == 'PASS' &&
+      needs.environment-precheck.outputs.netem_ok == 'PASS' &&
+      needs.environment-precheck.outputs.veth_ok == 'PASS'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          ref: ${{ inputs.expected_head }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Download validator binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: m3-bz3-node
+          path: m3-bin
+
+      - name: Verify binary before use
+        run: |
+          set -eu
+          cd m3-bin && sha256sum -c bz3_node.sha256 && chmod +x bz3_node
+
+      - name: Network perturbations over veth + netem
+        env:
+          BZ3_HEIGHTS: ${{ inputs.heights }}
+        run: sudo --preserve-env=BZ3_HEIGHTS bash scripts/m3_perturb.sh "$PWD/m3-bin/bz3_node" "$PWD/m3-perturb"
+
+      - name: Upload perturbation logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: m3-perturbations
+          path: m3-perturb/
+          retention-days: 14
+
+  # ---------------------------------------------------------------- job 6
+  recovery-and-restart:
+    name: recovery-and-restart
+    needs: linux-compilation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          ref: ${{ inputs.expected_head }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Download validator binary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: m3-bz3-node
+          path: m3-bin
+
+      - name: Verify binary before use
+        run: |
+          set -eu
+          cd m3-bin && sha256sum -c bz3_node.sha256 && chmod +x bz3_node
+
+      - name: Crash, lock release, resume, restore
+        env:
+          BZ3_HEIGHTS: ${{ inputs.heights }}
+        run: bash scripts/m3_recovery.sh "$PWD/m3-bin/bz3_node" "$PWD/m3-recovery"
+
+      - name: Upload recovery logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: m3-recovery
+          path: m3-recovery/
+          retention-days: 14
+
+  # ---------------------------------------------------------------- job 7
+  final-report:
+    name: final-report
+    needs:
+      - environment-precheck
+      - linux-compilation
+      - m1-m2-regression
+      - four-validator-network
+      - four-validator-namespaces
+      - network-perturbations
+      - recovery-and-restart
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Download every artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          path: m3-all
+
+      - name: Inventory and hash
+        run: |
+          set -eu
+          cd m3-all
+          find . -type f | sort | while read -r f; do sha256sum "$f"; done | tee ../m3-artifacts.sha256
+          echo "files=$(wc -l < ../m3-artifacts.sha256)"
+
+      - name: Verdict
+        env:
+          COMPAT: ${{ needs.environment-precheck.outputs.compatible }}
+          NETNS: ${{ needs.environment-precheck.outputs.netns_ok }}
+          NETEM: ${{ needs.environment-precheck.outputs.netem_ok }}
+          REG: ${{ needs.m1-m2-regression.result }}
+          LAB: ${{ needs.four-validator-network.result }}
+          NSLAB: ${{ needs.four-validator-namespaces.result }}
+          PERT: ${{ needs.network-perturbations.result }}
+          REC: ${{ needs.recovery-and-restart.result }}
+        run: |
+          set -eu
+          # Normalised states: PASS / FAIL / SKIPPED / BLOCKED / NOT TESTED / NOT IMPLEMENTED.
+          # A skipped job is reported SKIPPED and is never counted as a validation.
+          state() {
+            case "$1" in
+              success) echo PASS ;;
+              failure) echo FAIL ;;
+              skipped) echo SKIPPED ;;
+              cancelled) echo BLOCKED ;;
+              "") echo "NOT TESTED" ;;
+              *) echo "NOT TESTED" ;;
+            esac
+          }
+          {
+            echo "## M3 GitHub lab verdict"
+            echo ""
+            echo "| Gate | State |"
+            echo "|---|---|"
+            echo "| runner compatible (11 capabilities) | $COMPAT |"
+            echo "| NETNS_OK | $NETNS |"
+            echo "| NETEM_OK | $NETEM |"
+            echo "| m1-m2-regression (166 + F13 + BX/BY/C0) | $(state "$REG") |"
+            echo "| four-validator-network (loopback, A/B/C) | $(state "$LAB") |"
+            echo "| four-validator-namespaces (isolated) | $(state "$NSLAB") |"
+            echo "| network-perturbations (P1-P6) | $(state "$PERT") |"
+            echo "| recovery-and-restart | $(state "$REC") |"
+            echo "| RESTORE_SAME_CHAIN | $(state "$REC") |"
+            echo "| LIVE_NETWORK_CATCHUP | NOT IMPLEMENTED |"
+            echo ""
+            echo "A SKIPPED row is not a validation: it means the capability was missing."
+          } >> "$GITHUB_STEP_SUMMARY"
+          # The isolated lab may legitimately be SKIPPED when the runner lacks
+          # CAP_NET_ADMIN; a FAILURE is never tolerated, a skip is reported as is.
+          test "$REG" = "success"
+          test "$LAB" = "success"
+          test "$REC" = "success"
+          test "$NSLAB" != "failure"
+          if [ "$NSLAB" != "success" ]; then
+            echo "NOTE: four-validator-namespaces is '$NSLAB' -> no isolated-network claim is made" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload the whole campaign
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: m3-campaign
+          path: |
+            m3-all/
+            m3-artifacts.sha256
+          retention-days: 14
