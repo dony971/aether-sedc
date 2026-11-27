@@ -272,15 +272,25 @@ jobs:
           set -eu
           ls -l target/release/bz3_node
           file target/release/bz3_node
-          sha256sum target/release/bz3_node | tee bz3_node.sha256
+          sha256sum target/release/bz3_node
+          # Publish the binary at a FLAT path. The artifact layout is then
+          # deterministic: consumers download it into m3-bin/ and verify
+          # m3-bin/bz3_node against m3-bin/bz3_node.sha256, then chmod that
+          # exact same file before running it.
+          mkdir -p m3-dist
+          cp target/release/bz3_node m3-dist/bz3_node
+          chmod +x m3-dist/bz3_node
+          ( cd m3-dist && sha256sum bz3_node > bz3_node.sha256 )
+          test -s m3-dist/bz3_node
+          test -s m3-dist/bz3_node.sha256
+          cat m3-dist/bz3_node.sha256
 
       - name: Upload bz3_node
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: m3-bz3-node
-          path: |
-            target/release/bz3_node
-            bz3_node.sha256
+          path: m3-dist/
+          if-no-files-found: error
           retention-days: 7
 
   # ---------------------------------------------------------------- job 3
