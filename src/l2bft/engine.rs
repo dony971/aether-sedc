@@ -1903,6 +1903,13 @@ impl BftState {
                 "no checkpoint was decided at this height for the generation in force".to_string(),
             ));
         }
+        let decided = decided.unwrap();
+        // F1: the closure must carry the identifier of the decided checkpoint.
+        if closure.value_id != decided {
+            return Err(BftError::Rejected(
+                "the closure does not carry the decided value".to_string(),
+            ));
+        }
         // N-6: a closure is installable only if its installation obligation was
         // created when it was decided. The obligation binds the exact decided
         // checkpoint (`value_id`) and candidate (`candidate_id`), so a caller
@@ -1921,6 +1928,15 @@ impl BftState {
         {
             return Err(BftError::Rejected(
                 "the installation does not match the decided transition".to_string(),
+            ));
+        }
+        // F1: the durable obligation must carry the same decided value.
+        if pending.value_id != decided {
+            self.block_recovery(RecoveryReason::IncompleteState(
+                "the pending installation does not carry the decided value".to_string(),
+            ));
+            return Err(BftError::Rejected(
+                "the pending installation does not carry the decided value".to_string(),
             ));
         }
         if pending.installed {

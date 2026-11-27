@@ -541,7 +541,7 @@ fn audit_ledger(
         }
         match storage.get_transaction(tx.id) {
             Ok(row) if transaction_payload_matches(&row, tx) => {
-                audit.persisted() += 1;
+                audit.persisted += 1;
                 if row.weight != tx.weight {
                     audit.storage_weight_mismatches += 1;
                 }
@@ -1243,7 +1243,7 @@ async fn run_round_async(
     }
 
     let applied = applied_ids.len() as u64;
-    let persisted = audit.persisted();
+    let persisted = audit.persisted;
     let unresolved = expected as u64 - applied;
     let first_submission = first_submission.unwrap_or(start);
     let last_submission = last_submission.unwrap_or(first_submission);
@@ -1387,7 +1387,7 @@ fn build_record(
         receiver_admission_events: round.receiver_admission_events,
         transactions_receiver_admitted: round.receiver_admitted,
         transactions_applied: round.applied,
-        transactions_persisted: round.persisted(),
+        transactions_persisted: round.persisted,
         transactions_rejected: round.rpc_refusals,
         duplicate_applies: round.duplicate_apply,
         persistence_failures: round.audit.storage_row_mismatches
@@ -1446,7 +1446,7 @@ fn build_record(
             FORMULA_APPLIED,
         ),
         completion_rate: make_rate_metric(
-            round.persisted(),
+            round.persisted,
             round.first_submission_us,
             round.last_persisted_us,
             FORMULA_COMPLETION,

@@ -12,6 +12,7 @@ pub mod phase4aw_convergence_tests;
 pub mod phase4ax_selection_boundary_tests;
 pub mod phase4bi_recovery_persist_tests;
 pub mod phase4c_adversarial_audit_tests;
+pub mod phase4f13_vote_index_tests;
 pub mod phase4g_stake_finality_tests;
 pub mod phase4h_v6_adversarial_audit_tests;
 pub mod phase4i_v6_remediation_tests;

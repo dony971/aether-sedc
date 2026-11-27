@@ -1052,8 +1052,8 @@ async fn run_round_by(
                             result.last_applied = Some(outcome.applied_at);
                             result.ledger_apply_us.push(outcome.process_us);
 
-                            if outcome.persisted() {
-                                result.persisted() += 1;
+                            if outcome.persisted {
+                                result.persisted += 1;
                                 persisted_atomic.fetch_add(1, Ordering::Relaxed);
                                 let persisted_at =
                                     outcome.persisted_at.expect("persisted timestamp");
@@ -1231,9 +1231,9 @@ async fn run_round_by(
         result.applied, expected
     );
     assert_eq!(
-        result.persisted() as usize, expected,
+        result.persisted as usize, expected,
         "persisted {} of {} topology transactions",
-        result.persisted(), expected
+        result.persisted, expected
     );
     assert_eq!(result.rejected, 0, "rejected topology transactions");
     assert_eq!(result.duplicates, 0, "duplicate topology transactions");
@@ -1326,7 +1326,7 @@ async fn run_round_by(
         submitted: expected as u64,
         received: result.received,
         applied: result.applied,
-        persisted: result.persisted(),
+        persisted: result.persisted,
         rejected: result.rejected,
         duplicates: result.duplicates,
         persistence_failures: result.persistence_failures,
@@ -1560,7 +1560,7 @@ fn build_repetition_record(
         transactions_submitted: round.submitted,
         transactions_received: round.received,
         transactions_applied: round.applied,
-        transactions_persisted: round.persisted(),
+        transactions_persisted: round.persisted,
         transactions_rejected: round.rejected,
         duplicates_received: round.duplicates,
         persistence_failures: round.persistence_failures,
@@ -1598,13 +1598,13 @@ fn build_repetition_record(
             FORMULA_APPLIED,
         ),
         persistence_rate: make_rate_metric(
-            round.persisted(),
+            round.persisted,
             round.first_persisted_us,
             round.last_persisted_us,
             FORMULA_PERSISTED,
         ),
         completion_rate: make_rate_metric(
-            round.persisted(),
+            round.persisted,
             round.first_submission_us,
             round.last_persisted_us,
             FORMULA_COMPLETION,
@@ -1835,7 +1835,7 @@ fn aggregate_rounds(
         submitted += round.submitted;
         received += round.received;
         applied += round.applied;
-        persisted += round.persisted();
+        persisted += round.persisted;
         rejected += round.rejected;
         duplicates += round.duplicates;
         persistence_failures += round.persistence_failures;

@@ -1,4 +1,4 @@
-//! Mission BD — verified synchronisation and bootstrap.
+//! Mission BD â verified synchronisation and bootstrap.
 //!
 //! A chain is produced by a real cluster (one engine and one store per
 //! validator), then handed to a synchronising node as a *bundle*. The receiving
@@ -16,6 +16,7 @@ use aether_unified::consensus::generation::{
 use aether_unified::consensus::roots::ids_root;
 use aether_unified::consensus::transitions::{
     AdmittedSet, CandidateOperator, GenerationClosure, GenerationLedger, SetPolicy,
+    TransitionError,
 };
 use aether_unified::l2bft::{
     check_commitments, compare_histories, install_history, participation, restore_engine,
@@ -252,11 +253,12 @@ fn closure_of(
     generation: GenerationId,
     candidate: [u8; 32],
     new_set_root: [u8; 32],
+    value_id: [u8; 32],
 ) -> GenerationClosure {
     GenerationClosure {
         height: CheckpointHeight(height),
         generation,
-        value_id: [0x77; 32],
+        value_id,
         candidate_id: candidate,
         new_set_root,
     }
@@ -290,8 +292,8 @@ fn build(seeds: &[u8], weight: u64, transitions: usize, next_seeds: &[u8], salt:
             CheckpointHeight(height as u64),
             old.set_root(),
         );
-        let closure = closure_of(height as u64, old.generation(), candidate, set.set_root());
         let cp = cluster.checkpoint(height as u64, Some(candidate));
+        let closure = closure_of(height as u64, old.generation(), candidate, set.set_root(), cp.id());
         let cert = cluster.run_cycle(cp.id());
         cluster.finalize_all(&cert, &cp);
         checkpoints.push(cp);
@@ -751,5 +753,151 @@ fn bd_18_a_certificate_from_another_generation_is_refused() {
     match verify_history(&evil) {
         Err(SyncError::CertificateInvalid(_, _)) | Err(SyncError::CertificateForeign(_, _)) => {}
         other => panic!("a certificate of another generation must be refused, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mission M1 â F1: the closure value is bound to the certified checkpoint
+// ---------------------------------------------------------------------------
+
+/// All key/value pairs currently in a store, for the "nothing was written"
+/// assertion. `scan("")` matches every key.
+fn dump(store: &MemoryAtomicSlotStore) -> Vec<(String, Vec<u8>)> {
+    store.scan("").expect("scan")
+}
+
+/// A bundle in which only `closure.value_id` differs from the certified
+/// checkpoint. The forged value is the identifier of **another real checkpoint**
+/// of the same chain, not a random constant: a legitimate identifier from this
+/// very history must still be refused for this position.
+fn forged_value_bundle(fx: &Fixture) -> SyncBundle {
+    let mut forged = bundle(fx, 0, 1);
+    let other = fx.checkpoints[1].id();
+    assert_ne!(other, fx.checkpoints[0].id());
+    let closure = forged.generations[1]
+        .closure
+        .as_mut()
+        .expect("the height-0 closure");
+    assert_eq!(closure.value_id, fx.checkpoints[0].id());
+    closure.value_id = other;
+    forged
+}
+
+#[test]
+fn f1_01_bundle_closure_value_id_must_be_the_certified_checkpoint() {
+    let fx = build(&[1, 2, 3, 4], 10, 1, &[1, 2, 3, 4], 0);
+    let forged = forged_value_bundle(&fx);
+    let joiner = MemoryAtomicSlotStore::new();
+    let before = dump(&joiner);
+
+    match verify_history(&forged) {
+        Err(SyncError::CertificateForeign(height, what)) => {
+            assert_eq!(height, 0);
+            assert_eq!(what, "closure value");
+        }
+        other => panic!("a closure naming another value must be refused, got {other:?}"),
+    }
+    // `install_bundle` only calls `install_history` after `verify_history`
+    // succeeds; a refused bundle must not have mutated the store either way.
+    assert_eq!(dump(&joiner), before, "no byte may be written");
+}
+
+#[test]
+fn f1_02_bundle_with_honest_value_id_still_verifies_and_installs() {
+    let fx = build(&[1, 2, 3, 4], 10, 1, &[1, 2, 3, 4], 0);
+    let honest = bundle(&fx, 0, 1);
+    let history = verify_history(&honest).expect("the nominal bundle verifies");
+    assert_eq!(history.ledger.closures.len(), 1);
+    assert_eq!(history.ledger.closures[0].value_id, fx.checkpoints[0].id());
+
+    let joiner = MemoryAtomicSlotStore::new();
+    install_history(&joiner, &history).expect("the nominal bundle installs");
+    let ledger = GenerationLedger::load(&joiner)
+        .expect("load")
+        .expect("the ledger was written");
+    assert_eq!(ledger.closures[0].value_id, fx.checkpoints[0].id());
+    assert!(history.links.len() >= 2);
+
+    // Defence in depth: a ledger poisoned by a *direct local write* still halts
+    // when an honest closure for the same height is applied. A bundle can no
+    // longer reach this state (refused at verification); `apply_closure` itself
+    // never chooses a side.
+    let mut poisoned = history.ledger.clone();
+    poisoned.closures[0].value_id = [0x99u8; 32];
+    let store = MemoryAtomicSlotStore::new();
+    poisoned.persist(&store).expect("direct local ledger write");
+    let mut loaded = GenerationLedger::load(&store)
+        .expect("load")
+        .expect("ledger present");
+    let next_generation = fx.generations[1].registry.generation();
+    match loaded.apply_closure(history.ledger.closures[0], next_generation, 1) {
+        Err(TransitionError::Ledger(reason)) => {
+            assert!(reason.contains("two transitions decided at height 0"), "{reason}")
+        }
+        other => panic!("a contradictory closure must halt the ledger, got {other:?}"),
+    }
+    assert!(!loaded.status.may_sign(), "the ledger must be halted");
+}
+
+#[test]
+fn f1_03_a_certificate_from_another_checkpoint_is_refused() {
+    let fx = build(&[1, 2, 3, 4], 10, 1, &[1, 2, 3, 4], 0);
+    let mut evil = bundle(&fx, 0, 1);
+    // The height-1 link keeps its checkpoint but carries the certificate of the
+    // height-0 checkpoint: another checkpoint of the same chain and the same
+    // validator set, so only the identifier check can tell them apart.
+    evil.links[1].certificate = fx.certificates[0].clone();
+    let joiner = MemoryAtomicSlotStore::new();
+    let before = dump(&joiner);
+
+    match verify_history(&evil) {
+        Err(SyncError::CertificateForeign(height, what)) => {
+            assert_eq!(height, 1);
+            assert_eq!(what, "value");
+        }
+        Err(SyncError::CertificateInvalid(height, reason)) => {
+            assert_eq!(height, 1, "unexpected certificate error: {reason}");
+        }
+        other => panic!("a certificate of another checkpoint must be refused, got {other:?}"),
+    }
+    assert_eq!(dump(&joiner), before, "no byte may be written");
+}
+
+#[test]
+fn f1_04_a_closure_not_backed_by_a_checkpoint_is_refused() {
+    let fx = build(&[1, 2, 3, 4], 10, 1, &[1, 2, 3, 4], 0);
+    let mut evil = bundle(&fx, 0, 1);
+
+    // A second transition is appended at height 1 — the height of the tip
+    // checkpoint, which carries no `transition_id`. The checkpoint itself, its
+    // certificate and the first closure stay honest; only the generation chain
+    // invents a decision that no certified checkpoint ever took.
+    let old = fx.generations[1].registry.clone();
+    let set = AdmittedSet::admit(
+        &policy(old.total_voting_weight().get()),
+        &candidates(&[1, 2, 3, 4], 10),
+        2,
+        0,
+        Some(&old),
+    )
+    .expect("admissible second transition");
+    let forged = GenerationClosure {
+        height: CheckpointHeight(1),
+        generation: old.generation(),
+        value_id: [0xAAu8; 32],
+        candidate_id: set.candidate_id(old.generation(), CheckpointHeight(1), old.set_root()),
+        new_set_root: set.set_root(),
+    };
+    evil.generations.push(GenerationSpec {
+        number: 2,
+        registry: set.registry().clone(),
+        closure: Some(forged),
+    });
+
+    match verify_history(&evil) {
+        Err(SyncError::GenerationChain(reason)) => {
+            assert!(reason.contains("not certified by a checkpoint"), "{reason}")
+        }
+        other => panic!("an uncertified closure must be refused, got {other:?}"),
     }
 }

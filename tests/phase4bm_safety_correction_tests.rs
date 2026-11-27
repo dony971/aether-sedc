@@ -312,11 +312,12 @@ fn closure_at(
     next: &ValidatorRegistry,
     height: CheckpointHeight,
     candidate: [u8; 32],
+    value_id: [u8; 32],
 ) -> GenerationClosure {
     GenerationClosure {
         height,
         generation: old.generation(),
-        value_id: [0x77u8; 32],
+        value_id,
         candidate_id: candidate,
         new_set_root: next.set_root(),
     }
@@ -529,7 +530,7 @@ fn bm_05_decided_closure_blocks_advance_and_direct_decision() {
     // The obligation is installable and yields the next generation.
     cluster.engines[0]
         .close_generation(
-            closure_at(&old, &next, CheckpointHeight(0), candidate),
+            closure_at(&old, &next, CheckpointHeight(0), candidate, cp.id()),
             &next,
             &cluster.stores[0],
         )
@@ -544,7 +545,7 @@ fn bm_05_decided_closure_blocks_advance_and_direct_decision() {
 
 #[test]
 fn bm_06_installation_requires_the_certified_candidate() {
-    let (mut cluster, next, candidate, _cp, _cert) = decided_transition();
+    let (mut cluster, next, candidate, cp, _cert) = decided_transition();
     let old = cluster.registry.clone();
 
     // A different registry for the same position: its candidate id is not the
@@ -552,7 +553,7 @@ fn bm_06_installation_requires_the_certified_candidate() {
     let (foreign, _) = next_registry(&old, &[5, 6, 7, 8], 10, 1);
     assert!(matches!(
         cluster.engines[0].close_generation(
-            closure_at(&old, &foreign, CheckpointHeight(0), candidate),
+            closure_at(&old, &foreign, CheckpointHeight(0), candidate, [0u8; 32]),
             &foreign,
             &cluster.stores[0]
         ),
@@ -566,7 +567,7 @@ fn bm_06_installation_requires_the_certified_candidate() {
         cluster.engines[0].close_generation(
             GenerationClosure {
                 candidate_id: [0xEEu8; 32],
-                ..closure_at(&old, &next, CheckpointHeight(0), candidate)
+                ..closure_at(&old, &next, CheckpointHeight(0), candidate, [0u8; 32])
             },
             &next,
             &cluster.stores[0]
@@ -580,7 +581,7 @@ fn bm_06_installation_requires_the_certified_candidate() {
     forged.pending_installs.clear();
     assert!(matches!(
         forged.close_generation(
-            closure_at(&old, &next, CheckpointHeight(0), candidate),
+            closure_at(&old, &next, CheckpointHeight(0), candidate, [0u8; 32]),
             &next,
             &cluster.stores[0]
         ),
@@ -591,14 +592,14 @@ fn bm_06_installation_requires_the_certified_candidate() {
     // generation is refused before anything else happens.
     cluster.engines[0]
         .close_generation(
-            closure_at(&old, &next, CheckpointHeight(0), candidate),
+            closure_at(&old, &next, CheckpointHeight(0), candidate, cp.id()),
             &next,
             &cluster.stores[0],
         )
         .expect("installation");
     assert!(matches!(
         cluster.engines[0].close_generation(
-            closure_at(&old, &next, CheckpointHeight(0), candidate),
+            closure_at(&old, &next, CheckpointHeight(0), candidate, [0u8; 32]),
             &next,
             &cluster.stores[0]
         ),
@@ -611,7 +612,7 @@ fn bm_06_installation_requires_the_certified_candidate() {
 
 #[test]
 fn bm_07_restart_between_decision_and_installation_blocks_signing() {
-    let (cluster, next, _candidate, _cp, _cert) = decided_transition();
+    let (cluster, next, _candidate, cp, _cert) = decided_transition();
 
     // Restart at h_close + 1 with the old registry: the obligation survives,
     // and the engine refuses to sign.
@@ -661,11 +662,11 @@ fn bm_07_restart_between_decision_and_installation_blocks_signing() {
 
 #[test]
 fn bm_08_restart_after_installation_restores_the_new_generation() {
-    let (mut cluster, next, candidate, _cp, _cert) = decided_transition();
+    let (mut cluster, next, candidate, cp, _cert) = decided_transition();
     let old = cluster.registry.clone();
     cluster.engines[0]
         .close_generation(
-            closure_at(&old, &next, CheckpointHeight(0), candidate),
+            closure_at(&old, &next, CheckpointHeight(0), candidate, cp.id()),
             &next,
             &cluster.stores[0],
         )
@@ -723,7 +724,7 @@ fn bm_10_three_generations_keep_one_obligation_per_closure() {
     let cp0 = cluster.checkpoint(0, Some(cand0));
     let cert0 = cluster.run_cycle(cp0.id());
     cluster.finalize_all(&cert0, &cp0);
-    cluster.close_all(closure_at(&gen0, &gen1, CheckpointHeight(0), cand0), &gen1);
+    cluster.close_all(closure_at(&gen0, &gen1, CheckpointHeight(0), cand0, cp0.id()), &gen1);
 
     // A normal checkpoint at height 1 does not close anything.
     let cp1 = cluster.checkpoint(1, None);
@@ -737,7 +738,7 @@ fn bm_10_three_generations_keep_one_obligation_per_closure() {
     let cp2 = cluster.checkpoint(2, Some(cand1));
     let cert2 = cluster.run_cycle(cp2.id());
     cluster.finalize_all(&cert2, &cp2);
-    cluster.close_all(closure_at(&gen1, &gen2, CheckpointHeight(2), cand1), &gen2);
+    cluster.close_all(closure_at(&gen1, &gen2, CheckpointHeight(2), cand1, cp2.id()), &gen2);
 
     assert_eq!(cluster.height, CheckpointHeight(3));
     assert_eq!(cluster.engines[0].ledger.closures.len(), 2);

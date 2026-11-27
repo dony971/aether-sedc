@@ -154,17 +154,26 @@ pub struct StakeRegistry {
     /// no map entry (consumed on use; direct unbond intents for known
     /// validators apply to the record immediately).
     unbond_intents: HashMap<[u8; 32], u64>,
-    /// PHASE 4L (B+G): per-conflict latest-vote index, conflict-key ->
-    /// validator -> latest vote (max by (epoch, vote id), exactly the
-    /// selection support_breakdown used to recompute by scanning the whole
-    /// registry). DERIVED CACHE, not source of truth: the `votes` map stays
-    /// authoritative. Maintained incrementally in insert_vote for the
-    /// affected (key, validator) only (G), rebuilt from scratch by
-    /// rebuild_vote_index (restore path). Excluded from snapshots
-    /// (rebuilt by replay). support_breakdown reads it instead of the
-    /// O(V x T) whole-registry scan. Deterministic iteration via sorted
-    /// keys at read sites, same order as the reference.
-    vote_index: HashMap<ConflictKey, HashMap<[u8; 32], Vote>>,
+    /// PHASE 4L (B+G) / F13: per-conflict epoch-ordered vote index,
+    /// conflict-key -> validator -> sorted epochs. DERIVED CACHE, not
+    /// source of truth: the `votes` map stays authoritative (the epoch is
+    /// one field of its key, so no vote payload is duplicated here).
+    /// Maintained incrementally in insert_vote for the affected (key,
+    /// validator, epoch) only, rebuilt from scratch by rebuild_vote_index
+    /// (restore path). Excluded from snapshots (rebuilt by replay).
+    ///
+    /// F13: an ordered epoch list replaces the former single "global
+    /// latest vote" slot. The global slot forced a whole-registry scan
+    /// (`best_admissible_votes`) whenever the latest vote was future
+    /// (EPOCH_GRACE allows epoch+1), i.e. O(|votes|) per support call and
+    /// O(members x |votes|) per try_finalize; it also made ingestion
+    /// quadratic (each insert rescanned the map). Selecting the
+    /// predecessor of `at_epoch` is now O(log e) with e = epochs stored
+    /// for one (key, validator) (bounded in practice by the grace window),
+    /// and ingestion is a targeted insertion. A sorted Vec<u64> (rather
+    /// than a BTreeMap<u64, Vote>) keeps the index small: 8 bytes per
+    /// epoch, versus a full node per pair. See F13-DESIGN.md.
+    vote_index: HashMap<ConflictKey, HashMap<[u8; 32], Vec<u64>>>,
 }
 
 impl StakeRegistry {
@@ -374,40 +383,39 @@ impl StakeRegistry {
         (support as u128) * 3 >= (total as u128) * 2
     }
 
-    /// PHASE 4L (B+G): refresh the per-conflict index entry for one
-    /// (key, validator) from the authoritative `votes` map (max by
-    /// (epoch, vote id), mirroring exactly what the reference per-validator
-    /// selection finds). Epochs per (validator, key) are few, so this is
-    /// O(epochs), not O(V x T). Called on every insert_vote exit (even
-    /// no-mutation Duplicate paths: idempotent no-op then) so no mutation
-    /// path can leave the index behind.
-    fn refresh_vote_index(&mut self, key: ConflictKey, validator: [u8; 32]) {
-        let mut best: Option<Vote> = None;
-        for ((vv, epoch, k), vote) in self.votes.iter() {
-            if *vv != validator || *k != key {
-                continue;
+    /// F13: refresh one (key, validator, epoch) slot of the index from the
+    /// authoritative `votes` map. The map holds at most one vote per triple,
+    /// so the update is a single binary search + insertion (or removal) in
+    /// the pair's sorted epoch list. No registry scan, so ingestion is no
+    /// longer quadratic. Called on every insert_vote exit (including
+    /// no-mutation Duplicate paths: idempotent) so no mutation path can
+    /// leave the index behind.
+    fn refresh_vote_index(&mut self, key: ConflictKey, validator: [u8; 32], epoch: u64) {
+        if self.votes.contains_key(&(validator, epoch, key)) {
+            let by_epoch = self
+                .vote_index
+                .entry(key)
+                .or_default()
+                .entry(validator)
+                .or_default();
+            if let Err(pos) = by_epoch.binary_search(&epoch) {
+                by_epoch.insert(pos, epoch);
             }
-            let better = match &best {
-                None => true,
-                Some(b) => (*epoch, vote.id()) > (b.epoch, b.id()),
-            };
-            if better {
-                best = Some(vote.clone());
-            }
-        }
-        match best {
-            Some(b) => {
-                self.vote_index.entry(key).or_default().insert(validator, b);
-            }
-            None => {
-                // Defensive: map holds no vote for this pair (unreachable
-                // through insert_vote, which just touched it). Drop any
-                // stale entry rather than serve derived incoherence.
-                if let Some(per_v) = self.vote_index.get_mut(&key) {
-                    per_v.remove(&validator);
-                    if per_v.is_empty() {
-                        self.vote_index.remove(&key);
+        } else {
+            // Defensive: the authoritative map holds no vote for this
+            // triple. Drop any stale entry rather than serve derived
+            // incoherence, then prune empty containers.
+            if let Some(per_validator) = self.vote_index.get_mut(&key) {
+                if let Some(by_epoch) = per_validator.get_mut(&validator) {
+                    if let Ok(pos) = by_epoch.binary_search(&epoch) {
+                        by_epoch.remove(pos);
                     }
+                    if by_epoch.is_empty() {
+                        per_validator.remove(&validator);
+                    }
+                }
+                if per_validator.is_empty() {
+                    self.vote_index.remove(&key);
                 }
             }
         }
@@ -458,22 +466,26 @@ impl StakeRegistry {
         Self::restore(snapshot)
     }
 
-    /// PHASE 4L (B+G): full index rebuild from the authoritative map
-    /// (restore-path safety net; replay already maintains incrementally).
+    /// F13: full index rebuild from the authoritative map (restore-path
+    /// safety net; replay already maintains incrementally). One pass over
+    /// `votes`, one epoch push per vote: O(|votes| log e) for the per-pair
+    /// sorts, instead of the former O(|votes|^2) refresh-per-pair.
     fn rebuild_vote_index(&mut self) {
-        self.vote_index.clear();
-        let mut pairs: Vec<([u8; 32], ConflictKey)> = self
-            .votes
-            .keys()
-            .map(|(vv, _, k)| (*vv, *k))
-            .collect();
-        // Deterministic rebuild order (result is order-independent, but
-        // keep it sorted for reproducibility).
-        pairs.sort();
-        pairs.dedup();
-        for (vv, k) in pairs {
-            self.refresh_vote_index(k, vv);
+        let mut index: HashMap<ConflictKey, HashMap<[u8; 32], Vec<u64>>> = HashMap::new();
+        for (validator, epoch, key) in self.votes.keys() {
+            index
+                .entry(*key)
+                .or_default()
+                .entry(*validator)
+                .or_default()
+                .push(*epoch);
         }
+        for per_validator in index.values_mut() {
+            for by_epoch in per_validator.values_mut() {
+                by_epoch.sort_unstable();
+            }
+        }
+        self.vote_index = index;
     }
 
     /// PHASE 4L fail-closed harness hooks (tests only): simulate an
@@ -490,11 +502,72 @@ impl StakeRegistry {
         self.rebuild_vote_index();
     }
 
+    /// F13 harness hook (tests only): drop the index for ONE conflict key,
+    /// simulating a torn/partial update (the worst observable index error;
+    /// updates themselves are infallible in-memory list insertions). Used to
+    /// prove fail-closed behavior for the affected key and clean recovery
+    /// from the authoritative map.
+    #[cfg(test)]
+    pub fn drop_vote_index_for_key_for_test(&mut self, key: ConflictKey) {
+        self.vote_index.remove(&key);
+    }
+
     /// PHASE 4L harness hook (tests only): total indexed (key, validator)
-    /// entries (memory estimate input).
+    /// entries (memory estimate input). Unchanged semantics under F13: one
+    /// entry per pair, regardless of how many epochs it holds.
     #[cfg(test)]
     pub fn vote_index_len_for_test(&self) -> usize {
         self.vote_index.values().map(|m| m.len()).sum()
+    }
+
+    /// F13 harness hook (tests only): total indexed (key, validator, epoch)
+    /// slots. Used to prove that the added epoch dimension stays bounded by
+    /// the grace window and to estimate memory.
+    #[cfg(test)]
+    pub fn vote_index_epoch_len_for_test(&self) -> usize {
+        self.vote_index
+            .values()
+            .flat_map(|m| m.values())
+            .map(|by_epoch| by_epoch.len())
+            .sum()
+    }
+
+    /// F13 harness hook (tests only): invariant check that the derived index
+    /// is exactly the authoritative map projected onto
+    /// (key, validator, epoch). Any divergence after an insert, an
+    /// equivocation, a rebuild or a restore is a consensus bug.
+    #[cfg(test)]
+    pub fn vote_index_is_consistent_for_test(&self) -> bool {
+        let mut expected: HashMap<ConflictKey, HashMap<[u8; 32], Vec<u64>>> = HashMap::new();
+        for (validator, epoch, key) in self.votes.keys() {
+            expected
+                .entry(*key)
+                .or_default()
+                .entry(*validator)
+                .or_default()
+                .push(*epoch);
+        }
+        for per_validator in expected.values_mut() {
+            for by_epoch in per_validator.values_mut() {
+                by_epoch.sort_unstable();
+            }
+        }
+        if expected != self.vote_index {
+            return false;
+        }
+        for (key, per_validator) in &self.vote_index {
+            for (validator, by_epoch) in per_validator {
+                if !by_epoch.windows(2).all(|w| w[0] < w[1]) {
+                    return false; // must stay sorted and deduplicated
+                }
+                for epoch in by_epoch {
+                    if !self.votes.contains_key(&(*validator, *epoch, *key)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Insert a vote. Returns the disposition:
@@ -515,6 +588,7 @@ impl StakeRegistry {
     pub fn insert_vote(&mut self, vote: Vote) -> VoteInsertOutcome {
         let ck = (vote.conflict_sender, vote.conflict_nonce);
         let vv = vote.validator;
+        let epoch = vote.epoch;
         let key = (
             vote.validator,
             vote.epoch,
@@ -526,7 +600,7 @@ impl StakeRegistry {
                 if vote.id() < existing.id() {
                     self.votes.insert(key, vote);
                 }
-                self.refresh_vote_index(ck, vv);
+                self.refresh_vote_index(ck, vv, epoch);
                 return VoteInsertOutcome::Duplicate;
             }
             // Different side: equivocation UNLESS this exact vote was seen
@@ -536,7 +610,7 @@ impl StakeRegistry {
             // downstream). Only a genuinely NEW side creates evidence.
             let vid = vote.id();
             if vid == existing.id() {
-                self.refresh_vote_index(ck, vv);
+                self.refresh_vote_index(ck, vv, epoch);
                 return VoteInsertOutcome::Duplicate;
             }
             let mut seen_before = false;
@@ -555,7 +629,7 @@ impl StakeRegistry {
                 }
             }
             if seen_before {
-                self.refresh_vote_index(ck, vv);
+                self.refresh_vote_index(ck, vv, epoch);
                 return VoteInsertOutcome::Duplicate;
             }
             // Equivocation: same (validator, epoch, key), different side.
@@ -576,11 +650,11 @@ impl StakeRegistry {
             if keep_new {
                 self.votes.insert(key, vote);
             }
-            self.refresh_vote_index(ck, vv);
+            self.refresh_vote_index(ck, vv, epoch);
             return VoteInsertOutcome::Equivocated { evidence_id: eid };
         }
         self.votes.insert(key, vote);
-        self.refresh_vote_index(ck, vv);
+        self.refresh_vote_index(ck, vv, epoch);
         VoteInsertOutcome::Accepted
     }
 
@@ -648,33 +722,72 @@ impl StakeRegistry {
         self.support_breakdown(key, side, at_epoch, is_strict_descendant).0
     }
 
-    /// Best admissible vote per validator for `key` at `at_epoch`
-    /// (max by `(epoch, vote_id)` with `epoch <= at_epoch`), computed in ONE
-    /// pass over the authoritative map. This is the correctness fallback of
-    /// the optimized path: `vote_index` caches the GLOBAL latest vote, so a
-    /// future vote can hide an admissible historical vote from the same
-    /// validator. Exactly one vote is returned per validator, so no double
-    /// counting is possible. Only called when at least one indexed entry is
-    /// future; the common case never pays for it.
-    fn best_admissible_votes(
+    /// F13: admissible selection for `key` at `at_epoch`: for every validator
+    /// indexed on the key, the vote with the greatest epoch `<= at_epoch`
+    /// (binary search in the pair's sorted epoch list). Returns the selection
+    /// sorted by validator plus the number of index probes (one per
+    /// validator), so tests can assert the traversal count is independent of
+    /// the total number of stored votes.
+    ///
+    /// Equivalence with the reference selection: the authoritative map holds
+    /// at most one vote per (validator, epoch, key), so the greatest epoch
+    /// under the bound is exactly the max by (epoch, vote_id) under the bound.
+    fn admissible_selection(
         &self,
         key: ConflictKey,
         at_epoch: u64,
-    ) -> HashMap<[u8; 32], &Vote> {
-        let mut best: HashMap<[u8; 32], &Vote> = HashMap::new();
-        for ((vv, epoch, k), vote) in self.votes.iter() {
-            if *k != key || *epoch > at_epoch {
-                continue;
-            }
-            let better = match best.get(vv) {
-                None => true,
-                Some(b) => (*epoch, vote.id()) > (b.epoch, b.id()),
-            };
-            if better {
-                best.insert(*vv, vote);
+    ) -> (Vec<([u8; 32], &Vote)>, usize) {
+        let mut selected: Vec<([u8; 32], &Vote)> = Vec::new();
+        let mut probes = 0usize;
+        if let Some(per_validator) = self.vote_index.get(&key) {
+            let mut ordered: Vec<[u8; 32]> = per_validator.keys().copied().collect();
+            ordered.sort();
+            for validator in ordered {
+                probes += 1;
+                let by_epoch = &per_validator[&validator];
+                let upper = by_epoch.partition_point(|epoch| *epoch <= at_epoch);
+                if upper == 0 {
+                    continue;
+                }
+                let epoch = by_epoch[upper - 1];
+                // The epoch is a field of the authoritative key: the vote
+                // itself is never duplicated in the index.
+                match self.votes.get(&(validator, epoch, key)) {
+                    Some(vote) => selected.push((validator, vote)),
+                    None => debug_assert!(
+                        false,
+                        "vote index holds an epoch absent from the authoritative map"
+                    ),
+                }
             }
         }
-        best
+        (selected, probes)
+    }
+
+    /// Shared scoring step: sum the eligible weight of the selected votes
+    /// pointing at `side` or strictly inside its descendant closure, and
+    /// collect their ids (sorted). One weight read per selected validator.
+    fn score_selection<F>(
+        &self,
+        selected: &[([u8; 32], &Vote)],
+        side: &[u8; 32],
+        at_epoch: u64,
+        is_strict_descendant: &F,
+    ) -> (u64, Vec<VoteId>)
+    where
+        F: Fn(&[u8; 32]) -> bool,
+    {
+        let mut total = 0u64;
+        let mut ids: Vec<VoteId> = Vec::new();
+        for (validator, vote) in selected {
+            debug_assert!(vote.epoch <= at_epoch);
+            if vote.side == *side || is_strict_descendant(&vote.side) {
+                total = total.saturating_add(self.voting_weight(validator, at_epoch));
+                ids.push(vote.id());
+            }
+        }
+        ids.sort();
+        (total, ids)
     }
 
     /// Supporting weight PLUS the contributing vote ids (sorted, distinct
@@ -682,6 +795,9 @@ impl StakeRegistry {
     /// Powers finality certificates (F-D4): the quorum vote set pinned
     /// with the decision, so finality is re-verifiable and re-gossipable
     /// without the live registry (lost-vote reconstruction).
+    ///
+    /// F13: cost is O(validators_on_key + selected x log e), independent of
+    /// the total number of stored votes. No fallback scan remains.
     pub fn support_breakdown<F>(
         &self,
         key: ConflictKey,
@@ -692,55 +808,28 @@ impl StakeRegistry {
     where
         F: Fn(&[u8; 32]) -> bool,
     {
-        // PHASE 4L (B+G optimized path): read the per-conflict latest-vote
-        // index instead of scanning the whole registry on every call. The
-        // index stores the GLOBAL latest vote for (key, validator) (max by
-        // (epoch, vote id) over the map), maintained incrementally on every
-        // insert_vote exit and rebuilt on restore. When that vote is future
-        // relative to `at_epoch`, the admissible vote is recovered from the
-        // authoritative map (L1.1-C fallback). Iteration order stays sorted,
-        // same as the reference. Weights still read live (eligibility/slash
-        // applied at read time, never cached).
-        let mut total = 0u64;
-        let mut ids: Vec<VoteId> = Vec::new();
-        if let Some(per_validator) = self.vote_index.get(&key) {
-            let mut ordered: Vec<[u8; 32]> = per_validator.keys().copied().collect();
-            ordered.sort();
-            // L1.1-C (Rule B): the index caches the GLOBAL latest vote. It
-            // does not tell us whether that vote is admissible at `at_epoch`,
-            // so a future vote must never shadow an older admissible vote
-            // from the same validator: filter BEFORE selecting, not after.
-            // When any indexed entry is future, recover the admissible
-            // winners from the authoritative map in ONE pass (not one pass
-            // per validator). Votes stay stored/indexed either way (gossip
-            // convergence); they just do not weigh yet.
-            let fallback = if ordered
-                .iter()
-                .any(|v| per_validator[v].epoch > at_epoch)
-            {
-                Some(self.best_admissible_votes(key, at_epoch))
-            } else {
-                None
-            };
-            for v in ordered {
-                let indexed = &per_validator[&v];
-                let bv = if indexed.epoch <= at_epoch {
-                    indexed
-                } else {
-                    match fallback.as_ref().and_then(|m| m.get(&v)) {
-                        Some(b) => *b,
-                        None => continue,
-                    }
-                };
-                debug_assert!(bv.epoch <= at_epoch);
-                if bv.side == *side || is_strict_descendant(&bv.side) {
-                    total = total.saturating_add(self.voting_weight(&v, at_epoch));
-                    ids.push(bv.id());
-                }
-            }
-        }
-        ids.sort();
-        (total, ids)
+        let (selected, _probes) = self.admissible_selection(key, at_epoch);
+        self.score_selection(&selected, side, at_epoch, &is_strict_descendant)
+    }
+
+    /// F13 harness hook (tests only): identical computation to
+    /// support_breakdown, returning the number of index probes (one per
+    /// validator of the key). The non-amplification test asserts that this
+    /// count does not grow with |votes|.
+    #[cfg(test)]
+    pub fn support_breakdown_counted_for_test<F>(
+        &self,
+        key: ConflictKey,
+        side: &[u8; 32],
+        at_epoch: u64,
+        is_strict_descendant: F,
+    ) -> (u64, Vec<VoteId>, usize)
+    where
+        F: Fn(&[u8; 32]) -> bool,
+    {
+        let (selected, probes) = self.admissible_selection(key, at_epoch);
+        let (total, ids) = self.score_selection(&selected, side, at_epoch, &is_strict_descendant);
+        (total, ids, probes)
     }
 
     /// PHASE 4L reference path (tests only, never compiled into production

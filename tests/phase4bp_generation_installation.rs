@@ -120,10 +120,10 @@ fn closing(seeds: &[u8], next_seeds: &[u8], salt: u8) -> Closing {
         CheckpointHeight(0),
         registry.set_root(),
     );
-    let closure = GenerationClosure {
+    let mut closure = GenerationClosure {
         height: CheckpointHeight(0),
         generation: registry.generation(),
-        value_id: [0x77; 32],
+        value_id: [0u8; 32],
         candidate_id: candidate,
         new_set_root: set.set_root(),
     };
@@ -137,6 +137,7 @@ fn closing(seeds: &[u8], next_seeds: &[u8], salt: u8) -> Closing {
         Some(candidate),
     )
     .expect("checkpoint");
+    closure.value_id = cp.id();
 
     // One real round: prevotes, certificate, precommits, certificate, finality.
     let mut prevotes: Vec<ConsensusVote> = Vec::new();
@@ -721,4 +722,78 @@ fn bp_21_two_contradictory_closures_block_instead_of_being_merged() {
 #[allow(dead_code)]
 fn member_ids() -> Vec<ValidatorId> {
     SEEDS.iter().map(|seed| vid(*seed)).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Mission M1 — F1: the local closure path binds the decided value
+// ---------------------------------------------------------------------------
+
+#[test]
+fn f1_05_close_generation_refuses_another_value() {
+    let mut c = closing(&SEEDS, &SEEDS, 0);
+    let mut forged = c.closure;
+    forged.value_id = [0x99u8; 32];
+
+    let refused = c
+        .engine
+        .close_generation(forged, &c.next_canonical, &c.store);
+    assert!(
+        matches!(refused, Err(BftError::Rejected(_))),
+        "a closure not carrying the decided value must be refused, got {refused:?}"
+    );
+    assert!(
+        GenerationLedger::load(&c.store).expect("load").is_none(),
+        "no ledger byte may be written before the guard passes"
+    );
+    let pending = pending_at(&c.store, 0).expect("the obligation exists from finality");
+    assert!(!pending.installed, "the obligation must not be marked installed");
+    assert_eq!(pending.value_id, c.checkpoint.id());
+    assert_eq!(
+        c.engine.generation,
+        c.registry.generation(),
+        "the engine stays in the closing generation"
+    );
+}
+
+#[test]
+fn f1_06_restore_after_honest_install_is_clean() {
+    let mut c = closing(&SEEDS, &SEEDS, 0);
+    assert_eq!(c.closure.value_id, c.checkpoint.id());
+    c.engine
+        .close_generation(c.closure, &c.next_canonical, &c.store)
+        .expect("honest closure installs");
+    let decision = c.engine.finality.expect("decided");
+
+    // The ledger, the durable mark and the decision name the same value.
+    let ledger = GenerationLedger::load(&c.store)
+        .expect("load")
+        .expect("ledger");
+    let pending = pending_at(&c.store, 0).expect("marker");
+    assert_eq!(ledger.closures.len(), 1);
+    assert_eq!(ledger.closures[0].value_id, pending.value_id);
+    assert_eq!(pending.value_id, decision.checkpoint_id);
+    assert_eq!(decision.checkpoint_id, c.checkpoint.id());
+    assert!(pending.installed, "the mark proves this exact closure");
+    assert_eq!(pending.installed_set_root, c.next_canonical.set_root());
+
+    c.engine
+        .advance_height(CheckpointHeight(1), &c.store)
+        .expect("activation");
+    assert_eq!(ledger.closures[0].value_id, decision.checkpoint_id);
+
+    let restored = restore_engine(&c.store, &c.next_canonical, None, NET, CheckpointHeight(1));
+    assert_eq!(restored.state.generation, c.next_canonical.generation());
+    assert!(
+        restored.state.may_sign().is_ok(),
+        "an honest install must restart clean, got {:?}",
+        restored.state.persisted().status
+    );
+    let marker = restored
+        .state
+        .pending_installs
+        .get(&CheckpointHeight(0))
+        .copied()
+        .expect("marker kept");
+    assert!(marker.installed);
+    assert_eq!(marker.value_id, decision.checkpoint_id);
 }

@@ -96,6 +96,10 @@ pub enum TransitionError {
         max: u64,
     },
 
+    /// `SetPolicy` is internally inconsistent (configuration error).
+    #[error("SetPolicy: {0}")]
+    Policy(&'static str),
+
     /// `R-SET-2`: the total weight leaves the allowed window.
     #[error("R-SET-2: total weight {total} outside [1, {max}]")]
     TotalWeightOutOfRange {
@@ -222,16 +226,37 @@ pub struct CandidateOperator {
     pub jailed: bool,
 }
 
+impl SetPolicy {
+    /// Validate the internal consistency of the policy.
+    ///
+    /// Called before any weight derivation or admission logic.
+    pub fn validate(&self) -> Result<(), TransitionError> {
+        if self.min_weight > self.max_weight {
+            return Err(TransitionError::Policy("min_weight above max_weight"));
+        }
+        if self.max_weight == 0 || self.w_max == 0 {
+            return Err(TransitionError::Policy("a weight bound is zero"));
+        }
+        if self.w_max < self.min_weight {
+            return Err(TransitionError::Policy("w_max below min_weight"));
+        }
+        if self.deposit_unit == 0 {
+            return Err(TransitionError::Policy("deposit_unit is zero"));
+        }
+        if self.n_min == 0 || self.n_min > self.n_max {
+            return Err(TransitionError::Policy("member bounds are inverted"));
+        }
+        Ok(())
+    }
+}
+
 impl CandidateOperator {
     /// Weight derived from the deposit (`R-SET-2`), never declared directly.
     pub fn derived_weight(&self, policy: &SetPolicy) -> ValidatorWeight {
         let unit = policy.deposit_unit.max(1);
         let scaled = self.deposit / unit;
-        ValidatorWeight(
-            scaled
-                .clamp(policy.min_weight, policy.max_weight)
-                .max(policy.min_weight),
-        )
+        // Never panic: `min`/`max` cannot panic, unlike `clamp` when min > max.
+        ValidatorWeight(scaled.min(policy.max_weight).max(policy.min_weight))
     }
 
     /// `R-SET-1` eligibility.
@@ -277,6 +302,8 @@ impl AdmittedSet {
         epoch_pin: u64,
         old: Option<&ValidatorRegistry>,
     ) -> Result<Self, TransitionError> {
+        // Validate the policy before any derived computation.
+        policy.validate()?;
         // R-SET-3 — cardinality over the *declared* list.
         if candidates.len() < policy.n_min || candidates.len() > policy.n_max {
             return Err(TransitionError::Cardinality {

@@ -1,0 +1,40 @@
+# M3 identity manifest - 15 files.
+#
+# RULE: every hash below is defined over LF line endings.
+#
+# Why: the sealed M1/M2 working tree (%TEMP%\opencode\a066m2-f13-optimization\
+# repo-m2) stores its .rs files with CRLF, because it was produced on Windows,
+# while the commits they came from (C2 59e5de5f, base c83db1fc) store LF. The
+# commit procedure therefore applies exactly one transformation, CRLF -> LF, and
+# this manifest describes the result.
+#
+# The transformation is EOL-only and content preserving. Two proofs:
+#   1. every file satisfies b.replace(b"\r\n", b"\n") == b.replace(b"\r", b""),
+#      i.e. nothing but the line terminator changes;
+#   2. after normalisation the three BX/BY/C0 files hash to the exact blobs of
+#      base commit c83db1fc02db93d2a62a7e5e4ee80781f9488eb7:
+#        2e3330872ad78760b9021bd1296b28ed66ef565e  tests/phase4bx_dag_topology_tests.rs
+#        11c9de298bbb9d5861c99fdd355a460f3b803a2e  tests/phase4by_ledger_apply_benchmark_tests.rs
+#        0eb2625076a82301cd86b868b8cd79ea8872bb46  tests/phase4c0_full_pipeline_benchmark_tests.rs
+#      Normalisation restores the upstream bytes; it does not invent new ones.
+#      Their SHA-256 is unchanged because those three files were already LF.
+#
+# A tree that does not match these values is NOT the M1+M2 tree.
+#
+# --- M1 / M2 corrections --------------------------------------------------------
+5f0b39fe6db24f0d1fc5cc49dd17132f05765e32235fa3a0b2cdc993decb4c5a src/stake.rs
+8716a5b42969727f2b4b12772651134976726f6f1c9b6c16ecc7b9d31a63f136 src/consensus/transitions.rs
+582c5e8a5956a3de02c15480662b01020668ccbd1bc0e5dfe9458e474596bdde src/l2bft/sync.rs
+8571e5f03ca5a122c8704a4f2e54fb2e7eb9bea1dd63379c67d44af0063df0bf src/l2bft/engine.rs
+24ebef0be069a54a23cd287182ce6515d5abceaa6e58a9a9b3321467ea9aea5f src/tests/phase4f13_vote_index_tests.rs
+e4973edd13a3f2c3e5b9c49ed644de49abdb5edc8348317fa17bd9db71dc85c8 src/tests/mod.rs
+5584ea28d1d42de2de57ce32b9538d26ff67e2949838c58bc46cf14d204e46a5 tests/phase4f3_setpolicy_validation_tests.rs
+dcf4b3f8d3969c7be1f512a07dfc136afa06ccfad39b33fffd646aae3aefb30c tests/phase4bm_safety_correction_tests.rs
+a20bae66800c787184d439e272d1f5f320ec49dc4d5ac7b923f0ebaa9cdd8aba tests/phase4bo_inter_node_validation.rs
+42b84329126d429ea40bb90bf4aab2df105ef4c8dcc97c9f4a32e7e2b0991847 tests/phase4bp_generation_installation.rs
+599dd21bbb50677fcae2d2b08699abbdbd8e29915f3f2fd143f0212a4fa94948 tests/phase4dd_generation_integration_tests.rs
+cd23c7e0e9fc8e86a14e4950d468389de473538234fa5b625de0d45765546b8a tests/phase4de_bootstrap_sync_tests.rs
+# --- BX / BY / C0: identical to base commit c83db1fc, already LF ---------------
+4e83e711e4feb5d61062b95b22d939987b775a9f07b2e144042f94b3e6e8310d tests/phase4bx_dag_topology_tests.rs
+4b1ea3c6febbde05e543ce487e7ee0a4a5e55c34e8612140e0a34dbfba9a1717 tests/phase4by_ledger_apply_benchmark_tests.rs
+ab9995f15c7e1e726813273cb6231e881966d1a9b2b6f84b89c4e52b3957ad58 tests/phase4c0_full_pipeline_benchmark_tests.rs

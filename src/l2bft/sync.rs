@@ -281,6 +281,28 @@ fn registry_of<'a>(
 /// the registry of **their** generation, set roots are recomputed from the
 /// registry members, and the transition identifier of a closing checkpoint is
 /// recomputed from the candidate formula.
+/// F1: a closure at or above the anchor must be backed by a checkpoint of the
+/// bundle. Closures strictly below the anchor name a closing checkpoint the
+/// bundle does not carry; their effect is already summarised by the anchor's
+/// authenticated generation and set root, so they are left to the pre-anchor
+/// history and cannot move the active generation at the anchor.
+fn require_certified_closure(
+    certified: &BTreeMap<u64, [u8; 32]>,
+    anchor_height: u64,
+    height: u64,
+    closure: GenerationClosure,
+) -> Result<(), SyncError> {
+    if height < anchor_height {
+        return Ok(());
+    }
+    if certified.get(&height) == Some(&closure.value_id) {
+        return Ok(());
+    }
+    Err(SyncError::GenerationChain(format!(
+        "the generation closed at height {height} is not certified by a checkpoint of this bundle"
+    )))
+}
+
 pub fn verify_history(bundle: &SyncBundle) -> Result<VerifiedHistory, SyncError> {
     if bundle.links.is_empty() {
         return Err(SyncError::EmptyBundle);
@@ -360,6 +382,12 @@ pub fn verify_history(bundle: &SyncBundle) -> Result<VerifiedHistory, SyncError>
     let mut ledger =
         GenerationLedger::new(anchor.network, bundle.generations[0].registry.generation());
     let mut applied = 0usize;
+    // F1: every closure whose closing checkpoint is part of the bundle must be
+    // backed by that checkpoint. `certified_closures` records the ones whose
+    // checkpoint carried a transition and passed the `value_id` guard below.
+    // A closure at or above the anchor that is absent here was not decided by
+    // any checkpoint of this bundle and is refused before it is applied.
+    let mut certified_closures: BTreeMap<u64, [u8; 32]> = BTreeMap::new();
 
     // --- links -------------------------------------------------------------
     let first = &bundle.links[0];
@@ -438,7 +466,8 @@ pub fn verify_history(bundle: &SyncBundle) -> Result<VerifiedHistory, SyncError>
         // Install every generation whose closing checkpoint precedes this
         // height. A closure is applied only after its checkpoint was verified.
         while applied < installs.len() && installs[applied].0 < cp.height.get() {
-            let (_, closure, generation, number) = installs[applied];
+            let (height, closure, generation, number) = installs[applied];
+            require_certified_closure(&certified_closures, anchor.height.get(), height, closure)?;
             ledger
                 .apply_closure(closure, generation, number)
                 .map_err(|e| SyncError::GenerationChain(e.to_string()))?;
@@ -482,6 +511,11 @@ pub fn verify_history(bundle: &SyncBundle) -> Result<VerifiedHistory, SyncError>
                 .filter_map(|g| g.closure)
                 .find(|c| c.height == cp.height && c.generation == cp.generation)
                 .ok_or(SyncError::UnknownTransition(cp.height.get()))?;
+            // F1: the closure must carry the identifier of the certified checkpoint.
+            if closure.value_id != cp.id() {
+                return Err(SyncError::CertificateForeign(cp.height.get(), "closure value"));
+            }
+            certified_closures.insert(cp.height.get(), closure.value_id);
             let recomputed = candidate_id(
                 cp.generation,
                 cp.height,
@@ -560,7 +594,8 @@ pub fn verify_history(bundle: &SyncBundle) -> Result<VerifiedHistory, SyncError>
     // The tip may itself close a generation: that installation is part of what
     // the verified history establishes, and nothing above the tip is applied.
     while applied < installs.len() && installs[applied].0 <= tip.get() {
-        let (_, closure, generation, number) = installs[applied];
+        let (height, closure, generation, number) = installs[applied];
+        require_certified_closure(&certified_closures, anchor.height.get(), height, closure)?;
         ledger
             .apply_closure(closure, generation, number)
             .map_err(|e| SyncError::GenerationChain(e.to_string()))?;

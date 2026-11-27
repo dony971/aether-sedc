@@ -337,11 +337,12 @@ fn closure_of(
     generation: GenerationId,
     candidate: [u8; 32],
     new_set_root: [u8; 32],
+    value_id: [u8; 32],
 ) -> GenerationClosure {
     GenerationClosure {
         height: CheckpointHeight(height),
         generation,
-        value_id: [0x77; 32],
+        value_id,
         candidate_id: candidate,
         new_set_root,
     }
@@ -372,7 +373,7 @@ fn bc_01_normal_transition_installs_the_next_generation() {
     );
 
     cluster.close_all(
-        closure_of(0, old.generation(), candidate, set.set_root()),
+        closure_of(0, old.generation(), candidate, set.set_root(), cp.id()),
         set.registry(),
     );
 
@@ -420,7 +421,7 @@ fn bc_03_closed_generation_cannot_vote_any_more() {
     // advancing: every signing path is closed, even with a valid registry.
     cluster.engines[0]
         .close_generation(
-            closure_of(0, old.generation(), candidate, set.set_root()),
+            closure_of(0, old.generation(), candidate, set.set_root(), cp.id()),
             set.registry(),
             &cluster.stores[0],
         )
@@ -470,7 +471,7 @@ fn bc_04_new_generation_votes_only_after_activation() {
     let cert = cluster.run_cycle(cp.id());
     cluster.finalize_all(&cert, &cp);
     cluster.close_all(
-        closure_of(0, old.generation(), candidate, set.set_root()),
+        closure_of(0, old.generation(), candidate, set.set_root(), cp.id()),
         set.registry(),
     );
 
@@ -508,7 +509,7 @@ fn bc_05_direct_finalize_cannot_bypass_the_ledger() {
     let cert = cluster.run_cycle(cp.id());
     cluster.finalize_all(&cert, &cp);
     cluster.close_all(
-        closure_of(0, old.generation(), candidate, set.set_root()),
+        closure_of(0, old.generation(), candidate, set.set_root(), cp.id()),
         set.registry(),
     );
 
@@ -548,7 +549,7 @@ fn bc_06_certificate_from_a_closed_generation_is_refused() {
     // Keep a genuine precommit certificate of generation `g` …
     let old_cert = cert;
     cluster.close_all(
-        closure_of(0, old.generation(), candidate, set.set_root()),
+        closure_of(0, old.generation(), candidate, set.set_root(), cp.id()),
         set.registry(),
     );
 
@@ -853,7 +854,7 @@ fn bc_13_incomplete_transition_is_refused() {
     let store = MemoryAtomicSlotStore::new();
     let err = engine
         .close_generation(
-            closure_of(3, old.generation(), candidate, set.set_root()),
+            closure_of(3, old.generation(), candidate, set.set_root(), [0u8; 32]),
             set.registry(),
             &store,
         )
@@ -865,7 +866,7 @@ fn bc_13_incomplete_transition_is_refused() {
     let mut engine = BftState::new(NET, &old, CheckpointHeight(0), ANCHOR);
     let err = engine
         .close_generation(
-            closure_of(0, old.generation(), candidate, set.set_root()),
+            closure_of(0, old.generation(), candidate, set.set_root(), [0u8; 32]),
             set.registry(),
             &store,
         )
@@ -887,7 +888,7 @@ fn bc_14_crash_between_closure_and_installation_blocks_signing() {
     // Only validator 0 installs the ledger, then "crashes" before advancing.
     cluster.engines[0]
         .close_generation(
-            closure_of(0, old.generation(), candidate, set.set_root()),
+            closure_of(0, old.generation(), candidate, set.set_root(), cp.id()),
             set.registry(),
             &cluster.stores[0],
         )
@@ -948,7 +949,7 @@ fn bc_15_crash_after_installation_restores_the_new_generation() {
     let cert = cluster.run_cycle(cp.id());
     cluster.finalize_all(&cert, &cp);
     cluster.close_all(
-        closure_of(0, old.generation(), candidate, set.set_root()),
+        closure_of(0, old.generation(), candidate, set.set_root(), cp.id()),
         set.registry(),
     );
 
@@ -993,7 +994,7 @@ fn bc_16_concurrent_old_and_new_generation_cannot_both_be_restored() {
     // Validator 0 closes and installs; validator 1 stops before the closure.
     cluster.engines[0]
         .close_generation(
-            closure_of(0, old.generation(), candidate, set.set_root()),
+            closure_of(0, old.generation(), candidate, set.set_root(), cp.id()),
             set.registry(),
             &cluster.stores[0],
         )
@@ -1068,7 +1069,7 @@ fn bc_17_enforcement_holds_on_4_5_7_and_21_validators() {
         let cert = cluster.run_cycle(cp.id());
         cluster.finalize_all(&cert, &cp);
         cluster.close_all(
-            closure_of(0, old.generation(), candidate, set.set_root()),
+            closure_of(0, old.generation(), candidate, set.set_root(), cp.id()),
             set.registry(),
         );
 

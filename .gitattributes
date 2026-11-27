@@ -1,0 +1,11 @@
+# Byte-exact commits for the M3 laboratory.
+#
+# The M1/M2 sources carry CRLF inside their committed blobs: their SHA-256 values
+# in expected-sources.sha256 were measured on those exact bytes. Any end-of-line
+# normalisation performed by git (core.autocrlf=true, a global .gitattributes,
+# or a checkout filter) would rewrite the blobs, and the identity gate would then
+# reject the tree on the Linux runner -- fail-closed, but pointless.
+#
+# `-text` disables ALL end-of-line conversion for every path, so what is committed
+# is byte-for-byte what the manifest describes.
+* -text

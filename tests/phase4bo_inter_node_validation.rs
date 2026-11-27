@@ -285,14 +285,15 @@ fn build(seeds: &[u8], weight: u64, transitions: usize, next_seeds: &[u8], salt:
             CheckpointHeight(height as u64),
             old.set_root(),
         );
-        let closure = GenerationClosure {
+        let mut closure = GenerationClosure {
             height: CheckpointHeight(height as u64),
             generation: old.generation(),
-            value_id: [0x77; 32],
+            value_id: [0u8; 32],
             candidate_id: candidate,
             new_set_root: set.set_root(),
         };
         let cp = cluster.checkpoint(height as u64, Some(candidate));
+        closure.value_id = cp.id();
         let cert = cluster.run_cycle(cp.id());
         cluster.finalize_all(&cert, &cp);
         checkpoints.push(cp);
@@ -334,14 +335,15 @@ fn decided_only(seeds: &[u8], weight: u64, next_seeds: &[u8], salt: u8) -> Decid
     )
     .expect("admissible set");
     let candidate = set.candidate_id(old.generation(), CheckpointHeight(0), old.set_root());
-    let closure = GenerationClosure {
+    let mut closure = GenerationClosure {
         height: CheckpointHeight(0),
         generation: old.generation(),
-        value_id: [0x77; 32],
+        value_id: [0u8; 32],
         candidate_id: candidate,
         new_set_root: set.set_root(),
     };
     let cp = cluster.checkpoint(0, Some(candidate));
+    closure.value_id = cp.id();
     let cert = cluster.run_cycle(cp.id());
     cluster.finalize_all(&cert, &cp);
     DecidedOnly {
